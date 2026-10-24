@@ -1889,7 +1889,6 @@ impl MailWindow {
             .filter_map(|j| self.conversations.get(j))
             .map(|c| c.latest_message_id.clone())
             .collect();
-        let dark = cx.palette().is_dark();
         let store = self.store.clone();
         self.prerender = Some(cx.spawn(async move |this, cx| {
             // Let the open message paint and quick j/k runs settle before starting.
@@ -1904,7 +1903,8 @@ impl MailWindow {
                         if this.remote_allowed.contains(&m.id) || this.prefs.remote_images == RemoteImages::Allow {
                             return None;
                         }
-                        let (html, _) = this.browser_document(&Self::message_source(&m), Some(&m));
+                        let dark = cx.palette().is_dark();
+                        let (html, _) = this.browser_document(&Self::message_source(&m), Some(&m), cx.palette());
                         if crate::browser_body::is_rendered(&html, false, dark, size) {
                             return None;
                         }

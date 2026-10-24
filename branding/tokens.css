@@ -9,24 +9,24 @@
 }
 [data-overlook-theme="light"] {
   color-scheme: light;
-  --ol-background: #F4F3EE;
-  --ol-surface: #FFFEFB;
-  --ol-sidebar: #F0F1EC;
-  --ol-foreground: #192B35;
-  --ol-muted: #5E6D73;
-  --ol-divider: #DCE2DF;
-  --ol-controlBorder: #74868B;
-  --ol-hover: #E8EDE9;
-  --ol-accent: #365F73;
-  --ol-action: #365F73;
+  --ol-background: #CDD1C9;
+  --ol-surface: #E1E2DC;
+  --ol-sidebar: #C4CBC1;
+  --ol-foreground: #29332E;
+  --ol-muted: #4B564D;
+  --ol-divider: #A7B0A5;
+  --ol-controlBorder: #657267;
+  --ol-hover: #D5DAD1;
+  --ol-accent: #3F6654;
+  --ol-action: #3F6654;
   --ol-onAction: #FFFFFF;
-  --ol-selection: #E3EDEA;
-  --ol-selectionText: #284D5D;
-  --ol-focus: #986020;
+  --ol-selection: #BDCDBF;
+  --ol-selectionText: #29332E;
+  --ol-focus: #92581D;
   --ol-success: #386449;
   --ol-warning: #805015;
   --ol-error: #A13E37;
-  --ol-brandAccent: #FF9D32;
+  --ol-brandAccent: #92581D;
 }
 [data-overlook-theme="dark"] {
   color-scheme: dark;

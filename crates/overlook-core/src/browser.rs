@@ -41,6 +41,24 @@ const CSP: &str = "default-src 'none'; script-src 'none'; style-src 'unsafe-inli
 /// Oversized or excessively complex documents become a fixed inert error page;
 /// excessively nested CSS is discarded without affecting other styles.
 pub fn prepare_document(source: &str) -> BrowserDocument {
+    prepare_document_with_defaults(source, "body { background: white; color: black; }")
+}
+
+/// Apply display-only RGB defaults at zero CSS specificity so sender styles and
+/// legacy body color attributes win. These colors never enter stored/sent mail.
+pub fn prepare_document_with_colors(
+    source: &str,
+    background: u32,
+    foreground: u32,
+) -> BrowserDocument {
+    let defaults = format!(
+        ":where(body:not([bgcolor]):not([background])) {{ background-color: #{:06X}; }} :where(body:not([text])) {{ color: #{:06X}; }}",
+        background & 0xFFFFFF, foreground & 0xFFFFFF,
+    );
+    prepare_document_with_defaults(source, &defaults)
+}
+
+fn prepare_document_with_defaults(source: &str, defaults: &str) -> BrowserDocument {
     // Count every '<', including comments/text, as a conservative allocation
     // bound before invoking the HTML parser. Do not copy or echo rejected input.
     if source.len() > MAX_SOURCE_BYTES
@@ -51,11 +69,11 @@ pub fn prepare_document(source: &str) -> BrowserDocument {
             .count()
             > MAX_TAG_STARTS
     {
-        return preparation_error();
+        return preparation_error(defaults);
     }
     let dom = parse_document(RcDom::default(), ParseOpts::default()).one(source);
     if !dom_within_limits(&dom.document) {
-        return preparation_error();
+        return preparation_error(defaults);
     }
     let mut styles = String::new();
     prepare_nodes(&dom.document, false, &mut styles);
@@ -107,10 +125,10 @@ pub fn prepare_document(source: &str) -> BrowserDocument {
     let styles = cleaner.clean(&styles).to_string();
     let html_attrs = clean_root_attributes(&html_root, &cleaner, false);
     let body_attrs = clean_root_attributes(&body_root, &cleaner, true);
-    let html = format!("<!doctype html><html{html_attrs}><head><meta http-equiv=\"Content-Security-Policy\" content=\"{CSP}\"><style>body {{ margin: 0; background: white; color: black; font-family: Arial, sans-serif; font-size: 16px; }}</style>{styles}</head><body{body_attrs}>{body}</body></html>");
+    let html = format!("<!doctype html><html{html_attrs}><head><meta http-equiv=\"Content-Security-Policy\" content=\"{CSP}\"><style>body {{ margin: 0; font-family: Arial, sans-serif; font-size: 16px; }} {defaults}</style>{styles}</head><body{body_attrs}>{body}</body></html>");
     let counted = parse_document(RcDom::default(), ParseOpts::default()).one(html.as_str());
     if !dom_within_limits(&counted.document) {
-        return preparation_error();
+        return preparation_error(defaults);
     }
     let remote_resources = count_resources(&counted.document);
     BrowserDocument {
@@ -119,9 +137,9 @@ pub fn prepare_document(source: &str) -> BrowserDocument {
     }
 }
 
-fn preparation_error() -> BrowserDocument {
+fn preparation_error(defaults: &str) -> BrowserDocument {
     BrowserDocument {
-        html: format!("<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\" content=\"{CSP}\"></head><body><p>Message too large or complex to display safely.</p></body></html>"),
+        html: format!("<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\" content=\"{CSP}\"><style>{defaults}</style></head><body><p>Message too large or complex to display safely.</p></body></html>"),
         remote_resources: 0,
     }
 }

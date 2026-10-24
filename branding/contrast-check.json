@@ -3,77 +3,77 @@
     "theme": "light",
     "foreground": "foreground",
     "background": "surface",
-    "ratio": 14.48,
+    "ratio": 10.03,
     "minimum": 4.5
   },
   {
     "theme": "light",
     "foreground": "muted",
     "background": "surface",
-    "ratio": 5.32,
+    "ratio": 5.89,
     "minimum": 4.5
   },
   {
     "theme": "light",
     "foreground": "muted",
     "background": "sidebar",
-    "ratio": 4.73,
+    "ratio": 4.62,
     "minimum": 4.5
   },
   {
     "theme": "light",
     "foreground": "onAction",
     "background": "action",
-    "ratio": 6.9,
+    "ratio": 6.48,
     "minimum": 4.5
   },
   {
     "theme": "light",
     "foreground": "selectionText",
     "background": "selection",
-    "ratio": 7.61,
+    "ratio": 7.87,
     "minimum": 4.5
   },
   {
     "theme": "light",
     "foreground": "accent",
     "background": "surface",
-    "ratio": 6.85,
+    "ratio": 4.97,
     "minimum": 4.5
   },
   {
     "theme": "light",
     "foreground": "focus",
     "background": "surface",
-    "ratio": 5.17,
+    "ratio": 4.43,
     "minimum": 3
   },
   {
     "theme": "light",
     "foreground": "controlBorder",
     "background": "surface",
-    "ratio": 3.77,
+    "ratio": 3.88,
     "minimum": 3
   },
   {
     "theme": "light",
     "foreground": "success",
     "background": "surface",
-    "ratio": 6.74,
+    "ratio": 5.22,
     "minimum": 4.5
   },
   {
     "theme": "light",
     "foreground": "warning",
     "background": "surface",
-    "ratio": 6.77,
+    "ratio": 5.24,
     "minimum": 4.5
   },
   {
     "theme": "light",
     "foreground": "error",
     "background": "surface",
-    "ratio": 6.39,
+    "ratio": 4.94,
     "minimum": 4.5
   },
   {

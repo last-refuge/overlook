@@ -20,12 +20,12 @@ PALETTE = {
 }
 THEMES = {
     "light": {
-        "background": "#F4F3EE", "surface": "#FFFEFB", "sidebar": "#F0F1EC",
-        "foreground": "#192B35", "muted": "#5E6D73", "divider": "#DCE2DF",
-        "controlBorder": "#74868B", "hover": "#E8EDE9", "accent": "#365F73",
-        "action": "#365F73", "onAction": "#FFFFFF", "selection": "#E3EDEA",
-        "selectionText": "#284D5D", "focus": "#986020", "success": "#386449",
-        "warning": "#805015", "error": "#A13E37", "brandAccent": "#FF9D32",
+        "background": "#CDD1C9", "surface": "#E1E2DC", "sidebar": "#C4CBC1",
+        "foreground": "#29332E", "muted": "#4B564D", "divider": "#A7B0A5",
+        "controlBorder": "#657267", "hover": "#D5DAD1", "accent": "#3F6654",
+        "action": "#3F6654", "onAction": "#FFFFFF", "selection": "#BDCDBF",
+        "selectionText": "#29332E", "focus": "#92581D", "success": "#386449",
+        "warning": "#805015", "error": "#A13E37", "brandAccent": "#92581D",
     },
     "dark": {
         "background": "#101A21", "surface": "#17242C", "sidebar": "#121F27",

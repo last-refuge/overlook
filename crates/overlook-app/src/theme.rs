@@ -1,4 +1,4 @@
-//! Overlook's built-in themes. Light and Dark retain the original brand palettes.
+//! Overlook's built-in themes. Light uses the Soft stone palette.
 //!
 //! `Palette` holds the semantic tokens the custom mail views paint with. The same values are
 //! projected onto the component library's theme so inputs, menus, buttons, and scrollbars
@@ -50,28 +50,28 @@ impl Palette {
     pub fn light() -> Self {
         Self {
             resolved: ResolvedTheme::Light,
-            background: c(0xF4F3EE),
-            surface: c(0xFFFEFB),
-            sidebar: c(0xF0F1EC),
-            foreground: c(0x192B35),
-            muted: c(0x5E6D73),
-            divider: c(0xDCE2DF),
-            control_border: c(0x74868B),
-            hover: c(0xE8EDE9),
-            accent: c(0x365F73),
-            action: c(0x365F73),
+            background: c(0xCDD1C9),
+            surface: c(0xE1E2DC),
+            sidebar: c(0xC4CBC1),
+            foreground: c(0x29332E),
+            muted: c(0x4B564D),
+            divider: c(0xA7B0A5),
+            control_border: c(0x657267),
+            hover: c(0xD5DAD1),
+            accent: c(0x3F6654),
+            action: c(0x3F6654),
             on_action: c(0xFFFFFF),
-            selection: c(0xE3EDEA),
-            selection_text: c(0x284D5D),
-            focus: c(0x986020),
+            selection: c(0xBDCDBF),
+            selection_text: c(0x29332E),
+            focus: c(0x92581D),
             success: c(0x386449),
             warning: c(0x805015),
             error: c(0xA13E37),
-            brand_accent: c(0xFF9D32),
-            avatar: c(0xE4EBE3),
-            avatar_ink: c(0x42614E),
-            chip: c(0xEAEFEC),
-            label_slate: c(0x365F73),
+            brand_accent: c(0x92581D),
+            avatar: c(0xBDCDBF),
+            avatar_ink: c(0x29332E),
+            chip: c(0xD5DAD1),
+            label_slate: c(0x3F6654),
             label_plum: c(0x7C6BB6),
             label_amber: c(0xC98A3A),
         }
@@ -125,6 +125,7 @@ impl Palette {
             background, surface, sidebar, foreground, muted, divider, control_border,
             hover, accent: action, action, selection, selection_text, focus,
             avatar: selection, avatar_ink: selection_text, chip: hover, label_slate: action,
+            brand_accent: c(0xFF9D32),
             ..Self::light()
         };
         if theme == ResolvedTheme::Alexander {
@@ -157,9 +158,19 @@ impl Palette {
         if self.resolved == ResolvedTheme::Alexander { c(0xFF9F0A) } else { self.accent }
     }
 
-    /// Keep the message center white independently of the surrounding light colorway.
+    /// Light shares its stone surface with reading and composition. Other light
+    /// colorways retain their white message center.
     pub fn message_surface(&self) -> Hsla {
-        if self.is_dark() { self.surface } else { c(0xFFFFFF) }
+        if matches!(self.resolved, ResolvedTheme::Light | ResolvedTheme::Dark) { self.surface } else { c(0xFFFFFF) }
+    }
+
+    /// Theme defaults only; sender-authored HTML colors still take precedence.
+    pub fn prepare_browser_document(&self, source: &str) -> overlook_core::BrowserDocument {
+        if self.resolved == ResolvedTheme::Light {
+            overlook_core::browser::prepare_document_with_colors(source, color_rgb(self.message_surface()), color_rgb(self.foreground))
+        } else {
+            overlook_core::prepare_document(source)
+        }
     }
 
     pub fn is_dark(&self) -> bool {
@@ -190,7 +201,7 @@ impl ActivePalette for App {
 fn component_colors(theme: ResolvedTheme) -> serde_json::Value {
     let base = if theme.is_dark() { DARK_JSON } else { LIGHT_JSON };
     let mut colors: serde_json::Value = serde_json::from_str(base).expect("valid color tokens");
-    if matches!(theme, ResolvedTheme::Light | ResolvedTheme::Dark) {
+    if theme == ResolvedTheme::Dark {
         return colors;
     }
     let p = Palette::for_theme(theme);
@@ -227,12 +238,21 @@ fn component_colors(theme: ResolvedTheme) -> serde_json::Value {
     ] {
         colors[key] = serde_json::Value::String(color_hex(value));
     }
+    if theme == ResolvedTheme::Light {
+        colors["input.border"] = serde_json::Value::String(color_hex(p.control_border));
+    }
     colors
 }
 
-fn color_hex(color: Hsla) -> String {
+fn color_rgb(color: Hsla) -> u32 {
     let rgba = Rgba::from(color);
-    format!("#{:02X}{:02X}{:02X}", (rgba.r * 255.).round() as u8, (rgba.g * 255.).round() as u8, (rgba.b * 255.).round() as u8)
+    ((rgba.r * 255.).round() as u32) << 16
+        | ((rgba.g * 255.).round() as u32) << 8
+        | (rgba.b * 255.).round() as u32
+}
+
+fn color_hex(color: Hsla) -> String {
+    format!("#{:06X}", color_rgb(color))
 }
 
 fn component_theme(theme: ResolvedTheme) -> ThemeConfig {
@@ -368,11 +388,15 @@ mod tests {
     }
 
     #[test]
-    fn message_center_is_white_except_in_dark_mode() {
+    fn message_center_uses_stone_for_light_and_preserves_other_colorways() {
         for pref in AppearancePreference::ALL {
             for system in [SystemAppearance::Light, SystemAppearance::Dark, SystemAppearance::Unknown] {
                 let p = Palette::for_theme(pref.resolve(system));
-                let expected = if p.is_dark() { p.surface } else { c(0xFFFFFF) };
+                let expected = match p.resolved {
+                    ResolvedTheme::Light => c(0xE1E2DC),
+                    ResolvedTheme::Dark => p.surface,
+                    _ => c(0xFFFFFF),
+                };
                 assert_eq!(p.message_surface(), expected, "{pref:?}, {system:?}");
             }
         }

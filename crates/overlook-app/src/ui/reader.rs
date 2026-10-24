@@ -46,6 +46,8 @@ impl MailWindow {
         source.hash(&mut hash);
         allow_remote.hash(&mut hash);
         dark.hash(&mut hash);
+        // Light-to-light switches must also refresh Chromium's default paper.
+        std::mem::discriminant(&cx.palette().resolved).hash(&mut hash);
         if source.as_bytes().windows(4).any(|chunk| chunk.eq_ignore_ascii_case(b"cid:")) {
             if let Some(m) = original {
                 // Downloading a PDF or other non-inline attachment does not
@@ -60,18 +62,17 @@ impl MailWindow {
         let mut cache = self.browser_bodies.borrow_mut();
         if let Some((old, count, view)) = cache.get_mut(&key) {
             if *old != fingerprint {
-                let mut doc = overlook_core::browser::prepare_document(source);
-                if let Some(m) = original { doc.html = self.resolve_inline_images(m, doc.html); }
-                *count = doc.remote_resources;
+                let (html, resources) = self.browser_document(source, original, cx.palette());
+                *count = resources;
                 *old = fingerprint;
-                view.update(cx, |body, cx| body.set_document(doc.html, allow_remote, dark, cx));
+                view.update(cx, |body, cx| body.set_document(html, allow_remote, dark, cx));
             }
             return (view.clone().into_any_element(), *count);
         }
         if cache.len() >= 4 {
             return (div().p_3().child("Collapse another message to load this browser-rendered body (four live documents maximum).").into_any_element(), 0);
         }
-        let (html, count) = self.browser_document(source, original);
+        let (html, count) = self.browser_document(source, original, cx.palette());
         let native_scroll = (key.starts_with("message-") || key.starts_with("outbox-")).then(|| self.reader_scroll.clone());
         let view = cx.new(|cx| {
             let mut body = if key.starts_with("message-") {
@@ -91,8 +92,8 @@ impl MailWindow {
 
     /// The document Chromium renders for a body: prepared, with inline images resolved.
     /// Opening and pre-rendering must agree on it exactly to share a finished render.
-    pub(super) fn browser_document(&self, source: &str, original: Option<&Message>) -> (String, usize) {
-        let mut doc = overlook_core::browser::prepare_document(source);
+    pub(super) fn browser_document(&self, source: &str, original: Option<&Message>, palette: &crate::theme::Palette) -> (String, usize) {
+        let mut doc = palette.prepare_browser_document(source);
         if let Some(m) = original { doc.html = self.resolve_inline_images(m, doc.html); }
         (doc.html, doc.remote_resources)
     }
