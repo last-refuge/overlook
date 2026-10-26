@@ -289,8 +289,9 @@ impl MailWindow {
             .when(!selected && unread, |d| d.bg(p.background))
             .when(!selected, |d| d.hover(|d| d.bg(p.hover)))
             // Unread and selected both mark the left edge, like Outlook: unread with the
-            // accent bar, selected with the same bar on the tinted background.
-            .when(selected || unread, |d| {
+            // accent bar, selected with the same bar on the tinted background. Alexander's
+            // light blue selection carries itself, so its amber bar marks unread mail only.
+            .when(unread || (selected && p.resolved != overlook_core::ResolvedTheme::Alexander), |d| {
                 d.child(
                     div()
                         .absolute()

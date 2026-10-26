@@ -2434,7 +2434,7 @@ mod tests {
         let palette = crate::theme::Palette::light();
         let mut actor = Actor::start(Arc::new(AtomicBool::new(false)), false).unwrap();
         for (source, paper, ink) in [
-            ("<p>Synthetic unstyled message</p>", [225, 226, 220], "rgb(41, 51, 46)"),
+            ("<p>Synthetic unstyled message</p>", [255, 255, 255], "rgb(41, 51, 46)"),
             ("<style>body{background:#203040;color:#fafafa}</style><p>Authored stylesheet</p>", [32, 48, 64], "rgb(250, 250, 250)"),
             ("<body style='background:#203040;color:#fafafa'><p>Authored inline style</p></body>", [32, 48, 64], "rgb(250, 250, 250)"),
             ("<body bgcolor='#203040' text='#fafafa'><p>Authored legacy attributes</p></body>", [32, 48, 64], "rgb(250, 250, 250)"),
@@ -2445,17 +2445,6 @@ mod tests {
             let pixels = image::load_from_memory(&png).unwrap().into_rgb8();
             assert_eq!(pixels.get_pixel(400, 50).0, paper, "{source}");
             assert_eq!(actor.cdp.eval("getComputedStyle(document.body).color".into()).unwrap(), ink, "{source}");
-        }
-        // A colorway switch replaces the prepared defaults, not the stored mail.
-        let source = "<p>Synthetic unstyled message</p>";
-        for theme in [overlook_core::ResolvedTheme::White, overlook_core::ResolvedTheme::Light] {
-            let palette = crate::theme::Palette::for_theme(theme);
-            let document = palette.prepare_browser_document(source);
-            actor.load(&document.html, false).unwrap();
-            let (png, _, _) = actor.frame().unwrap();
-            let pixels = image::load_from_memory(&png).unwrap().into_rgb8();
-            let expected = if theme == overlook_core::ResolvedTheme::Light { [225, 226, 220] } else { [255, 255, 255] };
-            assert_eq!(pixels.get_pixel(400, 50).0, expected);
         }
     }
 

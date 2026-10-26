@@ -116,7 +116,7 @@ impl Palette {
             ResolvedTheme::Gray => [0xE5E7EB, 0xF3F4F6, 0xD1D5DB, 0x1F2937, 0x4B5563, 0xB8BEC7, 0x6B7280, 0xDDE1E7, 0x374151, 0xCDD5DF, 0x1F2937, 0x805015],
             ResolvedTheme::Blue => [0xEDF4FC, 0xF8FBFF, 0xDCE9F8, 0x172D4D, 0x4E6480, 0xC7D6E8, 0x657F9F, 0xE2EDFA, 0x245A96, 0xD3E4F8, 0x193F70, 0x805015],
             ResolvedTheme::White => [0xFFFFFF, 0xFFFFFF, 0xFAFAFA, 0x20242B, 0x59616D, 0xE0E3E7, 0x767D87, 0xF0F2F5, 0x374151, 0xE5E9EF, 0x20242B, 0x805015],
-            ResolvedTheme::Alexander => [0xDFE3E8, 0xFFFFFF, 0xE3E6EB, 0x182B46, 0x48596C, 0xB8C2CF, 0x63748A, 0xECEEF1, 0x1F57A5, 0xDDE0E4, 0x17314D, 0x1F57A5],
+            ResolvedTheme::Alexander => [0xDFE3E8, 0xFFFFFF, 0xE3E6EB, 0x182B46, 0x48596C, 0xB8C2CF, 0x63748A, 0xECEEF1, 0x1F57A5, 0xCCE8FF, 0x17314D, 0x1F57A5],
             ResolvedTheme::Pink => [0xFCF0F5, 0xFFFAFC, 0xF5DFE9, 0x402536, 0x765364, 0xE8C9D8, 0xA06A84, 0xF6E4ED, 0x963D68, 0xF0D4E2, 0x692C4B, 0x805015],
         };
         let [background, surface, sidebar, foreground, muted, divider, control_border, hover, action, selection, selection_text, focus] = colors.map(c);
@@ -129,6 +129,8 @@ impl Palette {
             ..Self::light()
         };
         if theme == ResolvedTheme::Alexander {
+            // Outlook-style light blue marks selected folders and messages; avatars stay gray.
+            palette.avatar = c(0xDDE0E4);
             palette.chip = c(0xECEEF1);
             palette.brand_accent = c(0xFF9F0A);
             palette.label_amber = c(0xFF9F0A);
@@ -158,10 +160,9 @@ impl Palette {
         if self.resolved == ResolvedTheme::Alexander { c(0xFF9F0A) } else { self.accent }
     }
 
-    /// Light shares its stone surface with reading and composition. Other light
-    /// colorways retain their white message center.
+    /// Keep the message center white in every light colorway, including the stone Light.
     pub fn message_surface(&self) -> Hsla {
-        if matches!(self.resolved, ResolvedTheme::Light | ResolvedTheme::Dark) { self.surface } else { c(0xFFFFFF) }
+        if self.is_dark() { self.surface } else { c(0xFFFFFF) }
     }
 
     /// Theme defaults only; sender-authored HTML colors still take precedence.
@@ -388,27 +389,24 @@ mod tests {
     }
 
     #[test]
-    fn message_center_uses_stone_for_light_and_preserves_other_colorways() {
+    fn message_center_is_white_except_in_dark_mode() {
         for pref in AppearancePreference::ALL {
             for system in [SystemAppearance::Light, SystemAppearance::Dark, SystemAppearance::Unknown] {
                 let p = Palette::for_theme(pref.resolve(system));
-                let expected = match p.resolved {
-                    ResolvedTheme::Light => c(0xE1E2DC),
-                    ResolvedTheme::Dark => p.surface,
-                    _ => c(0xFFFFFF),
-                };
+                let expected = if p.is_dark() { p.surface } else { c(0xFFFFFF) };
                 assert_eq!(p.message_surface(), expected, "{pref:?}, {system:?}");
             }
         }
     }
 
     #[test]
-    fn alexander_has_navy_navigation_gray_highlights_and_amber_edge() {
+    fn alexander_has_navy_navigation_blue_selection_and_amber_edge() {
         let p = Palette::for_theme(ResolvedTheme::Alexander);
         assert_eq!(p.surface, c(0xFFFFFF));
         assert_eq!(p.action, c(0x1F57A5));
         assert_eq!(p.chip, c(0xECEEF1));
-        assert_eq!(p.selection, c(0xDDE0E4));
+        assert_eq!(p.selection, c(0xCCE8FF));
+        assert_eq!(p.avatar, c(0xDDE0E4));
         assert_eq!(p.brand_accent, c(0xFF9F0A));
         assert_eq!(p.message_accent(), c(0xFF9F0A));
         assert_eq!(p.label_amber, c(0xFF9F0A));
