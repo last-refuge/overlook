@@ -165,6 +165,17 @@ impl Palette {
         if self.is_dark() { self.surface } else { c(0xFFFFFF) }
     }
 
+    /// Light lifts the message list to a pale green above its stone frame; other
+    /// themes paint the list with their surface.
+    pub fn list_surface(&self) -> Hsla {
+        if self.resolved == ResolvedTheme::Light { c(0xF3F7F1) } else { self.surface }
+    }
+
+    /// Unread rows sit one step darker than the list they belong to.
+    pub fn list_unread(&self) -> Hsla {
+        if self.resolved == ResolvedTheme::Light { c(0xE3EBE0) } else { self.background }
+    }
+
     /// Theme defaults only; sender-authored HTML colors still take precedence.
     pub fn prepare_browser_document(&self, source: &str) -> overlook_core::BrowserDocument {
         if self.resolved == ResolvedTheme::Light {
@@ -368,6 +379,8 @@ mod tests {
                 (p.foreground, p.background), (p.foreground, p.surface),
                 (p.foreground, p.sidebar), (p.muted, p.surface),
                 (p.foreground, p.message_surface()), (p.muted, p.message_surface()),
+                (p.foreground, p.list_surface()), (p.muted, p.list_surface()),
+                (p.foreground, p.list_unread()), (p.accent, p.list_unread()),
                 (p.muted, p.sidebar), (p.selection_text, p.selection),
                 (p.on_action, p.action), (p.avatar_ink, p.avatar),
             ] {

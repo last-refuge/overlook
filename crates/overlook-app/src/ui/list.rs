@@ -183,7 +183,7 @@ impl MailWindow {
             .key_context("MessageList")
             .track_focus(&self.list_focus)
             .size_full()
-            .bg(p.surface)
+            .bg(p.list_surface())
             .border_r_1()
             .border_color(p.divider)
             .child(header)
@@ -286,7 +286,7 @@ impl MailWindow {
             .border_color(if selected { gpui_kit::transparent_black() } else { p.divider })
             .cursor_pointer()
             .when(selected, |d| d.bg(p.selection))
-            .when(!selected && unread, |d| d.bg(p.background))
+            .when(!selected && unread, |d| d.bg(p.list_unread()))
             .when(!selected, |d| d.hover(|d| d.bg(p.hover)))
             // Unread and selected both mark the left edge, like Outlook: unread with the
             // accent bar, selected with the same bar on the tinted background. Alexander's
