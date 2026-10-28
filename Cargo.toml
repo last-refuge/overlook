@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.6.3"
+version = "1.6.4"
 edition = "2021"
 license = "Proprietary"
 authors = ["Last Refuge"]
