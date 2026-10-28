@@ -154,7 +154,9 @@ pub enum BrowserEvent {
 
 /// The complete Chromium command line apart from the private profile directory. DevTools is
 /// reachable only through the inherited pipe (fds 3/4): no remote-debugging port, no
-/// Chromium logging, crash reporting, or network access of its own.
+/// Chromium logging, crash reporting, or network access of its own. Chromium stays out of the
+/// system keyring: the private profile keeps no passwords, so its "Safe Storage" key would
+/// only add keyring reads that bypass Overlook's audited credentials module.
 const CHROMIUM_FLAGS: &[&str] = &[
     // Keep a 2x backing surface; CSS metrics/input remain independent.
     "--force-device-scale-factor=2", "--headless=new", "--remote-debugging-pipe", "--no-first-run", "--no-default-browser-check", "--no-startup-window",
@@ -163,7 +165,7 @@ const CHROMIUM_FLAGS: &[&str] = &[
     "--disable-application-cache", "--disk-cache-size=1", "--media-cache-size=1",
     "--disable-features=MediaRouter,OptimizationHints,AutofillServerCommunication,SpeculationRulesPrefetch",
     "--host-resolver-rules=MAP * ~NOTFOUND", "--proxy-server=http://127.0.0.1:9",
-    "--js-flags=--max-old-space-size=128", "--renderer-process-limit=2",
+    "--js-flags=--max-old-space-size=128", "--renderer-process-limit=2", "--password-store=basic",
 ];
 
 #[derive(Clone)]
@@ -1528,6 +1530,7 @@ mod tests {
     fn chromium_debugging_is_pipe_only_with_no_port_or_logging() {
         assert!(CHROMIUM_FLAGS.contains(&"--remote-debugging-pipe"));
         assert!(CHROMIUM_FLAGS.contains(&"--disable-crash-reporter"));
+        assert!(CHROMIUM_FLAGS.contains(&"--password-store=basic"), "Chromium must not use the system keyring");
         for flag in CHROMIUM_FLAGS {
             for forbidden in ["--remote-debugging-port", "--remote-debugging-address", "--remote-allow-origins", "--enable-logging", "--v=", "--vmodule", "--auto-open-devtools"] {
                 assert!(!flag.starts_with(forbidden), "{flag}");
