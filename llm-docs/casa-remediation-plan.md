@@ -32,7 +32,7 @@ v1.6.3 (SMTP certificate wording) and v1.6.4 (Chromium kept out of the keyring, 
 
 Live captures from v1.6.4 done 2026-10-28 (`round-2/live-captures.md`). Portal package built by `round-2/make-portal.sh` into `round-2/portal/` (one PDF per control, plus PNG pages); comments in `round-2/responses-round-2.md`.
 
-Still to do: upload, reload to verify persistence, submit.
+Submitted 28 October 2026: all 13 failed rows updated in the TAC portal (new comment, round-1 image removed, one v1.6.4 JPEG each from `round-2/portal-images/`), verified after a fresh reload (comment hashes matched, one file per row), then submitted by Jason. Upload Evidence is now locked; status Revalidation, awaiting tester review. TAC support: casasupport@tacsecurity.com.
 
 ## The pattern behind the failures
 
