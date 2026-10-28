@@ -164,7 +164,6 @@ fn connect_error(e: SmtpError) -> ProviderError {
     }
 }
 
-/// The fixed message for a lettre TLS error, from the rustls error underneath when present.
 /// The fixed message for a rustls failure anywhere in the error's causes, directly or inside
 /// an I/O error.
 fn rustls_cause(e: &SmtpError) -> Option<&'static str> {
@@ -179,6 +178,7 @@ fn rustls_cause(e: &SmtpError) -> Option<&'static str> {
     None
 }
 
+/// The fixed message for a lettre TLS error, from the rustls error underneath when present.
 fn tls_message(e: &SmtpError) -> &'static str {
     let mut source = std::error::Error::source(e);
     while let Some(inner) = source {
@@ -472,6 +472,24 @@ mod tests {
         assert_eq!(transport(addr).send("jason@example.com", &["maya@northstar.example".into()], MESSAGE), Err(ProviderError::Offline));
         let (addr, _rx) = serve(Behaviour::DropDuringGreeting);
         assert_eq!(transport(addr).probe(), Err(ProviderError::Offline));
+    }
+
+    #[test]
+    fn failed_implicit_tls_handshake_is_a_secure_connection_failure_not_offline() {
+        // A server that answers the TLS ClientHello with plain text. lettre reports the rustls
+        // failure as a network error; it must still read as a TLS failure, in fixed words.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut hello = [0u8; 512];
+                let _ = stream.read(&mut hello);
+                let _ = stream.write_all(b"220 smtp.example ESMTP plain text, not TLS\r\n");
+            }
+        });
+        let t = Transport::new(ServerEndpoint::new("127.0.0.1", addr.port(), Security::Tls, "jason@example.com"), "hunter2").with_timeout(Duration::from_secs(5));
+        assert_eq!(t.probe(), Err(ProviderError::Rejected(crate::secure_error::SECURE_CONNECTION_FAILED.into())));
     }
 
     #[test]

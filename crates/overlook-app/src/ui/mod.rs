@@ -332,6 +332,23 @@ pub(crate) fn sign_in_label_for(provider: ProviderKind) -> &'static str {
 /// A Google sign-in in progress (the browser has been opened).
 pub struct SignIn {
     cancel: Arc<AtomicBool>,
+    /// The address this sign-in was started for ("Sign in again"), if any.
+    expected: Option<String>,
+}
+
+/// The warning shown when Google returns a different account than the one being signed in
+/// again: the sign-in still counts for the account actually chosen, but the original stays
+/// signed out.
+fn sign_in_mismatch(expected: Option<&str>, actual: &str, added: bool) -> Option<String> {
+    let expected = expected?.trim().to_lowercase();
+    if expected.is_empty() || expected == actual {
+        return None;
+    }
+    Some(if added {
+        format!("You signed in as {actual}, not {expected}, so {actual} was added. {expected} still needs you to sign in again.")
+    } else {
+        format!("You signed in as {actual}, not {expected}. {expected} still needs you to sign in again.")
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1164,7 +1181,7 @@ impl MailWindow {
                 return;
             }
         };
-        let pending = match PendingSignIn::start(config, hint) {
+        let pending = match PendingSignIn::start(config, hint.clone()) {
             Ok(p) => p,
             Err(e) => {
                 crate::ui::toast(window, cx, crate::notify::Level::Error, e);
@@ -1172,7 +1189,7 @@ impl MailWindow {
             }
         };
         let url = pending.url.clone();
-        self.signin = Some(SignIn { cancel: pending.cancel_handle() });
+        self.signin = Some(SignIn { cancel: pending.cancel_handle(), expected: hint });
         cx.open_url(&url);
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
@@ -1191,7 +1208,7 @@ impl MailWindow {
 
     fn finish_google_sign_in(&mut self, result: Result<SignInResult, String>, window: &mut Window, cx: &mut Context<Self>) {
         let was_cancelled = self.signin.is_none();
-        self.signin = None;
+        let expected = self.signin.take().and_then(|s| s.expected);
         let result = match result {
             Ok(r) => r,
             Err(e) => {
@@ -1203,9 +1220,11 @@ impl MailWindow {
             }
         };
         let email = result.user.email.to_lowercase();
+        let mut added = false;
         let account = match self.store.account_by_email(ProviderKind::Gmail, &email) {
             Ok(Some(existing)) => existing,
             _ => {
+                added = true;
                 let account = Account {
                     id: AccountId(format!("gmail:{email}")),
                     provider: ProviderKind::Gmail,
@@ -1240,7 +1259,12 @@ impl MailWindow {
         }
         let _ = self.store.set_sync_state(&account.id, &SyncState::Syncing, None);
         self.accounts = self.store.accounts().unwrap_or_default();
-        crate::ui::toast(window, cx, crate::notify::Level::Success, format!("Signed in as {}. Downloading recent mail…", account.email));
+        if let Some(warning) = sign_in_mismatch(expected.as_deref(), &email, added) {
+            tracing::info!(target: "overlook::signin", account = %account.id.0, "signed in to a different Google account than the one being signed in again");
+            crate::ui::toast(window, cx, crate::notify::Level::Warning, warning);
+        } else {
+            crate::ui::toast(window, cx, crate::notify::Level::Success, format!("Signed in as {}. Downloading recent mail…", account.email));
+        }
         self.switch_account(account.id.clone(), window, cx);
         self.sync_account(account.id, window, cx);
     }
@@ -3387,6 +3411,21 @@ impl Render for MailWindow {
             .when(self.account_setup.is_some(), |d| d.child(self.render_account_setup(cx)))
             .when(self.quick_look.is_some(), |d| d.child(self.render_quick_look(cx)))
             .when(self.palette.is_some(), |d| d.child(self.render_palette(cx)))
+    }
+}
+
+#[cfg(test)]
+mod sign_in_tests {
+    use super::sign_in_mismatch;
+
+    #[test]
+    fn signing_in_as_another_google_account_is_called_out() {
+        assert_eq!(sign_in_mismatch(None, "b@example.com", true), None);
+        assert_eq!(sign_in_mismatch(Some("A@Example.com"), "a@example.com", false), None);
+        let added = sign_in_mismatch(Some("a@example.com"), "b@example.com", true).unwrap();
+        assert!(added.contains("b@example.com was added") && added.contains("a@example.com still needs"), "{added}");
+        let existing = sign_in_mismatch(Some("a@example.com"), "b@example.com", false).unwrap();
+        assert!(!existing.contains("added") && existing.contains("not a@example.com"), "{existing}");
     }
 }
 
