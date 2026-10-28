@@ -4,7 +4,7 @@ Assessment **CASA-23625-12721**. TAC returned it on 27 October 2026 with 13 cont
 
 ## Status — 27 October 2026
 
-Code changes are on branch `casa-round-2` (not yet merged or released):
+Released in v1.6.0, with follow-ups in v1.6.1:
 
 | Control | Change | Where |
 | --- | --- | --- |
@@ -14,7 +14,14 @@ Code changes are on branch `casa-round-2` (not yet merged or released):
 | 6.5.1 | Credential-free `overlook::signin` events for consent, loopback callback, token exchange/refresh, userinfo, revocation, IMAP/SMTP/POP3 logins | `oauth.rs`, `google_signin.rs`, `imap/connection.rs`, `smtp.rs`, `pop3/client.rs` |
 | 2.2.1 | Sign out (account menu and Settings); `invalid_grant` deletes the stored refresh token; Gmail sessions idle 90 days are revoked and signed out; one shared invalidation routine with Remove account | `gmail/api.rs`, `providers.rs`, `ui/mod.rs`, `ui/sidebar.rs`, `ui/settings.rs` |
 | 5.2.1 | Outgoing attachment policy (Gmail's blocked types, executable-content sniffing, zip/tar one level deep) at attach and send time; MIME type from extension; received programs/scripts are never opened | `overlook-core/src/attachment_policy.rs`, `ui/composer.rs`, `outgoing.rs`, `ui/mod.rs`, `README.md` |
-| 3.1.4 | No code change: store ids are random UUIDs or provider ids and never typed by the user; the inventory is evidence work | — |
+| 3.1.4 | Store-level `ensure_owned` refuses any user-initiated change naming another account's message, label, draft, calendar or event; callers pass the acting account; a test drives each path with a second account's ids (v1.6.1) | `overlook-store/src/lib.rs`, call sites in `ui/` and `sync.rs` |
+| 1.1.1 | Rejected credentials stop automatic sync for that account until the user signs in again, so no repeated failed logins reach the provider (v1.6.1) | `ui/mod.rs` |
+| 6.5.1 | `overlook.log` created 0600 and the data folder 0700, tightening older installs (v1.6.1) | `overlook-app/src/main.rs` |
+| 5.2.1 | Attachments copied into a generated folder with a cleaned name (no path, control or bidi-override characters) and 0600 permissions; 25 MB encoded cap at attach and send; ClamAV scan when installed (v1.6.1) | `attachment_policy.rs`, `ui/composer.rs`, `malware_scan.rs`, `outgoing.rs` |
+| 2.2.1 | Gmail sessions also end 180 days after sign-in, however active; sign-in time kept across refreshes (v1.6.1) | `gmail/oauth.rs`, `gmail/api.rs`, `ui/mod.rs` |
+| 6.1.1 | `cargo audit` in CI and before every release; a known vulnerability fails the build; JSON report published with each release (v1.6.1) | `.github/workflows/` |
+
+Known limitations to disclose: rustls does not check certificate revocation (4.1.2); the attachment policy is a blocklist, as Gmail's is, not an allowlist (5.2.1). Owner tasks added by the remediation guidance: HSTS and a TLS 1.2 minimum on `lastrefuge.ai` in Cloudflare (4.1.1); a subdomain inventory alongside the zone export (6.4.1).
 
 Still to do: release, live captures, evidence documents, owner tasks (Cloudflare export, SSL Labs, ADA list), resubmission.
 
