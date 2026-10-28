@@ -28,9 +28,9 @@ Known limitations to disclose: rustls does not check certificate revocation (4.1
 
 Evidence written 28 October 2026, kept out of git in `llm-docs/casa/round-2/` because it names the origin server: zone export, records screenshot, SSL Labs A+ reports for both hostnames and the subdomain inventory (4.1.1, 4.1.2, 6.4.1); crypto inventory (4.1.3); IDOR inventory (3.1.4). The secrets access policy (6.7.1) is public at `docs/secrets-policy.md`. Cloudflare now proxies `lastrefuge.ai` and `www` with Full (Strict), HSTS (1 year, includeSubDomains), TLS 1.2 minimum and Always Use HTTPS.
 
-v1.6.3 (SMTP certificate wording) is the release the round-2 evidence describes. Also written: supply-chain triage (6.1.1), live TLS results (4.1.1, 4.1.2), authentication services and the 100-failures-per-hour control (1.1.1; no public ADA-approved list exists), and `live-capture.sh`.
+v1.6.3 (SMTP certificate wording) and v1.6.4 (Chromium kept out of the keyring, found by the 6.7.1 live capture) followed; v1.6.4 is the release the round-2 evidence describes. Also written: supply-chain triage (6.1.1), live TLS results (4.1.1, 4.1.2), authentication services and the 100-failures-per-hour control (1.1.1; no public ADA-approved list exists), and `live-capture.sh`.
 
-Still to do: live captures from v1.6.3, portal-ready renders, resubmission.
+Still to do: live captures from v1.6.4, portal-ready renders, resubmission.
 
 ## The pattern behind the failures
 
