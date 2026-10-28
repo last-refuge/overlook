@@ -174,7 +174,13 @@ pub fn connect_with_socket(endpoint: &ServerEndpoint, password: &str, timeout: D
     if endpoint.username.trim().is_empty() {
         return Err(ProviderError::SignInRequired);
     }
-    let session = client.login(endpoint.username.trim(), password).map_err(|(e, _)| login_error(&e))?;
+    tracing::info!(target: "overlook::signin", host, port = endpoint.port, mechanism = "LOGIN", username = "[account]", password = "[REDACTED]", "IMAP sign-in");
+    let session = client.login(endpoint.username.trim(), password).map_err(|(e, _)| {
+        let error = login_error(&e);
+        tracing::info!(target: "overlook::signin", host, outcome = if error == ProviderError::SignInRequired { "rejected" } else { "failed" }, "IMAP sign-in result");
+        error
+    })?;
+    tracing::info!(target: "overlook::signin", host, outcome = "accepted", "IMAP sign-in result");
     Ok((session, socket))
 }
 

@@ -97,6 +97,7 @@ fn token_response(mut response: ureq::http::Response<ureq::Body>, previous_refre
         .map_err(|e| AuthError::Protocol(crate::secure_error::ureq("Google token response", e).into()))?;
     if status != 200 {
         let code = body.get("error").and_then(|v| v.as_str()).unwrap_or("unknown_error");
+        tracing::info!(target: "overlook::signin", status, error = code, "token response: rejected");
         let description = body.get("error_description").and_then(|v| v.as_str()).unwrap_or("");
         let message = if description.is_empty() { code.to_owned() } else { format!("{code}: {description}") };
         return Err(if matches!(code, "invalid_grant" | "invalid_client" | "unauthorized_client" | "access_denied") {
@@ -116,6 +117,18 @@ fn token_response(mut response: ureq::http::Response<ureq::Body>, previous_refre
         .and_then(|v| v.as_str())
         .map(str::to_owned)
         .or_else(|| previous_refresh.map(str::to_owned));
+    // Credential-free record of the exchange: which fields arrived, never their values.
+    tracing::info!(
+        target: "overlook::signin",
+        status,
+        token_type = body.get("token_type").and_then(|v| v.as_str()).unwrap_or(""),
+        expires_in,
+        scope = body.get("scope").and_then(|v| v.as_str()).unwrap_or(""),
+        access_token = "[REDACTED]",
+        refresh_token = if body.get("refresh_token").is_some() { "[REDACTED, new]" } else if previous_refresh.is_some() { "[not returned, previous kept]" } else { "[absent]" },
+        id_token = if body.get("id_token").is_some() { "[REDACTED]" } else { "[absent]" },
+        "token response: accepted"
+    );
     Ok(OAuthTokens {
         access_token,
         refresh_token,
@@ -135,6 +148,7 @@ fn post_form(url: &str, body: &str) -> Result<ureq::http::Response<ureq::Body>, 
 /// Exchanges an authorization code for tokens (blocking; run on a background thread).
 pub fn exchange_code(config: &ClientConfig, code: &str, redirect_uri: &str, verifier: &str) -> Result<OAuthTokens, AuthError> {
     let mut body = token_request_body(&config.client_id, code, redirect_uri, verifier);
+    log_token_request("authorization_code", config, &[("code", "[REDACTED]"), ("code_verifier", "[REDACTED]"), ("redirect_uri", redirect_uri)]);
     if let Some(secret) = &config.client_secret {
         body.push_str("&client_secret=");
         body.push_str(&url_encode(secret));
@@ -153,11 +167,20 @@ pub fn refresh(config: &ClientConfig, refresh_token: &str) -> Result<OAuthTokens
     .map(|(k, v)| format!("{k}={}", url_encode(v)))
     .collect::<Vec<_>>()
     .join("&");
+    log_token_request("refresh_token", config, &[("refresh_token", "[REDACTED]")]);
     if let Some(secret) = &config.client_secret {
         body.push_str("&client_secret=");
         body.push_str(&url_encode(secret));
     }
     token_response(post_form(TOKEN_ENDPOINT, &body)?, Some(refresh_token))
+}
+
+/// Records a token request's shape. Values that are credentials appear only as
+/// `[REDACTED]`; the client id is the public installed-app identifier.
+fn log_token_request(grant_type: &str, config: &ClientConfig, fields: &[(&str, &str)]) {
+    let fields = fields.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ");
+    let client_secret = if config.client_secret.is_some() { "[REDACTED]" } else { "[absent]" };
+    tracing::info!(target: "overlook::signin", endpoint = TOKEN_ENDPOINT, grant_type, client_id = %config.client_id, client_secret, "token request: {fields}");
 }
 
 /// Revoke the Google grant before discarding the refresh token. No secret in the URL.
@@ -166,6 +189,7 @@ pub fn revoke(tokens: &OAuthTokens) -> Result<(), AuthError> {
     if token.is_empty() { return Ok(()); }
     let mut response = post_form("https://oauth2.googleapis.com/revoke", &format!("token={}", url_encode(token)))?;
     let status = response.status().as_u16();
+    tracing::info!(target: "overlook::signin", endpoint = "https://oauth2.googleapis.com/revoke", token = "[REDACTED]", status, "token revocation");
     if status == 200 { return Ok(()); }
     let body: serde_json::Value = response.body_mut().read_json().unwrap_or_default();
     if status == 400 && body.get("error").and_then(|v| v.as_str()) == Some("invalid_token") { return Ok(()); }
@@ -179,6 +203,7 @@ pub fn fetch_userinfo(access_token: &str) -> Result<UserInfo, AuthError> {
         .header("Authorization", &format!("Bearer {access_token}"))
         .call()
         .map_err(|e| AuthError::Network(crate::secure_error::ureq("Google OAuth request", e).into()))?;
+    tracing::info!(target: "overlook::signin", endpoint = USERINFO_ENDPOINT, authorization = "Bearer [REDACTED]", status = response.status().as_u16(), "userinfo request");
     if response.status().as_u16() != 200 {
         return Err(AuthError::Protocol(format!("userinfo returned {}", response.status())));
     }
@@ -461,6 +486,42 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().extend_from_slice(bytes); Ok(bytes.len()) }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    /// The token exchange is Overlook's credential-submission step (the password itself goes
+    /// to Google in the browser). Its log lines must show the exchange without any value.
+    #[test]
+    fn token_exchange_logs_shape_without_credentials() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let captured = Capture(Default::default());
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().without_time().with_ansi(false).with_writer(move || writer.clone()));
+        let config = ClientConfig { client_id: "synthetic-client.apps.googleusercontent.com".into(), client_secret: Some("synthetic-client-secret".into()) };
+        tracing::subscriber::with_default(subscriber, || {
+            log_token_request("authorization_code", &config, &[("code", "[REDACTED]"), ("code_verifier", "[REDACTED]"), ("redirect_uri", "http://127.0.0.1:43123/callback")]);
+            let body = r#"{"access_token":"synthetic-access-secret","refresh_token":"synthetic-refresh-secret","id_token":"synthetic-id-secret","expires_in":3599,"token_type":"Bearer","scope":"https://mail.google.com/"}"#;
+            let response = ureq::http::Response::builder().status(200).body(ureq::Body::builder().mime_type("application/json").data(body)).unwrap();
+            let tokens = token_response(response, None).unwrap();
+            assert_eq!(tokens.access_token, "synthetic-access-secret");
+            let denied = ureq::http::Response::builder().status(400).body(ureq::Body::builder().mime_type("application/json").data(r#"{"error":"invalid_grant","error_description":"Bad Request"}"#)).unwrap();
+            assert!(matches!(token_response(denied, Some("synthetic-refresh-secret")), Err(AuthError::Denied(_))));
+        });
+        let bytes = captured.0.lock().unwrap().clone();
+        let log = String::from_utf8(bytes).unwrap();
+        println!("{log}");
+        assert!(log.contains("overlook::signin"));
+        assert!(log.contains("grant_type=\"authorization_code\""), "{log}");
+        assert!(log.contains("code=[REDACTED] code_verifier=[REDACTED]"));
+        assert!(log.contains("token response: accepted") && log.contains("token response: rejected"));
+        assert!(log.contains("error=\"invalid_grant\""));
+        assert!(!log.contains("-secret"), "{log}");
+    }
 
     #[test]
     fn pkce_matches_rfc_7636_appendix_b() {

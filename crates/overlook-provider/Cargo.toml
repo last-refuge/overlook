@@ -32,3 +32,6 @@ roxmltree = "0.21"
 url = "2"
 ical = { version = "0.11", default-features = false, features = ["ical"] }
 jiff = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }

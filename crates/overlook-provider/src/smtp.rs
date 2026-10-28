@@ -114,7 +114,12 @@ impl Transport {
             }
         }
         if !endpoint.username.is_empty() {
-            conn.auth(&[Mechanism::Plain, Mechanism::Login], &Credentials::new(endpoint.username.clone(), self.password.clone())).map_err(auth_error)?;
+            tracing::info!(target: "overlook::signin", host = %endpoint.host, port = endpoint.port, mechanisms = "PLAIN LOGIN", username = "[account]", password = "[REDACTED]", "SMTP sign-in");
+            conn.auth(&[Mechanism::Plain, Mechanism::Login], &Credentials::new(endpoint.username.clone(), self.password.clone())).map_err(|e| {
+                tracing::info!(target: "overlook::signin", host = %endpoint.host, outcome = "rejected or failed", "SMTP sign-in result");
+                auth_error(e)
+            })?;
+            tracing::info!(target: "overlook::signin", host = %endpoint.host, outcome = "accepted", "SMTP sign-in result");
         }
         Ok(conn)
     }

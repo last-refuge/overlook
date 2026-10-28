@@ -67,6 +67,7 @@ impl PendingSignIn {
             login_hint,
         };
         let url = request.url();
+        tracing::info!(target: "overlook::signin", authorization_endpoint = "https://accounts.google.com/o/oauth2/v2/auth", redirect_uri = %request.redirect_uri, code_challenge_method = "S256", code_challenge = "[REDACTED]", state = "[REDACTED]", "sign-in started: Google consent opens in the system browser");
         let cancel = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = mpsc::channel();
         let flag = cancel.clone();
@@ -117,6 +118,7 @@ impl PendingSignIn {
             return Err("Google did not return a refresh token. Remove Overlook from your Google account's third-party access and sign in again.".into());
         }
         let user = fetch_userinfo(&tokens.access_token).map_err(|e| e.to_string())?;
+        tracing::info!(target: "overlook::signin", "Google account identified; credentials go to the system keyring next");
         Ok(SignInResult { tokens, user })
     }
 }
@@ -129,9 +131,11 @@ fn handle_connection(mut stream: TcpStream, expected: &AuthorizationRequest) -> 
     let n = stream.read(&mut buf).ok()?;
     let request = String::from_utf8_lossy(&buf[..n]);
     let Some((query, denied)) = validated_callback(&request, expected) else {
+        tracing::info!(target: "overlook::signin", "loopback request refused: method, path, host, or state did not match");
         let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n");
         return None;
     };
+    tracing::info!(target: "overlook::signin", state_matched = true, outcome = if denied { "consent declined" } else { "authorization code received" }, code = "[REDACTED]", "loopback callback accepted");
     let body = completion_page(denied);
     let _ = stream.write_all(
         format!(

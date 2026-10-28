@@ -81,6 +81,7 @@ impl Client {
             },
             other => other,
         };
+        tracing::info!(target: "overlook::signin", host = %self.host, mechanism = "USER/PASS", username = "[account]", password = "[REDACTED]", "POP3 sign-in");
         self.send(&format!("USER {user}"), "USER ****").and_then(|_| self.ok()).map_err(sign_in)?;
         self.send(&format!("PASS {password}"), "PASS ****").and_then(|_| self.ok()).map_err(sign_in)?;
         Ok(())
