@@ -21,3 +21,22 @@ jobs:
         run: cargo test --workspace --locked
       - name: Shell syntax
         run: bash -n install.sh && bash -n packaging/PKGBUILD && bash -n scripts/make-release-tarball.sh
+  audit:
+    name: Dependency audit (RustSec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Fails on any known vulnerability in Cargo.lock; unmaintained-crate warnings are
+      # reported but do not fail the job. The JSON report is kept with the run.
+      - name: Audit Cargo.lock
+        run: |
+          cargo audit --json > cargo-audit.json || true
+          cargo audit
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cargo-audit
+          path: cargo-audit.json

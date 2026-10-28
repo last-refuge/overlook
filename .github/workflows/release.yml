@@ -26,6 +26,16 @@ jobs:
           echo "tag=$TAG cargo=$CARGO"
           [ "$TAG" = "$CARGO" ] || { echo "Tag v$TAG does not match Cargo.toml version $CARGO"; exit 1; }
           echo "VERSION=$TAG" >> "$GITHUB_ENV"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # A release never ships with a known-vulnerable Rust dependency. The report is
+      # published with the release as evidence of the scan.
+      - name: Dependency audit (RustSec)
+        run: |
+          mkdir -p dist
+          cargo audit --json > dist/cargo-audit.json || true
+          cargo audit
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
         run: cargo build --release --locked -p overlook
@@ -37,7 +47,7 @@ jobs:
           cp -r "$GITHUB_WORKSPACE" /tmp/src && chown -R builder /tmp/pkg /tmp/src
           # Reuse the compiled target directory so makepkg does not rebuild from scratch.
           sudo -u builder env OVERLOOK_SRC=/tmp/src CARGO_HOME=/home/builder/.cargo RUSTUP_HOME=/root/.rustup PATH="/root/.cargo/bin:$PATH" bash -c 'cd /tmp/pkg && rustup default stable >/dev/null 2>&1 || true; makepkg -f --noconfirm'
-          mkdir -p dist && cp /tmp/pkg/*.pkg.tar.* dist/
+          cp /tmp/pkg/*.pkg.tar.* dist/
       - name: Build the generic tarball
         run: scripts/make-release-tarball.sh "$VERSION" dist
       - name: Checksums and installer
