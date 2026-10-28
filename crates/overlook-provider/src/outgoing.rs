@@ -45,12 +45,17 @@ pub fn build_raw(account: &Account, draft: &Draft, in_reply_to: Option<&Message>
         builder.multipart(alternative)
     } else {
         let mut multipart = MultiPart::mixed().multipart(alternative);
+        let total: u64 = draft.attachments.iter().map(|a| std::fs::metadata(&a.local_path).map(|m| m.len()).unwrap_or(a.size_bytes)).sum();
+        if !overlook_core::attachment_policy::within_size_limit(total) {
+            return Err(overlook_core::attachment_policy::TOO_LARGE.to_owned());
+        }
         for att in &draft.attachments {
             let bytes = std::fs::read(&att.local_path).map_err(|e| format!("could not read attachment {}: {e}", att.filename))?;
             // Re-checked at send time: covers drafts restored from storage and forwards.
             overlook_core::attachment_policy::check_outgoing(&att.filename, &bytes).map_err(|refusal| format!("{}: {refusal}", att.filename))?;
             let content_type = ContentType::parse(&att.mime_type).unwrap_or(ContentType::parse("application/octet-stream").unwrap());
-            multipart = multipart.singlepart(MimeAttachment::new(att.filename.clone()).body(bytes, content_type));
+            let filename = overlook_core::attachment_policy::sanitize_filename(&att.filename);
+            multipart = multipart.singlepart(MimeAttachment::new(filename).body(bytes, content_type));
         }
         builder.multipart(multipart)
     }

@@ -464,40 +464,12 @@ impl MailWindow {
         let Some(c) = self.composer.as_ref() else { return };
         let draft_id = c.draft.id.clone();
         let receiver = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: Some("Attach".into()) });
-        let outgoing_dir = self.outgoing_dir.clone();
+        let outgoing_dir = self.outgoing_dir.join(draft_id.as_str());
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = receiver.await else { return };
-            let mut added = Vec::new();
-            let mut refused = Vec::new();
-            for path in paths {
-                let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_string()) else { continue };
-                // Programs, scripts and archives holding them are never attached.
-                let mime_type = match overlook_core::attachment_policy::check_outgoing_file(&name, &path) {
-                    Ok(Ok(mime)) => mime,
-                    Ok(Err(refusal)) => {
-                        tracing::info!(target: "overlook::attachments", reason = ?refusal, "outgoing attachment refused");
-                        refused.push(refusal.to_string());
-                        continue;
-                    }
-                    Err(_) => continue,
-                };
-                let dir = outgoing_dir.join(draft_id.as_str());
-                if std::fs::create_dir_all(&dir).is_err() {
-                    continue;
-                }
-                let dest = dir.join(&name);
-                if std::fs::copy(&path, &dest).is_err() {
-                    continue;
-                }
-                let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
-                added.push(DraftAttachment {
-                    id: AttachmentId::generate(),
-                    filename: name,
-                    mime_type: mime_type.into(),
-                    size_bytes: size,
-                    local_path: dest.to_string_lossy().to_string(),
-                });
-            }
+            let Ok(existing) = this.update(cx, |this, _| this.composer.as_ref().map(|c| c.draft.attachments.iter().map(|a| a.size_bytes).sum::<u64>()).unwrap_or(0)) else { return };
+            // Reading, scanning and copying stay off the UI thread.
+            let (added, refused) = cx.background_spawn(async move { prepare_attachments(paths, &outgoing_dir, existing) }).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 if let Some(first) = refused.first() {
                     let more = if refused.len() > 1 { format!(" ({} files not attached.)", refused.len()) } else { String::new() };
@@ -1128,4 +1100,86 @@ pub enum LinePrefix {
     Bullet,
     Number,
     Quote,
+}
+
+/// Checks and copies files chosen for a draft. Each accepted file is copied to its own
+/// generated folder under the draft's outgoing directory, with a cleaned name and
+/// owner-only, non-executable permissions (0600). Returns the attachments and the reasons
+/// for any refusals. Blocking.
+fn prepare_attachments(paths: Vec<std::path::PathBuf>, dir: &std::path::Path, mut total: u64) -> (Vec<DraftAttachment>, Vec<String>) {
+    use overlook_core::attachment_policy::{check_outgoing, sanitize_filename, within_size_limit, TOO_LARGE};
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let mut added = Vec::new();
+    let mut refused = Vec::new();
+    for path in paths {
+        let Some(original) = path.file_name().map(|n| n.to_string_lossy().to_string()) else { continue };
+        let name = sanitize_filename(&original);
+        let Ok(content) = std::fs::read(&path) else {
+            refused.push(format!("Couldn’t read “{name}”."));
+            continue;
+        };
+        if !within_size_limit(total + content.len() as u64) {
+            refused.push(TOO_LARGE.to_owned());
+            continue;
+        }
+        // Programs, scripts and archives holding them are never attached.
+        let mime_type = match check_outgoing(&name, &content) {
+            Ok(mime) => mime,
+            Err(refusal) => {
+                tracing::info!(target: "overlook::attachments", reason = ?refusal, "outgoing attachment refused");
+                refused.push(refusal.to_string());
+                continue;
+            }
+        };
+        if crate::malware_scan::scan(&path) == crate::malware_scan::Scan::Infected {
+            refused.push(crate::malware_scan::INFECTED.to_owned());
+            continue;
+        }
+        let id = AttachmentId::generate();
+        let folder = dir.join(id.as_str());
+        let dest = folder.join(&name);
+        let written = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&folder)
+            .and_then(|_| std::fs::write(&dest, &content))
+            .and_then(|_| std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)));
+        if written.is_err() {
+            refused.push(format!("Couldn’t attach “{name}”."));
+            continue;
+        }
+        total += content.len() as u64;
+        added.push(DraftAttachment { id, filename: name, mime_type: mime_type.into(), size_bytes: content.len() as u64, local_path: dest.to_string_lossy().to_string() });
+    }
+    (added, refused)
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::prepare_attachments;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn attachments_are_copied_privately_with_clean_names_and_limits() {
+        let root = std::env::temp_dir().join(format!("overlook-attach-{}", std::process::id()));
+        let source = root.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        let report = source.join("report\u{202e}fdp.txt");
+        std::fs::write(&report, b"quarterly numbers").unwrap();
+        std::fs::set_permissions(&report, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let program = source.join("holiday.jpg");
+        std::fs::write(&program, b"\x7fELF\x02").unwrap();
+        let (added, refused) = prepare_attachments(vec![report, program], &root.join("draft"), 0);
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].filename, "reportfdp.txt");
+        assert_eq!(added[0].mime_type, "text/plain");
+        let copied = std::path::Path::new(&added[0].local_path);
+        assert_eq!(std::fs::metadata(copied).unwrap().permissions().mode() & 0o777, 0o600, "no exec bit carried over");
+        assert_eq!(copied.parent().unwrap().file_name().unwrap().to_str().unwrap(), added[0].id.as_str());
+        assert_eq!(refused.len(), 1);
+        // Already at the limit: nothing more fits.
+        let small = source.join("small.txt");
+        std::fs::write(&small, b"x").unwrap();
+        let (added, refused) = prepare_attachments(vec![small], &root.join("draft"), 19 * 1024 * 1024);
+        assert!(added.is_empty());
+        assert_eq!(refused, vec![overlook_core::attachment_policy::TOO_LARGE.to_owned()]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }

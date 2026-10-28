@@ -11,7 +11,8 @@
 //!   checked one level deep, as Gmail does.
 //!
 //! Accepted files are labelled with a MIME type derived from their extension, falling back
-//! to `application/octet-stream`. The check runs when a file is attached and again when the
+//! to `application/octet-stream`. Their names are cleaned ([`sanitize_filename`]) and a
+//! message's attachments are capped at [`MAX_ATTACHMENTS_ENCODED_BYTES`] once encoded. The check runs when a file is attached and again when the
 //! message is built for sending, so drafts restored from storage are covered too.
 
 use std::io::Read;
@@ -22,6 +23,40 @@ pub const BLOCKED_EXTENSIONS: &[&str] = &[
     // Linux and macOS executables, launchers and packages.
     "sh", "bash", "zsh", "csh", "ksh", "run", "elf", "desktop", "appimage", "deb", "rpm", "flatpak", "flatpakref", "snap", "pkg", "command", "app",
 ];
+
+/// Gmail and most providers refuse messages over 25 MB. Attachments travel base64-encoded
+/// (4 bytes for every 3), so this allows about 18.75 MB of files per message.
+pub const MAX_ATTACHMENTS_ENCODED_BYTES: u64 = 25 * 1024 * 1024;
+
+/// The size a set of attachments occupies once base64-encoded for mail.
+pub fn encoded_size(raw_bytes: u64) -> u64 {
+    raw_bytes.div_ceil(3) * 4
+}
+
+/// Whether attachments totalling `raw_bytes` fit in one message.
+pub fn within_size_limit(raw_bytes: u64) -> bool {
+    encoded_size(raw_bytes) <= MAX_ATTACHMENTS_ENCODED_BYTES
+}
+
+/// The fixed wording when attachments would exceed the limit.
+pub const TOO_LARGE: &str = "Attachments can total at most about 18 MB per message (25 MB once encoded for mail).";
+
+/// Cleans a user-supplied file name before it is stored or sent: only the final path
+/// component, no control or bidirectional-override characters (which can disguise
+/// `photo<U+202E>gpj.exe` as `photoexe.jpg`), no leading dots, at most 180 characters.
+pub fn sanitize_filename(name: &str) -> String {
+    let last = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let cleaned: String = last
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}'))
+        .collect();
+    let trimmed = cleaned.trim().trim_start_matches('.').trim();
+    let mut out: String = trimmed.chars().take(180).collect();
+    if out.is_empty() {
+        out = "attachment".into();
+    }
+    out
+}
 
 /// Why a file was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,6 +330,27 @@ mod tests {
         }
         let tar = tar_with(&["a.pdf"]);
         let _ = check_outgoing("cut.tar", &tar[..700]);
+    }
+
+    #[test]
+    fn filenames_are_cleaned() {
+        assert_eq!(sanitize_filename("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_filename("C:\\Users\\x\\report.pdf"), "report.pdf");
+        assert_eq!(sanitize_filename("photo\u{202e}gpj.exe"), "photogpj.exe");
+        assert_eq!(sanitize_filename("tab\tname\n.txt"), "tabname.txt");
+        assert_eq!(sanitize_filename("..hidden"), "hidden");
+        assert_eq!(sanitize_filename("  "), "attachment");
+        assert_eq!(sanitize_filename(&"a".repeat(400)).len(), 180);
+        // A cleaned name still reveals a blocked extension that the override tried to hide.
+        assert!(blocked_extension(&sanitize_filename("invoice\u{202e}fdp.exe")).is_some());
+    }
+
+    #[test]
+    fn size_limit_counts_base64_overhead() {
+        assert_eq!(encoded_size(3), 4);
+        assert_eq!(encoded_size(4), 8);
+        assert!(within_size_limit(18 * 1024 * 1024));
+        assert!(!within_size_limit(19 * 1024 * 1024));
     }
 
     #[test]
