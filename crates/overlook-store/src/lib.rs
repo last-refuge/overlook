@@ -93,6 +93,15 @@ fn ensure_owned<'a>(tx: &Connection, what: Owned, account: &AccountId, ids: impl
     Ok(())
 }
 
+/// Refuses a record whose own `account_id` names a different account than the caller's.
+fn ensure_same_account(record_account: &AccountId, account: &AccountId, noun: &'static str) -> Result<()> {
+    if record_account != account {
+        tracing::warn!(target: "overlook::access", kind = noun, "refused a change to another account's record");
+        return Err(StoreError::NotOwned(noun));
+    }
+    Ok(())
+}
+
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// Which mailbox the list is showing.
@@ -629,7 +638,10 @@ impl Store {
     /// Writes a local event change and its pending operation atomically.
     pub fn apply_event_change(&self, account: &AccountId, event: &Event, kind: OperationKind) -> Result<PendingOperation> {
         let ts = now();
+        ensure_same_account(&event.account_id, account, "event")?;
         self.with_tx(|tx| {
+            ensure_owned(tx, Owned::Calendar, account, [event.calendar_id.0.as_str()])?;
+            ensure_owned(tx, Owned::Event, account, [event.id.0.as_str()])?;
             caldav::reject_caldav_write(tx, &event.calendar_id)?;
             upsert_event_tx(tx, event)?;
             insert_operation_tx(tx, account, kind, ts)
@@ -1304,6 +1316,7 @@ impl Store {
 
     /// Saves a contact changed on this device and queues the push.
     pub fn save_contact_locally(&self, account: &AccountId, contact: &Contact) -> Result<PendingOperation> {
+        ensure_same_account(&contact.account_id, account, "contact")?;
         let ts = now();
         let mut c = contact.clone();
         c.pending = true;
@@ -2159,6 +2172,19 @@ mod tests {
         let mut edited = event.clone();
         edited.summary = "Renamed".into();
         not_owned(store.apply_series_change(&other, &edited, RecurrenceScope::This).map(|_| ()));
+        not_owned(store.apply_event_change(&other, &edited, OperationKind::UpdateEvent { event_id: edited.id.clone(), scope: RecurrenceScope::This }).map(|_| ()));
+        let mut foreign = edited.clone();
+        foreign.account_id = other.clone();
+        not_owned(store.apply_event_change(&other, &foreign, OperationKind::UpdateEvent { event_id: foreign.id.clone(), scope: RecurrenceScope::This }).map(|_| ()));
+        let mut planted = edited.clone();
+        planted.id = EventId::from("acct-2:cal:planted");
+        planted.account_id = other.clone();
+        not_owned(store.apply_event_change(&other, &planted, OperationKind::CreateEvent { event_id: planted.id.clone() }).map(|_| ()));
+
+        // Contacts.
+        let contact = Contact::new_local(owner.clone(), 0);
+        not_owned(store.save_contact_locally(&other, &contact).map(|_| ()));
+        assert!(store.contacts(&owner).unwrap().is_empty() && store.pending_operations(&other).unwrap().is_empty());
         assert_eq!(store.event(&event.id).unwrap().unwrap().summary, "Standup");
         assert!(store.calendars(&owner).unwrap()[0].visible);
         assert!(store.pending_operations(&other).unwrap().is_empty());

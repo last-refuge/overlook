@@ -28,6 +28,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 webpki-roots = "1"
 base64 = "0.22"
 rand = "0.10"
+sha2 = "0.10"
 roxmltree = "0.21"
 url = "2"
 ical = { version = "0.11", default-features = false, features = ["ical"] }

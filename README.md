@@ -159,6 +159,7 @@ client that belongs to you. Nothing passes through a Last Refuge server.
 Tokens are stored in your system keyring (GNOME Keyring or KWallet through the Secret Service), never in
 files. In Google's *Testing* mode you will be asked to sign in again every seven days; publishing the app
 in Google Cloud lifts that. The [native app guide](llm-docs/overlook-native-app.md#gmail) has the details.
+The [secrets access policy](docs/secrets-policy.md) lists every stored secret, who can reach it, and how access is logged.
 
 ## Keyboard
 
