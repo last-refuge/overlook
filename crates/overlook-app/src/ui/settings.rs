@@ -632,7 +632,7 @@ impl MailWindow {
                     if is_gmail { "Revokes Overlook’s access at Google and deletes the stored sign-in. Downloaded mail stays on this device until you sign in again. Requires internet." } else { "Deletes the stored password from the system keyring. Downloaded mail stays on this device until you sign in again." },
                     Button::new("settings-sign-out").small().label("Sign out").on_click(cx.listener(move |this, _, window, cx| {
                         this.close_settings(window, cx);
-                        this.sign_out_account(sign_out_id.clone(), false, window, cx);
+                        this.sign_out_account(sign_out_id.clone(), None, window, cx);
                     })).into_any_element(),
                 ))
             })

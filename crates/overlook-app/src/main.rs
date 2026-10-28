@@ -227,7 +227,7 @@ mod security_tests {
             tracing::trace!(target: "ureq_proto::client", "synthetic-wire-secret");
             tracing::trace!(target: "lettre::smtp", "synthetic-smtp-secret");
             tracing::trace!(target: "oo7::dbus", "synthetic-vault-secret");
-            let tokens = overlook_provider::gmail::OAuthTokens { access_token: "synthetic-access-secret".into(), refresh_token: Some("synthetic-refresh-secret".into()), expires_at: 3600000, scope: None };
+            let tokens = overlook_provider::gmail::OAuthTokens { access_token: "synthetic-access-secret".into(), refresh_token: Some("synthetic-refresh-secret".into()), expires_at: 3600000, scope: None, signed_in_at: 0 };
             tracing::info!(target: "overlook::synthetic_login", ?tokens, "Synthetic login credential diagnostic (not a live Google login)");
         });
         let output = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();

@@ -234,7 +234,7 @@ impl MailWindow {
                                     let t = this.clone();
                                     let id = active_id.clone();
                                     menu = menu.item(PopupMenuItem::new("Sign out").on_click(move |_, window, cx| {
-                                        let _ = t.update(cx, |this, cx| this.sign_out_account(id.clone(), false, window, cx));
+                                        let _ = t.update(cx, |this, cx| this.sign_out_account(id.clone(), None, window, cx));
                                     }));
                                 }
                                 let t = this.clone();

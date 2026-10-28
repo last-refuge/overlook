@@ -14,6 +14,7 @@ mod reader;
 mod sidebar;
 mod widgets;
 
+use overlook_provider::gmail::api::SessionExpiry;
 use crate::assets::icon;
 use crate::google_signin::{self, PendingSignIn, SignInResult};
 use crate::updater::{self, InstallKind, PacmanOutcome, Progress, ReleaseInfo};
@@ -300,7 +301,8 @@ pub(super) fn open_received_attachment(path: &std::path::Path, filename: &str, w
 }
 
 const SIGNED_OUT_WORDING: &str = "You signed out of this account. Sign in again to continue syncing. Downloaded mail stays on this device.";
-const SESSION_EXPIRED_WORDING: &str = "Signed out after 90 days without use. Sign in again to continue syncing.";
+const SESSION_IDLE_WORDING: &str = "Signed out after 90 days without use. Sign in again to continue syncing.";
+const SESSION_AGE_WORDING: &str = "Signed out because this sign-in is 180 days old. Sign in again to continue syncing.";
 
 /// Ends an account's session everywhere it exists: revokes the Google grant (through the
 /// shared client, so cloned providers stop too) and deletes every stored credential.
@@ -919,9 +921,10 @@ impl MailWindow {
 
     /// Signs out of an account without removing it: the Google grant is revoked, every
     /// stored credential is deleted, and downloaded mail stays on this device. The account
-    /// then waits in "Sign in again". `expired` marks the automatic sign-out after
-    /// [`overlook_provider::gmail::api::SESSION_IDLE_LIMIT_MS`] of inactivity.
-    pub(crate) fn sign_out_account(&mut self, id: AccountId, expired: bool, window: &mut Window, cx: &mut Context<Self>) {
+    /// then waits in "Sign in again". `expired` is set for the automatic sign-out when a
+    /// session ends on its own (see [`overlook_provider::gmail::api::SessionExpiry`]).
+    pub(crate) fn sign_out_account(&mut self, id: AccountId, expiry: Option<SessionExpiry>, window: &mut Window, cx: &mut Context<Self>) {
+        let expired = expiry.is_some();
         let Some(account) = self.accounts.iter().find(|a| a.id == id).cloned() else { return };
         if account.provider == ProviderKind::Sample || !self.removing_accounts.insert(id.clone()) { return; }
         let gmail = self.providers.get(&id).and_then(|p| p.gmail.clone());
@@ -929,7 +932,12 @@ impl MailWindow {
         if !expired {
             crate::ui::toast(window, cx, crate::notify::Level::Info, "Signing out…");
         }
-        tracing::info!(target: "overlook::signin", account = %id.0, reason = if expired { "session idle limit reached" } else { "user signed out" }, "sign-out started");
+        let reason = match expiry {
+            Some(SessionExpiry::Idle) => "session idle limit (90 days) reached",
+            Some(SessionExpiry::MaxAge) => "session age limit (180 days) reached",
+            None => "user signed out",
+        };
+        tracing::info!(target: "overlook::signin", account = %id.0, reason, "sign-out started");
         cx.spawn_in(window, async move |this, cx| {
             let result = cx.background_spawn(async move { end_session(&account, &background_id, gmail) }).await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -941,12 +949,21 @@ impl MailWindow {
                         this.syncing.remove(&id);
                         this.next_retry.remove(&id);
                         this.refresh_idle_watchers();
-                        let wording = if expired { SESSION_EXPIRED_WORDING } else { SIGNED_OUT_WORDING };
+                        let wording = match expiry {
+                            Some(SessionExpiry::Idle) => SESSION_IDLE_WORDING,
+                            Some(SessionExpiry::MaxAge) => SESSION_AGE_WORDING,
+                            None => SIGNED_OUT_WORDING,
+                        };
                         this.provider_issues.insert(id.clone(), wording.into());
                         let _ = this.store.set_sync_state(&id, &SyncState::SignInRequired, None);
                         if let Some(account) = this.accounts.iter().find(|a| a.id == id) {
                             let email = account.email.clone();
-                            crate::ui::toast(window, cx, crate::notify::Level::Info, if expired { format!("Signed out of {email} after 90 days without use. Sign in again to continue.") } else { format!("Signed out of {email}. Downloaded mail stays on this device.") });
+                            let text = match expiry {
+                                Some(SessionExpiry::Idle) => format!("Signed out of {email} after 90 days without use. Sign in again to continue."),
+                                Some(SessionExpiry::MaxAge) => format!("Your sign-in for {email} is 180 days old. Sign in again to continue."),
+                                None => format!("Signed out of {email}. Downloaded mail stays on this device."),
+                            };
+                            crate::ui::toast(window, cx, crate::notify::Level::Info, text);
                         }
                         this.reload(cx);
                     }
@@ -959,12 +976,13 @@ impl MailWindow {
         }).detach();
     }
 
-    /// Signs out connected Gmail sessions that have been idle past the limit.
+    /// Signs out connected Gmail sessions that are idle past the limit or past their maximum
+    /// age.
     fn expire_idle_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let now_ms = now();
-        let expired: Vec<AccountId> = self.providers.iter().filter(|(_, p)| p.gmail.as_ref().is_some_and(|g| g.idle_expired(now_ms))).map(|(id, _)| id.clone()).collect();
-        for id in expired {
-            self.sign_out_account(id, true, window, cx);
+        let expired: Vec<(AccountId, SessionExpiry)> = self.providers.iter().filter_map(|(id, p)| Some((id.clone(), p.gmail.as_ref()?.session_expiry(now_ms)?))).collect();
+        for (id, expiry) in expired {
+            self.sign_out_account(id, Some(expiry), window, cx);
         }
     }
 

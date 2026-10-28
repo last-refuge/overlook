@@ -46,6 +46,19 @@ pub type InvalidationSink = Box<dyn Fn() + Send + Sync>;
 /// six-month expiry for unused refresh tokens.
 pub const SESSION_IDLE_LIMIT_MS: i64 = 90 * 24 * 60 * 60 * 1000;
 
+/// However active, a Gmail session ends this long after its sign-in: the refresh token is
+/// revoked and deleted, and the user signs in again.
+pub const SESSION_MAX_AGE_MS: i64 = 180 * 24 * 60 * 60 * 1000;
+
+/// Why a session has ended on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionExpiry {
+    /// Unused for [`SESSION_IDLE_LIMIT_MS`].
+    Idle,
+    /// Older than [`SESSION_MAX_AGE_MS`].
+    MaxAge,
+}
+
 /// Minimum spacing between requests. Gmail meters usage in quota units per user per minute;
 /// a `messages.get` costs 5 units, so 6 requests per second stays well inside the default
 /// allowance while keeping a 150-message download under half a minute.
@@ -65,7 +78,12 @@ pub struct GmailClient {
 
 impl GmailClient {
     /// `on_tokens` is called whenever tokens are refreshed so the caller can persist them.
-    pub fn new(config: ClientConfig, tokens: OAuthTokens, on_tokens: TokenSink) -> Self {
+    pub fn new(config: ClientConfig, mut tokens: OAuthTokens, on_tokens: TokenSink) -> Self {
+        // Tokens stored before sign-in times were recorded start their clock now; the next
+        // refresh persists it.
+        if tokens.signed_in_at == 0 {
+            tokens.signed_in_at = overlook_core::time::now();
+        }
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .https_only(true)
@@ -81,10 +99,12 @@ impl GmailClient {
         self
     }
 
-    /// Whether the session has been idle past [`SESSION_IDLE_LIMIT_MS`]. Every refresh moves
-    /// `expires_at` forward, so its age measures the time since the session was last used.
-    pub fn idle_expired(&self, now: i64) -> bool {
-        session_idle_expired(self.tokens().expires_at, now)
+    /// Whether the session has ended on its own: idle past [`SESSION_IDLE_LIMIT_MS`] (every
+    /// refresh moves `expires_at` forward, so its age measures the time since last use), or
+    /// older than [`SESSION_MAX_AGE_MS`] since sign-in.
+    pub fn session_expiry(&self, now: i64) -> Option<SessionExpiry> {
+        let tokens = self.tokens();
+        session_expiry(&tokens, now)
     }
 
     /// Blocks future use (including cloned providers), drains an in-flight request, then
@@ -135,7 +155,8 @@ impl GmailClient {
 
     fn accept_refresh(&self, result: Result<OAuthTokens, AuthError>) -> Result<String, ApiError> {
         match result {
-            Ok(fresh) => {
+            Ok(mut fresh) => {
+                fresh.signed_in_at = self.tokens.lock().unwrap().signed_in_at;
                 (self.on_tokens)(&fresh);
                 let token = fresh.access_token.clone();
                 *self.tokens.lock().unwrap() = fresh;
@@ -423,12 +444,23 @@ pub fn session_idle_expired(expires_at: i64, now: i64) -> bool {
     expires_at > 0 && now - expires_at > SESSION_IDLE_LIMIT_MS
 }
 
+/// See [`SessionExpiry`]. The absolute limit is checked first.
+pub fn session_expiry(tokens: &OAuthTokens, now: i64) -> Option<SessionExpiry> {
+    if tokens.signed_in_at > 0 && now - tokens.signed_in_at > SESSION_MAX_AGE_MS {
+        Some(SessionExpiry::MaxAge)
+    } else if session_idle_expired(tokens.expires_at, now) {
+        Some(SessionExpiry::Idle)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod batch_tests {
     use super::*;
 
     fn synthetic_client(on_tokens: TokenSink) -> GmailClient {
-        GmailClient::new(ClientConfig { client_id: "synthetic".into(), client_secret: None }, OAuthTokens { access_token: "synthetic-access".into(), refresh_token: Some("synthetic-refresh".into()), expires_at: 0, scope: None }, on_tokens)
+        GmailClient::new(ClientConfig { client_id: "synthetic".into(), client_secret: None }, OAuthTokens { access_token: "synthetic-access".into(), refresh_token: Some("synthetic-refresh".into()), expires_at: 0, scope: None, signed_in_at: 0 }, on_tokens)
     }
 
     #[test]
@@ -456,6 +488,30 @@ mod batch_tests {
     }
 
     #[test]
+    fn sessions_end_after_180_days_however_active_and_refresh_keeps_the_sign_in_time() {
+        let day = 24 * 60 * 60 * 1000;
+        let signed_in = 1_800_000_000_000;
+        let tokens = |expires_at| OAuthTokens { access_token: "a".into(), refresh_token: Some("r".into()), expires_at, scope: None, signed_in_at: signed_in };
+        assert_eq!(session_expiry(&tokens(signed_in + 179 * day), signed_in + 179 * day), None);
+        assert_eq!(session_expiry(&tokens(signed_in + 181 * day), signed_in + 181 * day), Some(SessionExpiry::MaxAge), "active daily, still ends");
+        assert_eq!(session_expiry(&tokens(signed_in + day), signed_in + 95 * day), Some(SessionExpiry::Idle));
+        let persisted = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sink = persisted.clone();
+        let client = GmailClient::new(ClientConfig { client_id: "synthetic".into(), client_secret: None }, tokens(signed_in), Box::new(move |t| *sink.lock().unwrap() = Some(t.signed_in_at)));
+        let mut fresh = tokens(signed_in + 2 * day);
+        fresh.signed_in_at = signed_in + 2 * day;
+        client.accept_refresh(Ok(fresh)).unwrap();
+        assert_eq!(*persisted.lock().unwrap(), Some(signed_in));
+        assert_eq!(client.tokens().signed_in_at, signed_in);
+    }
+
+    #[test]
+    fn legacy_tokens_start_their_clock_when_loaded() {
+        let client = synthetic_client(Box::new(|_| {}));
+        assert!(client.tokens().signed_in_at > 0);
+    }
+
+    #[test]
     fn sessions_expire_after_ninety_idle_days() {
         let day = 24 * 60 * 60 * 1000;
         let last_refresh = 1_800_000_000_000;
@@ -467,7 +523,7 @@ mod batch_tests {
 
     #[test]
     fn disconnect_blocks_cloned_client_and_retains_retry_on_failure() {
-        let client = std::sync::Arc::new(GmailClient::new(ClientConfig { client_id: "synthetic".into(), client_secret: None }, OAuthTokens { access_token: "synthetic-access".into(), refresh_token: Some("synthetic-refresh".into()), expires_at: i64::MAX, scope: None }, Box::new(|_| panic!("no refresh may persist after disconnect"))));
+        let client = std::sync::Arc::new(GmailClient::new(ClientConfig { client_id: "synthetic".into(), client_secret: None }, OAuthTokens { access_token: "synthetic-access".into(), refresh_token: Some("synthetic-refresh".into()), expires_at: i64::MAX, scope: None, signed_in_at: 0 }, Box::new(|_| panic!("no refresh may persist after disconnect"))));
         let clone = client.clone();
         assert!(client.disconnect_with(|_| Err(AuthError::Network("synthetic offline".into()))).is_err());
         assert_eq!(clone.get("messages", &[]), Err(ApiError::Unauthorized));

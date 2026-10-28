@@ -39,6 +39,10 @@ pub struct OAuthTokens {
     /// Unix milliseconds.
     pub expires_at: i64,
     pub scope: Option<String>,
+    /// Unix milliseconds of the sign-in that issued the refresh token; kept across
+    /// refreshes. 0 for tokens stored before this field existed.
+    #[serde(default)]
+    pub signed_in_at: i64,
 }
 
 impl std::fmt::Debug for ClientConfig {
@@ -134,6 +138,8 @@ fn token_response(mut response: ureq::http::Response<ureq::Body>, previous_refre
         refresh_token,
         expires_at: overlook_core::time::now() + expires_in * 1000,
         scope: body.get("scope").and_then(|v| v.as_str()).map(str::to_owned),
+        // A refresh keeps the original sign-in time (see `GmailClient::accept_refresh`).
+        signed_in_at: overlook_core::time::now(),
     })
 }
 
@@ -547,8 +553,8 @@ mod tests {
         assert_eq!(cfg.client_id, "123-abc.apps.googleusercontent.com");
         assert_eq!(cfg.client_secret.as_deref(), Some("GOCSPX-x"));
         assert!(ClientConfig::from_google_json("{}").is_err());
-        assert!(!OAuthTokens { access_token: "a".into(), refresh_token: None, expires_at: 10_000_000, scope: None }.is_expired(1_000_000));
-        assert!(OAuthTokens { access_token: "a".into(), refresh_token: None, expires_at: 1_050_000, scope: None }.is_expired(1_000_000));
+        assert!(!OAuthTokens { access_token: "a".into(), refresh_token: None, expires_at: 10_000_000, scope: None, signed_in_at: 0 }.is_expired(1_000_000));
+        assert!(OAuthTokens { access_token: "a".into(), refresh_token: None, expires_at: 1_050_000, scope: None, signed_in_at: 0 }.is_expired(1_000_000));
     }
 
     #[test]
@@ -584,7 +590,7 @@ mod tests {
 
     #[test]
     fn secret_debug_output_is_redacted() {
-        let tokens = OAuthTokens { access_token: "synthetic-access-secret".into(), refresh_token: Some("synthetic-refresh-secret".into()), expires_at: 123, scope: None };
+        let tokens = OAuthTokens { access_token: "synthetic-access-secret".into(), refresh_token: Some("synthetic-refresh-secret".into()), expires_at: 123, scope: None, signed_in_at: 0 };
         let config = ClientConfig { client_id: "public-client".into(), client_secret: Some("synthetic-client-secret".into()) };
         let pkce = Pkce::from_random(&[7; 48]);
         let output = format!("{tokens:?} {config:?} {pkce:?}");
