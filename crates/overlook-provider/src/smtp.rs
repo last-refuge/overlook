@@ -148,8 +148,12 @@ fn connect_error(e: SmtpError) -> ProviderError {
     }
     crate::secure_error::log_detail("SMTP connection", &e);
     // A certificate or handshake failure will not succeed on retry; report it in fixed words.
+    // With implicit TLS, lettre reports a failed handshake as a network error wrapping rustls's.
     if e.is_tls() {
         return ProviderError::Rejected(tls_message(&e).into());
+    }
+    if let Some(message) = rustls_cause(&e) {
+        return ProviderError::Rejected(message.into());
     }
     // Network, timeouts, or a connection closed mid-reply (lettre reports the EOF as an
     // incomplete response): the server was never properly reached.
@@ -161,6 +165,20 @@ fn connect_error(e: SmtpError) -> ProviderError {
 }
 
 /// The fixed message for a lettre TLS error, from the rustls error underneath when present.
+/// The fixed message for a rustls failure anywhere in the error's causes, directly or inside
+/// an I/O error.
+fn rustls_cause(e: &SmtpError) -> Option<&'static str> {
+    let mut source = std::error::Error::source(e);
+    while let Some(inner) = source {
+        let tls = inner.downcast_ref::<rustls::Error>().or_else(|| inner.downcast_ref::<std::io::Error>().and_then(|io| io.get_ref()).and_then(|i| i.downcast_ref::<rustls::Error>()));
+        if let Some(tls) = tls {
+            return Some(crate::secure_error::rustls_message(tls));
+        }
+        source = inner.source();
+    }
+    None
+}
+
 fn tls_message(e: &SmtpError) -> &'static str {
     let mut source = std::error::Error::source(e);
     while let Some(inner) = source {
