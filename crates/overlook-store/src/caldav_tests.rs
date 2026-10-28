@@ -106,7 +106,7 @@ fn cache_resources_visibility_and_coverage_survive_restart() {
         let store = Store::open(&path).unwrap();
         install(&store, &c, &s);
         store
-            .set_calendar_visible(&s.calendars[0].calendar.id, false)
+            .set_calendar_visible(&c.account_id, &s.calendars[0].calendar.id, false)
             .unwrap();
     }
     {

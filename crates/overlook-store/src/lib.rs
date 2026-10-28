@@ -39,6 +39,58 @@ pub enum StoreError {
     NotFound(String),
     #[error("{0}")]
     Invalid(String),
+    /// Object-level authorization failed: the record belongs to another account.
+    #[error("that {0} belongs to a different account")]
+    NotOwned(&'static str),
+}
+
+/// Tables whose rows carry an `account_id`, for object-level authorization. The table name
+/// comes from this fixed list, never from input.
+#[derive(Clone, Copy, Debug)]
+enum Owned {
+    Message,
+    Label,
+    Draft,
+    Calendar,
+    Event,
+}
+
+impl Owned {
+    fn table(self) -> &'static str {
+        match self {
+            Owned::Message => "messages",
+            Owned::Label => "labels",
+            Owned::Draft => "drafts",
+            Owned::Calendar => "calendars",
+            Owned::Event => "events",
+        }
+    }
+
+    fn noun(self) -> &'static str {
+        match self {
+            Owned::Message => "message",
+            Owned::Label => "label",
+            Owned::Draft => "draft",
+            Owned::Calendar => "calendar",
+            Owned::Event => "event",
+        }
+    }
+}
+
+/// Object-level authorization for create, read, update and delete by id: every existing
+/// record named must belong to `account`. Ids that do not exist are left to the caller
+/// (a create, or a no-op). Unpredictable ids are not relied on.
+fn ensure_owned<'a>(tx: &Connection, what: Owned, account: &AccountId, ids: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    let sql = format!("SELECT account_id FROM {} WHERE id=?1", what.table());
+    let mut statement = tx.prepare_cached(&sql)?;
+    for id in ids {
+        let owner: Option<String> = statement.query_row([id], |r| r.get(0)).optional()?;
+        if owner.is_some_and(|owner| owner != account.0) {
+            tracing::warn!(target: "overlook::access", kind = what.noun(), "refused a change to another account's record");
+            return Err(StoreError::NotOwned(what.noun()));
+        }
+    }
+    Ok(())
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -425,8 +477,9 @@ impl Store {
     }
 
     /// Per-message override for Focused Inbox (`None` clears it).
-    pub fn set_focus_override(&self, ids: &[MessageId], focused: Option<bool>) -> Result<()> {
+    pub fn set_focus_override(&self, account: &AccountId, ids: &[MessageId], focused: Option<bool>) -> Result<()> {
         self.with_tx(|tx| {
+            ensure_owned(tx, Owned::Message, account, ids.iter().map(|i| i.0.as_str()))?;
             for id in ids {
                 tx.execute("UPDATE messages SET focus_override=?2 WHERE id=?1", params![id.0, focused])?;
             }
@@ -496,9 +549,10 @@ impl Store {
         })
     }
 
-    pub fn set_calendar_visible(&self, id: &CalendarId, visible: bool) -> Result<()> {
-        self.with_conn(|c| {
-            c.execute("UPDATE calendars SET visible=?2 WHERE id=?1", params![id.0, visible])?;
+    pub fn set_calendar_visible(&self, account: &AccountId, id: &CalendarId, visible: bool) -> Result<()> {
+        self.with_tx(|tx| {
+            ensure_owned(tx, Owned::Calendar, account, [id.0.as_str()])?;
+            tx.execute("UPDATE calendars SET visible=?2 WHERE id=?1 AND account_id=?3", params![id.0, visible, account.0])?;
             Ok(())
         })
     }
@@ -605,6 +659,8 @@ impl Store {
     pub fn delete_event_locally_scoped(&self, account: &AccountId, event: &Event, scope: RecurrenceScope) -> Result<PendingOperation> {
         let ts = now();
         self.with_tx(|tx| {
+            ensure_owned(tx, Owned::Calendar, account, [event.calendar_id.0.as_str()])?;
+            ensure_owned(tx, Owned::Event, account, [event.id.0.as_str()])?;
             caldav::reject_caldav_write(tx, &event.calendar_id)?;
             for member in Self::series_members_tx(tx, account, event, scope)? {
                 tx.execute("DELETE FROM events WHERE id=?1", [&member.id.0])?;
@@ -634,6 +690,8 @@ impl Store {
         let delta = before.as_ref().map(|b| event.start - b.start).unwrap_or(0);
         let duration = event.end - event.start;
         self.with_tx(|tx| {
+            ensure_owned(tx, Owned::Calendar, account, [event.calendar_id.0.as_str()])?;
+            ensure_owned(tx, Owned::Event, account, [event.id.0.as_str()])?;
             caldav::reject_caldav_write(tx, &event.calendar_id)?;
             let members = before.as_ref().map(|b| Self::series_members_tx(tx, account, b, scope)).transpose()?.unwrap_or_default();
             for member in members {
@@ -799,8 +857,9 @@ impl Store {
         })
     }
 
-    pub fn delete_draft(&self, id: &DraftId) -> Result<()> {
+    pub fn delete_draft(&self, account: &AccountId, id: &DraftId) -> Result<()> {
         self.with_tx(|tx| {
+            ensure_owned(tx, Owned::Draft, account, [id.0.as_str()])?;
             tx.execute("DELETE FROM drafts WHERE id=?1", [&id.0])?;
             // Any queued send for this draft is cancelled with it.
             tx.execute(
@@ -825,8 +884,9 @@ impl Store {
     }
 
     /// Returns a queued (not yet in-flight) draft to editing and removes its send operation.
-    pub fn cancel_send(&self, id: &DraftId) -> Result<Draft> {
+    pub fn cancel_send(&self, account: &AccountId, id: &DraftId) -> Result<Draft> {
         self.with_tx(|tx| {
+            ensure_owned(tx, Owned::Draft, account, [id.0.as_str()])?;
             let mut found = load_drafts(tx, "WHERE d.id=?1", params![id.0])?;
             let mut draft = found.pop().ok_or_else(|| StoreError::NotFound(id.0.clone()))?;
             if !matches!(draft.state, DraftState::Queued | DraftState::Failed(_)) {
@@ -845,8 +905,9 @@ impl Store {
 
     /// Queues an uncertain or failed send again: the draft returns to `Queued` and its
     /// operation to `Pending`, so the next sync submits it (a fresh attempt, no reconcile).
-    pub fn resend(&self, id: &DraftId) -> Result<Draft> {
+    pub fn resend(&self, account: &AccountId, id: &DraftId) -> Result<Draft> {
         self.with_tx(|tx| {
+            ensure_owned(tx, Owned::Draft, account, [id.0.as_str()])?;
             let mut found = load_drafts(tx, "WHERE d.id=?1", params![id.0])?;
             let mut draft = found.pop().ok_or_else(|| StoreError::NotFound(id.0.clone()))?;
             if !matches!(draft.state, DraftState::Uncertain | DraftState::Failed(_)) {
@@ -868,8 +929,9 @@ impl Store {
 
     /// Drops an uncertain or failed send together with its draft. The message may or may
     /// not have left the server; the user has decided not to send it again.
-    pub fn discard_send(&self, id: &DraftId) -> Result<()> {
+    pub fn discard_send(&self, account: &AccountId, id: &DraftId) -> Result<()> {
         self.with_tx(|tx| {
+            ensure_owned(tx, Owned::Draft, account, [id.0.as_str()])?;
             let mut found = load_drafts(tx, "WHERE d.id=?1", params![id.0])?;
             let draft = found.pop().ok_or_else(|| StoreError::NotFound(id.0.clone()))?;
             if !matches!(draft.state, DraftState::Uncertain | DraftState::Failed(_) | DraftState::Queued) {
@@ -1764,6 +1826,12 @@ impl RawMessage {
 }
 
 fn apply_change_tx(tx: &Connection, account: &AccountId, change: &LocalChange) -> Result<()> {
+    // Object-level authorization: every message and label the change names must be this
+    // account's, before anything is written.
+    ensure_owned(tx, Owned::Message, account, change.message_ids().iter().map(|i| i.0.as_str()))?;
+    if let LocalChange::AddLabel { label_id, .. } | LocalChange::RemoveLabel { label_id, .. } = change {
+        ensure_owned(tx, Owned::Label, account, [label_id.0.as_str()])?;
+    }
     let label_id_of = |kind: LabelKind| -> Result<LabelId> {
         tx.query_row(
             "SELECT id FROM labels WHERE account_id=?1 AND kind=?2 LIMIT 1",
@@ -1841,6 +1909,11 @@ fn insert_operation_tx(tx: &Connection, account: &AccountId, kind: OperationKind
 }
 
 fn save_draft_tx(tx: &Connection, d: &Draft) -> Result<()> {
+    // A draft is saved under its own account; an id already used by another account's
+    // draft is refused rather than overwritten.
+    ensure_owned(tx, Owned::Draft, &d.account_id, [d.id.0.as_str()])?;
+    // Its conversation and the message it replies to must be the same account's.
+    ensure_owned(tx, Owned::Message, &d.account_id, d.in_reply_to.iter().map(|m| m.0.as_str()))?;
     tx.execute(
         "INSERT INTO drafts(id, account_id, kind, conversation_id, in_reply_to, to_json, cc_json, bcc_json, subject, body_text, body_html,
             state_json, created_at, updated_at, provider_id, include_quote)
@@ -2023,6 +2096,79 @@ mod tests {
             .unwrap();
     }
 
+    /// CASA 3.1.4: every create, read-for-update, update and delete by id is refused when
+    /// the record belongs to another account, and nothing changes or is queued.
+    #[test]
+    fn records_of_another_account_cannot_be_changed() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let owner = AccountId::from("acct-1");
+        let other = AccountId::from("acct-2");
+        store.upsert_account(&Account { id: other.clone(), provider: ProviderKind::Sample, display_name: "Other".into(), email: "other@example.com".into(), created_at: 2 }).unwrap();
+        let not_owned = |r: Result<()>| assert!(matches!(r, Err(StoreError::NotOwned(_))), "{r:?}");
+        let m1 = MessageId::from("m1");
+
+        // Update and delete of messages and labels through local changes.
+        for change in [
+            LocalChange::SetRead { message_ids: vec![m1.clone()], read: true },
+            LocalChange::SetStarred { message_ids: vec![m1.clone()], starred: true },
+            LocalChange::Archive { message_ids: vec![m1.clone()] },
+            LocalChange::Trash { message_ids: vec![m1.clone()] },
+            LocalChange::AddLabel { message_ids: vec![], label_id: LabelId::from("label-user") },
+        ] {
+            not_owned(store.apply_change(&other, change).map(|_| ()));
+        }
+        not_owned(store.set_focus_override(&other, &[m1.clone()], Some(true)));
+        let m1_now = store.message(&m1).unwrap().unwrap();
+        assert!(!m1_now.is_read && !m1_now.is_starred && m1_now.focus_override.is_none());
+        assert!(m1_now.label_ids.contains(&LabelId::from("label-inbox")));
+        assert!(store.pending_operations(&other).unwrap().is_empty());
+
+        // Drafts: overwrite, delete, and every Outbox action.
+        let mut draft = Draft::new(owner.clone(), DraftKind::New, 0);
+        draft.to = vec![Address::named("Maya", "maya@northstar.example")];
+        draft.subject = "Owner's draft".into();
+        store.queue_send(&draft).unwrap();
+        let mut hijack = draft.clone();
+        hijack.account_id = other.clone();
+        hijack.subject = "Replaced".into();
+        not_owned(store.save_draft(&hijack));
+        not_owned(store.delete_draft(&other, &draft.id));
+        not_owned(store.cancel_send(&other, &draft.id).map(|_| ()));
+        not_owned(store.resend(&other, &draft.id).map(|_| ()));
+        not_owned(store.discard_send(&other, &draft.id));
+        let kept = store.draft(&draft.id).unwrap().unwrap();
+        assert_eq!((kept.account_id, kept.subject.as_str(), kept.state), (owner.clone(), "Owner's draft", DraftState::Queued));
+        // A reply may not point at another account's message.
+        let mut reply = Draft::new(other.clone(), DraftKind::Reply, 0);
+        reply.in_reply_to = Some(m1.clone());
+        not_owned(store.save_draft(&reply));
+
+        // Calendars and events.
+        let cal = Calendar { id: CalendarId::from("acct-1:cal"), account_id: owner.clone(), provider_id: None, name: "Cal".into(), color: None, is_primary: true, can_edit: true, visible: true, sort_order: 0, default_reminders: vec![] };
+        store.replace_calendars(&owner, &[cal.clone()]).unwrap();
+        let event = Event {
+            id: EventId::from("acct-1:cal:e1"), account_id: owner.clone(), calendar_id: cal.id.clone(), provider_id: None, ical_uid: None,
+            summary: "Standup".into(), description: None, location: None, start: 0, end: 1_800_000, all_day: false,
+            status: EventStatus::Confirmed, organizer: None, attendees: vec![], html_link: None, conference_url: None, recurring_event_id: None, updated: 0,
+            event_type: None, color: None, reminders: None, original_start: None, wants_conference: false, pending: false,
+        };
+        store.upsert_events(&[event.clone()]).unwrap();
+        not_owned(store.set_calendar_visible(&other, &cal.id, false));
+        not_owned(store.delete_event_locally_scoped(&other, &event, RecurrenceScope::This).map(|_| ()));
+        let mut edited = event.clone();
+        edited.summary = "Renamed".into();
+        not_owned(store.apply_series_change(&other, &edited, RecurrenceScope::This).map(|_| ()));
+        assert_eq!(store.event(&event.id).unwrap().unwrap().summary, "Standup");
+        assert!(store.calendars(&owner).unwrap()[0].visible);
+        assert!(store.pending_operations(&other).unwrap().is_empty());
+
+        // The owner can still do all of it.
+        store.apply_change(&owner, LocalChange::SetRead { message_ids: vec![m1.clone()], read: true }).unwrap();
+        store.set_calendar_visible(&owner, &cal.id, false).unwrap();
+        store.discard_send(&owner, &draft.id).unwrap();
+    }
+
     #[test]
     fn change_and_operation_survive_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -2186,7 +2332,7 @@ mod tests {
         assert_eq!(store.drafts(&acct, false).unwrap().len(), 0);
         assert_eq!(store.account_status(&acct).unwrap().outbox_items, 1);
 
-        let restored = store.cancel_send(&draft_id).unwrap();
+        let restored = store.cancel_send(&acct, &draft_id).unwrap();
         assert_eq!(restored.state, DraftState::Editing);
         assert_eq!(store.pending_count(&acct).unwrap(), 0);
         assert_eq!(store.drafts(&acct, false).unwrap().len(), 1);
@@ -2309,7 +2455,7 @@ mod tests {
         let other = store.conversations(&acct, "jason@example.com", &MailboxView::Kind(LabelKind::Inbox), ListFilter::All, Some(FocusTab::Other)).unwrap();
         assert!(other.is_empty(), "rule moves the sender to Focused");
         store.set_focus_rule(&acct, "deals@shop.example", None).unwrap();
-        store.set_focus_override(&[MessageId::from("m1")], Some(false)).unwrap();
+        store.set_focus_override(&acct, &[MessageId::from("m1")], Some(false)).unwrap();
         let other = store.conversations(&acct, "jason@example.com", &MailboxView::Kind(LabelKind::Inbox), ListFilter::All, Some(FocusTab::Other)).unwrap();
         assert_eq!(other.len(), 2);
         assert_eq!(store.view_count(&acct, "jason@example.com", &MailboxView::Kind(LabelKind::Inbox), Some(FocusTab::Focused)).unwrap(), 1);
@@ -2366,12 +2512,12 @@ mod tests {
             default_reminders: vec![10],
         };
         store.replace_calendars(&acct, &[cal.clone()]).unwrap();
-        store.set_calendar_visible(&cal.id, false).unwrap();
+        store.set_calendar_visible(&acct, &cal.id, false).unwrap();
         let mut hidden = cal.clone();
         hidden.name = "Jason Alexander".into();
         store.replace_calendars(&acct, &[hidden]).unwrap();
         assert!(!store.calendars(&acct).unwrap()[0].visible, "visibility survives provider refresh");
-        store.set_calendar_visible(&cal.id, true).unwrap();
+        store.set_calendar_visible(&acct, &cal.id, true).unwrap();
         let event = Event {
             id: EventId::from("acct-1:cal:primary:e1"),
             account_id: acct.clone(),

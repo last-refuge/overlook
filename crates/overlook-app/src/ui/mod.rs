@@ -2098,7 +2098,7 @@ impl MailWindow {
                             .filter_map(|(acct, w)| {
                                 match w {
                                     LocalWrite::Change(c) => store.apply_change(&acct, c).map(|_| ()),
-                                    LocalWrite::FocusOverride { ids, focused } => store.set_focus_override(&ids, focused),
+                                    LocalWrite::FocusOverride { ids, focused } => store.set_focus_override(&acct, &ids, focused),
                                     LocalWrite::FocusRule { email, focused } => store.set_focus_rule(&acct, &email, focused),
                                 }
                                 .err()
@@ -2329,12 +2329,13 @@ impl MailWindow {
         let to_save = draft.clone();
         self.open_composer(draft, window, cx);
         let draft_id = to_save.id.clone();
+        let draft_account = to_save.account_id.clone();
         cx.spawn_in(window, async move |this, cx| {
             let result = cx.background_spawn(async move { store.save_editing_draft(&to_save) }).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(_) if this.unwanted_drafts.remove(&draft_id) => {
-                        let _ = this.store.delete_draft(&draft_id);
+                        let _ = this.store.delete_draft(&draft_account, &draft_id);
                         this.reload_drafts();
                     }
                     Ok(_) => {
@@ -2368,7 +2369,7 @@ impl MailWindow {
     }
 
     pub(crate) fn cancel_send(&mut self, id: DraftId, window: &mut Window, cx: &mut Context<Self>) {
-        match self.store.cancel_send(&id) {
+        match self.store.cancel_send(&self.account.id, &id) {
             Ok(draft) => {
                 self.outbox_selected = None;
                 self.view = MailboxView::Kind(LabelKind::Drafts);
@@ -2384,7 +2385,7 @@ impl MailWindow {
 
     /// "Send again" on an uncertain or failed Outbox item: a fresh attempt, now.
     pub(crate) fn resend_draft(&mut self, id: DraftId, window: &mut Window, cx: &mut Context<Self>) {
-        match self.store.resend(&id) {
+        match self.store.resend(&self.account.id, &id) {
             Ok(draft) => {
                 self.reload(cx);
                 self.sync_account(draft.account_id, window, cx);
@@ -2395,7 +2396,7 @@ impl MailWindow {
 
     /// "Discard" on an uncertain or failed Outbox item: the draft and its send are dropped.
     pub(crate) fn discard_send(&mut self, id: DraftId, window: &mut Window, cx: &mut Context<Self>) {
-        match self.store.discard_send(&id) {
+        match self.store.discard_send(&self.account.id, &id) {
             Ok(()) => {
                 self.outbox_selected = None;
                 self.reload(cx);

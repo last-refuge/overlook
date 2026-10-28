@@ -228,7 +228,7 @@ impl MailWindow {
 
     pub(crate) fn toggle_calendar_visible(&mut self, id: CalendarId, cx: &mut Context<Self>) {
         if let Some(c) = self.calendars.iter().find(|c| c.id == id) {
-            let _ = self.store.set_calendar_visible(&id, !c.visible);
+            let _ = self.store.set_calendar_visible(&c.account_id, &id, !c.visible);
         }
         self.reload_calendar();
         cx.notify();

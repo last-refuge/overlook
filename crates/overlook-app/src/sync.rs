@@ -878,7 +878,7 @@ mod tests {
     fn cancelled_send_is_not_sent() {
         let (store, account, provider) = seeded();
         let draft = queued_draft(&store, &account);
-        store.cancel_send(&draft.id).unwrap();
+        store.cancel_send(&account.id, &draft.id).unwrap();
         provider.set_online(true);
         let outcome = block_on(run_sync(store.clone(), arc(&provider), None, account.clone()));
         assert!(outcome.sent.is_empty());
@@ -1370,7 +1370,7 @@ mod tests {
         assert_eq!(store.draft(&draft.id).unwrap().unwrap().state, DraftState::Uncertain);
 
         // "Send again": a fresh attempt that succeeds and lands in Sent.
-        store.resend(&draft.id).unwrap();
+        store.resend(&draft.account_id, &draft.id).unwrap();
         assert_eq!(store.draft(&draft.id).unwrap().unwrap().state, DraftState::Queued);
         let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
         assert_eq!(outcome.sent, vec!["Agenda".to_owned()]);
@@ -1384,7 +1384,7 @@ mod tests {
         env.smtp.set(Behaviour::DropAfterData);
         block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
         assert_eq!(store.draft(&draft.id).unwrap().unwrap().state, DraftState::Uncertain);
-        store.discard_send(&draft.id).unwrap();
+        store.discard_send(&draft.account_id, &draft.id).unwrap();
         assert!(store.draft(&draft.id).unwrap().is_none());
         assert_eq!(store.pending_count(&env.account.id).unwrap(), 0);
         env.smtp.set(Behaviour::Normal);
@@ -1622,7 +1622,7 @@ mod tests {
         assert_eq!((outcome.state.clone(), outcome.sent.len()), (Some(SyncState::UpToDate), 0), "{outcome:?}");
         assert_eq!(store.draft(&draft.id).unwrap().unwrap().state, DraftState::Uncertain);
         assert!(Raw::imap_login(imap_port).search("Sent", &rfc).is_empty(), "nothing in Sent yet");
-        store.resend(&draft.id).unwrap();
+        store.resend(&draft.account_id, &draft.id).unwrap();
         let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone()));
         assert_eq!(outcome.sent, vec![draft.subject.clone()], "{outcome:?}");
         let on_server = Raw::imap_login(imap_port).search("Sent", &rfc);

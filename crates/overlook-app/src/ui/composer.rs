@@ -372,7 +372,7 @@ impl MailWindow {
                 }
                 if c.draft.is_empty() && c.last_saved.is_some() {
                     // Nothing was written; do not leave an empty draft behind.
-                    let _ = self.store.delete_draft(&c.draft.id);
+                    let _ = self.store.delete_draft(&c.draft.account_id, &c.draft.id);
                     self.reload_drafts();
                 }
             }
@@ -387,7 +387,7 @@ impl MailWindow {
                 // Its first save may still be running; it removes the draft when it lands.
                 self.unwanted_drafts.insert(c.draft.id.clone());
             }
-            let _ = self.store.delete_draft(&c.draft.id);
+            let _ = self.store.delete_draft(&c.draft.account_id, &c.draft.id);
             self.reload_drafts();
             crate::ui::toast(window, cx, crate::notify::Level::Info, "Draft discarded.");
             self.list_focus.focus(window, cx);
@@ -426,7 +426,8 @@ impl MailWindow {
                 // The message is already safe in the Outbox; Undo takes it back to the composer
                 // until the sync that sends it starts.
                 let id = draft.id.clone();
-                self.toast_with_undo(text, move |this, window, cx| this.undo_send(id.clone(), window, cx), window, cx);
+                let account = draft.account_id.clone();
+                self.toast_with_undo(text, move |this, window, cx| this.undo_send(account.clone(), id.clone(), window, cx), window, cx);
                 self.list_focus.focus(window, cx);
                 if online {
                     if delay == 0 {
@@ -450,8 +451,8 @@ impl MailWindow {
     }
 
     /// Takes a just-sent message back out of the Outbox into the composer.
-    pub(super) fn undo_send(&mut self, id: DraftId, window: &mut Window, cx: &mut Context<Self>) {
-        match self.store.cancel_send(&id) {
+    pub(super) fn undo_send(&mut self, account: AccountId, id: DraftId, window: &mut Window, cx: &mut Context<Self>) {
+        match self.store.cancel_send(&account, &id) {
             Ok(_) => {
                 self.reload(cx);
                 self.open_draft(id, window, cx);

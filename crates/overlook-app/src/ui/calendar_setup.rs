@@ -183,9 +183,10 @@ impl MailWindow {
             .when(!form.calendars.is_empty(), |d| d.child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).child("Show calendars")))
             .children(form.calendars.iter().map(|calendar| {
                 let id = calendar.id.clone();
+                let account_id = calendar.account_id.clone();
                 h_flex().gap(px(8.)).items_center()
                     .child(Switch::new(SharedString::from(format!("caldav-visible-{id}"))).accessibility_label(format!("Show {}", calendar.name)).checked(calendar.visible).disabled(form.busy).on_click(cx.listener(move |this, visible: &bool, _, cx| {
-                        if this.store.set_calendar_visible(&id, *visible).is_ok() {
+                        if this.store.set_calendar_visible(&account_id, &id, *visible).is_ok() {
                             if let Some(form) = this.settings.as_mut().and_then(|s| s.caldav.as_mut()) {
                                 if let Some(c) = form.calendars.iter_mut().find(|c| c.id == id) { c.visible = *visible; }
                             }
