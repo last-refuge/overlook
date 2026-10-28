@@ -170,7 +170,7 @@ struct ApiAsset {
 /// Asks GitHub for the latest release. Blocking; run on a background thread.
 pub fn check_latest() -> Result<ReleaseInfo, String> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let mut response = agent().get(&url).header("Accept", "application/vnd.github+json").call().map_err(|e| format!("could not reach GitHub: {e}"))?;
+    let mut response = agent().get(&url).header("Accept", "application/vnd.github+json").call().map_err(|e| format!("could not reach GitHub: {}", overlook_provider::secure_error::ureq("update check", e)))?;
     let status = response.status().as_u16();
     if status == 404 {
         return Err("No release has been published yet.".into());
@@ -178,7 +178,7 @@ pub fn check_latest() -> Result<ReleaseInfo, String> {
     if status != 200 {
         return Err(format!("GitHub answered {status}."));
     }
-    let release: ApiRelease = response.body_mut().read_json().map_err(|e| format!("unexpected answer from GitHub: {e}"))?;
+    let release: ApiRelease = response.body_mut().read_json().map_err(|e| format!("unexpected answer from GitHub: {}", overlook_provider::secure_error::ureq("update check response", e)))?;
     if release.draft || release.prerelease {
         return Err("The latest release is not ready yet.".into());
     }
@@ -212,7 +212,7 @@ pub fn download(asset: &ReleaseAsset, dir: &Path, progress: &Progress) -> Result
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let dest = dir.join(&asset.name);
     let part = dir.join(format!("{}.part", asset.name));
-    let mut response = agent().get(&asset.url).call().map_err(|e| format!("download failed: {e}"))?;
+    let mut response = agent().get(&asset.url).call().map_err(|e| format!("download failed: {}", overlook_provider::secure_error::ureq("update download", e)))?;
     if response.status().as_u16() != 200 {
         return Err(format!("download failed: HTTP {}", response.status()));
     }
@@ -221,7 +221,7 @@ pub fn download(asset: &ReleaseAsset, dir: &Path, progress: &Progress) -> Result
     let mut reader = response.body_mut().as_reader();
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = reader.read(&mut buf).map_err(|e| format!("download interrupted: {e}"))?;
+        let n = reader.read(&mut buf).map_err(|e| format!("download interrupted: {}", overlook_provider::secure_error::io("update download", &e)))?;
         if n == 0 {
             break;
         }
@@ -237,8 +237,8 @@ pub fn download(asset: &ReleaseAsset, dir: &Path, progress: &Progress) -> Result
 /// Fetches the release's SHA256SUMS and returns the expected digest for `name`.
 pub fn expected_sha256(release: &ReleaseInfo, name: &str) -> Result<String, String> {
     let sums = release.checksums().ok_or("the release has no SHA256SUMS file")?;
-    let mut response = agent().get(&sums.url).call().map_err(|e| format!("could not fetch checksums: {e}"))?;
-    let text = response.body_mut().read_to_string().map_err(|e| e.to_string())?;
+    let mut response = agent().get(&sums.url).call().map_err(|e| format!("could not fetch checksums: {}", overlook_provider::secure_error::ureq("update checksums", e)))?;
+    let text = response.body_mut().read_to_string().map_err(|e| overlook_provider::secure_error::ureq("update checksums", e).to_owned())?;
     parse_sha256sums(&text, name).ok_or_else(|| format!("no checksum listed for {name}"))
 }
 

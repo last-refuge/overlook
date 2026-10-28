@@ -14,6 +14,7 @@ pub mod mime;
 pub mod outgoing;
 pub mod pop3;
 pub mod sample;
+pub mod secure_error;
 pub mod smtp;
 
 pub use calendar::{CalendarProvider, EventChanges};

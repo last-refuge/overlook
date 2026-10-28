@@ -158,7 +158,7 @@ impl GmailClient {
                 .get(url)
                 .header("Authorization", &format!("Bearer {token}"))
                 .call()
-                .map_err(|e| ApiError::Transport(e.to_string()))
+                .map_err(|e| ApiError::Transport(crate::secure_error::ureq("Google API request", e).into()))
         })
     }
 
@@ -168,7 +168,7 @@ impl GmailClient {
                 .post(url)
                 .header("Authorization", &format!("Bearer {token}"))
                 .send_json(body)
-                .map_err(|e| ApiError::Transport(e.to_string()))
+                .map_err(|e| ApiError::Transport(crate::secure_error::ureq("Google API request", e).into()))
         })
     }
 
@@ -178,7 +178,7 @@ impl GmailClient {
                 .patch(url)
                 .header("Authorization", &format!("Bearer {token}"))
                 .send_json(body)
-                .map_err(|e| ApiError::Transport(e.to_string()))
+                .map_err(|e| ApiError::Transport(crate::secure_error::ureq("Google API request", e).into()))
         })
     }
 
@@ -188,7 +188,7 @@ impl GmailClient {
                 .put(url)
                 .header("Authorization", &format!("Bearer {token}"))
                 .send_json(body)
-                .map_err(|e| ApiError::Transport(e.to_string()))
+                .map_err(|e| ApiError::Transport(crate::secure_error::ureq("Google API request", e).into()))
         })
     }
 
@@ -198,7 +198,7 @@ impl GmailClient {
                 .delete(url)
                 .header("Authorization", &format!("Bearer {token}"))
                 .call()
-                .map_err(|e| ApiError::Transport(e.to_string()))
+                .map_err(|e| ApiError::Transport(crate::secure_error::ureq("Google API request", e).into()))
         })
     }
 
@@ -213,7 +213,7 @@ impl GmailClient {
             self.throttle();
             let mut response = request(&token)?;
             let status = response.status().as_u16();
-            let text = response.body_mut().read_to_string().map_err(|e| ApiError::Transport(e.to_string()))?;
+            let text = response.body_mut().read_to_string().map_err(|e| ApiError::Transport(crate::secure_error::ureq("Google API request", e).into()))?;
             match status {
                 200..=299 => {
                     if text.trim().is_empty() {
@@ -271,10 +271,10 @@ impl GmailClient {
                 .header("Authorization", &format!("Bearer {token}"))
                 .header("Content-Type", &format!("multipart/mixed; boundary={boundary}"))
                 .send(body.as_bytes())
-                .map_err(|e| ApiError::Transport(e.to_string()))?;
+                .map_err(|e| ApiError::Transport(crate::secure_error::ureq("Google API request", e).into()))?;
             let status = response.status().as_u16();
             let content_type = response.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_owned();
-            let text = response.body_mut().read_to_string().map_err(|e| ApiError::Transport(e.to_string()))?;
+            let text = response.body_mut().read_to_string().map_err(|e| ApiError::Transport(crate::secure_error::ureq("Google API request", e).into()))?;
             match status {
                 200..=299 => {
                     let Some(reply_boundary) = content_type.split(';').map(str::trim).find_map(|p| p.strip_prefix("boundary=")).map(|b| b.trim_matches('"').to_owned()) else {

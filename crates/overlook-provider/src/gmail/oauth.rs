@@ -94,7 +94,7 @@ fn token_response(mut response: ureq::http::Response<ureq::Body>, previous_refre
     let body: serde_json::Value = response
         .body_mut()
         .read_json()
-        .map_err(|e| AuthError::Protocol(format!("token response was not JSON: {e}")))?;
+        .map_err(|e| AuthError::Protocol(crate::secure_error::ureq("Google token response", e).into()))?;
     if status != 200 {
         let code = body.get("error").and_then(|v| v.as_str()).unwrap_or("unknown_error");
         let description = body.get("error_description").and_then(|v| v.as_str()).unwrap_or("");
@@ -129,7 +129,7 @@ fn post_form(url: &str, body: &str) -> Result<ureq::http::Response<ureq::Body>, 
         .post(url)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .send(body.as_bytes())
-        .map_err(|e| AuthError::Network(e.to_string()))
+        .map_err(|e| AuthError::Network(crate::secure_error::ureq("Google OAuth request", e).into()))
 }
 
 /// Exchanges an authorization code for tokens (blocking; run on a background thread).
@@ -178,11 +178,11 @@ pub fn fetch_userinfo(access_token: &str) -> Result<UserInfo, AuthError> {
         .get(USERINFO_ENDPOINT)
         .header("Authorization", &format!("Bearer {access_token}"))
         .call()
-        .map_err(|e| AuthError::Network(e.to_string()))?;
+        .map_err(|e| AuthError::Network(crate::secure_error::ureq("Google OAuth request", e).into()))?;
     if response.status().as_u16() != 200 {
         return Err(AuthError::Protocol(format!("userinfo returned {}", response.status())));
     }
-    let body: serde_json::Value = response.body_mut().read_json().map_err(|e| AuthError::Protocol(e.to_string()))?;
+    let body: serde_json::Value = response.body_mut().read_json().map_err(|e| AuthError::Protocol(crate::secure_error::ureq("Google userinfo response", e).into()))?;
     let email = body
         .get("email")
         .and_then(|v| v.as_str())

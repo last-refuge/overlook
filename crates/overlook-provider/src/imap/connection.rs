@@ -68,7 +68,7 @@ fn io_error(host: &str, what: &str, e: &std::io::Error) -> ProviderError {
     use std::io::ErrorKind::*;
     match e.kind() {
         // rustls reports certificate and protocol failures as InvalidData.
-        InvalidData => ProviderError::Rejected(format!("{what} to {host} failed: {}", e.get_ref().map(|inner| inner.to_string()).unwrap_or_else(|| e.to_string()))),
+        InvalidData => ProviderError::Rejected(format!("{what} to {host} failed: {}", crate::secure_error::io(what, e))),
         _ => ProviderError::Offline,
     }
 }
@@ -90,8 +90,8 @@ pub(crate) fn tcp_connect(endpoint: &ServerEndpoint, timeout: Duration) -> Resul
 /// Completes the TLS handshake before the stream is handed to the IMAP client, so a
 /// certificate problem is reported as such rather than as a lost connection.
 pub(crate) fn wrap_tls(host: &str, mut tcp: TcpStream) -> Result<Stream, ProviderError> {
-    let name = rustls::pki_types::ServerName::try_from(host.to_owned()).map_err(|e| ProviderError::Rejected(format!("“{host}” is not a valid server name: {e}")))?;
-    let mut conn = rustls::ClientConnection::new(tls_config(), name).map_err(|e| ProviderError::Rejected(format!("TLS setup failed: {e}")))?;
+    let name = rustls::pki_types::ServerName::try_from(host.to_owned()).map_err(|e| { crate::secure_error::log_detail("TLS server name", e); ProviderError::Rejected(format!("“{host}”: {}", crate::secure_error::INVALID_SERVER_NAME)) })?;
+    let mut conn = rustls::ClientConnection::new(tls_config(), name).map_err(|e| { crate::secure_error::log_detail("TLS setup", &e); ProviderError::Rejected(crate::secure_error::rustls_message(&e).into()) })?;
     while conn.is_handshaking() {
         conn.complete_io(&mut tcp).map_err(|e| io_error(host, "The TLS handshake", &e))?;
     }

@@ -141,13 +141,33 @@ fn connect_error(e: SmtpError) -> ProviderError {
     if let Some(mapped) = by_status(&e) {
         return mapped;
     }
-    // Network, TLS, timeouts, or a connection closed mid-reply (lettre reports the EOF as an
+    crate::secure_error::log_detail("SMTP connection", &e);
+    // A certificate or handshake failure will not succeed on retry; report it in fixed words.
+    if e.is_tls() {
+        return ProviderError::Rejected(tls_message(&e).into());
+    }
+    // Network, timeouts, or a connection closed mid-reply (lettre reports the EOF as an
     // incomplete response): the server was never properly reached.
     if e.is_client() {
-        ProviderError::Temporary(e.to_string())
+        ProviderError::Temporary(crate::secure_error::UNREADABLE_RESPONSE.into())
     } else {
         ProviderError::Offline
     }
+}
+
+/// The fixed message for a lettre TLS error, from the rustls error underneath when present.
+fn tls_message(e: &SmtpError) -> &'static str {
+    let mut source = std::error::Error::source(e);
+    while let Some(inner) = source {
+        if let Some(tls) = inner.downcast_ref::<rustls::Error>() {
+            return crate::secure_error::rustls_message(tls);
+        }
+        if let Some(io) = inner.downcast_ref::<std::io::Error>() {
+            return crate::secure_error::io_message(io);
+        }
+        source = inner.source();
+    }
+    crate::secure_error::SECURE_CONNECTION_FAILED
 }
 
 fn auth_error(e: SmtpError) -> ProviderError {
@@ -155,7 +175,10 @@ fn auth_error(e: SmtpError) -> ProviderError {
         Some(code) if code.severity == Severity::PermanentNegativeCompletion => ProviderError::SignInRequired,
         Some(_) => ProviderError::Temporary(reply_text(&e)),
         // No shared mechanism is a settings problem, not a network one.
-        None if e.is_client() => ProviderError::Rejected(e.to_string()),
+        None if e.is_client() => {
+            crate::secure_error::log_detail("SMTP authentication", &e);
+            ProviderError::Rejected("the outgoing server offers no sign-in method Overlook supports".into())
+        }
         None => connect_error(e),
     }
 }
