@@ -20,10 +20,15 @@ Released in v1.6.0, with follow-ups in v1.6.1:
 | 5.2.1 | Attachments copied into a generated folder with a cleaned name (no path, control or bidi-override characters) and 0600 permissions; 25 MB encoded cap at attach and send; ClamAV scan when installed (v1.6.1) | `attachment_policy.rs`, `ui/composer.rs`, `malware_scan.rs`, `outgoing.rs` |
 | 2.2.1 | Gmail sessions also end 180 days after sign-in, however active; sign-in time kept across refreshes (v1.6.1) | `gmail/oauth.rs`, `gmail/api.rs`, `ui/mod.rs` |
 | 6.1.1 | `cargo audit` in CI and before every release; a known vulnerability fails the build; JSON report published with each release (v1.6.1) | `.github/workflows/` |
+| 3.1.4 | Event saves (create, RSVP, move) and contact saves refuse another account's record (v1.6.2) | `overlook-store/src/lib.rs` |
+| 4.1.3 | PKCE challenge uses the RustCrypto `sha2` crate; no hand-written crypto remains (v1.6.2) | `gmail/oauth.rs` |
+| 6.1.1 | Each release installs its package in a clean Arch container and attaches an SBOM, `arch-audit` report and Trivy crate scan (v1.6.2; also run for v1.6.1) | `.github/workflows/supply-chain.yml` |
 
 Known limitations to disclose: rustls does not check certificate revocation (4.1.2); the attachment policy is a blocklist, as Gmail's is, not an allowlist (5.2.1). Owner tasks added by the remediation guidance: HSTS and a TLS 1.2 minimum on `lastrefuge.ai` in Cloudflare (4.1.1); a subdomain inventory alongside the zone export (6.4.1).
 
-Still to do: release, live captures, evidence documents, owner tasks (Cloudflare export, SSL Labs, ADA list), resubmission.
+Evidence written 28 October 2026, kept out of git in `llm-docs/casa/round-2/` because it names the origin server: zone export, records screenshot, SSL Labs A+ reports for both hostnames and the subdomain inventory (4.1.1, 4.1.2, 6.4.1); crypto inventory (4.1.3); IDOR inventory (3.1.4). The secrets access policy (6.7.1) is public at `docs/secrets-policy.md`. Cloudflare now proxies `lastrefuge.ai` and `www` with Full (Strict), HSTS (1 year, includeSubDomains), TLS 1.2 minimum and Always Use HTTPS.
+
+Still to do: live captures from v1.6.2, triage of the supply-chain reports (6.1.1), ADA list (1.1.1), resubmission.
 
 ## The pattern behind the failures
 
