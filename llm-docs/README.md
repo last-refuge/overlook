@@ -16,6 +16,7 @@ Overlook is a native Linux mail client in Rust, with an Outlook-inspired workflo
 - [Fastmail live qualification](fastmail-live-qualification.md): observed hosted-service results and incomplete checks, kept separate from simulated tests.
 - [Google data flow review](google-data-flow-review.md): source evidence, privacy qualifications, test results, and architecture wording for the CASA applicability discussion.
 - [CASA AL1 assessment handoff](casa/README.md): the submitted 48-control assessment, 50 evidence images, live verification, security fixes, submission confirmation, and assessor/release follow-up items.
+- [CASA remediation plan](casa-remediation-plan.md): plan for the 13 controls TAC failed on 27 October 2026.
 - [Brand system](overlook-brand.md): the selected identity, positioning, logo usage, colors, typography, voice, and product design guidance.
 - [Brand asset guide](overlook-brand-assets.md): the asset inventory, implementation handoff, regeneration instructions, and archive packaging.
 - [Art direction](overlook-art-direction.md): original landscape artwork provenance and exact generation prompt.
