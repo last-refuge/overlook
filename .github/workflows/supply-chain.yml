@@ -1,0 +1,75 @@
+name: Supply-chain scan
+# Installs a published release package in a clean, fully updated Arch container and records
+# what it runs on: an SBOM of the native packages and the Rust crates, Arch's security
+# tracker report for the installed packages (Chromium, poppler and the rest), and a Trivy
+# scan of Cargo.lock. The reports are attached to the release.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to scan, e.g. v1.6.1
+        required: true
+permissions:
+  contents: write
+jobs:
+  scan:
+    name: Scan the released package
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    env:
+      TAG: ${{ inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Install scanners
+        run: pacman -Syu --noconfirm git github-cli arch-audit pacman-contrib syft trivy
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Install the released package and its optional runtime pieces
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          mkdir -p /tmp/release dist
+          VERSION="${TAG#v}"
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D /tmp/release -p SHA256SUMS -p "overlook-$VERSION-1-x86_64.pkg.tar.zst"
+          (cd /tmp/release && sha256sum -c SHA256SUMS --ignore-missing)
+          pacman -U --noconfirm "/tmp/release/overlook-$VERSION-1-x86_64.pkg.tar.zst"
+          pacman -S --noconfirm --needed gnome-keyring poppler xdg-desktop-portal-gtk
+      - name: Native package inventory
+        run: |
+          {
+            echo "# Overlook $TAG runtime closure on Arch Linux, $(date -u +%Y-%m-%dT%H:%MZ)"
+            for p in $(pactree -lu overlook) gnome-keyring poppler xdg-desktop-portal-gtk; do pacman -Q "$p"; done | sort -u
+          } > dist/native-packages.txt
+          pacman -Q > dist/container-packages.txt
+          cat dist/native-packages.txt
+      - name: Arch security tracker report
+        run: |
+          {
+            echo "# arch-audit $(pacman -Q arch-audit | cut -d' ' -f2), $(date -u +%Y-%m-%dT%H:%MZ), all installed packages"
+            arch-audit --show-cve || true
+            echo
+            echo "# Of these, fixed in a newer package than installed:"
+            arch-audit --upgradable --show-cve || true
+          } > dist/arch-audit.txt
+          cat dist/arch-audit.txt
+      - name: SBOMs
+        run: |
+          syft scan dir:/ --exclude './proc/**' --exclude './sys/**' --exclude './dev/**' --exclude './__w/**' --exclude './__e/**' --exclude './tmp/**' -o cyclonedx-json=dist/sbom-native.cdx.json
+          syft scan file:Cargo.lock -o cyclonedx-json=dist/sbom-crates.cdx.json
+      - name: Trivy scan of the Rust dependencies
+        run: |
+          trivy fs --scanners vuln --format json --output dist/trivy-crates.json Cargo.lock
+          trivy fs --scanners vuln Cargo.lock
+      - uses: actions/upload-artifact@v4
+        with:
+          name: supply-chain-${{ inputs.tag }}
+          path: dist/
+      - name: Attach the reports to the release
+        run: |
+          cd dist
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber native-packages.txt arch-audit.txt sbom-native.cdx.json sbom-crates.cdx.json trivy-crates.json
