@@ -98,7 +98,7 @@ fn init_logging() {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::Layer;
-    let filter = || tracing_subscriber::EnvFilter::from_default_env().add_directive("overlook=info".parse().unwrap());
+    let filter = log_filter;
     let path = data_dir().join("overlook.log");
     let _ = std::fs::create_dir_all(data_dir());
     if std::fs::metadata(&path).is_ok_and(|m| m.len() > 4 * 1024 * 1024) {
@@ -113,6 +113,35 @@ fn init_logging() {
         None => registry.init(),
     }
 }
+
+/// Release builds log Overlook's own targets at info and ignore `RUST_LOG`, so verbose
+/// diagnostics (`overlook::diag` and other debug/trace events) cannot be switched on in
+/// production. Development builds honour `RUST_LOG` for troubleshooting.
+fn log_filter() -> tracing_subscriber::EnvFilter {
+    if cfg!(debug_assertions) {
+        tracing_subscriber::EnvFilter::from_default_env().add_directive("overlook=info".parse().unwrap())
+    } else {
+        tracing_subscriber::EnvFilter::new(RELEASE_LOG_FILTER)
+    }
+}
+
+const RELEASE_LOG_FILTER: &str = "overlook=info";
+
+/// Release builds replace the default panic output (message, thread name, optional
+/// backtrace) with one fixed line on stderr. The location and message go only to the log.
+fn install_panic_hook() {
+    if cfg!(debug_assertions) {
+        return;
+    }
+    std::panic::set_hook(Box::new(|info| {
+        let location = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_default();
+        let message = info.payload().downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| info.payload().downcast_ref::<String>().cloned()).unwrap_or_default();
+        tracing::error!(target: "overlook::panic", location, "internal error: {message}");
+        eprintln!("{PANIC_NOTICE}");
+    }));
+}
+
+const PANIC_NOTICE: &str = "Overlook hit an internal error. Details were written to overlook.log in the data folder.";
 
 /// Protocol and vault diagnostics can contain wire bytes or secrets. An RUST_LOG
 /// override must never enable them in either the file log or stderr.
@@ -132,6 +161,27 @@ mod security_tests {
     impl Write for Capture {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().extend_from_slice(bytes); Ok(bytes.len()) }
         fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    #[test]
+    fn release_filter_ignores_rust_log_and_stops_at_info() {
+        let filter = tracing_subscriber::EnvFilter::new(super::RELEASE_LOG_FILTER);
+        let captured = Capture(Arc::new(Mutex::new(Vec::new())));
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().without_time().with_ansi(false).with_writer(move || writer.clone()).with_filter(tracing_subscriber::filter::filter_fn(safe_log_metadata)).with_filter(filter));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "overlook::sync", "visible-info");
+            tracing::debug!(target: "overlook::diag", "hidden-debug-detail");
+            tracing::trace!(target: "overlook::signin", "hidden-trace");
+            tracing::info!(target: "overlook_provider::imap", "visible-provider-info");
+            tracing::debug!(target: "overlook_provider::smtp", "hidden-provider-debug");
+            tracing::info!(target: "gpui::window", "hidden-foreign-info");
+        });
+        let bytes = captured.0.lock().unwrap().clone();
+        let output = String::from_utf8(bytes).unwrap();
+        assert!(output.contains("visible-info") && output.contains("visible-provider-info"), "{output}");
+        assert!(!output.contains("hidden"), "{output}");
+        assert!(!super::PANIC_NOTICE.contains('{'));
     }
 
     #[test]
@@ -169,10 +219,11 @@ fn main() {
         return;
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("Overlook {} — a clear view of what matters.\n\nUsage: overlook [mailto:…] [--version] [--help]\n\nEnvironment:\n  OVERLOOK_DATA_DIR      profile directory (default ~/.local/share/overlook)\n  OVERLOOK_CONFIG_DIR    directory holding google-oauth-client.json (default ~/.config/overlook)\n  OVERLOOK_SIGN_IN=gmail start the Google sign-in at launch (imap / pop3: open that account setup)\n  OVERLOOK_BROWSER_BIN  compatible Chromium executable (default PATH discovery)\n  RUST_LOG=overlook=debug tracing output", env!("CARGO_PKG_VERSION"));
+        println!("Overlook {} — a clear view of what matters.\n\nUsage: overlook [mailto:…] [--version] [--help]\n\nEnvironment:\n  OVERLOOK_DATA_DIR      profile directory (default ~/.local/share/overlook)\n  OVERLOOK_CONFIG_DIR    directory holding google-oauth-client.json (default ~/.config/overlook)\n  OVERLOOK_SIGN_IN=gmail start the Google sign-in at launch (imap / pop3: open that account setup)\n  OVERLOOK_BROWSER_BIN  compatible Chromium executable (default PATH discovery){}", env!("CARGO_PKG_VERSION"), if cfg!(debug_assertions) { "\n  RUST_LOG=overlook=debug tracing output (development builds only)" } else { "" });
         return;
     }
     init_logging();
+    install_panic_hook();
 
     let (store, accounts) = match open_store() {
         Ok(v) => v,

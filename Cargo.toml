@@ -30,6 +30,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 directories = "6"
 
+# Production builds: no debug assertions or overflow panics. Logging and panic output are
+# also restricted in release builds (crates/overlook-app/src/main.rs).
+[profile.release]
+debug-assertions = false
+overflow-checks = false
+
 [profile.dev]
 opt-level = 1
 

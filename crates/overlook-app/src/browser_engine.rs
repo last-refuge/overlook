@@ -152,6 +152,20 @@ pub enum BrowserEvent {
     Error(String),
 }
 
+/// The complete Chromium command line apart from the private profile directory. DevTools is
+/// reachable only through the inherited pipe (fds 3/4): no remote-debugging port, no
+/// Chromium logging, crash reporting, or network access of its own.
+const CHROMIUM_FLAGS: &[&str] = &[
+    // Keep a 2x backing surface; CSS metrics/input remain independent.
+    "--force-device-scale-factor=2", "--headless=new", "--remote-debugging-pipe", "--no-first-run", "--no-default-browser-check", "--no-startup-window",
+    "--disable-background-networking", "--disable-component-update", "--disable-sync", "--disable-extensions",
+    "--disable-default-apps", "--disable-breakpad", "--disable-crash-reporter",
+    "--disable-application-cache", "--disk-cache-size=1", "--media-cache-size=1",
+    "--disable-features=MediaRouter,OptimizationHints,AutofillServerCommunication,SpeculationRulesPrefetch",
+    "--host-resolver-rules=MAP * ~NOTFOUND", "--proxy-server=http://127.0.0.1:9",
+    "--js-flags=--max-old-space-size=128", "--renderer-process-limit=2",
+];
+
 #[derive(Clone)]
 pub struct BrowserHandle(Arc<Inner>);
 struct Inner {
@@ -489,14 +503,7 @@ impl Cdp {
             let executable = chromium_executable()
                 .ok_or("Chromium is not installed; configure OVERLOOK_BROWSER_BIN")?;
             let mut cmd = Command::new(executable);
-            // Keep a 2x backing surface; CSS metrics/input remain independent.
-            cmd.args(["--force-device-scale-factor=2", "--headless=new", "--remote-debugging-pipe", "--no-first-run", "--no-default-browser-check", "--no-startup-window",
-                "--disable-background-networking", "--disable-component-update", "--disable-sync", "--disable-extensions",
-                "--disable-default-apps", "--disable-breakpad", "--disable-crash-reporter",
-                "--disable-application-cache", "--disk-cache-size=1", "--media-cache-size=1",
-                "--disable-features=MediaRouter,OptimizationHints,AutofillServerCommunication,SpeculationRulesPrefetch",
-                "--host-resolver-rules=MAP * ~NOTFOUND", "--proxy-server=http://127.0.0.1:9",
-                "--js-flags=--max-old-space-size=128", "--renderer-process-limit=2"])
+            cmd.args(CHROMIUM_FLAGS)
                 .arg(format!("--user-data-dir={}", profile.display()))
                 // Isolate distro-wrapper flags, crash metadata, NSS state and
                 // caches from the user's ordinary browser configuration too.
@@ -1516,6 +1523,17 @@ mod cancelled_resource_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chromium_debugging_is_pipe_only_with_no_port_or_logging() {
+        assert!(CHROMIUM_FLAGS.contains(&"--remote-debugging-pipe"));
+        assert!(CHROMIUM_FLAGS.contains(&"--disable-crash-reporter"));
+        for flag in CHROMIUM_FLAGS {
+            for forbidden in ["--remote-debugging-port", "--remote-debugging-address", "--remote-allow-origins", "--enable-logging", "--v=", "--vmodule", "--auto-open-devtools"] {
+                assert!(!flag.starts_with(forbidden), "{flag}");
+            }
+        }
+    }
 
     // Synthetic TLS only: this key and trust anchor are never used by production.
     fn test_tls_config() -> ureq::tls::TlsConfig {
