@@ -208,6 +208,7 @@ impl MailWindow {
         let p = *cx.palette();
         match row {
             ListRow::Group(label, n) => h_flex()
+                .w_full()
                 .items_center()
                 .justify_between()
                 .px(px(11.))
@@ -277,6 +278,7 @@ impl MailWindow {
             .id(SharedString::from(format!("conv-{}", c.id)))
             .relative()
             .h_flex()
+            .w_full()
             .items_start()
             .gap(px(11.))
             .px(px(11.))
@@ -421,6 +423,7 @@ impl MailWindow {
         div()
             .id(SharedString::from(format!("draft-{}", d.id)))
             .h_flex()
+            .w_full()
             .items_start()
             .gap(px(11.))
             .px(px(11.))
