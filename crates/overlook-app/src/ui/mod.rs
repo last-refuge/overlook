@@ -2503,6 +2503,13 @@ impl MailWindow {
                         _ => "Sign in again to continue syncing. Your local drafts are safe.",
                     };
                     this.provider_issues.insert(account.id.clone(), wording.into());
+                    // Rejected credentials are never retried automatically: repeated failed
+                    // logins would look like a brute-force attempt to the provider and can
+                    // lock the account. Syncing resumes only after the user signs in again.
+                    if account.provider != ProviderKind::Sample && this.providers.remove(&account.id).is_some() {
+                        tracing::info!(target: "overlook::signin", account = %account.id.0, "credentials rejected; automatic sync stopped until the user signs in again");
+                        this.refresh_idle_watchers();
+                    }
                 }
                 this.reload(cx);
                 if matches!(outcome.state, Some(SyncState::UpToDate)) && account.id == this.account.id {

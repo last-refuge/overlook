@@ -100,11 +100,11 @@ fn init_logging() {
     use tracing_subscriber::Layer;
     let filter = log_filter;
     let path = data_dir().join("overlook.log");
-    let _ = std::fs::create_dir_all(data_dir());
+    restrict_to_owner(&data_dir());
     if std::fs::metadata(&path).is_ok_and(|m| m.len() > 4 * 1024 * 1024) {
         let _ = std::fs::rename(&path, path.with_extension("log.old"));
     }
-    let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
+    let file = open_private_log(&path).ok();
     let registry = tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_filter(tracing_subscriber::filter::filter_fn(safe_log_metadata)).with_filter(filter()));
     match file {
         Some(file) => registry
@@ -112,6 +112,23 @@ fn init_logging() {
             .init(),
         None => registry.init(),
     }
+}
+
+/// The profile (mail cache, logs, attachments) is readable by its owner only: 0700. An
+/// existing folder created with looser permissions by an older version is tightened too.
+fn restrict_to_owner(dir: &std::path::Path) {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir);
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+}
+
+/// Opens the log for appending with owner-only permissions (0600), tightening an older,
+/// world-readable file as well.
+fn open_private_log(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let file = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
 }
 
 /// Release builds log Overlook's own targets at info and ignore `RUST_LOG`, so verbose
@@ -161,6 +178,22 @@ mod security_tests {
     impl Write for Capture {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().extend_from_slice(bytes); Ok(bytes.len()) }
         fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    #[test]
+    fn log_and_profile_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("overlook-log-perms-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let log = dir.join("overlook.log");
+        std::fs::write(&log, b"older entry\n").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+        super::restrict_to_owner(&dir);
+        super::open_private_log(&log).unwrap();
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(&log).unwrap().permissions().mode() & 0o777, 0o600);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
