@@ -40,15 +40,24 @@ impl AccountProviders {
 pub fn gmail_providers(account: &Account, tokens: OAuthTokens) -> Result<AccountProviders, String> {
     let config = crate::google_signin::load_client_config()?;
     let account_id = account.id.clone();
-    let client = Arc::new(GmailClient::new(
-        config,
-        tokens,
-        Box::new(move |fresh| {
-            if let Err(e) = credentials::save_tokens(&account_id, fresh) {
-                warn!("could not persist refreshed tokens: {e}");
+    let invalidated_id = account.id.clone();
+    let client = Arc::new(
+        GmailClient::new(
+            config,
+            tokens,
+            Box::new(move |fresh| {
+                if let Err(e) = credentials::save_tokens(&account_id, fresh) {
+                    warn!("could not persist refreshed tokens: {e}");
+                }
+            }),
+        )
+        // Google rejected the refresh token (expired or revoked): delete the dead copy.
+        .with_on_invalidated(Box::new(move || {
+            if let Err(e) = credentials::delete_tokens(&invalidated_id) {
+                warn!("could not delete the rejected sign-in: {e}");
             }
-        }),
-    ));
+        })),
+    );
     let inbox_limit = crate::store_prefs_inbox_limit();
     let mut providers = AccountProviders::new(Arc::new(GmailProvider::new(client.clone()).with_inbox_limit(inbox_limit)), Some(Arc::new(GoogleCalendarProvider::new(client.clone()))));
     providers.gmail = Some(client);

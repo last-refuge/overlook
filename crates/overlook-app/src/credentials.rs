@@ -186,7 +186,6 @@ pub fn load_tokens(account: &AccountId) -> Result<Option<OAuthTokens>, VaultErro
 }
 
 /// Deletes stored OAuth tokens for an account. Blocking.
-#[allow(dead_code)] // Kept for callers that only want to drop the Gmail sign-in; remove_account uses delete_all_secrets.
 pub fn delete_tokens(account: &AccountId) -> Result<(), VaultError> {
     delete_secret(account, KIND_OAUTH_TOKENS)
 }

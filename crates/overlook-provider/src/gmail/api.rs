@@ -38,6 +38,13 @@ impl From<ApiError> for ProviderError {
 }
 
 pub type TokenSink = Box<dyn Fn(&OAuthTokens) + Send + Sync>;
+/// Called once when Google rejects the refresh token, so the stored copy can be deleted.
+pub type InvalidationSink = Box<dyn Fn() + Send + Sync>;
+
+/// A Gmail session that has not refreshed its access token for this long is signed out:
+/// the refresh token is revoked at Google and deleted locally. Shorter than Google's own
+/// six-month expiry for unused refresh tokens.
+pub const SESSION_IDLE_LIMIT_MS: i64 = 90 * 24 * 60 * 60 * 1000;
 
 /// Minimum spacing between requests. Gmail meters usage in quota units per user per minute;
 /// a `messages.get` costs 5 units, so 6 requests per second stays well inside the default
@@ -48,6 +55,7 @@ pub struct GmailClient {
     config: ClientConfig,
     tokens: Mutex<OAuthTokens>,
     on_tokens: TokenSink,
+    on_invalidated: Option<InvalidationSink>,
     agent: ureq::Agent,
     last_request: Mutex<Option<Instant>>,
     /// Serializes request/refresh persistence with grant revocation.
@@ -65,7 +73,18 @@ impl GmailClient {
             .timeout_global(Some(Duration::from_secs(40)))
             .build()
             .into();
-        Self { config, tokens: Mutex::new(tokens), on_tokens, agent, last_request: Mutex::new(None), session_lock: Mutex::new(()), active: AtomicBool::new(true) }
+        Self { config, tokens: Mutex::new(tokens), on_tokens, on_invalidated: None, agent, last_request: Mutex::new(None), session_lock: Mutex::new(()), active: AtomicBool::new(true) }
+    }
+
+    pub fn with_on_invalidated(mut self, sink: InvalidationSink) -> Self {
+        self.on_invalidated = Some(sink);
+        self
+    }
+
+    /// Whether the session has been idle past [`SESSION_IDLE_LIMIT_MS`]. Every refresh moves
+    /// `expires_at` forward, so its age measures the time since the session was last used.
+    pub fn idle_expired(&self, now: i64) -> bool {
+        session_idle_expired(self.tokens().expires_at, now)
     }
 
     /// Blocks future use (including cloned providers), drains an in-flight request, then
@@ -110,16 +129,45 @@ impl GmailClient {
         let Some(refresh) = current.refresh_token.as_deref() else {
             return Err(ApiError::Unauthorized);
         };
-        match oauth::refresh(&self.config, refresh) {
+        let result = oauth::refresh(&self.config, refresh);
+        self.accept_refresh(result)
+    }
+
+    fn accept_refresh(&self, result: Result<OAuthTokens, AuthError>) -> Result<String, ApiError> {
+        match result {
             Ok(fresh) => {
                 (self.on_tokens)(&fresh);
                 let token = fresh.access_token.clone();
                 *self.tokens.lock().unwrap() = fresh;
                 Ok(token)
             }
-            Err(AuthError::Denied(_)) => Err(ApiError::Unauthorized),
+            Err(AuthError::Denied(m)) => {
+                // invalid_grant: the refresh token expired or was revoked at Google. It can
+                // never work again, so it is dropped from memory and from the keyring.
+                if m.starts_with("invalid_grant") {
+                    self.invalidate_locally();
+                }
+                Err(ApiError::Unauthorized)
+            }
             Err(AuthError::Network(m)) => Err(ApiError::Transport(m)),
             Err(AuthError::Protocol(m)) => Err(ApiError::Server(m)),
+        }
+    }
+
+    /// Ends a session Google has already invalidated: no revocation call is needed.
+    fn invalidate_locally(&self) {
+        if !self.active.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        {
+            let mut tokens = self.tokens.lock().unwrap();
+            tokens.access_token.clear();
+            tokens.refresh_token = None;
+            tokens.expires_at = 0;
+        }
+        tracing::info!(target: "overlook::signin", "Google rejected the refresh token (invalid_grant); session ended and stored token deleted");
+        if let Some(sink) = &self.on_invalidated {
+            sink();
         }
     }
 
@@ -370,9 +418,52 @@ fn api_message(text: &str) -> String {
         .unwrap_or_else(|| text.chars().take(200).collect())
 }
 
+/// See [`SESSION_IDLE_LIMIT_MS`]. A zero `expires_at` means no session at all.
+pub fn session_idle_expired(expires_at: i64, now: i64) -> bool {
+    expires_at > 0 && now - expires_at > SESSION_IDLE_LIMIT_MS
+}
+
 #[cfg(test)]
 mod batch_tests {
     use super::*;
+
+    fn synthetic_client(on_tokens: TokenSink) -> GmailClient {
+        GmailClient::new(ClientConfig { client_id: "synthetic".into(), client_secret: None }, OAuthTokens { access_token: "synthetic-access".into(), refresh_token: Some("synthetic-refresh".into()), expires_at: 0, scope: None }, on_tokens)
+    }
+
+    #[test]
+    fn invalid_grant_ends_the_session_and_deletes_the_stored_token() {
+        let deleted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = deleted.clone();
+        let client = synthetic_client(Box::new(|_| panic!("a rejected refresh must not persist tokens")))
+            .with_on_invalidated(Box::new(move || { counter.fetch_add(1, Ordering::SeqCst); }));
+        assert_eq!(client.accept_refresh(Err(AuthError::Denied("invalid_grant: Token has been expired or revoked.".into()))), Err(ApiError::Unauthorized));
+        assert_eq!(deleted.load(Ordering::SeqCst), 1);
+        assert!(client.tokens().refresh_token.is_none() && client.tokens().access_token.is_empty());
+        // The client stays disabled; no second deletion or network attempt follows.
+        assert_eq!(client.get("messages", &[]), Err(ApiError::Unauthorized));
+        client.invalidate_locally();
+        assert_eq!(deleted.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn other_refusals_keep_the_stored_token() {
+        let client = synthetic_client(Box::new(|_| {})).with_on_invalidated(Box::new(|| panic!("only invalid_grant deletes the token")));
+        assert_eq!(client.accept_refresh(Err(AuthError::Denied("invalid_client".into()))), Err(ApiError::Unauthorized));
+        assert_eq!(client.tokens().refresh_token.as_deref(), Some("synthetic-refresh"));
+        assert!(matches!(client.accept_refresh(Err(AuthError::Network("offline".into()))), Err(ApiError::Transport(_))));
+        assert_eq!(client.tokens().refresh_token.as_deref(), Some("synthetic-refresh"));
+    }
+
+    #[test]
+    fn sessions_expire_after_ninety_idle_days() {
+        let day = 24 * 60 * 60 * 1000;
+        let last_refresh = 1_800_000_000_000;
+        assert!(!session_idle_expired(last_refresh, last_refresh + 89 * day));
+        assert!(!session_idle_expired(last_refresh, last_refresh + 90 * day));
+        assert!(session_idle_expired(last_refresh, last_refresh + 91 * day));
+        assert!(!session_idle_expired(0, last_refresh), "no session, nothing to expire");
+    }
 
     #[test]
     fn disconnect_blocks_cloned_client_and_retains_retry_on_failure() {

@@ -100,6 +100,7 @@ impl MailWindow {
         let active_id = self.account.id.clone();
         let active_email = self.account.email.clone();
         let needs_sign_in = self.active_issue().is_some();
+        let can_sign_out = self.account.provider != ProviderKind::Sample;
         let sign_in_label = self.sign_in_again_label();
         let this = cx.entity().downgrade();
         let state_color = match status.state {
@@ -227,6 +228,13 @@ impl MailWindow {
                                     let email = active_email.clone();
                                     menu = menu.item(PopupMenuItem::new(sign_in_label).on_click(move |_, window, cx| {
                                         let _ = t.update(cx, |this, cx| this.sign_in_again(Some(email.clone()), window, cx));
+                                    }));
+                                }
+                                if !needs_sign_in && can_sign_out {
+                                    let t = this.clone();
+                                    let id = active_id.clone();
+                                    menu = menu.item(PopupMenuItem::new("Sign out").on_click(move |_, window, cx| {
+                                        let _ = t.update(cx, |this, cx| this.sign_out_account(id.clone(), false, window, cx));
                                     }));
                                 }
                                 let t = this.clone();

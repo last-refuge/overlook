@@ -285,6 +285,26 @@ pub enum ListRow {
     Draft(Draft),
 }
 
+const SIGNED_OUT_WORDING: &str = "You signed out of this account. Sign in again to continue syncing. Downloaded mail stays on this device.";
+const SESSION_EXPIRED_WORDING: &str = "Signed out after 90 days without use. Sign in again to continue syncing.";
+
+/// Ends an account's session everywhere it exists: revokes the Google grant (through the
+/// shared client, so cloned providers stop too) and deletes every stored credential.
+/// Shared by Sign out and Remove account. Blocking; run in the background.
+fn end_session(account: &Account, id: &AccountId, gmail: Option<Arc<overlook_provider::gmail::GmailClient>>) -> Result<(), String> {
+    if account.provider == ProviderKind::Gmail {
+        if let Some(client) = gmail {
+            client.disconnect().map_err(|e| e.to_string())?;
+        } else if let Some(tokens) = credentials::load_tokens(id).map_err(|e| e.to_string())? {
+            overlook_provider::gmail::oauth::revoke(&tokens).map_err(|e| e.to_string())?;
+        }
+    }
+    if account.provider != ProviderKind::Sample {
+        credentials::delete_all_secrets(id).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// "Sign in again" for Google accounts, "Update password" for password accounts.
 pub(crate) fn sign_in_label_for(provider: ProviderKind) -> &'static str {
     match provider {
@@ -871,19 +891,7 @@ impl MailWindow {
         let background_id = id.clone();
         crate::ui::toast(window, cx, crate::notify::Level::Info, "Removing account and disconnecting access…");
         cx.spawn_in(window, async move |this, cx| {
-            let result = cx.background_spawn(async move {
-                if account.provider == ProviderKind::Gmail {
-                    if let Some(client) = gmail {
-                        client.disconnect().map_err(|e| e.to_string())?;
-                    } else if let Some(tokens) = credentials::load_tokens(&background_id).map_err(|e| e.to_string())? {
-                        overlook_provider::gmail::oauth::revoke(&tokens).map_err(|e| e.to_string())?;
-                    }
-                }
-                if account.provider != ProviderKind::Sample {
-                    credentials::delete_all_secrets(&background_id).map_err(|e| e.to_string())?;
-                }
-                Ok::<(), String>(())
-            }).await;
+            let result = cx.background_spawn(async move { end_session(&account, &background_id, gmail) }).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.removing_accounts.remove(&id);
                 match result {
@@ -893,6 +901,57 @@ impl MailWindow {
                 cx.notify();
             });
         }).detach();
+    }
+
+    /// Signs out of an account without removing it: the Google grant is revoked, every
+    /// stored credential is deleted, and downloaded mail stays on this device. The account
+    /// then waits in "Sign in again". `expired` marks the automatic sign-out after
+    /// [`overlook_provider::gmail::api::SESSION_IDLE_LIMIT_MS`] of inactivity.
+    pub(crate) fn sign_out_account(&mut self, id: AccountId, expired: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(account) = self.accounts.iter().find(|a| a.id == id).cloned() else { return };
+        if account.provider == ProviderKind::Sample || !self.removing_accounts.insert(id.clone()) { return; }
+        let gmail = self.providers.get(&id).and_then(|p| p.gmail.clone());
+        let background_id = id.clone();
+        if !expired {
+            crate::ui::toast(window, cx, crate::notify::Level::Info, "Signing out…");
+        }
+        tracing::info!(target: "overlook::signin", account = %id.0, reason = if expired { "session idle limit reached" } else { "user signed out" }, "sign-out started");
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx.background_spawn(async move { end_session(&account, &background_id, gmail) }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.removing_accounts.remove(&id);
+                match result {
+                    Ok(()) => {
+                        tracing::info!(target: "overlook::signin", account = %id.0, "sign-out complete: grant revoked, stored credentials deleted");
+                        this.providers.remove(&id);
+                        this.syncing.remove(&id);
+                        this.next_retry.remove(&id);
+                        this.refresh_idle_watchers();
+                        let wording = if expired { SESSION_EXPIRED_WORDING } else { SIGNED_OUT_WORDING };
+                        this.provider_issues.insert(id.clone(), wording.into());
+                        let _ = this.store.set_sync_state(&id, &SyncState::SignInRequired, None);
+                        if let Some(account) = this.accounts.iter().find(|a| a.id == id) {
+                            let email = account.email.clone();
+                            crate::ui::toast(window, cx, crate::notify::Level::Info, if expired { format!("Signed out of {email} after 90 days without use. Sign in again to continue.") } else { format!("Signed out of {email}. Downloaded mail stays on this device.") });
+                        }
+                        this.reload(cx);
+                    }
+                    // An automatic sign-out retries on the next sync pass, quietly.
+                    Err(e) if expired => tracing::warn!("idle sign-out incomplete: {e}"),
+                    Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Sign-out is incomplete: {e}. Reconnect and try again.")),
+                }
+                cx.notify();
+            });
+        }).detach();
+    }
+
+    /// Signs out connected Gmail sessions that have been idle past the limit.
+    fn expire_idle_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let now_ms = now();
+        let expired: Vec<AccountId> = self.providers.iter().filter(|(_, p)| p.gmail.as_ref().is_some_and(|g| g.idle_expired(now_ms))).map(|(id, _)| id.clone()).collect();
+        for id in expired {
+            self.sign_out_account(id, true, window, cx);
+        }
     }
 
     fn finish_remove_account(&mut self, id: AccountId, window: &mut Window, cx: &mut Context<Self>) {
@@ -2374,6 +2433,7 @@ impl MailWindow {
     /// Syncs every reachable account that is not in a retry pause. One account never
     /// blocks another.
     pub(crate) fn sync_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.expire_idle_sessions(window, cx);
         for id in self.accounts.iter().map(|a| a.id.clone()).collect::<Vec<_>>() {
             self.sync_caldav_account(id, false, cx);
         }

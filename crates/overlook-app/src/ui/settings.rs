@@ -625,6 +625,17 @@ impl MailWindow {
                         .into_any_element(),
                 )
             })
+            .when(account.provider != ProviderKind::Sample && issue.is_none(), |d| {
+                let sign_out_id = account.id.clone();
+                d.child(section("Sign out", None)).child(setting_row(
+                    "Sign out of this account",
+                    if is_gmail { "Revokes Overlook’s access at Google and deletes the stored sign-in. Downloaded mail stays on this device until you sign in again. Requires internet." } else { "Deletes the stored password from the system keyring. Downloaded mail stays on this device until you sign in again." },
+                    Button::new("settings-sign-out").small().label("Sign out").on_click(cx.listener(move |this, _, window, cx| {
+                        this.close_settings(window, cx);
+                        this.sign_out_account(sign_out_id.clone(), false, window, cx);
+                    })).into_any_element(),
+                ))
+            })
             .child(section("Remove", None))
             .child(setting_row(
                 "Remove this account from this device",
