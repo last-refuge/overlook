@@ -47,6 +47,8 @@ pub fn build_raw(account: &Account, draft: &Draft, in_reply_to: Option<&Message>
         let mut multipart = MultiPart::mixed().multipart(alternative);
         for att in &draft.attachments {
             let bytes = std::fs::read(&att.local_path).map_err(|e| format!("could not read attachment {}: {e}", att.filename))?;
+            // Re-checked at send time: covers drafts restored from storage and forwards.
+            overlook_core::attachment_policy::check_outgoing(&att.filename, &bytes).map_err(|refusal| format!("{}: {refusal}", att.filename))?;
             let content_type = ContentType::parse(&att.mime_type).unwrap_or(ContentType::parse("application/octet-stream").unwrap());
             multipart = multipart.singlepart(MimeAttachment::new(att.filename.clone()).body(bytes, content_type));
         }
@@ -110,6 +112,26 @@ mod tests {
             decoded
         } else { body.as_bytes().to_vec() };
         String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn send_time_check_refuses_a_renamed_executable_attachment() {
+        let account = Account { id: AccountId::from("g1"), provider: ProviderKind::Gmail, display_name: "Synthetic".into(), email: "synthetic@example.com".into(), created_at: 0 };
+        let dir = std::env::temp_dir().join(format!("overlook-attachment-policy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let attach = |name: &str, bytes: &[u8]| {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            DraftAttachment { id: AttachmentId::generate(), filename: name.into(), mime_type: "image/jpeg".into(), size_bytes: bytes.len() as u64, local_path: path.to_string_lossy().into() }
+        };
+        let mut draft = Draft::new(account.id.clone(), DraftKind::New, 0);
+        draft.to = vec![Address::named("Recipient", "recipient@example.com")];
+        draft.attachments = vec![attach("photo.jpg", b"\xff\xd8\xff\xe0")];
+        assert!(build_raw(&account, &draft, None, "<synthetic@example.com>").is_ok());
+        draft.attachments.push(attach("holiday.jpg", b"\x7fELF\x02\x01"));
+        let error = build_raw(&account, &draft, None, "<synthetic@example.com>").unwrap_err();
+        assert!(error.starts_with("holiday.jpg: Overlook doesn’t send programs"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

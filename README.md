@@ -39,13 +39,15 @@ and you can read, search, write, and file mail with no connection at all.
   keep their browser layout, with smooth native scrolling and no blank flash during reflow.
   If the renderer fails, available content stays visible with a Retry action. Image and PDF attachments show thumbnails
   and open in a quick look (PDFs through poppler's `pdftoppm`, which Omarchy ships); everything else opens with
-  your system apps. Every message has Reply, Forward, Print, Save
+  your system apps, except programs and scripts, which Overlook never launches. Every message has Reply, Forward, Print, Save
   as .eml and View source, and long threads expand or collapse in one click.
 - **Writing.** New, reply, reply all, forward, with autosave to the device, recipient suggestions from your
   Google Contacts and people you have written to, attachments, several named signatures per account with a
   picker in the composer, and `mailto:` links from other apps. Formatting as you type: bold, italics, links,
   lists, quotes and code, styled live in the editor with the marks still visible, a Preview of exactly what
-  recipients get, and the quoted original kept out of your way below the reply.
+  recipients get, and the quoted original kept out of your way below the reply. Like Gmail, Overlook does not
+  send programs, scripts, or installers (`.exe`, `.msi`, `.sh`, `.desktop`, `.AppImage` and similar), files whose
+  content is one under another name, or `.zip`/`.tar` archives containing them.
 - **A calendar, not an afterthought.** Day, Week, Month, and Agenda. Invitations with Accept, Tentative, and
   Decline, from the calendar or from the email itself. Create, edit, and delete events, drag them to move or
   resize, edit one occurrence of a repeating event or the whole series, invite guests and check whether they

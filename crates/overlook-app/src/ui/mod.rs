@@ -285,6 +285,20 @@ pub enum ListRow {
     Draft(Draft),
 }
 
+/// Hands a received attachment to the desktop, except programs and scripts: those are
+/// never launched from Overlook (saving them is still possible). Downloaded files are
+/// written without the executable bit.
+pub(super) fn open_received_attachment(path: &std::path::Path, filename: &str, window: &mut Window, cx: &mut App) {
+    use overlook_core::attachment_policy::{blocked_extension, is_executable_content};
+    let head = std::fs::File::open(path).and_then(|mut f| { use std::io::Read; let mut buf = vec![0; 512]; let n = f.read(&mut buf)?; buf.truncate(n); Ok(buf) }).unwrap_or_default();
+    if blocked_extension(filename).is_some() || is_executable_content(&head) {
+        tracing::info!(target: "overlook::attachments", "refused to open a received program or script");
+        crate::ui::toast(window, cx, crate::notify::Level::Warning, "This attachment is a program or script, so Overlook won’t open it. Use Save as… only if you trust the sender.");
+        return;
+    }
+    cx.open_with_system(path);
+}
+
 const SIGNED_OUT_WORDING: &str = "You signed out of this account. Sign in again to continue syncing. Downloaded mail stays on this device.";
 const SESSION_EXPIRED_WORDING: &str = "Signed out after 90 days without use. Sign in again to continue syncing.";
 
@@ -1474,7 +1488,7 @@ impl MailWindow {
             crate::ui::toast(window, cx, crate::notify::Level::Info, "Install poppler (pdftoppm) to preview PDFs inside Overlook.");
         }
         if let Some(path) = downloaded {
-            cx.open_with_system(&path);
+            open_received_attachment(&path, &attachment.filename, window, cx);
             return;
         }
         self.download_attachment(attachment, AfterDownload::Open, window, cx);
@@ -1674,7 +1688,7 @@ impl MailWindow {
                     Ok(path) => {
                         this.load_thread();
                         match after {
-                            AfterDownload::Open => cx.open_with_system(&path),
+                            AfterDownload::Open => open_received_attachment(&path, &attachment.filename, window, cx),
                             AfterDownload::SaveTo(target) => this.finish_save(&path, &target, window, cx),
                             AfterDownload::QuickLook => {
                                 let mut a = attachment.clone();

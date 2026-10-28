@@ -867,10 +867,10 @@ impl MailWindow {
                     .child(icon(if is_pdf { "file-text" } else { "image" }).size(px(16.)).text_color(gpui_kit::white()))
                     .child(div().flex_1().truncate().text_size(px(14.)).font_weight(FontWeight::MEDIUM).child(a.filename.clone()))
                     .child(div().text_size(px(12.)).opacity(0.7).child(if is_pdf && page_count > 0 { format!("{} · {} page{}", a.human_size(), page_count, if page_count == 1 { "" } else { "s" }) } else { a.human_size() }))
-                    .child(Button::new("ql-open").ghost().small().icon(icon("external-link").size(px(15.))).label("Open").on_click(cx.listener(move |_this, _, _w, cx| {
+                    .child(Button::new("ql-open").ghost().small().icon(icon("external-link").size(px(15.))).label("Open").on_click(cx.listener(move |_this, _, window, cx| {
                         cx.stop_propagation();
                         if let Some(path) = open.local_path.as_deref() {
-                            cx.open_with_system(std::path::Path::new(path));
+                            super::open_received_attachment(std::path::Path::new(path), &open.filename, window, cx);
                         }
                     })))
                     .child(Button::new("ql-save").ghost().small().icon(icon("download").size(px(15.))).label("Save as…").on_click(cx.listener(move |this, _, window, cx| {

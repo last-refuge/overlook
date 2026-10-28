@@ -7,6 +7,7 @@
 //! conversation grouping (threading by References for IMAP and POP3), truthful status wording, HTML sanitization, and theme resolution.
 
 pub mod appearance;
+pub mod attachment_policy;
 pub mod browser;
 pub mod calendar;
 pub mod calendar_connection;

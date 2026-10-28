@@ -468,8 +468,19 @@ impl MailWindow {
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = receiver.await else { return };
             let mut added = Vec::new();
+            let mut refused = Vec::new();
             for path in paths {
                 let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_string()) else { continue };
+                // Programs, scripts and archives holding them are never attached.
+                let mime_type = match overlook_core::attachment_policy::check_outgoing_file(&name, &path) {
+                    Ok(Ok(mime)) => mime,
+                    Ok(Err(refusal)) => {
+                        tracing::info!(target: "overlook::attachments", reason = ?refusal, "outgoing attachment refused");
+                        refused.push(refusal.to_string());
+                        continue;
+                    }
+                    Err(_) => continue,
+                };
                 let dir = outgoing_dir.join(draft_id.as_str());
                 if std::fs::create_dir_all(&dir).is_err() {
                     continue;
@@ -482,12 +493,16 @@ impl MailWindow {
                 added.push(DraftAttachment {
                     id: AttachmentId::generate(),
                     filename: name,
-                    mime_type: "application/octet-stream".into(),
+                    mime_type: mime_type.into(),
                     size_bytes: size,
                     local_path: dest.to_string_lossy().to_string(),
                 });
             }
             let _ = this.update_in(cx, |this, window, cx| {
+                if let Some(first) = refused.first() {
+                    let more = if refused.len() > 1 { format!(" ({} files not attached.)", refused.len()) } else { String::new() };
+                    crate::ui::toast(window, cx, crate::notify::Level::Warning, format!("{first}{more}"));
+                }
                 if let Some(c) = this.composer.as_mut() {
                     if c.draft.id == draft_id {
                         c.draft.attachments.extend(added);

@@ -4896,6 +4896,7 @@ version = "1.5.11"
 dependencies = [
  "ammonia",
  "cssparser",
+ "flate2",
  "html5ever 0.27.0",
  "jiff",
  "markdown",
@@ -4926,6 +4927,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tracing",
+ "tracing-subscriber",
  "ureq",
  "url",
  "webpki-roots",
