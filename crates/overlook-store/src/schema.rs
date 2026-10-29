@@ -2,7 +2,11 @@
 
 use rusqlite::Connection;
 
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17];
+
+const V17: &str = "
+ALTER TABLE draft_attachments ADD COLUMN content_id TEXT;
+";
 
 const V16: &str = "
 BEGIN;
@@ -436,10 +440,31 @@ mod calendar_migration_tests {
         assert_eq!(conn.query_row("SELECT summary FROM events WHERE id='event'", [], |r| r.get::<_, String>(0)).unwrap(), "Unsynced title");
         assert_eq!(conn.query_row("SELECT kind_json FROM pending_operations WHERE id='operation' AND state='pending'", [], |r| r.get::<_, String>(0)).unwrap(), queued_json);
         for (name, definition) in before {
+            // V17 adds a column to the draft attachments, which have nothing to do with calendars.
+            if name == "draft_attachments" {
+                continue;
+            }
             assert_eq!(conn.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name=?1", [name], |r| r.get::<_, String>(0)).unwrap(), definition);
         }
         migrate(&conn).unwrap(); // Reopening does not replay the new table creation.
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM calendar_connections", [], |r| r.get::<_, u32>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn upgrade_from_v16_keeps_draft_attachments_without_a_content_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..16] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 16).unwrap();
+        conn.execute("INSERT INTO accounts(id, provider, display_name, email, created_at) VALUES('test', 'gmail', 'Test', 'test@example.com', 1)", []).unwrap();
+        conn.execute("INSERT INTO drafts(id, account_id, kind, to_json, cc_json, bcc_json, subject, body_text, state_json, created_at, updated_at)
+            VALUES('draft', 'test', 'forward', '[]', '[]', '[]', 'Fwd: Plans', '', '{\"state\":\"editing\"}', 1, 1)", []).unwrap();
+        conn.execute("INSERT INTO draft_attachments(id, draft_id, filename, mime_type, size_bytes, local_path) VALUES('att', 'draft', 'plan.pdf', 'application/pdf', 8, '/outgoing/plan.pdf')", []).unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0)).unwrap(), MIGRATIONS.len() as u32);
+        let (name, content_id) = conn.query_row("SELECT filename, content_id FROM draft_attachments WHERE id='att'", [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))).unwrap();
+        assert_eq!((name.as_str(), content_id), ("plan.pdf", None));
     }
 
     #[test]

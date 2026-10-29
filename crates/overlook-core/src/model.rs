@@ -537,6 +537,17 @@ pub struct DraftAttachment {
     pub size_bytes: u64,
     /// Path inside the protected outgoing-attachment store. Never evicted as cache.
     pub local_path: String,
+    /// Set on an image the quoted original embeds with a `cid:` reference. It is sent inline,
+    /// next to the HTML that refers to it, and is not one of the files the user attached.
+    #[serde(default)]
+    pub content_id: Option<String>,
+}
+
+impl DraftAttachment {
+    /// A file the user can see and remove, as opposed to an image embedded in the quote.
+    pub fn is_listed(&self) -> bool {
+        self.content_id.is_none()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -653,7 +664,7 @@ impl Draft {
             && self.bcc.is_empty()
             && self.subject.trim().is_empty()
             && self.body_text.trim().is_empty()
-            && self.attachments.is_empty()
+            && self.attachments.iter().all(|a| !a.is_listed())
     }
 
     pub fn display_subject(&self) -> String {
@@ -844,6 +855,23 @@ mod tests {
         );
         assert_eq!(fwd.subject, "Fwd: Launch creative");
         assert_eq!(fwd.validate_for_send(), Err(SendValidationError::NoRecipients));
+    }
+
+    #[test]
+    fn images_embedded_in_the_quote_do_not_make_a_draft_non_empty() {
+        let attachment = |content_id: Option<&str>| DraftAttachment {
+            id: AttachmentId::generate(),
+            filename: "logo.png".into(),
+            mime_type: "image/png".into(),
+            size_bytes: 8,
+            local_path: "/outgoing/logo.png".into(),
+            content_id: content_id.map(str::to_owned),
+        };
+        let mut draft = Draft::new(AccountId::from("acct"), DraftKind::Forward, 0);
+        draft.attachments = vec![attachment(Some("logo@brand.example"))];
+        assert!(draft.is_empty());
+        draft.attachments.push(attachment(None));
+        assert!(!draft.is_empty());
     }
 
     #[test]

@@ -1957,8 +1957,8 @@ fn save_draft_tx(tx: &Connection, d: &Draft) -> Result<()> {
     tx.execute("DELETE FROM draft_attachments WHERE draft_id=?1", [&d.id.0])?;
     for a in &d.attachments {
         tx.execute(
-            "INSERT INTO draft_attachments(id, draft_id, filename, mime_type, size_bytes, local_path) VALUES(?1,?2,?3,?4,?5,?6)",
-            params![a.id.0, d.id.0, a.filename, a.mime_type, a.size_bytes as i64, a.local_path],
+            "INSERT INTO draft_attachments(id, draft_id, filename, mime_type, size_bytes, local_path, content_id) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![a.id.0, d.id.0, a.filename, a.mime_type, a.size_bytes as i64, a.local_path, a.content_id],
         )?;
     }
     Ok(())
@@ -2013,7 +2013,7 @@ fn load_drafts(c: &Connection, where_clause: &str, args: impl rusqlite::Params) 
             provider_id: provider.map(ProviderId),
         });
     }
-    let mut stmt = c.prepare("SELECT id, draft_id, filename, mime_type, size_bytes, local_path FROM draft_attachments ORDER BY rowid")?;
+    let mut stmt = c.prepare("SELECT id, draft_id, filename, mime_type, size_bytes, local_path, content_id FROM draft_attachments ORDER BY rowid")?;
     for row in stmt.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -2024,6 +2024,7 @@ fn load_drafts(c: &Connection, where_clause: &str, args: impl rusqlite::Params) 
                 mime_type: r.get(3)?,
                 size_bytes: r.get::<_, i64>(4)? as u64,
                 local_path: r.get(5)?,
+                content_id: r.get(6)?,
             },
         ))
     })? {
@@ -2368,6 +2369,27 @@ mod tests {
         bad.to.clear();
         assert!(store.queue_send(&bad).is_err());
         assert_eq!(store.pending_count(&acct).unwrap(), 0);
+    }
+
+    #[test]
+    fn draft_attachments_keep_their_content_id() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+        let mut draft = Draft::new(acct.clone(), DraftKind::Forward, 10);
+        let attach = |name: &str, content_id: Option<&str>| DraftAttachment {
+            id: AttachmentId::generate(),
+            filename: name.into(),
+            mime_type: "image/png".into(),
+            size_bytes: 4,
+            local_path: format!("/outgoing/{name}"),
+            content_id: content_id.map(str::to_owned),
+        };
+        draft.attachments = vec![attach("chart.png", None), attach("logo.png", Some("logo@example"))];
+        store.save_draft(&draft).unwrap();
+        let loaded = store.draft(&draft.id).unwrap().unwrap();
+        assert_eq!(loaded.attachments, draft.attachments);
+        assert_eq!(loaded.attachments.iter().filter(|a| a.is_listed()).count(), 1);
     }
 
     #[test]

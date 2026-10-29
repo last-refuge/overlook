@@ -42,7 +42,7 @@ and you can read, search, write, and file mail with no connection at all.
   your system apps, except programs and scripts, which Overlook never launches. Every message has Reply, Forward, Print, Save
   as .eml and View source, and long threads expand or collapse in one click.
 - **Writing.** New, reply, reply all, forward, with autosave to the device, recipient suggestions from your
-  Google Contacts and people you have written to, attachments, several named signatures per account with a
+  Google Contacts and people you have written to, attachments (a forward brings the original's along), several named signatures per account with a
   picker in the composer, and `mailto:` links from other apps. Formatting as you type: bold, italics, links,
   lists, quotes and code, styled live in the editor with the marks still visible, a Preview of exactly what
   recipients get, and the quoted original kept out of your way below the reply. Like Gmail, Overlook does not

@@ -54,6 +54,8 @@ pub struct Composer {
     pub suggestions: Vec<Address>,
     recipient_query: Option<RecipientQuery>,
     pub error: Option<String>,
+    /// Attachments of a forwarded message are still being copied into the draft.
+    pub attaching: bool,
     pub _subscriptions: Vec<Subscription>,
     reveal: Option<ComposerReveal>,
 }
@@ -154,6 +156,7 @@ impl MailWindow {
             suggestions: Vec::new(),
             recipient_query: None,
             error: None,
+            attaching: false,
             _subscriptions: subs,
             reveal,
         });
@@ -399,6 +402,11 @@ impl MailWindow {
         crate::watchdog::mark("send");
         self.sync_composer_fields(cx);
         let Some(c) = self.composer.as_mut() else { return };
+        if c.attaching {
+            c.error = Some("Still attaching the original message’s files. Try again in a moment.".into());
+            cx.notify();
+            return;
+        }
         if let Err(e) = c.draft.validate_for_send() {
             c.error = Some(e.to_string());
             let to = c.to.clone();
@@ -488,6 +496,76 @@ impl MailWindow {
         .detach();
     }
 
+    /// Copies the attachments of the message being forwarded into the draft, reading each from
+    /// its downloaded copy or, failing that, from the provider. Sending waits for it.
+    pub(super) fn attach_forwarded(&mut self, draft_id: DraftId, source: Message, window: &mut Window, cx: &mut Context<Self>) {
+        if source.attachments.is_empty() {
+            return;
+        }
+        let Some(c) = self.composer.as_mut().filter(|c| c.draft.id == draft_id) else { return };
+        c.attaching = true;
+        let provider = self.providers.get(&self.account.id).map(|p| p.mail.clone());
+        let account = self.account.clone();
+        let outgoing_dir = self.outgoing_dir.join(draft_id.as_str());
+        cx.spawn_in(window, async move |this, cx| {
+            let (added, skipped) = cx
+                .background_spawn(async move {
+                    let mut added = Vec::new();
+                    let mut skipped = Vec::new();
+                    let mut total = 0;
+                    // An image the quoted HTML embeds goes along inline; anything else is a file.
+                    let quoted = overlook_core::compose::quoted_html(&source);
+                    for a in &source.attachments {
+                        let content_id = a.content_id.clone().filter(|cid| a.is_inline_image() && overlook_core::compose::embeds_content_id(&quoted, cid));
+                        let local = a.local_path.as_deref().and_then(|p| std::fs::read(p).ok());
+                        let content = match (local, &provider) {
+                            (Some(bytes), _) => Ok(bytes),
+                            (None, Some(p)) => p.fetch_attachment(&account, &source, a).await.map_err(|e| format!("Couldn’t get “{}” to forward: {e}", a.filename)),
+                            (None, None) => Err(format!("Sign in again to forward “{}”.", a.filename)),
+                        };
+                        match content.and_then(|bytes| stage_attachment(&a.filename, &bytes, &outgoing_dir, total, content_id)) {
+                            Ok(att) => {
+                                total += att.size_bytes;
+                                added.push(att);
+                            }
+                            Err(reason) => skipped.push(reason),
+                        }
+                    }
+                    (added, skipped)
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if let Some(first) = skipped.first() {
+                    let more = if skipped.len() > 1 { format!(" ({} files not attached.)", skipped.len()) } else { String::new() };
+                    crate::ui::toast(window, cx, crate::notify::Level::Warning, format!("{first}{more}"));
+                }
+                match this.composer.as_mut().filter(|c| c.draft.id == draft_id) {
+                    Some(c) => {
+                        c.attaching = false;
+                        c.draft.attachments.extend(added);
+                        c.dirty = true;
+                        this.save_composer(window, cx);
+                    }
+                    // The composer was closed first: the files belong with the saved draft, or
+                    // nowhere if it was discarded.
+                    None => match this.store.draft(&draft_id) {
+                        Ok(Some(mut draft)) if draft.state == DraftState::Editing => {
+                            draft.attachments.extend(added);
+                            let _ = this.store.save_draft(&draft);
+                            this.reload_drafts();
+                        }
+                        _ => {
+                            let _ = std::fs::remove_dir_all(this.outgoing_dir.join(draft_id.as_str()));
+                        }
+                    },
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     pub(super) fn render_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *cx.palette();
         let Some(c) = self.composer.as_ref() else { return div().into_any_element() };
@@ -542,13 +620,16 @@ impl MailWindow {
         });
         let suggestion_field = c.recipient_query.as_ref().map(|q| q.field);
 
-        let attachments: Option<Div> = (!c.draft.attachments.is_empty()).then(|| {
+        let attaching = c.attaching;
+        // Images embedded in the quoted original are part of the quote, not files to list.
+        let attachments: Option<Div> = (c.draft.attachments.iter().any(DraftAttachment::is_listed) || attaching).then(|| {
             h_flex()
                 .flex_wrap()
+                .items_center()
                 .gap(px(8.))
                 .px(px(16.))
                 .py(px(8.))
-                .children(c.draft.attachments.iter().map(|a| {
+                .children(c.draft.attachments.iter().filter(|a| a.is_listed()).map(|a| {
                     let id = a.id.clone();
                     h_flex()
                         .items_center()
@@ -570,6 +651,7 @@ impl MailWindow {
                                 .on_click(cx.listener(move |this, _, window, cx| this.remove_attachment(id.clone(), window, cx))),
                         )
                 }))
+                .when(attaching, |d| d.child(div().text_size(px(12.)).text_color(p.muted).child("Attaching files from the original message…")))
         });
 
         let error = c.error.clone().map(|e| {
@@ -1108,53 +1190,61 @@ pub enum LinePrefix {
 /// owner-only, non-executable permissions (0600). Returns the attachments and the reasons
 /// for any refusals. Blocking.
 fn prepare_attachments(paths: Vec<std::path::PathBuf>, dir: &std::path::Path, mut total: u64) -> (Vec<DraftAttachment>, Vec<String>) {
-    use overlook_core::attachment_policy::{check_outgoing, sanitize_filename, within_size_limit, TOO_LARGE};
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use overlook_core::attachment_policy::sanitize_filename;
     let mut added = Vec::new();
     let mut refused = Vec::new();
     for path in paths {
         let Some(original) = path.file_name().map(|n| n.to_string_lossy().to_string()) else { continue };
-        let name = sanitize_filename(&original);
         let Ok(content) = std::fs::read(&path) else {
-            refused.push(format!("Couldn’t read “{name}”."));
+            refused.push(format!("Couldn’t read “{}”.", sanitize_filename(&original)));
             continue;
         };
-        if !within_size_limit(total + content.len() as u64) {
-            refused.push(TOO_LARGE.to_owned());
-            continue;
-        }
-        // Programs, scripts and archives holding them are never attached.
-        let mime_type = match check_outgoing(&name, &content) {
-            Ok(mime) => mime,
-            Err(refusal) => {
-                tracing::info!(target: "overlook::attachments", reason = ?refusal, "outgoing attachment refused");
-                refused.push(refusal.to_string());
-                continue;
+        match stage_attachment(&original, &content, dir, total, None) {
+            Ok(att) => {
+                total += att.size_bytes;
+                added.push(att);
             }
-        };
-        if crate::malware_scan::scan(&path) == crate::malware_scan::Scan::Infected {
-            refused.push(crate::malware_scan::INFECTED.to_owned());
-            continue;
+            Err(reason) => refused.push(reason),
         }
-        let id = AttachmentId::generate();
-        let folder = dir.join(id.as_str());
-        let dest = folder.join(&name);
-        let written = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&folder)
-            .and_then(|_| std::fs::write(&dest, &content))
-            .and_then(|_| std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)));
-        if written.is_err() {
-            refused.push(format!("Couldn’t attach “{name}”."));
-            continue;
-        }
-        total += content.len() as u64;
-        added.push(DraftAttachment { id, filename: name, mime_type: mime_type.into(), size_bytes: content.len() as u64, local_path: dest.to_string_lossy().to_string() });
     }
     (added, refused)
 }
 
+/// Applies the outgoing attachment policy to one file's `content` and, if it passes, writes
+/// it to its own folder under `dir`. `total` is the size already attached to the message.
+/// `content_id` marks an image the quoted original embeds. The error is the reason to show the user. Blocking.
+fn stage_attachment(original: &str, content: &[u8], dir: &std::path::Path, total: u64, content_id: Option<String>) -> Result<DraftAttachment, String> {
+    use overlook_core::attachment_policy::{check_outgoing, sanitize_filename, within_size_limit, TOO_LARGE};
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let name = sanitize_filename(original);
+    if !within_size_limit(total + content.len() as u64) {
+        return Err(TOO_LARGE.to_owned());
+    }
+    // Programs, scripts and archives holding them are never attached.
+    let mime_type = check_outgoing(&name, content).map_err(|refusal| {
+        tracing::info!(target: "overlook::attachments", reason = ?refusal, "outgoing attachment refused");
+        refusal.to_string()
+    })?;
+    let id = AttachmentId::generate();
+    let folder = dir.join(id.as_str());
+    let dest = folder.join(&name);
+    let written = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&folder)
+        .and_then(|_| std::fs::write(&dest, content))
+        .and_then(|_| std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)));
+    if written.is_err() {
+        let _ = std::fs::remove_dir_all(&folder);
+        return Err(format!("Couldn’t attach “{name}”."));
+    }
+    if crate::malware_scan::scan(&dest) == crate::malware_scan::Scan::Infected {
+        let _ = std::fs::remove_dir_all(&folder);
+        return Err(crate::malware_scan::INFECTED.to_owned());
+    }
+    Ok(DraftAttachment { id, filename: name, mime_type: mime_type.into(), size_bytes: content.len() as u64, local_path: dest.to_string_lossy().to_string(), content_id })
+}
+
 #[cfg(test)]
 mod attachment_tests {
-    use super::prepare_attachments;
+    use super::{prepare_attachments, stage_attachment};
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -1181,6 +1271,24 @@ mod attachment_tests {
         let (added, refused) = prepare_attachments(vec![small], &root.join("draft"), 19 * 1024 * 1024);
         assert!(added.is_empty());
         assert_eq!(refused, vec![overlook_core::attachment_policy::TOO_LARGE.to_owned()]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn staged_content_gets_the_same_checks_as_a_picked_file() {
+        let root = std::env::temp_dir().join(format!("overlook-stage-{}", std::process::id()));
+        let ok = stage_attachment("invoice.pdf", b"%PDF-1.7", &root, 0, None).unwrap();
+        assert_eq!((ok.filename.as_str(), ok.mime_type.as_str(), ok.size_bytes), ("invoice.pdf", "application/pdf", 8));
+        assert_eq!(std::fs::read(&ok.local_path).unwrap(), b"%PDF-1.7");
+        assert_eq!(std::fs::metadata(&ok.local_path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(stage_attachment("setup.exe", b"MZ", &root, 0, None).is_err());
+        assert!(stage_attachment("photo.jpg", b"\x7fELF\x02", &root, 0, None).is_err());
+        assert_eq!(stage_attachment("a.txt", b"x", &root, 19 * 1024 * 1024, None), Err(overlook_core::attachment_policy::TOO_LARGE.to_owned()));
+        // Refusals leave nothing behind.
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        // An image the quote embeds keeps its Content-ID and is not listed as a file.
+        let logo = stage_attachment("logo.png", b"\x89PNG\r\n\x1a\n", &root, 0, Some("logo@brand.example".into())).unwrap();
+        assert_eq!((logo.content_id.as_deref(), logo.is_listed(), ok.is_listed()), (Some("logo@brand.example"), false, true));
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

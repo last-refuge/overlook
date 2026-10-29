@@ -2,7 +2,7 @@
 //! bytes SMTP does, so every provider shares this builder.
 
 use lettre::message::header::ContentType;
-use lettre::message::{Attachment as MimeAttachment, Mailbox, MultiPart};
+use lettre::message::{Attachment as MimeAttachment, Mailbox, MultiPart, SinglePart};
 use lettre::Message as MimeMessage;
 use overlook_core::*;
 
@@ -40,21 +40,41 @@ pub fn build_raw(account: &Account, draft: &Draft, in_reply_to: Option<&Message>
     let bodies = overlook_core::compose::outgoing_bodies(draft, in_reply_to);
     let text = if bodies.text.is_empty() { "\n".to_owned() } else { bodies.text };
     let html = format!("<!DOCTYPE html><html><body>{}</body></html>", bodies.html);
-    let alternative = MultiPart::alternative_plain_html(text, html);
-    let message = if draft.attachments.is_empty() {
+    // Images the quoted original embeds travel inline, next to the HTML that refers to them.
+    // One the HTML no longer refers to (the quote was left out) has no place in the message.
+    let (inline, files): (Vec<&DraftAttachment>, Vec<&DraftAttachment>) = draft.attachments.iter().partition(|a| a.content_id.is_some());
+    let inline: Vec<&DraftAttachment> = inline
+        .into_iter()
+        .filter(|a| a.content_id.as_deref().is_some_and(|cid| overlook_core::compose::embeds_content_id(&html, cid)))
+        .collect();
+    let total: u64 = inline.iter().chain(&files).map(|a| std::fs::metadata(&a.local_path).map(|m| m.len()).unwrap_or(a.size_bytes)).sum();
+    if !overlook_core::attachment_policy::within_size_limit(total) {
+        return Err(overlook_core::attachment_policy::TOO_LARGE.to_owned());
+    }
+    // Read and re-check at send time: covers drafts restored from storage and forwards.
+    let load = |att: &DraftAttachment| -> Result<(String, Vec<u8>, ContentType), String> {
+        let bytes = std::fs::read(&att.local_path).map_err(|e| format!("could not read attachment {}: {e}", att.filename))?;
+        overlook_core::attachment_policy::check_outgoing(&att.filename, &bytes).map_err(|refusal| format!("{}: {refusal}", att.filename))?;
+        let content_type = ContentType::parse(&att.mime_type).unwrap_or(ContentType::parse("application/octet-stream").unwrap());
+        Ok((overlook_core::attachment_policy::sanitize_filename(&att.filename), bytes, content_type))
+    };
+    let alternative = if inline.is_empty() {
+        MultiPart::alternative_plain_html(text, html)
+    } else {
+        let mut related = MultiPart::related().singlepart(SinglePart::html(html));
+        for att in &inline {
+            let (filename, bytes, content_type) = load(att)?;
+            let content_id = att.content_id.clone().unwrap_or_default();
+            related = related.singlepart(MimeAttachment::new_inline_with_name(content_id, filename).body(bytes, content_type));
+        }
+        MultiPart::alternative().singlepart(SinglePart::plain(text)).multipart(related)
+    };
+    let message = if files.is_empty() {
         builder.multipart(alternative)
     } else {
         let mut multipart = MultiPart::mixed().multipart(alternative);
-        let total: u64 = draft.attachments.iter().map(|a| std::fs::metadata(&a.local_path).map(|m| m.len()).unwrap_or(a.size_bytes)).sum();
-        if !overlook_core::attachment_policy::within_size_limit(total) {
-            return Err(overlook_core::attachment_policy::TOO_LARGE.to_owned());
-        }
-        for att in &draft.attachments {
-            let bytes = std::fs::read(&att.local_path).map_err(|e| format!("could not read attachment {}: {e}", att.filename))?;
-            // Re-checked at send time: covers drafts restored from storage and forwards.
-            overlook_core::attachment_policy::check_outgoing(&att.filename, &bytes).map_err(|refusal| format!("{}: {refusal}", att.filename))?;
-            let content_type = ContentType::parse(&att.mime_type).unwrap_or(ContentType::parse("application/octet-stream").unwrap());
-            let filename = overlook_core::attachment_policy::sanitize_filename(&att.filename);
+        for att in &files {
+            let (filename, bytes, content_type) = load(att)?;
             multipart = multipart.singlepart(MimeAttachment::new(filename).body(bytes, content_type));
         }
         builder.multipart(multipart)
@@ -127,7 +147,7 @@ mod tests {
         let attach = |name: &str, bytes: &[u8]| {
             let path = dir.join(name);
             std::fs::write(&path, bytes).unwrap();
-            DraftAttachment { id: AttachmentId::generate(), filename: name.into(), mime_type: "image/jpeg".into(), size_bytes: bytes.len() as u64, local_path: path.to_string_lossy().into() }
+            DraftAttachment { id: AttachmentId::generate(), filename: name.into(), mime_type: "image/jpeg".into(), size_bytes: bytes.len() as u64, local_path: path.to_string_lossy().into(), content_id: None }
         };
         let mut draft = Draft::new(account.id.clone(), DraftKind::New, 0);
         draft.to = vec![Address::named("Recipient", "recipient@example.com")];
@@ -136,6 +156,84 @@ mod tests {
         draft.attachments.push(attach("holiday.jpg", b"\x7fELF\x02\x01"));
         let error = build_raw(&account, &draft, None, "<synthetic@example.com>").unwrap_err();
         assert!(error.starts_with("holiday.jpg: Overlook doesn’t send programs"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn forwarded_with_logo() -> (Account, Draft, std::path::PathBuf) {
+        let account = Account { id: AccountId::from("g1"), provider: ProviderKind::Gmail, display_name: "Synthetic".into(), email: "synthetic@example.com".into(), created_at: 0 };
+        let dir = std::env::temp_dir().join(format!("overlook-inline-{}-{}", std::process::id(), AttachmentId::generate()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, bytes: &[u8], mime: &str, content_id: Option<&str>| {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            DraftAttachment { id: AttachmentId::generate(), filename: name.into(), mime_type: mime.into(), size_bytes: bytes.len() as u64, local_path: path.to_string_lossy().into(), content_id: content_id.map(str::to_owned) }
+        };
+        let mut draft = Draft::new(account.id.clone(), DraftKind::Forward, 0);
+        draft.to = vec![Address::named("Recipient", "recipient@example.com")];
+        draft.subject = "Fwd: Brand update".into();
+        draft.body_text = "FYI".into();
+        draft.include_quote = true;
+        draft.in_reply_to = Some(MessageId::from("g1:1"));
+        draft.attachments = vec![write("logo.png", b"\x89PNG\r\n\x1a\n", "image/png", Some("logo@brand.example")), write("plan.pdf", b"%PDF-1.7", "application/pdf", None)];
+        (account, draft, dir)
+    }
+
+    fn quoted_source(html: &str) -> Message {
+        Message {
+            id: MessageId::from("g1:1"),
+            account_id: AccountId::from("g1"),
+            conversation_id: ConversationId::from("g1:t"),
+            provider_id: None,
+            from: Address::named("Maya Chen", "maya@northstar.example"),
+            to: vec![],
+            cc: vec![],
+            bcc: vec![],
+            reply_to: None,
+            subject: "Brand update".into(),
+            snippet: String::new(),
+            body: Body { html: Some(html.into()), text: None },
+            date: 0,
+            is_read: true,
+            is_starred: false,
+            is_outgoing: false,
+            label_ids: Default::default(),
+            attachments: vec![],
+            rfc_message_id: Some("<abc@northstar.example>".into()),
+            in_reply_to: None,
+            references: Vec::new(),
+            category: None,
+            is_important: false,
+            focus_override: None,
+            invitation: None,
+        }
+    }
+
+    #[test]
+    fn forwarded_inline_images_ride_beside_the_html_that_refers_to_them() {
+        let (account, draft, dir) = forwarded_with_logo();
+        let source = quoted_source("<p>New look</p><img src=\"cid:logo@brand.example\">");
+        let raw = String::from_utf8(build_raw(&account, &draft, Some(&source), "<fwd@overlook.example>").unwrap()).unwrap();
+        // The quote's `cid:` link resolves to a Content-ID part inside multipart/related ...
+        assert!(decoded_part(&raw, "text/html").contains("cid:logo@brand.example\""), "{raw}");
+        let nested = &raw[raw.find("multipart/mixed").expect("multipart/mixed")..];
+        let (alternative, plain, related) = (nested.find("multipart/alternative").unwrap(), nested.find("text/plain").unwrap(), nested.find("multipart/related").unwrap());
+        assert!(alternative < plain && plain < related, "mixed > alternative > (plain, related): {raw}");
+        assert_eq!(raw.matches("Content-ID: <logo@brand.example>").count(), 1, "{raw}");
+        assert!(raw.contains("Content-Disposition: inline"), "{raw}");
+        // ... and the real file is an ordinary attachment, outside it.
+        assert_eq!(raw.matches("Content-Disposition: attachment").count(), 1, "{raw}");
+        assert!(raw.find("plan.pdf").unwrap() > raw.rfind("Content-ID: <logo@brand.example>").unwrap(), "{raw}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inline_images_are_left_out_when_the_html_no_longer_refers_to_them() {
+        let (account, mut draft, dir) = forwarded_with_logo();
+        draft.include_quote = false;
+        let source = quoted_source("<p>New look</p><img src=\"cid:logo@brand.example\">");
+        let raw = String::from_utf8(build_raw(&account, &draft, Some(&source), "<fwd@overlook.example>").unwrap()).unwrap();
+        assert!(!raw.contains("multipart/related") && !raw.contains("Content-ID"), "{raw}");
+        assert!(raw.contains("plan.pdf"), "the real attachment is kept: {raw}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

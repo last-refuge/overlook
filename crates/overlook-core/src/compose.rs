@@ -169,6 +169,21 @@ pub fn parse_link(s: &str) -> Option<(&str, &str, usize)> {
     Some((text, url, url_end + 1))
 }
 
+/// The visible HTML of `source` as a reply or forward quotes it.
+pub fn quoted_html(source: &Message) -> String {
+    match (&source.body.html, &source.body.text) {
+        (Some(h), _) => clean_only(h, RemoteContent::Allowed),
+        (None, Some(t)) => text_to_html(t),
+        (None, None) => text_to_html(&source.snippet),
+    }
+}
+
+/// Whether `html` (as returned by [`quoted_html`] or [`outgoing_bodies`]) embeds the inline
+/// part with this `Content-ID`, which is written without angle brackets.
+pub fn embeds_content_id(html: &str, content_id: &str) -> bool {
+    html.contains(&format!("cid:{content_id}\""))
+}
+
 /// Both parts of an outgoing message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutgoingBodies {
@@ -185,11 +200,7 @@ pub fn outgoing_bodies(draft: &Draft, source: Option<&Message>) -> OutgoingBodie
     let Some(source) = source.filter(|_| draft.include_quote) else {
         return OutgoingBodies { text, html };
     };
-    let source_html = match (&source.body.html, &source.body.text) {
-        (Some(h), _) => clean_only(h, RemoteContent::Allowed),
-        (None, Some(t)) => text_to_html(t),
-        (None, None) => text_to_html(&source.snippet),
-    };
+    let source_html = quoted_html(source);
     // Use the same visible source for both MIME alternatives. A provider-generated
     // text derivative may predate our visibility/security policy.
     let source_text = if source.body.html.is_some() {

@@ -2353,6 +2353,10 @@ impl MailWindow {
         let to_save = draft.clone();
         self.open_composer(draft, window, cx);
         let draft_id = to_save.id.clone();
+        if kind == DraftKind::Forward {
+            // A forward carries the original's attachments along with its text.
+            self.attach_forwarded(draft_id.clone(), source, window, cx);
+        }
         let draft_account = to_save.account_id.clone();
         cx.spawn_in(window, async move |this, cx| {
             let result = cx.background_spawn(async move { store.save_editing_draft(&to_save) }).await;

@@ -107,7 +107,12 @@ no pre-pass, so the recipient gets the whole chain), forwards a header block and
 full. The quoted text is no longer part of `body_text`; the composer shows it collapsed under the
 editor with Show and Remove. `mime.rs` sends `multipart/alternative` (text + HTML), inside
 `multipart/mixed` when there are attachments; the local Sent copy and the Outbox preview use the
-same bodies. Drafts save `body_html` on every autosave.
+same bodies. A forward copies the original's attachments into the draft (`attach_forwarded`: the
+downloaded copy, else the provider, through the same policy, size and malware checks as a picked
+file; Send waits for it). An image the quoted HTML embeds with `cid:` keeps its `Content-ID`
+(`DraftAttachment.content_id`, schema v17), is not listed as a file in the composer, and is sent
+inside `multipart/related` next to the HTML, so the forwarded body shows it as the original did;
+if the quote is left out it is dropped. Drafts save `body_html` on every autosave.
 
 Not yet: pasting rich text (paste is plain), inline images in the composer, tables, font or
 colour choices (by design), and underline, which Markdown has no mark for.
