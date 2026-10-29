@@ -284,6 +284,32 @@ Composer header fields: `Enter` moves to the next field.
 
 The sidebar and list panes are resizable; sizes persist in `settings`. The layout menu in the header switches the reading pane between right and below, and density between comfortable and compact; both persist.
 
+### The message list
+
+`ui/list.rs` draws the list with GPUI's virtual `list()`: only the rows in view are laid out, and the
+`ListState` caches the height it measured for every row it has seen. Four rules keep that honest:
+
+- **Every row goes through `full_width`.** The list lays each item out as a root with a definite width and
+  a content-sized height, so a row that does not ask for the width is only as wide as its text (the list
+  looked "not filling the window"). The wrapper is a full-width column, so a new kind of row cannot
+  forget it. Do not put `.w_full()` on individual rows instead.
+- **Rows are rebuilt only when their inputs change** (`refresh_list_rows`): the data generation
+  (`list_data_generation`, bumped in `refresh_mail` and `reload_drafts`, the only places the lists are
+  assigned), the view, whether a search is active, and today's date for the day headings. Anything that
+  starts feeding `list_rows` from somewhere else must bump the generation or extend `RowsKey`, or the list
+  will not repaint. A change then splices only the rows that differ (`changed_span`).
+- **Anything that changes a row's height remeasures the list** (`RowLayout`: density, sender pictures,
+  previews). Add a new height-affecting setting to `RowLayout`; `ListState::remeasure` keeps the scroll
+  position.
+- **Rows carry what they need and nothing more.** A row's drag names its conversation
+  (`DraggedMail::Conversation`) and the message ids are looked up when the drag lands, because the row is
+  rebuilt on every repaint of a visible row.
+
+The list has 12 px of padding below the last row, set on the `list()` itself so it is part of the scroll
+extent. There is no automated layout test: GPUI's `test-support` feature adds about 20 crates (proptest,
+borsh, postage, ...) to `Cargo.lock`, which the release SBOMs and the CASA evidence are generated from.
+After a GPUI upgrade, look at the list at both densities by eye.
+
 ## Known gaps (tracked for the next sessions)
 
 - IMAP, SMTP and POP3 have only ever synced against the scripted servers in `scripts/spike-mail-servers.py` and the in-crate fakes; public servers were probed up to the login exchange over TLS and STARTTLS (Fastmail, Gmail, iCloud, Microsoft 365, Yahoo, Zoho) but no real account has been read from or written to. XOAUTH2 (Microsoft 365, Outlook.com, Gmail without an app password) is not implemented. `IDLE` has not been observed across a laptop sleep. POP3: restore is manual (stop Overlook, replace the data directory with a backup); `APOP` and `SASL` logins are not offered (`USER`/`PASS` over TLS or STLS only). After an uncertain send the account reads "Offline" until the next sync. See the interoperability matrix in `llm-docs/imap-pop3-implementation-plan.md`.

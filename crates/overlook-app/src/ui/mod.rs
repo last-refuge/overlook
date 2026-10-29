@@ -246,10 +246,19 @@ pub enum OnlineSearch {
     Failed(String),
 }
 
+/// The mail a drag carries. A row in the list names its conversation and leaves the
+/// messages to be looked up when the drag lands; building their ids for every row on every
+/// repaint cost far more than the rare drag that needs them.
+#[derive(Clone, Debug)]
+pub enum DraggedMail {
+    Conversation(ConversationId),
+    Messages(Vec<MessageId>),
+}
+
 /// A conversation being dragged from the list onto the sidebar.
 #[derive(Clone, Debug)]
 pub struct ConversationDrag {
-    pub message_ids: Vec<MessageId>,
+    pub mail: DraggedMail,
     pub title: String,
     pub count: usize,
 }
@@ -284,6 +293,27 @@ pub enum ListRow {
     Group(SharedString, usize),
     Conversation(ConversationSummary),
     Draft(Draft),
+}
+
+/// What the list's rows were last built from. Building them copies every conversation, so
+/// that waits for one of these to change instead of repeating on every repaint.
+#[derive(Clone, PartialEq)]
+struct RowsKey {
+    /// Bumped whenever the conversations, drafts or Outbox are reloaded.
+    data: u64,
+    view: MailboxView,
+    searching: bool,
+    /// Today, because the day groups ("Today", "Yesterday") move at midnight.
+    today: i64,
+    utc_offset: i32,
+}
+
+/// The settings that decide how tall a row is.
+#[derive(Clone, Copy, PartialEq)]
+struct RowLayout {
+    compact: bool,
+    avatars: bool,
+    previews: bool,
 }
 
 /// Hands a received attachment to the desktop, except programs and scripts: those are
@@ -434,6 +464,13 @@ pub struct MailWindow {
     /// so a change re-measures just the rows that differ.
     list_state: ListState,
     shown_rows: std::rc::Rc<std::cell::RefCell<Vec<ListRow>>>,
+    /// Counts reloads of the data `list_rows` reads, so a repaint can tell nothing changed.
+    list_data_generation: u64,
+    rows_key: std::cell::RefCell<Option<RowsKey>>,
+    /// Rows shown that are not day headings, for the count beside the title.
+    rows_total: std::cell::Cell<usize>,
+    /// The row layout the list's cached heights were measured with.
+    row_layout: std::cell::Cell<Option<RowLayout>>,
     drafts: Vec<Draft>,
     outbox: Vec<Draft>,
     status: AccountStatus,
@@ -650,6 +687,10 @@ impl MailWindow {
             unwanted_drafts: HashSet::new(),
             list_state: ListState::new(0, ListAlignment::Top, px(600.)),
             shown_rows: Default::default(),
+            list_data_generation: 0,
+            rows_key: Default::default(),
+            rows_total: Default::default(),
+            row_layout: Default::default(),
             drafts: Vec::new(),
             outbox: Vec::new(),
             status: AccountStatus::default(),
@@ -1337,6 +1378,7 @@ impl MailWindow {
         } else {
             self.search_results()
         };
+        self.list_data_generation += 1;
         // Search coverage counts cached bodies, a full scan: only worth it while searching.
         self.search_coverage = if self.search_query.trim().is_empty() { String::new() } else { self.search_coverage_line(&acct) };
         let mut counts = HashMap::new();
@@ -1420,6 +1462,7 @@ impl MailWindow {
         let acct = self.account.id.clone();
         self.drafts = self.store.drafts(&acct, false).unwrap_or_default();
         self.outbox = self.store.drafts(&acct, true).unwrap_or_default();
+        self.list_data_generation += 1;
         if let Some(sel) = &self.outbox_selected {
             if !self.outbox.iter().any(|d| &d.id == sel) {
                 self.outbox_selected = None;
@@ -2270,12 +2313,17 @@ impl MailWindow {
 
     /// Handles a conversation dropped onto a sidebar destination.
     pub(crate) fn drop_on_view(&mut self, drag: ConversationDrag, view: MailboxView, window: &mut Window, cx: &mut Context<Self>) {
-        let ids = drag.message_ids;
+        let ids = match drag.mail {
+            DraggedMail::Messages(ids) => ids,
+            DraggedMail::Conversation(id) => self.mail_index.message_ids_in(&id),
+        };
+        // The conversation can have left the index since the drag began.
+        let Some(newest) = ids.last().cloned() else { return };
         match view {
             MailboxView::Kind(LabelKind::Inbox) => self.move_to_inbox(ids, window, cx),
             MailboxView::Kind(LabelKind::Archive) => self.archive(ids, window, cx),
             MailboxView::Kind(LabelKind::Trash) => self.trash(ids, window, cx),
-            MailboxView::Kind(LabelKind::Starred) => self.set_starred(vec![ids.last().cloned().unwrap_or_else(|| ids[0].clone())], true, window, cx),
+            MailboxView::Kind(LabelKind::Starred) => self.set_starred(vec![newest], true, window, cx),
             MailboxView::Label(label_id) => self.move_to_label(ids, label_id, window, cx),
             _ => crate::ui::toast(window, cx, crate::notify::Level::Info, "Messages can be dropped on Inbox, Archive, Trash, Starred, or a label."),
         }

@@ -143,6 +143,13 @@ pub fn relative_label(ts: Timestamp, now: Timestamp, utc_offset_minutes: i32) ->
     }
 }
 
+/// The calendar day `ts` falls on in the given zone, as a day count. It changes exactly
+/// when [`day_group`] can change its answer for a fixed message.
+pub fn local_day(ts: Timestamp, utc_offset_minutes: i32) -> i64 {
+    let (date, _, _) = civil(ts, utc_offset_minutes);
+    days_from_civil(date.year, date.month, date.day)
+}
+
 pub fn day_group(ts: Timestamp, now: Timestamp, utc_offset_minutes: i32) -> DayGroup {
     let (date, _, weekday) = civil(ts, utc_offset_minutes);
     let (today, _, _) = civil(now, utc_offset_minutes);
@@ -224,6 +231,16 @@ mod tests {
         assert_eq!(date, CivilDate { year: 2026, month: 10, day: 12 });
         assert_eq!(format_clock(time), "10:42 AM");
         assert_eq!(WEEKDAYS[weekday as usize], "Monday");
+    }
+
+    #[test]
+    fn local_day_turns_over_at_local_midnight() {
+        let midnight_utc = days_from_civil(2026, 10, 12) * 86_400_000;
+        assert_eq!(local_day(midnight_utc, 0), days_from_civil(2026, 10, 12));
+        assert_eq!(local_day(midnight_utc - 1, 0), days_from_civil(2026, 10, 11));
+        // Five hours behind UTC, local midnight is 05:00 UTC.
+        assert_eq!(local_day(midnight_utc + 4 * 3_600_000, -300), days_from_civil(2026, 10, 11));
+        assert_eq!(local_day(midnight_utc + 5 * 3_600_000, -300), days_from_civil(2026, 10, 12));
     }
 
     #[test]

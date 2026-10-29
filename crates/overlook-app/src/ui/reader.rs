@@ -225,7 +225,7 @@ impl MailWindow {
                             let t = t.clone();
                             let ids = ids.clone();
                             menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                                let drag = super::ConversationDrag { message_ids: ids.clone(), title: String::new(), count: 0 };
+                                let drag = super::ConversationDrag { mail: super::DraggedMail::Messages(ids.clone()), title: String::new(), count: 0 };
                                 let _ = t.update(cx, |this, cx| this.drop_on_view(drag, view.clone(), window, cx));
                             }));
                         }

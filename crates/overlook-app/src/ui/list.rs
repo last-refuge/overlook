@@ -1,7 +1,7 @@
 //! Message list: title, filter tabs, day groups, and conversation rows.
 
 use super::widgets::*;
-use super::{ListRow, MailWindow};
+use super::{ListRow, MailWindow, RowLayout, RowsKey};
 use crate::assets::icon;
 use crate::theme::ActivePalette;
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -16,6 +16,27 @@ use overlook_core::time::{day_group, relative_label, DayGroup};
 use overlook_core::*;
 use overlook_store::{ListFilter, MailboxView};
 
+/// Wraps every row the list draws. The list lays each item out as a root with a definite
+/// width and a height that fits its content, and a root that does not ask for the width is
+/// sized to its contents, so a row would be only as wide as its text. A column that fills the
+/// width stretches whatever it holds, which keeps that true for every kind of row, including
+/// ones added later.
+fn full_width(row: impl IntoElement) -> AnyElement {
+    v_flex().w_full().child(row).into_any_element()
+}
+
+/// The rows that differ between two lists: the range of `old` that was replaced and how many
+/// rows replaced it. Rows that are the same at the start and at the end are left out, so the
+/// list keeps their measured heights and the scroll position. `None` when nothing differs.
+fn changed_span<T: PartialEq>(old: &[T], new: &[T]) -> Option<(std::ops::Range<usize>, usize)> {
+    if old == new {
+        return None;
+    }
+    let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+    let suffix = old[prefix..].iter().rev().zip(new[prefix..].iter().rev()).take_while(|(a, b)| a == b).count();
+    Some((prefix..old.len() - suffix, new.len() - prefix - suffix))
+}
+
 impl MailWindow {
     pub(super) fn render_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *cx.palette();
@@ -25,9 +46,9 @@ impl MailWindow {
         } else {
             self.view_title().into()
         };
-        let rows = self.list_rows();
-        let total = rows.iter().filter(|r| !matches!(r, ListRow::Group(..))).count();
-        self.sync_list_state(&rows);
+        self.refresh_list_rows(compact);
+        let no_rows = self.shown_rows.borrow().is_empty();
+        let total = self.rows_total.get();
         let focus_split = self.inbox_focus().is_some();
         let inbox_tab = self.inbox_tab;
         let filter = self.filter;
@@ -136,7 +157,7 @@ impl MailWindow {
             )
         };
 
-        let body: AnyElement = if rows.is_empty() {
+        let body: AnyElement = if no_rows {
             let nothing_local = !self.is_sample(&self.account.id) && self.store.message_count(&self.account.id).unwrap_or(0) == 0;
             let paused_hint: String = match &self.status.state {
                 SyncState::SyncFailed(reason) | SyncState::Paused(reason) if nothing_local && !self.is_syncing_active() => reason.clone(),
@@ -169,10 +190,15 @@ impl MailWindow {
                 .px(px(8.))
                 .child(
                     list(self.list_state.clone(), move |ix, _window, cx| {
-                        let Some(row) = shown.borrow().get(ix).cloned() else { return div().into_any_element() };
-                        view.update(cx, |this, cx| this.render_list_row(row, compact, cx))
+                        let row = shown.borrow().get(ix).cloned();
+                        match row {
+                            Some(row) => full_width(view.update(cx, |this, cx| this.render_list_row(row, compact, cx))),
+                            None => full_width(div()),
+                        }
                     })
-                    .size_full(),
+                    .size_full()
+                    // Room under the last row, which the list counts into how far it scrolls.
+                    .pb(px(12.)),
                 )
                 .vertical_scrollbar(&self.list_state)
                 .into_any_element()
@@ -191,24 +217,45 @@ impl MailWindow {
             .child(body)
     }
 
+    /// Brings the virtual list in line with the data. Building the rows copies every
+    /// conversation, so that waits for something they are built from to change rather than
+    /// repeating on every repaint; a long Archive then costs a repaint no more than an Inbox.
+    fn refresh_list_rows(&self, compact: bool) {
+        let key = RowsKey {
+            data: self.list_data_generation,
+            view: self.view.clone(),
+            searching: !self.search_query.is_empty(),
+            today: overlook_core::time::local_day(overlook_core::time::now(), self.utc_offset),
+            utc_offset: self.utc_offset,
+        };
+        if self.rows_key.borrow().as_ref() != Some(&key) {
+            let rows = self.list_rows();
+            self.rows_total.set(rows.iter().filter(|r| !matches!(r, ListRow::Group(..))).count());
+            self.sync_list_state(&rows);
+            *self.rows_key.borrow_mut() = Some(key);
+        }
+        // Density and the sender-picture and preview settings change every row's height, and
+        // the list keeps the heights it measured for rows that are out of view.
+        let layout = RowLayout { compact, avatars: self.prefs.show_avatars, previews: self.prefs.show_previews };
+        if self.row_layout.replace(Some(layout)).is_some_and(|before| before != layout) {
+            self.list_state.remeasure();
+        }
+    }
+
     /// Tells the virtual list which rows changed since the last frame. Rows that are the
     /// same at the start and the end keep their measured heights and the scroll position.
     fn sync_list_state(&self, rows: &[ListRow]) {
         let mut old = self.shown_rows.borrow_mut();
-        if old.as_slice() == rows {
-            return;
+        if let Some((replaced, count)) = changed_span(&old, rows) {
+            self.list_state.splice(replaced, count);
+            *old = rows.to_vec();
         }
-        let prefix = old.iter().zip(rows).take_while(|(a, b)| a == b).count();
-        let suffix = old[prefix..].iter().rev().zip(rows[prefix..].iter().rev()).take_while(|(a, b)| a == b).count();
-        self.list_state.splice(prefix..old.len() - suffix, rows.len() - prefix - suffix);
-        *old = rows.to_vec();
     }
 
     fn render_list_row(&mut self, row: ListRow, compact: bool, cx: &mut Context<Self>) -> AnyElement {
         let p = *cx.palette();
         match row {
             ListRow::Group(label, n) => h_flex()
-                .w_full()
                 .items_center()
                 .justify_between()
                 .px(px(11.))
@@ -268,17 +315,12 @@ impl MailWindow {
         let star_id = c.latest_message_id.clone();
         let starred = c.starred;
         let pending = c.pending;
-        let drag = super::ConversationDrag {
-            message_ids: self.mail_index.message_ids_in(&c.id),
-            title: c.subject.clone(),
-            count: c.message_count,
-        };
+        let drag = super::ConversationDrag { mail: super::DraggedMail::Conversation(c.id.clone()), title: c.subject.clone(), count: c.message_count };
 
         div()
             .id(SharedString::from(format!("conv-{}", c.id)))
             .relative()
             .h_flex()
-            .w_full()
             .items_start()
             .gap(px(11.))
             .px(px(11.))
@@ -423,7 +465,6 @@ impl MailWindow {
         div()
             .id(SharedString::from(format!("draft-{}", d.id)))
             .h_flex()
-            .w_full()
             .items_start()
             .gap(px(11.))
             .px(px(11.))
@@ -506,5 +547,43 @@ impl MailWindow {
                     this.open_draft(draft_id.clone(), window, cx);
                 }
             }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::changed_span;
+    // The parent's GPUI glob also exports a `test` proc macro.
+    use std::prelude::v1::test;
+
+    #[test]
+    fn an_unchanged_list_replaces_nothing() {
+        assert_eq!(changed_span(&[1, 2, 3], &[1, 2, 3]), None);
+        assert_eq!(changed_span::<u8>(&[], &[]), None);
+    }
+
+    #[test]
+    fn only_the_rows_that_differ_are_replaced() {
+        // New mail on top, mail removed from the end, one row changed in the middle.
+        assert_eq!(changed_span(&[2, 3, 4], &[1, 2, 3, 4]), Some((0..0, 1)));
+        assert_eq!(changed_span(&[1, 2, 3, 4], &[1, 2, 3]), Some((3..4, 0)));
+        assert_eq!(changed_span(&[1, 2, 3], &[1, 9, 3]), Some((1..2, 1)));
+        // Rows removed from the middle.
+        assert_eq!(changed_span(&[1, 2, 3, 4], &[1, 4]), Some((1..3, 0)));
+    }
+
+    #[test]
+    fn repeated_rows_do_not_make_the_start_and_end_overlap() {
+        // The shared prefix and suffix must not claim the same row twice.
+        assert_eq!(changed_span(&[1, 2, 2, 3], &[1, 2, 3]), Some((2..3, 0)));
+        assert_eq!(changed_span(&[1, 2, 3], &[1, 2, 2, 3]), Some((2..2, 1)));
+        assert_eq!(changed_span(&[7, 7], &[7, 7, 7]), Some((2..2, 1)));
+    }
+
+    #[test]
+    fn a_list_that_empties_or_fills_is_replaced_whole() {
+        assert_eq!(changed_span(&[1, 2], &[]), Some((0..2, 0)));
+        assert_eq!(changed_span::<u8>(&[], &[1, 2]), Some((0..0, 2)));
+        assert_eq!(changed_span(&[1, 2], &[3, 4, 5]), Some((0..2, 3)));
     }
 }
