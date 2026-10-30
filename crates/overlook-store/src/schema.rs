@@ -2,7 +2,17 @@
 
 use rusqlite::Connection;
 
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17, V18];
+
+/// The signature chosen for a draft, as it was when chosen. A table of its own, so nothing
+/// that exists is altered.
+const V18: &str = "
+CREATE TABLE draft_signatures (
+    draft_id TEXT PRIMARY KEY REFERENCES drafts(id) ON DELETE CASCADE,
+    signature_id TEXT,
+    html TEXT NOT NULL
+);
+";
 
 const V17: &str = "
 ALTER TABLE draft_attachments ADD COLUMN content_id TEXT;

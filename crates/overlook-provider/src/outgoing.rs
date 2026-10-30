@@ -119,7 +119,10 @@ mod tests {
     fn decoded_part(raw: &str, mime: &str) -> String {
         let start = raw.find(&format!("Content-Type: {mime}")).expect("MIME alternative");
         let (headers, body) = raw[start..].split_once("\r\n\r\n").expect("part headers");
-        let body = body.split("\r\n--").next().unwrap();
+        // The next MIME boundary ends the part. A "-- " signature line is not one: a boundary
+        // is followed by its token, never by a space.
+        let end = body.match_indices("\r\n--").find(|(i, _)| body[i + 4..].chars().next().is_some_and(|c| c != ' ')).map_or(body.len(), |(i, _)| i);
+        let body = &body[..end];
         let bytes = if headers.contains("base64") {
             use base64::Engine;
             base64::engine::general_purpose::STANDARD.decode(body.replace(['\r', '\n'], "")).unwrap()
@@ -223,6 +226,31 @@ mod tests {
         // ... and the real file is an ordinary attachment, outside it.
         assert_eq!(raw.matches("Content-Disposition: attachment").count(), 1, "{raw}");
         assert!(raw.find("plan.pdf").unwrap() > raw.rfind("Content-ID: <logo@brand.example>").unwrap(), "{raw}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_signature_with_an_image_is_sent_as_html_with_the_image_inline() {
+        let (account, mut draft, dir) = forwarded_with_logo();
+        // Only the logo, as a signature's image; no quote, and not a forward.
+        draft.attachments.retain(|a| a.content_id.is_some());
+        draft.kind = DraftKind::New;
+        draft.include_quote = false;
+        draft.in_reply_to = None;
+        draft.body_text = "See you Thursday.".into();
+        draft.signature_id = Some("work".into());
+        draft.signature_html = Some("<p><b>Jason Alexander</b><br>Last Refuge</p><img src=\"cid:logo@brand.example\" width=\"120\">".into());
+        let raw = String::from_utf8(build_raw(&account, &draft, None, "<sig@overlook.example>").unwrap()).unwrap();
+
+        let html = decoded_part(&raw, "text/html");
+        let (body, signature) = (html.find("See you Thursday.").unwrap(), html.find("Jason Alexander").unwrap());
+        assert!(body < signature && html.contains("cid:logo@brand.example"), "{html}");
+        let text = decoded_part(&raw, "text/plain").replace("\r\n", "\n");
+        assert!(text.starts_with("See you Thursday.\n\n-- \nJason Alexander\nLast Refuge"), "{text:?}");
+        // The image rides in multipart/related, found by the Content-ID the HTML names.
+        assert!(raw.contains("Content-Type: multipart/related"), "{raw}");
+        assert_eq!(raw.matches("Content-ID: <logo@brand.example>").count(), 1, "{raw}");
+        assert!(!raw.contains("Content-Disposition: attachment"), "it is not an attachment: {raw}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

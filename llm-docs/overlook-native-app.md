@@ -59,7 +59,7 @@ Google Calendar on the same OAuth client, with the `calendar.events` and `calend
 - **Calendar**: working hours (shaded outside in Day/Week), default event length, default reminder, show declined events, event reminders.
 - **About**: version, links, data locations, keyboard reference. **Back up mail…** asks for a folder and copies `overlook.sqlite` (a consistent `VACUUM INTO` copy), `raw/` and `attachments/` into it off the UI thread; the copy opens as a profile of its own (`OVERLOOK_DATA_DIR=<that folder>`), which is the restore path for now.
 
-Signatures are appended with a blank line when composing, and above the quoted original in replies. Not yet: multiple signatures per account, automatic replies (needs the `gmail.settings.basic` scope), rules and sweep, and rich-text signatures.
+Signatures are HTML and go below the message, above the quoted original in replies (see Contacts, signatures, … below). Not yet: automatic replies (needs the `gmail.settings.basic` scope), rules and sweep, and a WYSIWYG signature editor.
 
 ## Search
 
@@ -150,10 +150,28 @@ colour choices (by design), and underline, which Markdown has no mark for.
   field's value, so it is not saved, sent or undone. It is set only when the query changes, so Escape, Enter
   or a click dismisses it until the user types or moves again. The single-line input did not have ghost text;
   `vendor/gpui-base` now does (see `vendor/README.md`).
-- **Signatures.** `AccountPrefs.signatures` is a list of named Markdown-flavoured signatures with
-  `default_new` / `default_reply` ids (`None` = no signature); `normalized()` migrates the old single
-  `signature` field and the two include switches. Settings → Accounts manages them (add, rename, delete, pick
-  defaults); the composer toolbar has a Signature picker that swaps the block at the end of the body.
+- **Signatures.** `AccountPrefs.signatures` is a list of named signatures with `default_new` /
+  `default_reply` ids (`None` = no signature). A `Signature` is **HTML** (`html`) plus the images it embeds
+  (`images`: `content_id`, file name, MIME type, base64 data, kept in the preferences so they are backed up
+  with the database). In the HTML an image is `<img src="cid:ID">`; `normalized()` migrates the old single
+  `signature` field, the two include switches, and Markdown signatures (`body`, rendered to HTML once and then
+  emptied). Settings → Accounts has the editor (`ui/signature.rs`): a name, an HTML source box, a toolbar that
+  wraps or inserts tags around the selection (bold, italic, underline, link, bulleted list, line break;
+  `overlook_core::signature`, applied as a replacement so undo still works), **Image** (PNG, JPEG, GIF or WebP
+  chosen by content, at most 1 MB each, 20 and 4 MB per signature, scanned for malware once, inserted with a
+  `width` of at most 240 px), and a preview drawn by the native `TextView::html` (so it needs no Chromium
+  process; remote pictures are held back). Pasting HTML works as pasting text; pictures it carries as `data:`
+  URLs, which mail programs do not show, become stored images and `cid:` references the moment they land
+  (`extract_data_images`). Images the HTML no longer uses are dropped when the signature is left, not on every
+  keystroke, so undo still finds them.
+  A message takes a **copy** of its signature (`Draft.signature_id` / `signature_html`, table
+  `draft_signatures`, schema v18) with the images as inline attachments (`Content-ID` `sig-…@overlook`) in the
+  draft's own folder, so editing a signature later never changes a message already written or queued.
+  `outgoing_bodies` puts it between the body and the quote: HTML as `<div class="overlook_signature">` after
+  `clean_only`, plain text after a `-- ` line; `build_raw` sends the images in `multipart/related` (the same
+  path forwarded inline images use). The composer shows it as a block under the editor with Edit (opens it in
+  Settings) and ✕, and the toolbar's Signature picker changes it; the Preview and the Outbox draw the images
+  from the draft's files. A draft closed empty or discarded deletes its staged files.
 - **Automatic replies.** `MailProvider::fetch_vacation` / `set_vacation` (Gmail `settings/vacation`, scope
   `gmail.settings.basic`). Settings → Accounts loads them when the page opens and saves with one button; the
   end date is stored exclusive, so the last day runs through midnight.
@@ -335,7 +353,7 @@ After a GPUI upgrade, look at the list at both densities by eye.
 - IMAP, SMTP and POP3 have only ever synced against the scripted servers in `scripts/spike-mail-servers.py` and the in-crate fakes; public servers were probed up to the login exchange over TLS and STARTTLS (Fastmail, Gmail, iCloud, Microsoft 365, Yahoo, Zoho) but no real account has been read from or written to. XOAUTH2 (Microsoft 365, Outlook.com, Gmail without an app password) is not implemented. `IDLE` has not been observed across a laptop sleep. POP3: restore is manual (stop Overlook, replace the data directory with a backup); `APOP` and `SASL` logins are not offered (`USER`/`PASS` over TLS or STLS only). After an uncertain send the account reads "Offline" until the next sync. See the interoperability matrix in `llm-docs/imap-pop3-implementation-plan.md`.
 
 - Gmail: no attachment download for received mail yet, no progressive download beyond the newest 150 messages, no `cid:` inline images, and bodies are fetched one request per message (the Gmail batch endpoint would cut request count).
-- Composer is plain text. Rich text, signatures, and HTML output are phase 1 items; `body_html` is already stored separately.
+- The composer body is Markdown-flavoured text that is sent as HTML; signatures are HTML.
 - Attachment download for received mail is not implemented (cards show “Not downloaded”). Outgoing attachments are copied into the protected `outgoing/` store and persisted with the draft.
 - Multi-select and drag-and-drop are not implemented.
 - Hyprland draws no title bar; the kit’s window controls are not shown there. GNOME and KDE behaviour, fractional scaling, and screen readers (Orca) have not been checked yet.

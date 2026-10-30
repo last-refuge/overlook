@@ -58,7 +58,7 @@ pub struct SettingsState {
     /// Account shown on the Accounts page.
     pub account: AccountId,
     pub name_input: Entity<InputState>,
-    /// Body of the signature being edited.
+    /// HTML source of the signature being edited.
     pub signature: Entity<TextareaState>,
     pub signature_name: Entity<InputState>,
     pub selected_signature: Option<String>,
@@ -99,14 +99,16 @@ impl MailWindow {
         self.save_account_prefs(account, p);
     }
 
-    fn select_signature(&mut self, account: &AccountId, id: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn select_signature(&mut self, account: &AccountId, id: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        // Leaving a signature: let go of the pictures it no longer shows.
+        self.prune_signature_images(account);
         let p = self.account_prefs_for(account);
         let sig = id.as_deref().and_then(|i| p.signature_by_id(i)).cloned().unwrap_or_default();
         if let Some(state) = self.settings.as_mut() {
             state.selected_signature = id;
-            let (name, body) = (state.signature_name.clone(), state.signature.clone());
+            let (name, source) = (state.signature_name.clone(), state.signature.clone());
             name.update(cx, |s, cx| s.set_value(sig.name.clone(), window, cx));
-            body.update(cx, |s, cx| s.set_value(sig.body.clone(), window, cx));
+            source.update(cx, |s, cx| s.set_value(sig.html.clone(), window, cx));
         }
         cx.notify();
     }
@@ -114,7 +116,7 @@ impl MailWindow {
     fn add_signature(&mut self, account: &AccountId, window: &mut Window, cx: &mut Context<Self>) {
         let mut p = self.account_prefs_for(account);
         let id = AccountPrefs::new_signature_id();
-        p.signatures.push(Signature { id: id.clone(), name: format!("Signature {}", p.signatures.len() + 1), body: String::new() });
+        p.signatures.push(Signature { id: id.clone(), name: format!("Signature {}", p.signatures.len() + 1), ..Default::default() });
         if p.default_new.is_none() {
             p.default_new = Some(id.clone());
         }
@@ -254,7 +256,7 @@ impl MailWindow {
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("Your name").default_value(acct.display_name.clone()));
         let selected_signature = ap.default_new.clone().or_else(|| ap.signatures.first().map(|s| s.id.clone()));
         let selected = selected_signature.as_deref().and_then(|id| ap.signature_by_id(id)).cloned().unwrap_or_default();
-        let signature = cx.new(|cx| TextareaState::new(window, cx).placeholder("Jason Alexander\nLast Refuge").default_value(selected.body.clone()));
+        let signature = cx.new(|cx| TextareaState::new(window, cx).placeholder("<p><b>Jason Alexander</b><br>Last Refuge</p>").default_value(selected.html.clone()));
         let signature_name = cx.new(|cx| InputState::new(window, cx).placeholder("Signature name").default_value(selected.name.clone()));
         let vacation_subject = cx.new(|cx| InputState::new(window, cx).placeholder("Out of office"));
         let vacation_body = cx.new(|cx| TextareaState::new(window, cx).placeholder("I’m away until Monday and will reply when I’m back."));
@@ -282,11 +284,10 @@ impl MailWindow {
                 cx.notify();
             }
         }));
-        let for_account = acct.id.clone();
-        subs.push(cx.subscribe_in(&signature, window, move |this, state, event: &InputEvent, _window, cx| {
+        subs.push(cx.subscribe_in(&signature, window, move |this, state, event: &InputEvent, window, cx| {
             if matches!(event, InputEvent::Change) {
-                let body = state.read(cx).value().to_string();
-                this.update_selected_signature(&for_account, |s| s.body = body);
+                let html = state.read(cx).value().to_string();
+                this.edit_signature_html(html, window, cx);
             }
         }));
         let for_account = acct.id.clone();
@@ -352,6 +353,9 @@ impl MailWindow {
 
     pub(crate) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.cancel_calendar_setup_dialog();
+        if let Some(account) = self.settings.as_ref().map(|s| s.account.clone()) {
+            self.prune_signature_images(&account);
+        }
         self.settings = None;
         self.focus_current_module(window, cx);
         cx.notify();
@@ -571,7 +575,7 @@ impl MailWindow {
                     .into_any_element(),
             ))
             .children(state.caldav.as_ref().map(|form| self.render_calendar_setup(form, cx)))
-            .child(section("Signatures", Some("Added to the end of your messages. Written like the composer: **bold**, *italic*, links.")))
+            .child(section("Signatures", Some("Added below your message, above anything you are replying to. Write HTML below, use the buttons for the basics, or paste HTML from elsewhere. Pictures you insert or paste are sent with the message.")))
             .child({
                 let acct_id = account.id.clone();
                 let selected = state.selected_signature.clone();
@@ -598,7 +602,7 @@ impl MailWindow {
             })
             .when(state.selected_signature.is_some(), |d| {
                 d.child(setting_row("Name", "How this signature appears in the composer’s picker.", Input::new(&state.signature_name).w(px(280.)).into_any_element()))
-                    .child(div().rounded(px(8.)).border_1().border_color(p.divider).h(px(140.)).child(Textarea::new(&state.signature).h_full()))
+                    .child(self.render_signature_editor(state, &p, cx))
             })
             .child(setting_row("Use for new messages", "", self.signature_picker("default-new", &account.id, false, cx)))
             .child(setting_row("Use for replies and forwards", "", self.signature_picker("default-reply", &account.id, true, cx)))

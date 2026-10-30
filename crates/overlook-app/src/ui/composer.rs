@@ -44,8 +44,8 @@ pub struct Composer {
     pub source: Option<Message>,
     pub preview: bool,
     pub quote_shown: bool,
-    /// The signature currently in the body, by id.
-    pub signature_id: Option<String>,
+    /// The draft's signature as the composer draws it under the editor.
+    pub signature_view: Option<SharedString>,
     pub show_cc: bool,
     pub show_bcc: bool,
     pub dirty: bool,
@@ -99,10 +99,7 @@ impl MailWindow {
             state
         });
         let source = draft.in_reply_to.as_ref().and_then(|id| self.store.message(id).ok().flatten());
-        let signature_id = {
-            let ap = self.account_prefs_for(&self.account.id);
-            ap.default_signature(draft.kind != DraftKind::New).filter(|s| draft.body_text.contains(s.body.trim_end())).map(|s| s.id.clone())
-        };
+        let signature_view = super::signature::signature_view(&draft);
 
         let mut subs = Vec::new();
         for state in [&to, &cc, &bcc, &subject] {
@@ -151,7 +148,7 @@ impl MailWindow {
             source,
             preview: false,
             quote_shown: false,
-            signature_id,
+            signature_view,
             show_cc,
             show_bcc,
             dirty: false,
@@ -388,16 +385,24 @@ impl MailWindow {
         }
     }
 
+    /// Deletes the folder a draft's attachments were copied into: its signature's images, and
+    /// any files attached. Only for a draft that is gone.
+    pub(super) fn forget_staged_files(&self, draft: &DraftId) {
+        let _ = std::fs::remove_dir_all(self.outgoing_dir.join(draft.as_str()));
+    }
+
     pub(super) fn close_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.composer.is_some() {
             self.save_composer(window, cx);
             if let Some(c) = self.composer.take() {
                 if c.draft.is_empty() && c.last_saved.is_none() {
                     self.unwanted_drafts.insert(c.draft.id.clone());
+                    self.forget_staged_files(&c.draft.id);
                 }
                 if c.draft.is_empty() && c.last_saved.is_some() {
                     // Nothing was written; do not leave an empty draft behind.
                     let _ = self.store.delete_draft(&c.draft.account_id, &c.draft.id);
+                    self.forget_staged_files(&c.draft.id);
                     self.reload_drafts();
                 }
             }
@@ -413,6 +418,7 @@ impl MailWindow {
                 self.unwanted_drafts.insert(c.draft.id.clone());
             }
             let _ = self.store.delete_draft(&c.draft.account_id, &c.draft.id);
+            self.forget_staged_files(&c.draft.id);
             self.reload_drafts();
             crate::ui::toast(window, cx, crate::notify::Level::Info, "Draft discarded.");
             self.list_focus.focus(window, cx);
@@ -545,7 +551,7 @@ impl MailWindow {
                             (None, Some(p)) => p.fetch_attachment(&account, &source, a).await.map_err(|e| format!("Couldn’t get “{}” to forward: {e}", a.filename)),
                             (None, None) => Err(format!("Sign in again to forward “{}”.", a.filename)),
                         };
-                        match content.and_then(|bytes| stage_attachment(&a.filename, &bytes, &outgoing_dir, total, content_id)) {
+                        match content.and_then(|bytes| stage_attachment(&a.filename, &bytes, &outgoing_dir, total, content_id, true)) {
                             Ok(att) => {
                                 total += att.size_bytes;
                                 added.push(att);
@@ -767,7 +773,7 @@ impl MailWindow {
                     .text_size(px(15.))
                     .line_height(px(24.))
                     .child({
-                        let html = overlook_core::compose::outgoing_bodies(&c.draft, None).html;
+                        let html = super::signature::resolve_draft_images(&overlook_core::compose::outgoing_bodies(&c.draft, None).html, &c.draft.attachments);
                         self.browser_message_body(
                             format!("preview-{}", c.draft.id), &html, None,
                             self.prefs.remote_images == RemoteImages::Allow, p.is_dark(), cx,
@@ -785,6 +791,7 @@ impl MailWindow {
                     .child(self.composer_reveal_anchor(false, cx))
                     .into_any_element()
             })
+            .children(self.render_signature_block(c, &p, cx))
             .children(self.render_quote_block(c, &p, cx))
             .children(attachments)
             .children(error)
@@ -856,7 +863,7 @@ impl MailWindow {
             .child(div().flex_1())
             .child({
                 let ap = self.account_prefs_for(&self.account.id);
-                let current = c.signature_id.clone();
+                let current = c.draft.signature_id.clone();
                 let choices: Vec<(Option<String>, String)> = std::iter::once((None, "None".to_string())).chain(ap.signatures.iter().map(|s| (Some(s.id.clone()), s.name.clone()))).collect();
                 let label = current.as_deref().and_then(|id| ap.signature_by_id(id)).map(|s| s.name.clone()).unwrap_or_else(|| "No signature".into());
                 let t = cx.entity().downgrade();
@@ -951,29 +958,16 @@ impl MailWindow {
         )
     }
 
-    /// Swaps the signature block at the end of the body for another one, or removes it.
+    /// Gives the message another signature, or none. The message takes a copy of it, so editing
+    /// the signature in Settings later does not change this message.
     pub(super) fn set_signature(&mut self, id: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
-        let ap = self.account_prefs_for(&self.account.id);
-        let Some(c) = self.composer.as_ref() else { return };
-        let old = c.signature_id.as_deref().and_then(|i| ap.signature_by_id(i)).map(|s| s.body.trim_end().to_owned());
-        let new = id.as_deref().and_then(|i| ap.signature_by_id(i)).map(|s| s.body.trim_end().to_owned());
-        let body = c.body.clone();
-        body.update(cx, |s, cx| {
-            let mut text = s.value().to_string();
-            if let Some(old) = old.filter(|o| !o.is_empty()) {
-                if let Some(pos) = text.rfind(&old) {
-                    let before = text[..pos].trim_end_matches('\n').len();
-                    text = format!("{}{}", &text[..before], &text[pos + old.len()..]);
-                }
-            }
-            if let Some(new) = new.filter(|n| !n.is_empty()) {
-                let trimmed = text.trim_end_matches('\n').len();
-                text = format!("{}\n\n{}", &text[..trimmed], new);
-            }
-            s.set_value(text, window, cx);
-        });
+        let Some(mut draft) = self.composer.as_ref().map(|c| c.draft.clone()) else { return };
+        self.apply_signature(&mut draft, id.as_deref());
         if let Some(c) = self.composer.as_mut() {
-            c.signature_id = id;
+            c.signature_view = super::signature::signature_view(&draft);
+            c.draft.signature_id = draft.signature_id;
+            c.draft.signature_html = draft.signature_html;
+            c.draft.attachments = draft.attachments;
         }
         self.composer_changed(window, cx);
     }
@@ -1221,7 +1215,7 @@ fn prepare_attachments(paths: Vec<std::path::PathBuf>, dir: &std::path::Path, mu
             refused.push(format!("Couldn’t read “{}”.", sanitize_filename(&original)));
             continue;
         };
-        match stage_attachment(&original, &content, dir, total, None) {
+        match stage_attachment(&original, &content, dir, total, None, true) {
             Ok(att) => {
                 total += att.size_bytes;
                 added.push(att);
@@ -1234,8 +1228,10 @@ fn prepare_attachments(paths: Vec<std::path::PathBuf>, dir: &std::path::Path, mu
 
 /// Applies the outgoing attachment policy to one file's `content` and, if it passes, writes
 /// it to its own folder under `dir`. `total` is the size already attached to the message.
-/// `content_id` marks an image the quoted original embeds. The error is the reason to show the user. Blocking.
-fn stage_attachment(original: &str, content: &[u8], dir: &std::path::Path, total: u64, content_id: Option<String>) -> Result<DraftAttachment, String> {
+/// `content_id` marks an image the quoted original embeds, or a signature's. `scan` runs the
+/// malware scan on the copy; a signature's images were scanned when they were added to it. The
+/// error is the reason to show the user. Blocking.
+pub(super) fn stage_attachment(original: &str, content: &[u8], dir: &std::path::Path, total: u64, content_id: Option<String>, scan: bool) -> Result<DraftAttachment, String> {
     use overlook_core::attachment_policy::{check_outgoing, sanitize_filename, within_size_limit, TOO_LARGE};
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let name = sanitize_filename(original);
@@ -1257,7 +1253,7 @@ fn stage_attachment(original: &str, content: &[u8], dir: &std::path::Path, total
         let _ = std::fs::remove_dir_all(&folder);
         return Err(format!("Couldn’t attach “{name}”."));
     }
-    if crate::malware_scan::scan(&dest) == crate::malware_scan::Scan::Infected {
+    if scan && crate::malware_scan::scan(&dest) == crate::malware_scan::Scan::Infected {
         let _ = std::fs::remove_dir_all(&folder);
         return Err(crate::malware_scan::INFECTED.to_owned());
     }
@@ -1299,17 +1295,17 @@ mod attachment_tests {
     #[test]
     fn staged_content_gets_the_same_checks_as_a_picked_file() {
         let root = std::env::temp_dir().join(format!("overlook-stage-{}", std::process::id()));
-        let ok = stage_attachment("invoice.pdf", b"%PDF-1.7", &root, 0, None).unwrap();
+        let ok = stage_attachment("invoice.pdf", b"%PDF-1.7", &root, 0, None, true).unwrap();
         assert_eq!((ok.filename.as_str(), ok.mime_type.as_str(), ok.size_bytes), ("invoice.pdf", "application/pdf", 8));
         assert_eq!(std::fs::read(&ok.local_path).unwrap(), b"%PDF-1.7");
         assert_eq!(std::fs::metadata(&ok.local_path).unwrap().permissions().mode() & 0o777, 0o600);
-        assert!(stage_attachment("setup.exe", b"MZ", &root, 0, None).is_err());
-        assert!(stage_attachment("photo.jpg", b"\x7fELF\x02", &root, 0, None).is_err());
-        assert_eq!(stage_attachment("a.txt", b"x", &root, 19 * 1024 * 1024, None), Err(overlook_core::attachment_policy::TOO_LARGE.to_owned()));
+        assert!(stage_attachment("setup.exe", b"MZ", &root, 0, None, true).is_err());
+        assert!(stage_attachment("photo.jpg", b"\x7fELF\x02", &root, 0, None, true).is_err());
+        assert_eq!(stage_attachment("a.txt", b"x", &root, 19 * 1024 * 1024, None, true), Err(overlook_core::attachment_policy::TOO_LARGE.to_owned()));
         // Refusals leave nothing behind.
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
         // An image the quote embeds keeps its Content-ID and is not listed as a file.
-        let logo = stage_attachment("logo.png", b"\x89PNG\r\n\x1a\n", &root, 0, Some("logo@brand.example".into())).unwrap();
+        let logo = stage_attachment("logo.png", b"\x89PNG\r\n\x1a\n", &root, 0, Some("logo@brand.example".into()), true).unwrap();
         assert_eq!((logo.content_id.as_deref(), logo.is_listed(), ok.is_listed()), (Some("logo@brand.example"), false, true));
         std::fs::remove_dir_all(&root).unwrap();
     }

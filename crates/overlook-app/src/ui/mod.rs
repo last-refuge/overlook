@@ -11,6 +11,7 @@ mod mail_highlight;
 mod palette;
 mod list;
 mod settings;
+mod signature;
 mod reader;
 mod sidebar;
 mod widgets;
@@ -2374,7 +2375,8 @@ impl MailWindow {
         draft.cc = m.cc;
         draft.bcc = m.bcc;
         draft.subject = m.subject;
-        draft.body_text = format!("{}{}", m.body, self.account_prefs_for(&self.account.id).signature_block(false));
+        draft.body_text = m.body;
+        self.apply_signature(&mut draft, self.default_signature_id(false).as_deref());
         self.set_module(Module::Mail, window, cx);
         self.outbox_selected = None;
         self.open_composer(draft, window, cx);
@@ -2382,7 +2384,7 @@ impl MailWindow {
 
     pub(crate) fn compose_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut draft = Draft::new(self.account.id.clone(), DraftKind::New, now());
-        draft.body_text = self.account_prefs_for(&self.account.id).signature_block(false);
+        self.apply_signature(&mut draft, self.default_signature_id(false).as_deref());
         self.outbox_selected = None;
         self.open_composer(draft, window, cx);
     }
@@ -2401,9 +2403,9 @@ impl MailWindow {
     /// Replies to or forwards one particular message of the conversation.
     pub(crate) fn reply_to(&mut self, kind: DraftKind, source: Message, window: &mut Window, cx: &mut Context<Self>) {
         let mut draft = Draft::in_response_to_with(self.account.id.clone(), kind, &source, &self.owner(), now(), self.prefs.quote_on_reply);
-        // The quoted original is appended at send time and shown collapsed under the editor;
-        // the body starts with two blank lines for the reply and the signature below them.
-        draft.body_text = self.account_prefs_for(&self.account.id).signature_block(true);
+        // The quoted original is appended at send time and shown collapsed under the editor, and
+        // the signature goes between what is written and the quote.
+        self.apply_signature(&mut draft, self.default_signature_id(true).as_deref());
         // Open at once; the new draft is written in the background. Until it commits, the
         // composer is not marked saved (nothing has been typed yet, so nothing can be lost).
         let store = self.store.clone();
@@ -2421,6 +2423,7 @@ impl MailWindow {
                 match result {
                     Ok(_) if this.unwanted_drafts.remove(&draft_id) => {
                         let _ = this.store.delete_draft(&draft_account, &draft_id);
+                        this.forget_staged_files(&draft_id);
                         this.reload_drafts();
                     }
                     Ok(_) => {

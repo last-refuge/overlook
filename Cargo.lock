@@ -4895,6 +4895,7 @@ name = "overlook-core"
 version = "1.6.8"
 dependencies = [
  "ammonia",
+ "base64 0.22.1",
  "cssparser",
  "flate2",
  "html5ever 0.27.0",

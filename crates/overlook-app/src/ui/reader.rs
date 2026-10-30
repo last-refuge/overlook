@@ -989,7 +989,7 @@ impl MailWindow {
                     .child({
                         let source = d.in_reply_to.as_ref().and_then(|id| self.store.message(id).ok().flatten());
                         let allow_remote = self.prefs.remote_images == RemoteImages::Allow || source.as_ref().is_some_and(|m| self.remote_allowed.contains(&m.id));
-                        let html = overlook_core::compose::outgoing_bodies(d, source.as_ref()).html;
+                        let html = super::signature::resolve_draft_images(&overlook_core::compose::outgoing_bodies(d, source.as_ref()).html, &d.attachments);
                         self.browser_message_body(format!("outbox-{}", d.id), &html, source.as_ref(), allow_remote, p.is_dark(), cx).0
                     }),
             )

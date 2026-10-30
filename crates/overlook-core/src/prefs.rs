@@ -104,13 +104,30 @@ impl Default for Prefs {
     }
 }
 
-/// One named signature. The body is Markdown-flavoured text like the composer's.
+/// One named signature: HTML, with the images it embeds.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Signature {
     pub id: String,
     pub name: String,
+    /// The Markdown-flavoured text of older versions. `normalized` turns it into `html` and
+    /// empties it, so this is only ever set on preferences written before HTML signatures.
     pub body: String,
+    /// The signature as HTML. Its images are `cid:` references to `images`.
+    pub html: String,
+    pub images: Vec<SignatureImage>,
+}
+
+/// An image a signature embeds. It travels in the message as an inline part whose
+/// `Content-ID` is `content_id`, which the signature's HTML refers to as `cid:<content_id>`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SignatureImage {
+    pub content_id: String,
+    pub filename: String,
+    pub mime_type: String,
+    /// The file, base64-encoded.
+    pub data: String,
 }
 
 /// Per-account preferences.
@@ -138,12 +155,19 @@ impl AccountPrefs {
     }
 
     /// Brings older stored preferences up to date: the single signature becomes the first
-    /// named one, and the two "include" switches become the defaults.
+    /// named one, the two "include" switches become the defaults, and signatures written as
+    /// Markdown become HTML.
     pub fn normalized(mut self) -> Self {
         if self.signatures.is_empty() && !self.signature.trim().is_empty() {
-            self.signatures.push(Signature { id: "default".into(), name: "Default".into(), body: std::mem::take(&mut self.signature) });
+            self.signatures.push(Signature { id: "default".into(), name: "Default".into(), body: std::mem::take(&mut self.signature), ..Default::default() });
             self.default_new = self.sign_new_messages.then(|| "default".to_string());
             self.default_reply = self.sign_replies.then(|| "default".to_string());
+        }
+        for s in &mut self.signatures {
+            if s.html.trim().is_empty() && !s.body.trim().is_empty() {
+                s.html = crate::compose::render_markdown(s.body.trim_end());
+            }
+            s.body.clear();
         }
         self.sign_new_messages = true;
         self.sign_replies = true;
@@ -163,15 +187,7 @@ impl AccountPrefs {
 
     pub fn default_signature(&self, reply: bool) -> Option<&Signature> {
         let id = if reply { self.default_reply.as_deref() } else { self.default_new.as_deref() };
-        id.and_then(|i| self.signature_by_id(i)).filter(|s| !s.body.trim().is_empty())
-    }
-
-    /// Signature block to append to a body, or empty when none applies.
-    pub fn signature_block(&self, reply: bool) -> String {
-        match self.default_signature(reply) {
-            Some(s) => format!("\n\n{}", s.body.trim_end()),
-            None => String::new(),
-        }
+        id.and_then(|i| self.signature_by_id(i)).filter(|s| !s.html.trim().is_empty())
     }
 
     pub fn new_signature_id() -> String {
@@ -214,14 +230,33 @@ mod tests {
     }
 
     #[test]
-    fn signature_block_follows_toggles() {
+    fn older_signatures_become_html_and_defaults_follow_the_toggles() {
         let a = AccountPrefs { signature: "Jason\nLast Refuge  ".into(), sign_new_messages: true, sign_replies: false, ..Default::default() }.normalized();
         assert_eq!(a.signatures.len(), 1);
-        assert_eq!(a.signature_block(false), "\n\nJason\nLast Refuge");
-        assert_eq!(a.signature_block(true), "");
+        let html = &a.signatures[0].html;
+        assert!(html.starts_with("<p>Jason<br>") && html.contains("Last Refuge") && !html.contains("  "), "{html}");
+        assert_eq!(a.signatures[0].body, "", "the Markdown is gone once it is HTML");
+        assert_eq!(a.default_signature(false).map(|s| s.id.as_str()), Some("default"));
+        assert!(a.default_signature(true).is_none());
         let mut b = a.clone();
-        b.signatures.push(Signature { id: "short".into(), name: "Short".into(), body: "J.".into() });
+        b.signatures.push(Signature { id: "short".into(), name: "Short".into(), html: "<p>J.</p>".into(), ..Default::default() });
         b.default_reply = Some("short".into());
-        assert_eq!(b.signature_block(true), "\n\nJ.");
+        assert_eq!(b.default_signature(true).map(|s| s.html.as_str()), Some("<p>J.</p>"));
+    }
+
+    #[test]
+    fn normalizing_twice_does_not_bring_back_a_signature_that_was_emptied() {
+        let mut a = AccountPrefs { signature: "Jason".into(), ..Default::default() }.normalized();
+        a.signatures[0].html.clear();
+        let a = a.normalized();
+        assert_eq!(a.signatures[0].html, "");
+        assert!(a.default_signature(false).is_none(), "an empty signature is not used");
+    }
+
+    #[test]
+    fn preferences_from_before_images_load_with_none() {
+        let prefs: AccountPrefs = serde_json::from_str(r#"{"signatures":[{"id":"a","name":"A","body":"Hi"}]}"#).unwrap();
+        let prefs = prefs.normalized();
+        assert_eq!((prefs.signatures[0].images.len(), prefs.signatures[0].html.contains("Hi")), (0, true));
     }
 }

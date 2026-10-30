@@ -569,6 +569,14 @@ pub struct Draft {
     /// (and shown, collapsed, in the composer). The quoted text is not part of `body_text`.
     #[serde(default)]
     pub include_quote: bool,
+    /// The signature chosen for this message, by id in the account's signatures.
+    #[serde(default)]
+    pub signature_id: Option<String>,
+    /// That signature's HTML as it was when it was chosen, so editing signatures later never
+    /// changes a message already written or waiting in the Outbox. It goes below the body and
+    /// above the quote. Its images are inline attachments of the draft.
+    #[serde(default)]
+    pub signature_html: Option<String>,
     pub attachments: Vec<DraftAttachment>,
     pub state: DraftState,
     pub created_at: Timestamp,
@@ -592,6 +600,8 @@ impl Draft {
             body_text: String::new(),
             body_html: None,
             include_quote: false,
+            signature_id: None,
+            signature_html: None,
             attachments: Vec::new(),
             state: DraftState::Editing,
             created_at: now,

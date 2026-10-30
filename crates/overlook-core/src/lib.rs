@@ -25,6 +25,7 @@ pub mod recipients;
 pub mod prepass;
 pub mod sanitize;
 pub mod servers;
+pub mod signature;
 pub mod status;
 pub mod threading;
 pub mod time;

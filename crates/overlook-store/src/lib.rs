@@ -1954,6 +1954,10 @@ fn save_draft_tx(tx: &Connection, d: &Draft) -> Result<()> {
             d.include_quote as i64,
         ],
     )?;
+    tx.execute("DELETE FROM draft_signatures WHERE draft_id=?1", [&d.id.0])?;
+    if let Some(html) = &d.signature_html {
+        tx.execute("INSERT INTO draft_signatures(draft_id, signature_id, html) VALUES(?1,?2,?3)", params![d.id.0, d.signature_id, html])?;
+    }
     tx.execute("DELETE FROM draft_attachments WHERE draft_id=?1", [&d.id.0])?;
     for a in &d.attachments {
         tx.execute(
@@ -2006,12 +2010,22 @@ fn load_drafts(c: &Connection, where_clause: &str, args: impl rusqlite::Params) 
             body_text,
             body_html,
             include_quote,
+            signature_id: None,
+            signature_html: None,
             attachments: Vec::new(),
             state: serde_json::from_str(&state)?,
             created_at: created,
             updated_at: updated,
             provider_id: provider.map(ProviderId),
         });
+    }
+    let mut stmt = c.prepare("SELECT draft_id, signature_id, html FROM draft_signatures")?;
+    for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, String>(2)?)))? {
+        let (draft_id, signature_id, html) = row?;
+        if let Some(d) = drafts.iter_mut().find(|d| d.id.0 == draft_id) {
+            d.signature_id = signature_id;
+            d.signature_html = Some(html);
+        }
     }
     let mut stmt = c.prepare("SELECT id, draft_id, filename, mime_type, size_bytes, local_path, content_id FROM draft_attachments ORDER BY rowid")?;
     for row in stmt.query_map([], |r| {
@@ -2390,6 +2404,32 @@ mod tests {
         let loaded = store.draft(&draft.id).unwrap().unwrap();
         assert_eq!(loaded.attachments, draft.attachments);
         assert_eq!(loaded.attachments.iter().filter(|a| a.is_listed()).count(), 1);
+    }
+
+    #[test]
+    fn a_draft_keeps_the_signature_it_was_given() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+        let mut draft = Draft::new(acct.clone(), DraftKind::New, 10);
+        draft.signature_id = Some("sig-work".into());
+        draft.signature_html = Some("<p>Jason<br><img src=\"cid:sig-1@overlook\"></p>".into());
+        store.save_draft(&draft).unwrap();
+        let loaded = store.draft(&draft.id).unwrap().unwrap();
+        assert_eq!((loaded.signature_id.as_deref(), loaded.signature_html.as_deref()), (Some("sig-work"), draft.signature_html.as_deref()));
+
+        // Choosing no signature removes it; saving again does not duplicate it.
+        draft.signature_id = None;
+        draft.signature_html = None;
+        store.save_draft(&draft).unwrap();
+        let loaded = store.draft(&draft.id).unwrap().unwrap();
+        assert_eq!((loaded.signature_id, loaded.signature_html), (None, None));
+
+        // It goes with the draft.
+        draft.signature_html = Some("<p>x</p>".into());
+        store.save_draft(&draft).unwrap();
+        store.delete_draft(&acct, &draft.id).unwrap();
+        assert_eq!(store.with_read(|c| Ok(c.query_row("SELECT COUNT(*) FROM draft_signatures", [], |r| r.get::<_, i64>(0))?)).unwrap(), 0);
     }
 
     #[test]
