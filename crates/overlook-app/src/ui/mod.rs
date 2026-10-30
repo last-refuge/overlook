@@ -5,6 +5,7 @@ mod calendar;
 mod calendar_setup;
 mod calendar_changes;
 mod composer;
+mod contact_card;
 mod contacts;
 mod mail_highlight;
 mod palette;
@@ -481,7 +482,13 @@ pub struct MailWindow {
     expanded: BTreeSet<MessageId>,
     remote_allowed: BTreeSet<MessageId>,
     /// The message whose sender's contact card is open.
-    pub(crate) contact_card: Option<MessageId>,
+    /// The name whose card is pinned under a message header: the message and the lower-cased
+    /// address.
+    pub(crate) contact_card: Option<(MessageId, String)>,
+    /// Messages whose recipient list is shown in full rather than as "+N more".
+    recipients_expanded: BTreeSet<MessageId>,
+    /// Lower-cased address → position in `contacts`.
+    contact_index: HashMap<String, usize>,
     // Contacts module state.
     pub(crate) contacts: Vec<Contact>,
     pub(crate) contact_selected: Option<String>,
@@ -701,6 +708,8 @@ impl MailWindow {
             remote_allowed: BTreeSet::new(),
             quick_look: None,
             contact_card: None,
+            recipients_expanded: BTreeSet::new(),
+            contact_index: HashMap::new(),
             contacts: Vec::new(),
             contact_selected: None,
             contact_search,

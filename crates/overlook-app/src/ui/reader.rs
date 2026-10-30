@@ -535,21 +535,6 @@ impl MailWindow {
             let html = Self::message_source(m);
             self.browser_message_body(format!("message-{}", m.id), &html, Some(m), allow_remote, p.is_dark(), cx)
         };
-        let to_line = {
-            let names = |list: &[Address]| -> Vec<String> {
-                list.iter().map(|a| if a.email.eq_ignore_ascii_case(&self.account.email) { "me".to_owned() } else { a.display_name() }).collect()
-            };
-            let mut to = names(&m.to);
-            if to.is_empty() {
-                to.push("me".into());
-            }
-            let mut line = format!("to {}", to.join(", "));
-            let cc = names(&m.cc);
-            if !cc.is_empty() {
-                line.push_str(&format!(" · cc {}", cc.join(", ")));
-            }
-            line
-        };
         let sender_email = if m.is_outgoing { self.account.email.clone() } else { m.from.email.clone() };
         let mid = m.id.clone();
         let is_latest = self.selected_summary().is_some_and(|s| s.latest_message_id == m.id);
@@ -579,25 +564,19 @@ impl MailWindow {
                             .flex_1()
                             .min_w_0()
                             .child({
-                                let card_id = m.id.clone();
-                                div()
+                                let sender = div()
                                     .id(SharedString::from(format!("sender-{}", m.id)))
                                     .flex()
                                     .items_baseline()
                                     .gap(px(6.))
                                     .text_size(px(14.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .cursor_pointer()
                                     .hover(|d| d.text_color(p.accent))
                                     .child(who.display_name())
-                                    .when(!sender_email.eq_ignore_ascii_case(&who.display_name()), |d| d.child(div().text_size(px(12.)).font_weight(FontWeight::NORMAL).text_color(p.muted).child(format!("<{sender_email}>"))))
-                                    .on_click(cx.listener(move |this, _, _w, cx| {
-                                        cx.stop_propagation();
-                                        this.contact_card = if this.contact_card.as_ref() == Some(&card_id) { None } else { Some(card_id.clone()) };
-                                        cx.notify();
-                                    }))
+                                    .when(!sender_email.eq_ignore_ascii_case(&who.display_name()), |d| d.child(div().text_size(px(12.)).font_weight(FontWeight::NORMAL).text_color(p.muted).child(format!("<{sender_email}>"))));
+                                self.contact_trigger("from", &m.id, &who, sender, cx)
                             })
-                            .child(div().truncate().text_size(px(12.)).text_color(p.muted).child(to_line)),
+                            .child(self.render_recipients(m, cx)),
                     )
                     .child(
                         div()
@@ -633,7 +612,7 @@ impl MailWindow {
                             }),
                     ),
             )
-            .when(self.contact_card.as_ref() == Some(&m.id), |d| d.child(self.render_contact_card(&who, cx)))
+            .children(self.pinned_contact_card(m, cx))
             .when(!m.body.is_cached(), |d| {
                 d.child(
                     div()
@@ -744,63 +723,6 @@ impl MailWindow {
         }
         cache.insert(a.id.clone(), Some(url.clone()));
         Some(url)
-    }
-
-    /// Who a sender is: address book entry or correspondent, with the two things one does
-    /// next: write to them, or find everything they sent.
-    fn render_contact_card(&self, who: &Address, cx: &mut Context<Self>) -> Div {
-        let p = *cx.palette();
-        let contact = self.store.contact(&self.account.id, &who.email).ok().flatten();
-        let name = contact.as_ref().and_then(|c| c.name.clone()).or_else(|| who.name.clone()).unwrap_or_else(|| who.email.clone());
-        let source = match &contact {
-            Some(c) if c.in_address_book => "In your Google Contacts",
-            Some(_) => "Someone you have corresponded with",
-            None => "Not in your contacts",
-        };
-        let email = who.email.clone();
-        let compose_to = who.clone();
-        let search_from = format!("from:{}", who.email);
-        h_flex()
-            .items_center()
-            .gap(px(14.))
-            .px(px(14.))
-            .py(px(12.))
-            .rounded(px(10.))
-            .bg(p.chip)
-            .border_1()
-            .border_color(p.divider)
-            .child(match contact.as_ref().and_then(|c| c.photo_url.clone()) {
-                Some(url) => div().size(px(44.)).rounded_full().overflow_hidden().bg(p.avatar).child(img(SharedUri::from(url)).size_full().object_fit(ObjectFit::Cover)).into_any_element(),
-                None => avatar(who, 44., &p).into_any_element(),
-            })
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child(name))
-                    .child(div().text_size(px(12.)).text_color(p.muted).child(email))
-                    .child(div().text_size(px(11.)).text_color(p.muted).child(source)),
-            )
-            .child(Button::new("card-compose").small().icon(icon("pen-line").size(px(14.))).label("New message").on_click(cx.listener(move |this, _, window, cx| {
-                this.compose_new(window, cx);
-                if let Some(c) = this.composer.as_ref() {
-                    let to = c.to.clone();
-                    let header = compose_to.to_header();
-                    to.update(cx, |s, cx| s.set_value(header, window, cx));
-                }
-                this.sync_composer_fields(cx);
-            })))
-            .child({
-                let who = who.clone();
-                let in_book = contact.as_ref().is_some_and(|c| c.in_address_book);
-                Button::new("card-contacts").ghost().small().icon(icon(if in_book { "book-user" } else { "user-plus" }).size(px(14.))).label(if in_book { "Open in Contacts" } else { "Add to contacts" }).on_click(cx.listener(move |this, _, window, cx| this.show_in_contacts(who.clone(), window, cx)))
-            })
-            .child(Button::new("card-search").ghost().small().icon(icon("search").size(px(14.))).label("Mail from them").on_click(cx.listener(move |this, _, window, cx| {
-                let input = this.search_input.clone();
-                let q = search_from.clone();
-                input.update(cx, |s, cx| s.set_value(q.clone(), window, cx));
-                this.set_search(q, window, cx);
-            })))
     }
 
     /// The image attachment shown over the window, with Open and Save.

@@ -38,6 +38,7 @@ pub struct ContactForm {
 impl MailWindow {
     pub(crate) fn reload_contacts(&mut self) {
         self.contacts = self.store.contacts(&self.account.id).unwrap_or_default();
+        self.contact_index = super::contact_card::index_contacts(&self.contacts);
         if let Some(sel) = &self.contact_selected {
             if !self.contacts.iter().any(|c| &c.id == sel) {
                 self.contact_selected = None;
@@ -230,7 +231,7 @@ impl MailWindow {
         }
     }
 
-    fn compose_to_contact(&mut self, who: Address, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn compose_to_contact(&mut self, who: Address, window: &mut Window, cx: &mut Context<Self>) {
         self.set_module(super::calendar::Module::Mail, window, cx);
         self.compose_new(window, cx);
         if let Some(c) = self.composer.as_ref() {

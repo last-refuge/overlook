@@ -129,7 +129,17 @@ colour choices (by design), and underline, which Markdown has no mark for.
   daily `fetch_contacts` (`people/me/connections` + `otherContacts`) keeps rows with pending local edits.
   Scopes: `contacts` (read-write) and `contacts.other.readonly`; without the write scope the sidebar says
   changes stay on this device and offers Sign in again. The composer suggests address-book matches first,
-  and a sender card in the reader opens or adds the person in Contacts.
+  and the names in a message header (From, To, Cc) open a **contact card** (`ui/contact_card.rs`).
+- **Contact cards.** Hovering a name for about a third of a second floats the card (GPUI Kit `HoverCard`);
+  clicking pins the same card under the header until it is clicked again or closed, and the hover card steps
+  aside while it is pinned. The card shows the photo, name, title and organization, every address the person
+  has (with Copy), phone, the start of their notes, and where Overlook knows them from (address book,
+  correspondent, not a contact, or you), with New message, Open in Contacts or Add to contacts, and Mail from
+  them. People are found through `MailWindow.contact_index`, an in-memory map from lower-cased address to
+  position in `contacts` that `reload_contacts` rebuilds (address-book entries win over correspondents), so
+  every name in a long thread is a constant-time lookup. The To/Cc line lists five names and then "+N more",
+  which expands that message. The hover card is not drawn by the window's own view, so its buttons reach the
+  window through a weak handle. The composer's recipient fields are plain text inputs and have no cards.
 - **Signatures.** `AccountPrefs.signatures` is a list of named Markdown-flavoured signatures with
   `default_new` / `default_reply` ids (`None` = no signature); `normalized()` migrates the old single
   `signature` field and the two include switches. Settings → Accounts manages them (add, rename, delete, pick

@@ -858,6 +858,19 @@ mod tests {
     }
 
     #[test]
+    fn a_contact_is_known_by_its_name_or_its_given_and_family_names() {
+        let mut c = Contact { email: "maya@northstar.example".into(), ..Default::default() };
+        assert_eq!((c.known_name(), c.display_name().as_str()), (None, "maya@northstar.example"));
+        c.given_name = Some("Maya".into());
+        c.family_name = Some("Chen".into());
+        assert_eq!(c.known_name().as_deref(), Some("Maya Chen"));
+        c.name = Some("  ".into());
+        assert_eq!(c.known_name().as_deref(), Some("Maya Chen"), "a blank name does not count");
+        c.name = Some("Maya C.".into());
+        assert_eq!(c.display_name(), "Maya C.");
+    }
+
+    #[test]
     fn images_embedded_in_the_quote_do_not_make_a_draft_non_empty() {
         let attachment = |content_id: Option<&str>| DraftAttachment {
             id: AttachmentId::generate(),
@@ -919,16 +932,18 @@ impl Contact {
         Address { name: self.name.clone(), email: self.email.clone() }
     }
 
+    /// The name, or the given and family names together, when either is known.
+    pub fn known_name(&self) -> Option<String> {
+        self.name.clone().filter(|n| !n.trim().is_empty()).or_else(|| {
+            let full = format!("{} {}", self.given_name.clone().unwrap_or_default(), self.family_name.clone().unwrap_or_default());
+            let full = full.trim().to_owned();
+            (!full.is_empty()).then_some(full)
+        })
+    }
+
     /// Name, or the address, or a placeholder.
     pub fn display_name(&self) -> String {
-        self.name
-            .clone()
-            .filter(|n| !n.trim().is_empty())
-            .or_else(|| {
-                let full = format!("{} {}", self.given_name.clone().unwrap_or_default(), self.family_name.clone().unwrap_or_default());
-                let full = full.trim().to_owned();
-                (!full.is_empty()).then_some(full)
-            })
+        self.known_name()
             .or_else(|| (!self.email.is_empty()).then(|| self.email.clone()))
             .unwrap_or_else(|| "(No name)".into())
     }
