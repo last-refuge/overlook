@@ -10,7 +10,7 @@ use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputHi
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::{Disableable, Sizable};
 use overlook_core::compose::render_markdown;
-use overlook_core::recipients::{RecipientField, RecipientQuery};
+use overlook_core::recipients::{inline_suggestion, RecipientField, RecipientQuery};
 use std::rc::Rc;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -53,6 +53,8 @@ pub struct Composer {
     pub save_generation: u64,
     pub suggestions: Vec<Address>,
     recipient_query: Option<RecipientQuery>,
+    /// The suggestion shown as faint text inside a recipient field, and the field, for Tab.
+    ghost: Option<(RecipientField, Address)>,
     pub error: Option<String>,
     /// Attachments of a forwarded message are still being copied into the draft.
     pub attaching: bool,
@@ -110,6 +112,8 @@ impl MailWindow {
                 InputEvent::PressEnter { secondary: true, .. } => this.send_composer(window, cx),
                 InputEvent::PressEnter { .. } => this.focus_next_composer_field(window, cx),
                 InputEvent::Focus => this.refresh_recipient_suggestions(window, cx),
+                // Tab on the suggestion shown inside the field.
+                InputEvent::AcceptSuggestion => this.accept_inline_suggestion(window, cx),
                 _ => {}
             }));
         }
@@ -155,6 +159,7 @@ impl MailWindow {
             save_generation: 0,
             suggestions: Vec::new(),
             recipient_query: None,
+            ghost: None,
             error: None,
             attaching: false,
             _subscriptions: subs,
@@ -310,7 +315,24 @@ impl MailWindow {
         let c = self.composer.as_mut().unwrap();
         c.recipient_query = query;
         c.suggestions = suggestions;
+        // The first suggestion that continues what was typed is also offered in the field itself,
+        // as faint text that Tab accepts. It is set only when the query changes, so one the user
+        // dismissed (Escape, Enter, a click) stays dismissed until they type or move again.
+        let inline = c.recipient_query.as_ref().and_then(|q| inline_suggestion(q, &c.suggestions).map(|(a, ghost)| (q.field, a.clone(), ghost)));
+        c.ghost = inline.as_ref().map(|(field, address, _)| (*field, address.clone()));
+        for field in [RecipientField::To, RecipientField::Cc, RecipientField::Bcc] {
+            let text = inline.as_ref().filter(|(f, ..)| *f == field).map(|(.., ghost)| ghost.clone());
+            c.recipient_input(field).update(cx, |input, cx| input.set_ghost_text(text, cx));
+        }
         cx.notify();
+    }
+
+    /// Tab on the suggestion shown inside a recipient field: the same as choosing it below.
+    fn accept_inline_suggestion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(c) = self.composer.as_mut() else { return };
+        let (Some((_, address)), Some(query)) = (c.ghost.take(), c.recipient_query.clone()) else { return };
+        let draft_id = c.draft.id.clone();
+        self.accept_suggestion(&draft_id, &query, &address, window, cx);
     }
 
     /// The idle autosave: the write (a durable transaction that may wait for a sync's

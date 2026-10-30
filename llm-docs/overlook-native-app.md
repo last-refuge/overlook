@@ -140,6 +140,16 @@ colour choices (by design), and underline, which Markdown has no mark for.
   every name in a long thread is a constant-time lookup. The To/Cc line lists five names and then "+N more",
   which expands that message. The hover card is not drawn by the window's own view, so its buttons reach the
   window through a weak handle. The composer's recipient fields are plain text inputs and have no cards.
+- **Recipient completion.** Typing in To, Cc or Bcc lists suggestions below the field (address book first,
+  then people written to before) and, when one *starts with* what was typed and the caret is at the end of
+  the field, also completes it in place: the rest shows as faint ghost text after the caret, and **Tab**
+  accepts it, producing `Name <address>, ` exactly as clicking the suggestion does. `ghost_completion` and
+  `inline_suggestion` (`overlook-core/src/recipients.rs`) decide what to offer: the rest of the name followed
+  by the address, or the rest of the address; a name that needs quoting is not spelled out, and a later word
+  of a name (typing `chen` for Maya Chen) only matches in the list. The ghost is painted, never part of the
+  field's value, so it is not saved, sent or undone. It is set only when the query changes, so Escape, Enter
+  or a click dismisses it until the user types or moves again. The single-line input did not have ghost text;
+  `vendor/gpui-base` now does (see `vendor/README.md`).
 - **Signatures.** `AccountPrefs.signatures` is a list of named Markdown-flavoured signatures with
   `default_new` / `default_reply` ids (`None` = no signature); `normalized()` migrates the old single
   `signature` field and the two include switches. Settings → Accounts manages them (add, rename, delete, pick

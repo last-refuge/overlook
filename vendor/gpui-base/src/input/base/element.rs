@@ -3341,9 +3341,14 @@ impl<M: InputModeKind> Element for TextElement<M> {
                     let first_line_x = cursor_bounds.origin.x + cursor_bounds.size.width;
                     let p = point(first_line_x, cursor_row_y);
 
-                    // Paint background to cover any existing text
-                    let bg_bounds = Bounds::new(p, size(first_line.width + px(4.), line_height));
-                    window.paint_quad(fill(bg_bounds, editor_background));
+                    // Paint background to cover any existing text. A single-line field offers its
+                    // suggestion with the caret at the end of the text, where nothing needs
+                    // covering, and the field may not be drawn on the editor background at all.
+                    let at_end = !M::MULTI_LINE && selected_range.end == self.state.read(cx).text.len();
+                    if !at_end {
+                        let bg_bounds = Bounds::new(p, size(first_line.width + px(4.), line_height));
+                        window.paint_quad(fill(bg_bounds, editor_background));
+                    }
 
                     // Paint first line completion text
                     _ = first_line.paint(p, line_height, text_align, None, window, cx);
