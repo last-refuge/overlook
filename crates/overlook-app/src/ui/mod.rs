@@ -2619,6 +2619,9 @@ impl MailWindow {
                     }
                 }
                 this.reload(cx);
+                if outcome.draft_conflicts > 0 {
+                    crate::ui::toast(window, cx, crate::notify::Level::Warning, "A draft changed on another device. Your work was preserved; review Drafts and the Outbox before sending.");
+                }
                 if matches!(outcome.state, Some(SyncState::UpToDate)) && account.id == this.account.id {
                     this.prefetch_attachments(cx);
                 }

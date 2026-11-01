@@ -39,11 +39,19 @@ const DEFAULT_IMAGE_WIDTH: u32 = 240;
 
 /// Takes the signature off `draft`: its HTML, and the images it brought along.
 fn take_off_signature(draft: &mut Draft) {
+    let signature = draft.signature_html.take();
+    let imported_html = draft.imported.as_ref().and_then(|s| s.html.as_deref());
     draft.attachments.retain(|a| {
-        let ours = a.content_id.as_deref().is_some_and(sig::is_signature_content_id);
+        let ours = a.content_id.as_deref().is_some_and(|cid| {
+            sig::is_signature_content_id(cid)
+                && signature.as_deref().is_some_and(|html| overlook_core::compose::embeds_content_id(html, cid))
+                && !imported_html.is_some_and(|html| overlook_core::compose::embeds_content_id(html, cid))
+        });
         if ours {
+            let _ = std::fs::remove_file(&a.local_path);
             if let Some(folder) = std::path::Path::new(&a.local_path).parent() {
-                let _ = std::fs::remove_dir_all(folder);
+                // Imported attachments can share a directory. Only remove it if empty.
+                let _ = std::fs::remove_dir(folder);
             }
         }
         !ours
@@ -390,6 +398,25 @@ mod tests {
         assert_eq!(draft.attachments.iter().map(|a| a.filename.as_str()).collect::<Vec<_>>(), vec!["plan.pdf", "photo.png"]);
         assert_eq!((draft.signature_id, draft.signature_html), (None, None));
         assert!(std::path::Path::new(&kept.local_path).exists() && std::path::Path::new(&forwarded.local_path).exists());
+    }
+
+    #[test]
+    fn removing_a_signature_preserves_imported_images_and_files_in_the_same_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut draft = draft();
+        let imported_html = "<img src=\"cid:sig-original@overlook\">";
+        draft.imported = Some(DraftSource { text: "Imported".into(), html: Some(imported_html.into()), in_reply_to: None, references: Vec::new() });
+        draft.signature_html = Some("<img src=\"cid:sig-current@overlook\">".into());
+        for (name, cid) in [("original.png", Some("sig-original@overlook")), ("current.png", Some("sig-current@overlook")), ("report.pdf", None)] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, PNG).unwrap();
+            draft.attachments.push(DraftAttachment { id: AttachmentId::generate(), filename: name.into(), mime_type: "image/png".into(), size_bytes: PNG.len() as u64, local_path: path.to_string_lossy().into(), content_id: cid.map(str::to_owned) });
+        }
+        take_off_signature(&mut draft);
+        assert_eq!(draft.attachments.len(), 2);
+        assert!(dir.path().join("original.png").exists());
+        assert!(dir.path().join("report.pdf").exists());
+        assert!(!dir.path().join("current.png").exists());
     }
 
     #[test]

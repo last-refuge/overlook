@@ -74,6 +74,7 @@ pub struct GmailClient {
     /// Serializes request/refresh persistence with grant revocation.
     session_lock: Mutex<()>,
     active: AtomicBool,
+    api_base: String,
 }
 
 impl GmailClient {
@@ -91,7 +92,7 @@ impl GmailClient {
             .timeout_global(Some(Duration::from_secs(40)))
             .build()
             .into();
-        Self { config, tokens: Mutex::new(tokens), on_tokens, on_invalidated: None, agent, last_request: Mutex::new(None), session_lock: Mutex::new(()), active: AtomicBool::new(true) }
+        Self { config, tokens: Mutex::new(tokens), on_tokens, on_invalidated: None, agent, last_request: Mutex::new(None), session_lock: Mutex::new(()), active: AtomicBool::new(true), api_base: API_BASE.into() }
     }
 
     pub fn with_on_invalidated(mut self, sink: InvalidationSink) -> Self {
@@ -192,21 +193,28 @@ impl GmailClient {
         }
     }
 
-    fn url(path: &str, query: &[(&str, &str)]) -> String {
-        let mut url = format!("{API_BASE}/{path}");
-        if !query.is_empty() {
-            url.push('?');
-            url.push_str(&query.iter().map(|(k, v)| format!("{k}={}", url_encode(v))).collect::<Vec<_>>().join("&"));
-        }
-        url
-    }
-
     pub fn get(&self, path: &str, query: &[(&str, &str)]) -> Result<serde_json::Value, ApiError> {
-        self.get_url(&Self::url(path, query))
+        self.get_url(&format!("{}/{}{}", self.api_base, path, Self::query_string(query)))
     }
 
     pub fn post(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
-        self.post_url(&Self::url(path, &[]), body)
+        self.post_url(&format!("{}/{path}", self.api_base), body)
+    }
+
+    pub fn put(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
+        self.put_url(&format!("{}/{path}", self.api_base), body)
+    }
+
+    pub fn delete(&self, path: &str) -> Result<serde_json::Value, ApiError> {
+        self.delete_url(&format!("{}/{path}", self.api_base))
+    }
+
+    #[cfg(any(test, feature = "fake-servers"))]
+    pub fn with_test_endpoint(mut self, endpoint: String) -> Self {
+        assert!(endpoint.starts_with("http://127.0.0.1:"));
+        self.api_base = endpoint;
+        self.agent = ureq::Agent::config_builder().http_status_as_error(false).https_only(false).max_redirects(0).timeout_global(Some(Duration::from_secs(5))).build().into();
+        self
     }
 
     /// Whether the stored grant covers calendar access.
@@ -282,7 +290,9 @@ impl GmailClient {
             self.throttle();
             let mut response = request(&token)?;
             let status = response.status().as_u16();
-            let text = response.body_mut().read_to_string().map_err(|e| ApiError::Transport(crate::secure_error::ureq("Google API request", e).into()))?;
+            // Raw draft MIME is base64url inside JSON; ureq's default 10 MB limit
+            // would reject valid attachments well below our outgoing size limit.
+            let text = response.body_mut().with_config().limit(64 * 1024 * 1024).read_to_string().map_err(|e| ApiError::Transport(crate::secure_error::ureq("Google API request", e).into()))?;
             match status {
                 200..=299 => {
                     if text.trim().is_empty() {

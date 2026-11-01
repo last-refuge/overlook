@@ -3,7 +3,7 @@
 //! `INBOX` is always the Inbox. Sent, Trash, Spam and Archive are found by the account's
 //! `ImapPolicy` overrides first, then RFC 6154 SPECIAL-USE attributes, then common names;
 //! the first candidate wins. `\Drafts`, `\Flagged`, `\All`-less `\Important` and other
-//! virtual folders are not mapped (Drafts is a local view). Everything else is a user
+//! virtual folders are not mapped as mail (Drafts has its own synchronization). Everything else is a user
 //! label whose name is the path with the delimiter shown as " / ".
 
 use imap_proto::types::NameAttribute;
@@ -159,13 +159,20 @@ pub fn classify(folders: &[FolderInfo], policy: Option<&ImapPolicy>) -> Vec<(Fol
             continue;
         }
         let virtual_view = matches!(f.special_use().as_deref(), Some("\\Drafts" | "\\Flagged" | "\\Important" | "\\All" | "\\Sent" | "\\Trash" | "\\Junk" | "\\Archive"));
-        let drafts_name = f.near_top() && matches!(f.leaf().as_str(), "drafts" | "draft");
+        let drafts_name = f.near_top() && matches!(f.leaf().as_str(), "drafts" | "draft" | "draft messages");
         if virtual_view || drafts_name {
             continue;
         }
         out.push((f.clone(), LabelKind::User));
     }
     out
+}
+
+/// SPECIAL-USE works for localized and namespaced mailboxes. Common names cover
+/// servers without that extension; never mistake an arbitrary nested folder for Drafts.
+pub fn drafts_folder(folders: &[FolderInfo]) -> Option<&FolderInfo> {
+    folders.iter().find(|f| f.selectable() && f.has("\\Drafts"))
+        .or_else(|| folders.iter().find(|f| f.selectable() && f.near_top() && matches!(f.leaf().as_str(), "draft" | "drafts" | "draft messages")))
 }
 
 pub fn label_id(account: &AccountId, path: &str) -> LabelId {
@@ -239,7 +246,7 @@ mod tests {
         assert!(kinds.contains(&("Trash", LabelKind::Trash)));
         assert!(kinds.contains(&("Junk", LabelKind::Spam)));
         assert!(kinds.contains(&("Archive", LabelKind::Archive)), "name heuristic");
-        assert!(!kinds.iter().any(|(p, _)| *p == "Drafts"), "drafts are a local view");
+        assert!(!kinds.iter().any(|(p, _)| *p == "Drafts"), "drafts synchronize separately from received mail");
         assert!(!kinds.iter().any(|(p, _)| *p == "[Gmail]"), "unselectable containers are skipped");
         assert!(kinds.contains(&("Work/Clients", LabelKind::User)));
         assert!(kinds.contains(&("Deep/Nested/Trash", LabelKind::User)), "names only count near the top");

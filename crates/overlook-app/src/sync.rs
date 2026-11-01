@@ -18,6 +18,7 @@ use tracing::{info, warn};
 pub struct SyncOutcome {
     pub state: Option<SyncState>,
     pub calendar_changes: usize,
+    pub draft_conflicts: usize,
     /// The provider asked us to slow down; the caller should wait longer before retrying.
     pub rate_limited: bool,
     pub applied: usize,
@@ -685,6 +686,24 @@ pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calend
     }
     let _ = store.set_sync_state(&acct, &SyncState::Syncing, None);
 
+    // Reconcile drafts before replaying sends so any persisted, uncertain draft upload
+    // has a known remote identity before the Outbox can remove its local row.
+    let draft_error = match crate::draft_sync::synchronize(&store, provider.as_ref(), &account, &crate::data_dir().join("outgoing")).await {
+        Ok(conflicts) => { outcome.draft_conflicts += conflicts; None }
+        Err(err @ ProviderError::Rejected(_)) => {
+            outcome.failed.push(format!("Drafts: {err}"));
+            Some(state_for(&err))
+        }
+        Err(err) => {
+            let state = state_for(&err);
+            store.set_sync_state(&acct, &state, None).ok();
+            outcome.rate_limited = matches!(err, ProviderError::RateLimited(_));
+            outcome.stopped_offline = matches!(err, ProviderError::Offline);
+            outcome.state = Some(state);
+            return outcome;
+        }
+    };
+
     // What the user already did goes to the server first, so an archive or a send does not
     // wait behind a download. Anything queued meanwhile goes in the pass after it.
     let pre_state = if store.pending_count(&acct).unwrap_or(0) > 0 {
@@ -714,7 +733,7 @@ pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calend
     }
     sync_contacts(&store, provider.as_ref(), &account).await;
 
-    let final_state = if pre_state == SyncState::UpToDate {
+    let mut final_state = if pre_state == SyncState::UpToDate {
         replay_operations(&store, &provider, &calendar, &account, &mut outcome).await
     } else {
         pre_state
@@ -728,6 +747,14 @@ pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calend
         let _ = store.delete_messages(&gone);
     }
 
+    if let Err(err) = crate::draft_sync::flush_deletions(&store, provider.as_ref(), &account).await {
+        outcome.rate_limited |= matches!(err, ProviderError::RateLimited(_));
+        outcome.stopped_offline |= matches!(err, ProviderError::Offline);
+        final_state = state_for(&err);
+    }
+    if final_state == SyncState::UpToDate {
+        if let Some(state) = draft_error { final_state = state; }
+    }
     let success_at = if final_state == SyncState::UpToDate { Some(now()) } else { None };
     let _ = store.set_sync_state(&acct, &final_state, success_at);
     let _ = store.prune_applied(now() - 7 * 86_400_000);

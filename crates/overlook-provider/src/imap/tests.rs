@@ -81,6 +81,83 @@ fn pid(folder: &str, uidvalidity: u32, uid: u32) -> ProviderId {
 }
 
 #[test]
+fn drafts_round_trip_localized_mailboxes_and_recover_lost_append_replies() {
+    let mut state = mailbox();
+    // IMAP4rev1 mailbox names use modified UTF-7 on the wire (Entwürfe).
+    state.folder_mut("Drafts").path = "INBOX.Entw&APw-rfe".into();
+    let server = serve(state);
+    let p = provider(&server);
+    let account = account();
+    block(p.probe()).unwrap();
+    let raw = |token: &str, body: &str| format!("From: jason@example.com\r\nMessage-ID: <{token}@example.com>\r\nSubject: Draft\r\n\r\n{body}").into_bytes();
+    server.state.lock().unwrap().drop_after_next = Some("APPEND".into());
+    let result = block(p.put_draft(&account, None, &raw("draft-first", "First"), "<draft-first@example.com>", None));
+    assert!(result.is_ok(), "{result:?}; commands: {:?}", server.lock().log);
+    let first = result.unwrap().unwrap();
+    assert_eq!(server.state.lock().unwrap().commands("APPEND"), 1, "lost APPEND response must be reconciled before retry");
+    let first_ref = MessageRef::parse(&first.id).unwrap();
+    assert_eq!(first_ref.folder, "INBOX.Entw&APw-rfe");
+    assert!(server.state.lock().unwrap().folder(&first_ref.folder).messages[&first_ref.uid].has_flag("\\Draft"));
+    assert_eq!(block(p.list_drafts(&account)).unwrap(), vec![first.clone()]);
+    assert!(String::from_utf8(block(p.fetch_draft(&account, &first)).unwrap().unwrap()).unwrap().contains("First"));
+    let second = block(p.put_draft(&account, Some(&first), &raw("draft-edit", "Edited"), "<draft-edit@example.com>", None)).unwrap().unwrap();
+    assert_ne!(second.id, first.id);
+    assert_eq!(block(p.list_drafts(&account)).unwrap(), vec![second.clone()]);
+    assert!(block(p.fetch_draft(&account, &first)).unwrap().is_none());
+    assert_eq!(block(p.put_draft(&account, Some(&first), &raw("draft-edit", "Edited"), "<draft-edit@example.com>", None)).unwrap(), Some(second.clone()));
+    assert!(block(p.put_draft(&account, Some(&first), &raw("stale", "Stale"), "<stale@example.com>", None)).unwrap().is_none());
+    block(p.delete_remote_draft(&account, &second)).unwrap();
+    block(p.delete_remote_draft(&account, &second)).unwrap();
+    assert!(block(p.list_drafts(&account)).unwrap().is_empty());
+}
+
+#[test]
+fn draft_deletion_without_uidplus_does_not_expunge_other_clients_messages() {
+    let mut state = mailbox();
+    state.capabilities = "IMAP4rev1".into();
+    let unrelated = state.folder_mut("Drafts").add(FakeMessage::new(&["\\Deleted"], "14-Oct-2026 12:00:00 +0000", msg(&["Message-ID: <unrelated@example.com>"], "Other client's deletion")));
+    let server = serve(state);
+    let p = provider(&server);
+    let account = account();
+    let raw = msg(&["From: jason@example.com", "Message-ID: <no-uidplus@example.com>"], "Draft body");
+    let saved = block(p.put_draft(&account, None, &raw, "<no-uidplus@example.com>", None)).unwrap().unwrap();
+    block(p.delete_remote_draft(&account, &saved)).unwrap();
+    assert!(block(p.list_drafts(&account)).unwrap().is_empty());
+    let state = server.state.lock().unwrap();
+    assert!(state.folder("Drafts").messages.contains_key(&unrelated));
+    assert_eq!(state.commands("EXPUNGE"), 0);
+}
+
+#[test]
+fn draft_folder_creation_and_uidvalidity_reset_are_safe() {
+    let mut state = mailbox();
+    state.folders.retain(|f| f.path != "Drafts");
+    let server = serve(state);
+    let p = provider(&server);
+    let account = account();
+    assert!(block(p.list_drafts(&account)).unwrap().is_empty());
+    let raw = msg(&["From: jason@example.com", "Message-ID: <created-folder@example.com>"], "Draft body");
+    let saved = block(p.put_draft(&account, None, &raw, "<created-folder@example.com>", None)).unwrap().unwrap();
+    assert!(server.state.lock().unwrap().has_folder("Drafts"));
+    server.state.lock().unwrap().folder_mut("Drafts").uidvalidity += 1;
+    assert!(block(p.fetch_draft(&account, &saved)).unwrap().is_none());
+    block(p.delete_remote_draft(&account, &saved)).unwrap();
+    assert_eq!(block(p.list_drafts(&account)).unwrap().len(), 1, "stale UIDs must never delete the new mailbox's messages");
+}
+
+#[test]
+fn draft_flags_do_not_leak_unsent_messages_into_regular_mail() {
+    let mut state = mailbox();
+    let uid = state.folder_mut("INBOX").add(FakeMessage::new(&["\\Draft"], "14-Oct-2026 12:00:00 +0000", msg(&["From: jason@example.com", "Subject: Not sent", "Message-ID: <unsent@example.com>"], "Draft body")));
+    let server = serve(state);
+    let p = provider(&server);
+    let account = account();
+    let snapshot = block(p.fetch_snapshot(&account)).unwrap();
+    let messages = block(p.fetch_messages(&account, &[pid("INBOX", 1760400000, uid)], &snapshot.labels)).unwrap();
+    assert!(messages.is_empty());
+}
+
+#[test]
 fn snapshot_maps_folders_and_queues_newest_messages() {
     let server = serve(mailbox());
     let p = provider(&server);

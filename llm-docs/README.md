@@ -5,6 +5,7 @@ Overlook is a native Linux mail client in Rust, with an Outlook-inspired workflo
 - [Session handoff](session-handoff.md): comprehensive context and the recommended continuation milestone for another session.
 - [Foundation implementation plan](foundation-implementation-plan.md): validated technical foundation (Rust + GPUI), tradeoffs, workspace rules, milestone sequence, and status log.
 - [Native app guide](overlook-native-app.md): building, running, testing, architecture, keyboard shortcuts, and known gaps of the GPUI application in `crates/`.
+- [Draft synchronization](draft-sync.md): two-way Gmail/IMAP drafts, conflicts, durable uploads/deletions, MIME attachments, and retry recovery.
 - [Product and implementation plan](native-linux-mail-client-plan.md): phased provider support, architecture, offline synchronization, Light/Dark theming, and release criteria.
 - [IMAP and POP3 implementation plan](imap-pop3-implementation-plan.md): phase 2 and 3 design fitted to the current provider trait, sync engine, store, and settings UI; milestones M0 to M5.
 - [Calendars for IMAP accounts](imap-calendar-implementation-plan.md): Fastmail-first CalDAV discovery and setup, independent calendar sync, offline edits, recurrence and conflicts, with a follow-up for invitations and RSVP.

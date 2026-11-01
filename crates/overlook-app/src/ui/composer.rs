@@ -34,6 +34,7 @@ fn reveal_offset(offset: Pixels, top: Pixels, height: Pixels, viewport: Pixels, 
 }
 
 pub struct Composer {
+    _edit_guard: overlook_store::DraftEditGuard,
     pub draft: Draft,
     pub to: Entity<InputState>,
     pub cc: Entity<InputState>,
@@ -74,9 +75,13 @@ impl Composer {
 
 impl MailWindow {
     /// Opens the composer for `draft`, creating the input entities and autosave wiring.
-    pub(super) fn open_composer(&mut self, draft: Draft, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_composer(&mut self, mut draft: Draft, window: &mut Window, cx: &mut Context<Self>) {
         crate::watchdog::mark("open composer");
         self.close_composer(window, cx);
+        let edit_guard = self.store.edit_draft(&draft.id);
+        let saved = self.store.draft(&draft.id).ok().flatten();
+        let last_saved = saved.as_ref().map(|d| d.updated_at);
+        if let Some(saved) = saved { draft = saved; }
         let join = |list: &[Address]| list.iter().map(Address::to_header).collect::<Vec<_>>().join(", ");
         let to = cx.new(|cx| InputState::new(window, cx).placeholder("Recipients").default_value(join(&draft.to)));
         let cc = cx.new(|cx| InputState::new(window, cx).placeholder("Cc").default_value(join(&draft.cc)));
@@ -139,6 +144,7 @@ impl MailWindow {
         let show_cc = !draft.cc.is_empty();
         let show_bcc = !draft.bcc.is_empty();
         self.composer = Some(Composer {
+            _edit_guard: edit_guard,
             draft,
             to: to.clone(),
             cc,
@@ -152,7 +158,7 @@ impl MailWindow {
             show_cc,
             show_bcc,
             dirty: false,
-            last_saved: None,
+            last_saved,
             save_generation: 0,
             suggestions: Vec::new(),
             recipient_query: None,
@@ -257,6 +263,7 @@ impl MailWindow {
         c.error = None;
         c.save_generation += 1;
         let generation = c.save_generation;
+        let draft_id = c.draft.id.clone();
 
         self.refresh_recipient_suggestions(window, cx);
         cx.notify();
@@ -264,9 +271,9 @@ impl MailWindow {
         // Debounced durable autosave.
         cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(700)).await;
-            let _ = this.update_in(cx, |this, _window, cx| {
-                if this.composer.as_ref().is_some_and(|c| c.save_generation == generation && c.dirty) {
-                    this.autosave_composer(generation, cx);
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.composer.as_ref().is_some_and(|c| c.draft.id == draft_id && c.save_generation == generation && c.dirty) {
+                    this.autosave_composer(generation, window, cx);
                 }
             });
         })
@@ -335,18 +342,19 @@ impl MailWindow {
     /// The idle autosave: the write (a durable transaction that may wait for a sync's
     /// write) runs off the UI thread, so typing never hitches. "Saved" shows only after it
     /// commits, and only if nothing was typed meanwhile.
-    fn autosave_composer(&mut self, generation: u64, cx: &mut Context<Self>) {
+    fn autosave_composer(&mut self, generation: u64, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_composer_fields(cx);
         let Some(c) = self.composer.as_ref() else { return };
         if c.draft.is_empty() && c.last_saved.is_none() {
             return;
         }
         let draft = c.draft.clone();
+        let draft_id = draft.id.clone();
         let store = self.store.clone();
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let result = cx.background_spawn(async move { store.save_editing_draft(&draft).map(|_| ()) }).await;
-            let _ = this.update(cx, |this, cx| {
-                let Some(c) = this.composer.as_mut() else { return };
+            let _ = this.update_in(cx, |this, window, cx| {
+                let Some(c) = this.composer.as_mut().filter(|c| c.draft.id == draft_id) else { return };
                 match result {
                     Ok(()) if c.save_generation == generation => {
                         c.dirty = false;
@@ -356,6 +364,7 @@ impl MailWindow {
                     Err(e) => c.error = Some(format!("Couldn’t save on this device: {e}")),
                 }
                 this.reload_drafts();
+                this.schedule_draft_sync(window, cx);
                 cx.notify();
             });
         })
@@ -363,7 +372,7 @@ impl MailWindow {
     }
 
     /// Writes the draft to the store. Only after this succeeds does the UI say it is saved.
-    pub(super) fn save_composer(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> bool {
+    pub(super) fn save_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         self.sync_composer_fields(cx);
         let Some(c) = self.composer.as_mut() else { return false };
         if c.draft.is_empty() && c.last_saved.is_none() {
@@ -374,6 +383,7 @@ impl MailWindow {
                 c.dirty = false;
                 c.last_saved = Some(now());
                 self.reload_drafts();
+                self.schedule_draft_sync(window, cx);
                 cx.notify();
                 true
             }
@@ -407,6 +417,7 @@ impl MailWindow {
                 }
             }
             self.list_focus.focus(window, cx);
+            self.schedule_draft_sync(window, cx);
             cx.notify();
         }
     }
@@ -422,8 +433,27 @@ impl MailWindow {
             self.reload_drafts();
             crate::ui::toast(window, cx, crate::notify::Level::Info, "Draft discarded.");
             self.list_focus.focus(window, cx);
+            self.schedule_draft_sync(window, cx);
             cx.notify();
         }
+    }
+
+    /// Wait for a pause in typing before syncing saved drafts. The account's normal
+    /// rate-limit/offline backoff and single-flight sync still apply.
+    fn schedule_draft_sync(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.account.provider, ProviderKind::Gmail | ProviderKind::Imap) { return; }
+        let account = self.account.id.clone();
+        let editor = self.composer.as_ref().map(|c| (c.draft.id.clone(), c.save_generation));
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(1500)).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if !this.connected(&account) || this.next_retry.get(&account).is_some_and(|t| *t > now()) { return; }
+                if let (Some((id, generation)), Some(current)) = (&editor, &this.composer) {
+                    if current.draft.id == *id && current.save_generation != *generation { return; }
+                }
+                this.sync_account(account.clone(), window, cx);
+            });
+        }).detach();
     }
 
     pub(super) fn send_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {

@@ -13,19 +13,39 @@ fn mailbox(address: &Address) -> Result<Mailbox, String> {
 
 /// Returns the raw message bytes. `rfc_id` is the Message-ID (with angle brackets).
 pub fn build_raw(account: &Account, draft: &Draft, in_reply_to: Option<&Message>, rfc_id: &str) -> Result<Vec<u8>, String> {
+    build_message(account, draft, in_reply_to, rfc_id, false, false)
+}
+
+/// Gmail derives its envelope from MIME headers, including Bcc.
+pub fn build_gmail_raw(account: &Account, draft: &Draft, in_reply_to: Option<&Message>, rfc_id: &str) -> Result<Vec<u8>, String> {
+    build_message(account, draft, in_reply_to, rfc_id, false, true)
+}
+
+/// Drafts may have no recipient yet, or an unfinished recipient. The artificial SMTP
+/// envelope satisfies lettre's send-time checks but is never serialized or submitted.
+pub fn build_draft_raw(account: &Account, draft: &Draft, in_reply_to: Option<&Message>, rfc_id: &str) -> Result<Vec<u8>, String> {
+    build_message(account, draft, in_reply_to, rfc_id, true, true)
+}
+
+fn build_message(account: &Account, draft: &Draft, in_reply_to: Option<&Message>, rfc_id: &str, editing: bool, keep_bcc: bool) -> Result<Vec<u8>, String> {
     let mut builder = MimeMessage::builder()
         .from(mailbox(&Address::named(&account.display_name, &account.email))?)
         .subject(draft.subject.clone())
         .message_id(Some(rfc_id.to_owned()))
         .user_agent("Overlook".to_owned());
-    for a in &draft.to {
-        builder = builder.to(mailbox(a)?);
-    }
-    for a in &draft.cc {
-        builder = builder.cc(mailbox(a)?);
-    }
-    for a in &draft.bcc {
-        builder = builder.bcc(mailbox(a)?);
+    if keep_bcc { builder = builder.keep_bcc(); }
+    if editing {
+        use lettre::message::header::{HeaderName, HeaderValue};
+        builder = builder.envelope(lettre::address::Envelope::new(None, vec!["draft@invalid.example".parse().map_err(|e| format!("{e}"))?]).map_err(|e| e.to_string())?).keep_bcc();
+        for (name, addresses) in [("To", &draft.to), ("Cc", &draft.cc), ("Bcc", &draft.bcc)] {
+            if !addresses.is_empty() {
+                builder = builder.raw_header(HeaderValue::new(HeaderName::new_from_ascii_str(name), addresses.iter().map(Address::to_header).collect::<Vec<_>>().join(", ")));
+            }
+        }
+    } else {
+        for a in &draft.to { builder = builder.to(mailbox(a)?); }
+        for a in &draft.cc { builder = builder.cc(mailbox(a)?); }
+        for a in &draft.bcc { builder = builder.bcc(mailbox(a)?); }
     }
     if let Some(source) = in_reply_to {
         if let Some(id) = &source.rfc_message_id {
@@ -36,6 +56,9 @@ pub fn build_raw(account: &Account, draft: &Draft, in_reply_to: Option<&Message>
             };
             builder = builder.references(references);
         }
+    } else if let Some(original) = &draft.imported {
+        if let Some(id) = &original.in_reply_to { builder = builder.in_reply_to(id.clone()); }
+        if !original.references.is_empty() { builder = builder.references(original.references.join(" ")); }
     }
     let bodies = overlook_core::compose::outgoing_bodies(draft, in_reply_to);
     let text = if bodies.text.is_empty() { "\n".to_owned() } else { bodies.text };
@@ -115,6 +138,29 @@ pub fn message_to_raw(message: &Message) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drafts_allow_unfinished_recipients_and_keep_bcc_and_original_html() {
+        let account = Account { id: AccountId::from("draft-test"), provider: ProviderKind::Gmail, display_name: "Test".into(), email: "me@example.com".into(), created_at: 0 };
+        let mut draft = Draft::new(account.id.clone(), DraftKind::New, 0);
+        draft.body_text = "literal **text**".into();
+        draft.imported = Some(DraftSource { text: draft.body_text.clone(), html: Some("<p>literal <b>**text**</b></p>".into()), in_reply_to: Some("<parent@example.com>".into()), references: vec!["<parent@example.com>".into()] });
+        let raw = build_draft_raw(&account, &draft, None, "<draft@example.com>").unwrap();
+        let parsed = mail_parser::MessageParser::default().parse(&raw).unwrap();
+        assert!(parsed.to().is_none());
+        assert_eq!(parsed.body_text(0).unwrap(), "literal **text**");
+        assert!(parsed.body_html(0).unwrap().contains("<b>**text**</b>"));
+        draft.to = vec![Address::new(None, "unfinished")];
+        draft.bcc = vec![Address::new(None, "hidden@example.com")];
+        let raw = build_draft_raw(&account, &draft, None, "<draft@example.com>").unwrap();
+        let text = String::from_utf8(raw).unwrap();
+        assert!(text.contains("To: unfinished\r\n"));
+        assert!(text.contains("Bcc: hidden@example.com\r\n"));
+        assert!(text.contains("In-Reply-To: <parent@example.com>"));
+        draft.to = vec![Address::new(None, "friend@example.com")];
+        assert!(String::from_utf8(build_gmail_raw(&account, &draft, None, "<sent@example.com>").unwrap()).unwrap().contains("Bcc: hidden@example.com"));
+        assert!(!String::from_utf8(build_raw(&account, &draft, None, "<sent@example.com>").unwrap()).unwrap().contains("Bcc:"));
+    }
 
     fn decoded_part(raw: &str, mime: &str) -> String {
         let start = raw.find(&format!("Content-Type: {mime}")).expect("MIME alternative");

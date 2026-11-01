@@ -195,8 +195,9 @@ pub struct OutgoingBodies {
 /// asks for it. Replies get an attribution line and a blockquote; forwards get a header block
 /// and the original in full.
 pub fn outgoing_bodies(draft: &Draft, source: Option<&Message>) -> OutgoingBodies {
-    let mut text = markdown_to_plain(&draft.body_text);
-    let mut html = render_markdown(&draft.body_text);
+    let original = draft.imported.as_ref().filter(|s| s.text == draft.body_text);
+    let mut text = original.map_or_else(|| markdown_to_plain(&draft.body_text), |s| s.text.clone());
+    let mut html = original.map_or_else(|| render_markdown(&draft.body_text), |s| s.html.as_deref().map(|h| clean_only(h, RemoteContent::Allowed)).unwrap_or_else(|| text_to_html(&s.text)));
     // The signature goes under what was written and above the quoted message. Its plain-text
     // form follows the "-- " line that mail readers know to fold away.
     if let Some(signature) = draft.signature_html.as_deref().filter(|s| !s.trim().is_empty()) {

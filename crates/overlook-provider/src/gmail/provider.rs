@@ -2,7 +2,7 @@
 
 use super::api::{ApiError, GmailClient};
 use super::mapping::{self, base64url_encode, gmail_id, label_from_json, message_from_json};
-use crate::outgoing::build_raw;
+use crate::outgoing::build_gmail_raw as build_raw;
 use crate::{draft_message_id, AppliedChanges, BoxFuture, MailProvider, MailboxSnapshot, ProviderError, RemoteChanges, SendContext, SendOutcome, SentReceipt};
 use overlook_core::time::Timestamp;
 use overlook_core::*;
@@ -168,6 +168,27 @@ impl GmailProvider {
 impl MailProvider for GmailProvider {
     fn kind(&self) -> ProviderKind {
         ProviderKind::Gmail
+    }
+
+    fn supports_drafts(&self) -> bool { true }
+
+    fn list_drafts(&self, _account: &Account) -> BoxFuture<'_, Result<Vec<RemoteDraft>, ProviderError>> {
+        Box::pin(async move { super::drafts::list(&self.client) })
+    }
+
+    fn fetch_draft(&self, _account: &Account, remote: &RemoteDraft) -> BoxFuture<'_, Result<Option<Vec<u8>>, ProviderError>> {
+        let remote = remote.clone();
+        Box::pin(async move { super::drafts::fetch(&self.client, &remote) })
+    }
+
+    fn put_draft(&self, _account: &Account, remote: Option<&RemoteDraft>, raw: &[u8], message_id: &str, thread_id: Option<&str>) -> BoxFuture<'_, Result<Option<RemoteDraft>, ProviderError>> {
+        let (remote, raw, message_id, thread_id) = (remote.cloned(), raw.to_vec(), message_id.to_owned(), thread_id.map(str::to_owned));
+        Box::pin(async move { super::drafts::put(&self.client, remote.as_ref(), &raw, &message_id, thread_id.as_deref()) })
+    }
+
+    fn delete_remote_draft(&self, _account: &Account, remote: &RemoteDraft) -> BoxFuture<'_, Result<(), ProviderError>> {
+        let remote = remote.clone();
+        Box::pin(async move { super::drafts::delete(&self.client, &remote) })
     }
 
     fn probe(&self) -> BoxFuture<'_, Result<(), ProviderError>> {
@@ -552,7 +573,14 @@ impl MailProvider for GmailProvider {
                     body["threadId"] = Value::String(thread);
                 }
             }
-            let response = match self.client.post("messages/send", &body) {
+            if body.get("threadId").is_none() {
+                if let Some(thread) = draft.conversation_id.as_ref().and_then(|id| gmail_id(&account.id, id.as_str())) { body["threadId"] = json!(thread); }
+            }
+            let (endpoint, request) = match &draft.provider_id {
+                Some(id) => ("drafts/send", json!({"id": id.0, "message": body})),
+                None => ("messages/send", body),
+            };
+            let response = match self.client.post(endpoint, &request) {
                 Ok(v) => v,
                 // A transport failure after the request left this machine is not a clean
                 // failure: Gmail may have accepted the message.

@@ -90,6 +90,8 @@ pub fn message_from_json(account: &Account, v: &Value, labels: &HashMap<String, 
         .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect())
         .unwrap_or_default();
     let has = |name: &str| label_ids_raw.iter().any(|l| l == name);
+    // Editable drafts are synchronized separately; never turn them into received mail.
+    if has("DRAFT") { return None; }
 
     let payload = v.get("payload");
     let headers = payload.and_then(|p| p.get("headers")).and_then(|h| h.as_array());

@@ -48,6 +48,8 @@ and you can read, search, write, and file mail with no connection at all.
   recipients get, and the quoted original kept out of your way below the reply. Like Gmail, Overlook does not
   send programs, scripts, or installers (`.exe`, `.msi`, `.sh`, `.desktop`, `.AppImage` and similar), files whose
   content is one under another name, or `.zip`/`.tar` archives containing them.
+- **Drafts across devices.** Gmail and IMAP drafts sync both ways, including attachments and inline images.
+  Offline changes wait for a connection; conflicting edits are preserved as separate drafts. POP3 drafts stay local.
 - **A calendar, not an afterthought.** Day, Week, Month, and Agenda. Invitations with Accept, Tentative, and
   Decline, from the calendar or from the email itself. Create, edit, and delete events, drag them to move or
   resize, edit one occurrence of a repeating event or the whole series, invite guests and check whether they

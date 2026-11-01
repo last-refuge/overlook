@@ -58,6 +58,7 @@ mod tests;
 
 use crate::mime::{headers_from_rfc822, message_from_rfc822, MessageFlags};
 use crate::{build_raw, draft_message_id, smtp, AppliedChanges, BoxFuture, MailProvider, MailboxSnapshot, ProviderError, RemoteChanges, SendContext, SendOutcome, SentReceipt};
+mod drafts;
 use connection::{map_error, Session};
 use folders::FolderInfo;
 use imap::types::{Flag, UnsolicitedResponse};
@@ -591,6 +592,7 @@ impl ImapProvider {
         for chunk in uidset::chunks(uids, FETCH_CHUNK / 4) {
             let fetches = conn.session().uid_fetch(&chunk, "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER])").map_err(|e| map_error(&e))?;
             for f in fetches.iter() {
+                if f.flags().contains(&Flag::Draft) { continue; }
                 let Some(uid) = f.uid else { continue };
                 if f.flags().contains(&Flag::Seen) {
                     seen.insert(uid);
@@ -614,8 +616,9 @@ impl ImapProvider {
         let mut out = Vec::new();
         let mut sizes: HashMap<u32, u32> = HashMap::new();
         for chunk in uidset::chunks(uids, FETCH_CHUNK) {
-            let fetches = conn.session().uid_fetch(&chunk, "(UID RFC822.SIZE)").map_err(|e| map_error(&e))?;
+            let fetches = conn.session().uid_fetch(&chunk, "(UID FLAGS RFC822.SIZE)").map_err(|e| map_error(&e))?;
             for f in fetches.iter() {
+                if f.flags().contains(&Flag::Draft) { continue; }
                 if let Some(uid) = f.uid {
                     sizes.insert(uid, f.size.unwrap_or(0));
                 }
@@ -627,6 +630,7 @@ impl ImapProvider {
             let fetches = conn.session().uid_fetch(&chunk, "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[])").map_err(|e| map_error(&e))?;
             for f in fetches.iter() {
                 let (Some(uid), Some(body)) = (f.uid, f.body()) else { continue };
+                if f.flags().contains(&Flag::Draft) { continue; }
                 let flags = Self::flags_of(f, &label, MessageRef::provider_id(path, uidvalidity, uid));
                 out.push(message_from_rfc822(account, body, Self::local_id(account), &flags));
             }
@@ -642,6 +646,7 @@ impl ImapProvider {
     fn fetch_large(conn: &mut Conn, account: &Account, path: &str, uidvalidity: u32, uid: u32, label: &LabelId) -> Result<Option<Message>, ProviderError> {
         let fetches = conn.session().uid_fetch(uid.to_string(), "(UID FLAGS INTERNALDATE RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER])").map_err(|e| map_error(&e))?;
         let Some(f) = fetches.iter().find(|f| f.uid == Some(uid)) else { return Ok(None) };
+        if f.flags().contains(&Flag::Draft) { return Ok(None); }
         let header = f.header().unwrap_or_default().to_vec();
         let flags = Self::flags_of(f, label, MessageRef::provider_id(path, uidvalidity, uid));
         let Some(bs) = f.bodystructure() else {
@@ -1447,6 +1452,26 @@ pub fn decode_part(mime_headers: &[u8], body: &[u8]) -> Vec<u8> {
 }
 
 impl MailProvider for ImapProvider {
+    fn supports_drafts(&self) -> bool { true }
+
+    fn list_drafts(&self, _account: &Account) -> BoxFuture<'_, Result<Vec<RemoteDraft>, ProviderError>> {
+        Box::pin(async move { self.draft_listing() })
+    }
+
+    fn fetch_draft(&self, _account: &Account, remote: &RemoteDraft) -> BoxFuture<'_, Result<Option<Vec<u8>>, ProviderError>> {
+        let remote = remote.clone();
+        Box::pin(async move { self.draft_content(&remote) })
+    }
+
+    fn put_draft(&self, _account: &Account, remote: Option<&RemoteDraft>, raw: &[u8], message_id: &str, _thread_id: Option<&str>) -> BoxFuture<'_, Result<Option<RemoteDraft>, ProviderError>> {
+        let (remote, raw, message_id) = (remote.cloned(), raw.to_vec(), message_id.to_owned());
+        Box::pin(async move { self.write_draft(remote.as_ref(), &raw, &message_id) })
+    }
+
+    fn delete_remote_draft(&self, _account: &Account, remote: &RemoteDraft) -> BoxFuture<'_, Result<(), ProviderError>> {
+        let remote = remote.clone();
+        Box::pin(async move { self.remove_draft(&remote) })
+    }
     fn kind(&self) -> ProviderKind {
         ProviderKind::Imap
     }

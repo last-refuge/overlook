@@ -16,6 +16,7 @@ mod single_instance;
 mod updater;
 mod providers;
 mod sync;
+mod draft_sync;
 mod theme;
 mod ui;
 

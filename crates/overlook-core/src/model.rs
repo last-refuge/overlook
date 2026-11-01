@@ -551,6 +551,24 @@ impl DraftAttachment {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftSource {
+    /// Original body of an imported draft. Preserve its HTML until the text is edited.
+    pub text: String,
+    pub html: Option<String>,
+    pub in_reply_to: Option<String>,
+    pub references: Vec<String>,
+}
+
+/// A server draft and its content version. IMAP identifies versions by mailbox,
+/// UIDVALIDITY and UID; Gmail keeps the draft id while changing the message id.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteDraft {
+    pub id: ProviderId,
+    pub revision: String,
+    pub thread_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Draft {
     pub id: DraftId,
     pub account_id: AccountId,
@@ -565,6 +583,8 @@ pub struct Draft {
     /// The HTML rendering of `body_text`, which is Markdown-flavoured. Theme changes must
     /// never rewrite this.
     pub body_html: Option<String>,
+    #[serde(default)]
+    pub imported: Option<DraftSource>,
     /// Whether the message this replies to or forwards is appended below the body when sent
     /// (and shown, collapsed, in the composer). The quoted text is not part of `body_text`.
     #[serde(default)]
@@ -581,7 +601,7 @@ pub struct Draft {
     pub state: DraftState,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
-    /// Set when the provider has a copy of this draft (Gmail draft id).
+    /// The Gmail draft id or IMAP mailbox/UIDVALIDITY/UID of its server copy.
     pub provider_id: Option<ProviderId>,
 }
 
@@ -599,6 +619,7 @@ impl Draft {
             subject: String::new(),
             body_text: String::new(),
             body_html: None,
+            imported: None,
             include_quote: false,
             signature_id: None,
             signature_html: None,
@@ -669,7 +690,10 @@ impl Draft {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.to.is_empty()
+        // A server draft is intentional even if blank or containing only inline HTML.
+        // Opening and closing one must never discard it automatically.
+        self.imported.is_none()
+            && self.to.is_empty()
             && self.cc.is_empty()
             && self.bcc.is_empty()
             && self.subject.trim().is_empty()
