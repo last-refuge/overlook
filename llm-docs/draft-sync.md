@@ -1,6 +1,6 @@
 # Gmail and IMAP draft synchronization
 
-Implemented in the working 1.6.9 tree on 2026-11-01. Schema version 19.
+Released in [Overlook 1.6.9](https://github.com/last-refuge/overlook/releases/tag/v1.6.9) on 2026-11-01, commit `3f0b8f1`. Schema version 19. The working version after release is 1.6.10.
 
 ## Behavior
 
@@ -37,3 +37,5 @@ Protocol references: [Gmail draft lifecycle](https://developers.google.com/works
 No real account is mutated by these tests. Live Gmail/IMAP and native UI testing are still needed before claiming validation against production accounts.
 
 Final local checks on 2026-11-01: `cargo test --workspace --locked --no-fail-fast` passed 470 tests, with 33 ignored; `cargo clippy --workspace --all-targets --locked` completed with existing warnings and none in changed code. New Rust modules pass rustfmt checks, and `git diff --check` passes. Signature cleanup also has a regression test ensuring it cannot remove imported draft attachments that share a directory.
+
+Release verification: [the 1.6.9 release workflow](https://github.com/last-refuge/overlook/actions/runs/41357785312) passed package publication and the supply-chain scan. The downloaded pacman package and generic tarball match the published SHA-256 sums, both binaries report 1.6.9, and the public latest-release endpoint and installer dry-run select this release.
