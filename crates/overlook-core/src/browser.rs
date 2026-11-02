@@ -59,6 +59,15 @@ pub fn prepare_document_with_colors(
 }
 
 fn prepare_document_with_defaults(source: &str, defaults: &str) -> BrowserDocument {
+    let Some(dom) = parse_bounded_document(source) else {
+        return preparation_error(defaults);
+    };
+    prepare_dom(dom, defaults)
+}
+
+/// Shared with display-only thread history folding. Every parser entry point
+/// uses the same allocation, depth, and node limits as the browser sanitizer.
+pub(crate) fn parse_bounded_document(source: &str) -> Option<RcDom> {
     // Count every '<', including comments/text, as a conservative allocation
     // bound before invoking the HTML parser. Do not copy or echo rejected input.
     if source.len() > MAX_SOURCE_BYTES
@@ -69,12 +78,16 @@ fn prepare_document_with_defaults(source: &str, defaults: &str) -> BrowserDocume
             .count()
             > MAX_TAG_STARTS
     {
-        return preparation_error(defaults);
+        return None;
     }
     let dom = parse_document(RcDom::default(), ParseOpts::default()).one(source);
     if !dom_within_limits(&dom.document) {
-        return preparation_error(defaults);
+        return None;
     }
+    Some(dom)
+}
+
+fn prepare_dom(dom: RcDom, defaults: &str) -> BrowserDocument {
     let mut styles = String::new();
     prepare_nodes(&dom.document, false, &mut styles);
     // Only the parser's actual document roots may supply root attributes. No

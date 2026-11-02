@@ -46,7 +46,7 @@ use overlook_core::*;
 use overlook_provider::sample::SampleProvider;
 use overlook_store::{LocalChange, ListFilter, MailIndex, MailboxView, Store};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -484,6 +484,11 @@ pub struct MailWindow {
     selected: Option<ConversationId>,
     outbox_selected: Option<DraftId>,
     thread: Vec<Message>,
+    thread_history: HashMap<MessageId, String>,
+    thread_history_generation: Arc<AtomicU64>,
+    thread_history_task: Option<Task<()>>,
+    thread_history_pending: bool,
+    live_browser_messages: std::cell::RefCell<HashSet<String>>,
     expanded: BTreeSet<MessageId>,
     remote_allowed: BTreeSet<MessageId>,
     /// The message whose sender's contact card is open.
@@ -713,6 +718,11 @@ impl MailWindow {
             selected: None,
             outbox_selected: None,
             thread: Vec::new(),
+            thread_history: HashMap::new(),
+            thread_history_generation: Arc::new(AtomicU64::new(0)),
+            thread_history_task: None,
+            thread_history_pending: false,
+            live_browser_messages: Default::default(),
             expanded: BTreeSet::new(),
             remote_allowed: BTreeSet::new(),
             quick_look: None,
@@ -813,7 +823,7 @@ impl MailWindow {
         if this.selected.is_none() {
             if let Some(first) = this.conversations.first().map(|c| c.id.clone()) {
                 this.selected = Some(first);
-                this.load_thread();
+                this.load_thread(cx);
             }
         }
         this.focus_current_module(window, cx);
@@ -966,7 +976,7 @@ impl MailWindow {
         }
         self.reload(cx);
         self.selected = self.conversations.first().map(|c| c.id.clone());
-        self.load_thread();
+        self.load_thread(cx);
         self.focus_current_module(window, cx);
         if self.module == Module::Calendar { self.ensure_caldav_range(cx); }
         cx.notify();
@@ -1380,7 +1390,7 @@ impl MailWindow {
         self.refresh_mail();
         self.reload_drafts();
         self.status = self.store.account_status(&acct).unwrap_or_default();
-        self.load_thread();
+        self.load_thread(cx);
         self.reload_calendar();
         self.reload_contacts();
         cx.notify();
@@ -1489,13 +1499,16 @@ impl MailWindow {
         }
     }
 
-    fn load_thread(&mut self) {
-        self.thread = match &self.selected {
+    fn load_thread(&mut self, cx: &mut Context<Self>) {
+        let thread = match &self.selected {
             Some(id) => self.store.messages_in_conversation(&self.account.id, id).unwrap_or_default(),
             None => Vec::new(),
         };
+        let history_changed = thread.len() != self.thread.len() || thread.iter().zip(&self.thread).any(|(a, b)| a.id != b.id || a.subject != b.subject || a.body != b.body);
+        self.thread = thread;
         let unwritten = self.unwritten_changes();
         self.apply_to_thread(&unwritten);
+        if history_changed { self.prepare_thread_history(cx); }
     }
 
     /// Downloads the inline images of the open conversation that are not cached yet.
@@ -1535,7 +1548,7 @@ impl MailWindow {
         if !self.conversations.iter().any(|c| Some(&c.id) == self.selected.as_ref()) {
             self.selected = self.conversations.first().map(|c| c.id.clone());
             self.expanded.clear();
-            self.load_thread();
+            self.load_thread(cx);
         }
         self.list_focus.focus(window, cx);
         cx.notify();
@@ -1790,7 +1803,7 @@ impl MailWindow {
                 this.downloading.remove(&attachment.id);
                 match result {
                     Ok(path) => {
-                        this.load_thread();
+                        this.load_thread(cx);
                         match after {
                             AfterDownload::Open => open_received_attachment(&path, &attachment.filename, window, cx),
                             AfterDownload::SaveTo(target) => this.finish_save(&path, &target, window, cx),
@@ -1875,7 +1888,7 @@ impl MailWindow {
                 this.prefetching = false;
                 if fetched > 0 {
                     // The open conversation may have gained images; the index sees new paths.
-                    this.load_thread();
+                    this.load_thread(cx);
                     this.rebuild_mail_index(cx);
                     cx.notify();
                 }
@@ -1906,7 +1919,7 @@ impl MailWindow {
         if self.selected.is_none() || !self.conversations.iter().any(|c| Some(&c.id) == self.selected.as_ref()) {
             self.selected = self.conversations.first().map(|c| c.id.clone());
             self.expanded.clear();
-            self.load_thread();
+            self.load_thread(cx);
         }
         self.list_focus.focus(window, cx);
         cx.notify();
@@ -1925,7 +1938,7 @@ impl MailWindow {
         self.reload(cx);
         if !self.search_query.is_empty() && self.selected_summary().is_none() {
             self.selected = self.conversations.first().map(|c| c.id.clone());
-            self.load_thread();
+            self.load_thread(cx);
         }
         self.start_online_search(window, cx);
         cx.notify();
@@ -2022,7 +2035,7 @@ impl MailWindow {
         self.expanded.clear();
         self.reader_scroll.set_offset(point(px(0.), px(0.)));
         self.selected = id;
-        self.load_thread();
+        self.load_thread(cx);
         self.fetch_inline_images(window, cx);
         // Reading marks the conversation read: a local change with its pending operation.
         let unread: Vec<MessageId> = self.thread.iter().filter(|m| !m.is_read).map(|m| m.id.clone()).collect();
@@ -2411,6 +2424,7 @@ impl MailWindow {
 
     /// Replies to or forwards one particular message of the conversation.
     pub(crate) fn reply_to(&mut self, kind: DraftKind, source: Message, window: &mut Window, cx: &mut Context<Self>) {
+        if self.reuse_reply(kind, &source, window, cx) { return; }
         let mut draft = Draft::in_response_to_with(self.account.id.clone(), kind, &source, &self.owner(), now(), self.prefs.quote_on_reply);
         // The quoted original is appended at send time and shown collapsed under the editor, and
         // the signature goes between what is written and the quote.
@@ -2455,7 +2469,7 @@ impl MailWindow {
                 // Show the conversation being replied to, if it is in this view.
                 if self.conversations.iter().any(|c| c.id == conv) {
                     self.selected = Some(conv);
-                    self.load_thread();
+                    self.load_thread(cx);
                 }
             }
             self.open_composer(draft, window, cx);

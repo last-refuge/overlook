@@ -75,8 +75,10 @@ A generation counter drops results of a superseded query.
 
 ## Reader
 
-The conversation header has Expand all / Collapse all when there is more than one message. An expanded
-message has a ⋯ menu: Reply, Reply all, Forward (this message, not the latest), Mark as read/unread, Print
+The conversation header has Expand all / Collapse all when there is more than one message, and the
+toolbar has Jump to latest. Collapsed messages are separate cards with a snippet, date/time and file/star
+indicators. Every expanded message has Reply, Reply all and Forward in its header and below its body;
+these target that particular message. Its ⋯ menu also offers Mark as read/unread, Print
 (a standalone HTML page in `~/.cache/overlook/print/` opened in the browser, which prints), Save as .eml and
 View source (both from `MailProvider::fetch_raw`, Gmail's `format=raw`, with a rebuilt message as fallback).
 Clicking an expanded message's header collapses it, except the latest.
@@ -85,9 +87,11 @@ Image attachments (`Attachment::is_image`) are downloaded with the open conversa
 shown as thumbnails on their cards; clicking one opens a quick look over the window with Open, Save as and
 Esc. Other attachments open with the system application as before.
 
-Data tables survive the HTML flattening: `sanitize::is_data_table` keeps a table that has header cells or is
-a consistent grid of 2 to 8 short columns without nested tables or images, and the view lays it out as a
-grid (the vendored parser now keeps empty cells so columns stay aligned). Layout tables are still flattened.
+Repeated HTML history folds behind an expandable Message history control only when it matches an earlier
+message in this conversation; see Rendering below. Inline images already embedded in the body are omitted
+from the file cards. Up to four browser documents are live at once, prioritizing the latest message,
+the reply source and composer previews. Expand all keeps other messages readable as full native text
+when available; HTML-only messages offer Read message to open their complete browser body.
 
 ## Composer
 
@@ -98,8 +102,15 @@ styles it live: bold, italic, strikethrough, inline code, link text and URLs, he
 list markers, with the marks themselves faded. The toolbar and shortcuts (Ctrl+B/I/K, Ctrl+Shift+X
 strike, Ctrl+Shift+C code, Ctrl+Shift+8/7/9 bullets/numbers/quote, Ctrl+Shift+P preview) edit the
 text through `format_wrap`, `format_link` and `format_lines` in `ui/composer.rs`; Enter inside a
-list continues it and Enter on an empty item ends it. Preview swaps the editor for `TextView::html`
-of the rendered body.
+list continues it and Enter on an empty item ends it. Preview uses the isolated browser surface.
+
+Inline replies open immediately after the message being answered. Opening or returning to a reply brings
+the whole composer into view and follows delayed body reflow until the layout settles (bounded to eight
+seconds); mouse, keyboard or scroll input stops the reveal. Short panes align the beginning when the
+whole composer cannot fit. The editor height adapts to the pane. From and Subject are under Details for
+inline replies/forwards, and Enter skips hidden fields. New messages retain their full headers. Choosing
+Reply again returns to the existing editor; switching Reply / Reply all in the heading or through actions
+updates recipients while retaining typed text, attachments and the draft identity.
 
 `overlook_core::compose` turns the text into the two parts of the message: `render_markdown`
 (the `markdown` crate, GFM, raw HTML escaped, single newlines as `<br>`) and `markdown_to_plain`.
@@ -195,60 +206,26 @@ colour choices (by design), and underline, which Markdown has no mark for.
 
 ## Rendering
 
-Received HTML goes through three stages before the native view sees it, all in `overlook-core`:
+Received HTML uses the isolated Chromium surface described in
+[message rendering and isolation](../docs/message-formatting.md). Browser preparation starts from
+original stored HTML, preserves safe authored CSS and layout, and removes active content. The browser
+sandbox and resource-consent policy apply to folded and unfolded content alike. Native text renders
+plain-text mail and provides a full-text fallback for older expanded messages beyond the live-view budget.
 
-1. `prepass::prepare` works on the DOM (html5ever). It removes what a browser would hide
-   (`display:none`, `visibility:hidden`, zero font size, `max-height:0`, `mso-hide`, the `hidden`
-   attribute, `preheader` classes, 1×1 tracking pixels, `<head>`/`<title>`/`<style>`), drops spacer
-   blocks (Gmail's `<div><br></div>`, Outlook's `<p>&nbsp;</p>`), trims `<br>`s that only add blank
-   lines, rewrites `<center>` to `<div>` and `<dt>/<dd>` to blocks, protects `<pre>` whitespace, turns
-   bare URLs into links, and splits the quoted history of a reply (Gmail `gmail_quote`, `blockquote
-   type=cite`, Yahoo, Thunderbird) into `Sanitized.quoted`, taking everything after the quote start at
-   every nesting level. Forwards and Outlook's `From: / Sent: / To:` header blocks are not split: the
-   header is context for notes people write inside the quoted text, and Gmail shows it too. Every
-   embedded message header (Outlook's block, Gmail's `gmail_attr` line, a "Forwarded message" or
-   "Original Message" marker) gets a rule in front of it, so a forwarded chain reads as separate messages;
-   the reader adds the same rule when it inlines a split quote.
-2. `sanitize_html` (ammonia) enforces the tag and attribute allow-list and the remote-image policy,
-   then `flatten_tables` turns layout tables into block flow. Of an author's inline styling only the
-   text colour is kept (`style="color:…"` reduced to that one declaration, `<font color>`), because
-   colour carries meaning in annotated replies; the vendored view renders it through a `TextMark`
-   colour. The reader runs `adapt_colors` so dark colours lighten on the dark theme and near-white
-   ones darken on the light theme, hue preserved.
-3. The view, `TextView::html` from the vendored `gpui-base` (see `vendor/README.md`), renders it.
+`overlook_core::thread_history` prepares display-only history disclosures in the background. It recognizes
+Gmail/cite/Thunderbird/Yahoo quotes and Outlook reply-header boundaries, and folds a tail only when its
+normalized visible text plus image/link targets exactly match a previous full message. Forwarded blocks,
+unknown history, short ambiguous text, added notes and changed resources remain visible. The original DOM
+ancestors and styles survive, and opening Message history restores all content. Work is bounded to 64
+messages / 8 MiB, uses the browser parser's size/depth/node limits, and rejects stale generations. This
+does not change stored HTML, outgoing quotes, printing or raw source. Plain-text quoted history remains
+inline. Browser interaction changes are excluded from the initial-render cache so an expanded disclosure
+cannot be painted over a newly closed document.
 
-The reader collapses `Sanitized.quoted` behind "Show quoted text" only when the quoted text repeats an
-earlier message of the same conversation (`quote_repeats_thread`); otherwise it is shown inline, since a
-quote the reader has never seen is content, not history. It replaces `cid:
-image references with `data:` URLs built from the downloaded inline attachment (`Attachment.content_id`,
-schema v6; inline images of the open conversation are fetched automatically, up to 4 MB each; a
-one-time backfill re-fetches older messages with `cid:` references). Plain-text mail is converted by
-`text_to_html`: paragraphs, `<br>` line breaks, nested blockquotes for `>` quoting with the markers
-removed, and linked URLs.
-
-`cargo run -p overlook-core --example sanitize_dump -- file.html` prints the sanitized output for a
-saved message. The rendering review of 2026-10-12 used fourteen fixtures (Gmail reply with quoted
-thread, newsletter with preheader and tables, nested lists, Outlook/Word mail, plain text with
-quotes, code, inline cid image, headings and rules, data table, Unicode/RTL, dark-mode hostile
-colors, hidden junk and tracking, forwarded message, long paragraphs); all render correctly. Known
-remaining gaps: data tables are flattened rather than laid out as a grid; `sup`/`sub` are shown
-inline; styles and colors from the mail are ignored by design.
-
-### Repeating events, drag, guests
-
-- A repeating occurrence carries `recurring_event_id` and `original_start`. Edit and Delete on one ask for a
-  scope: this event, this and following, or all (`RecurrenceScope`, `cal_scope_prompt`). The store applies
-  the edit to the local occurrences the scope covers (`apply_series_change`, `delete_event_locally_scoped`)
-  and queues one operation with the scope. Google: "all" patches the master with the series' times shifted
-  by the same amount; "following" ends the master's RRULE with `UNTIL` just before the occurrence and creates
-  a new series from it (`recurrence_until`, `recurrence_for_split`; a COUNT is dropped because it no longer
-  adds up). The next incremental sync brings every instance back from Google.
-- In Day and Week, a block can be dragged to another time or day and its bottom edge dragged to change the end
-  (`CalDrag`, 15-minute snapping, saved as an ordinary update of that occurrence).
-- The event editor has Guests (comma-separated addresses; known guests keep their responses, the owner is
-  added as organizer), Check availability (`CalendarProvider::free_busy`, Google's `freeBusy`), and Add a
-  Google Meet link (`wants_conference` → `conferenceData.createRequest` with `conferenceDataVersion=1`).
-  Rooms are Workspace resource calendars and are not offered; a personal Gmail account has none.
+Downloaded inline `cid:` attachments are resolved to bounded data URLs for rendering. Original CID
+references and attachments remain stored. The legacy native `sanitize` / `prepass` projection still serves
+safe outgoing quote serialization and other native projections; it is not the received browser layout
+pipeline. `cargo run -p overlook-core --example sanitize_dump -- file.html` inspects that native projection.
 
 ## Gmail
 
@@ -312,7 +289,7 @@ Reference captures from this run are in `branding/previews/overlook-native-*.png
 - **Uncertain delivery.** If the provider reports a dropped connection after accepting a message, the draft and operation become `Uncertain`, replay stops, and the next cycle calls `reconcile_send` before any retry.
 - **Sync engine** (`crates/overlook-app/src/sync.rs`) runs on a background thread: probe → `Syncing` → replay pending operations by `seq` → `UpToDate` with a timestamp, or `Offline` / `SignInRequired` / `SyncFailed(reason)`. It runs at startup when reachable, after each local change while connected, every 30 seconds, and from Sync now / F5.
 - **Themes.** `theme.rs` holds Light (Soft stone, approved 23 October 2026) and Dark (matching `branding/tokens.json`) plus Gray, Blue, White, Alexander, and Pink, and projects the active palette onto the component library. Light uses stone reading/compose surfaces with charcoal text and pine accents. Its HTML defaults have zero CSS specificity and defer to sender styles and legacy body color attributes. The browser cache includes the resolved colorway, and pre-rendering uses the same themed preparation as opening a message. The preference is stored in `settings`; Follow system selects Light or Dark from the window appearance, which GPUI reads from the desktop settings portal. Switching changes display colors only, never stored messages or outgoing mail formatting.
-- **Received HTML** is sanitized by `overlook_core::sanitize` (allowlisted tags and bounded inline presentation, no stylesheets/scripts/forms/frames, `http(s)`/`mailto`/`cid` only, remote images blocked by default). The native renderer preserves hard breaks, distinct flow/paragraph spacing, and inherited typography. Composer quotes and Outbox previews enforce the same resource consent. See [the formatting review and regression workflow](../docs/message-formatting.md) for supported behavior and browser-layout limitations.
+- **Received HTML** uses `overlook_core::browser` preparation and an isolated Chromium document, preserving safe authored CSS/layout with active content disabled and remote resources blocked by default. Display-only thread history folding precedes preparation; stored mail is unchanged. Composer and Outbox previews enforce the same resource consent. See [the formatting review and regression workflow](../docs/message-formatting.md) for policy and limits.
 - **Fonts.** Inter and Source Serif 4 Display are embedded and registered at startup; the wordmark is the outlined SVG.
 
 ### Keyboard

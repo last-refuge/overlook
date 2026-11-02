@@ -28,6 +28,7 @@ pub mod servers;
 pub mod signature;
 pub mod status;
 pub mod threading;
+pub mod thread_history;
 pub mod time;
 pub mod tz;
 
