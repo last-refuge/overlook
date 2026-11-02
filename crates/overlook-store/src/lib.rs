@@ -18,6 +18,7 @@ mod caldav;
 mod caldav_outbox;
 mod schema;
 mod draft_sync;
+mod time_zone;
 pub use draft_sync::{DraftEditGuard, DraftSyncEntry, DraftUpload, same_draft_content};
 
 pub use index::{apply_to_message, MailIndex};

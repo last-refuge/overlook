@@ -57,7 +57,7 @@ pub fn resolve_change(
         return Err("Calendar account changed. Reopen the changes panel.".into());
     }
     if keep_local {
-        if change.timezone != format!("{:?}", tz::system_zone()) {
+        if change.timezone != tz::cache_key() {
             return Err(
                 "Return to the time zone in which this edit was saved before keeping your changes."
                     .into(),
@@ -155,7 +155,7 @@ fn synchronize_using(
             })
         })?;
         let cached = store
-            .caldav_checkpoints(connection, from, to, &format!("{:?}", tz::system_zone()))
+            .caldav_checkpoints(connection, from, to, &tz::cache_key())
             .map_err(|_| {
                 CalDavError::InvalidResponse("Saved calendar checkpoints could not be read.")
             })?;
@@ -438,7 +438,7 @@ mod tests {
         let snapshot = CalDavSnapshot {
             from: event.start - 1,
             to: event.end + 1,
-            timezone: format!("{:?}", tz::system_zone()),
+            timezone: tz::cache_key(),
             calendars: vec![CalDavCalendarSnapshot {
                 calendar,
                 resources: vec![],

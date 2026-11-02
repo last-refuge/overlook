@@ -26,6 +26,12 @@ pub trait CalendarProvider: Send + Sync {
     /// Creates the event; returns the provider's copy.
     fn create_event(&self, account: &Account, calendar: &Calendar, event: &Event) -> BoxFuture<'_, Result<Event, ProviderError>>;
 
+    /// The zone in which date-only timestamps in this saved event were projected.
+    /// Keep it stable while a request is in flight, even if the display zone changes.
+    fn create_event_in_zone(&self, account: &Account, calendar: &Calendar, event: &Event, _zone: &tz::TimeZone) -> BoxFuture<'_, Result<Event, ProviderError>> {
+        self.create_event(account, calendar, event)
+    }
+
     fn update_event(&self, account: &Account, calendar: &Calendar, event: &Event) -> BoxFuture<'_, Result<Event, ProviderError>>;
 
     fn delete_event(&self, account: &Account, calendar: &Calendar, provider_id: &ProviderId) -> BoxFuture<'_, Result<(), ProviderError>>;
@@ -34,6 +40,10 @@ pub trait CalendarProvider: Send + Sync {
     /// The default knows only single events.
     fn update_event_scoped(&self, account: &Account, calendar: &Calendar, event: &Event, _scope: RecurrenceScope) -> BoxFuture<'_, Result<Event, ProviderError>> {
         self.update_event(account, calendar, event)
+    }
+
+    fn update_event_scoped_in_zone(&self, account: &Account, calendar: &Calendar, event: &Event, scope: RecurrenceScope, _zone: &tz::TimeZone) -> BoxFuture<'_, Result<Event, ProviderError>> {
+        self.update_event_scoped(account, calendar, event, scope)
     }
 
     /// Deletes with a scope; `recurring_event_id` and `split_at` describe the series when

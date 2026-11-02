@@ -110,7 +110,7 @@ struct DateValue {
 }
 
 pub(super) fn property_timestamp(p: &Property) -> Result<i64, CalDavError> {
-    Ok(date(p, &tz::system_zone())?.timestamp)
+    Ok(date(p, &tz::current_zone())?.timestamp)
 }
 
 fn date(p: &Property, local_zone: &TimeZone) -> Result<DateValue, CalDavError> {

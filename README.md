@@ -72,8 +72,10 @@ and you can read, search, write, and file mail with no connection at all.
   SMTP. POP3 downloads and keeps your mail here, with a backup button. Scripted servers only so far; see the
   status below.
 - **Settings that do things.** Accounts and signatures, notifications, sync interval, mark-as-read timing,
-  remote content, download size, working hours, reminders, automatic replies (out of office), and more. Every
+  remote content, download size, working hours, reminders, time-zone overrides, automatic replies (out of office), and more. Every
   control takes effect immediately.
+  Mail and calendar use date-aware daylight-saving rules. Overlook checks for system time-zone changes
+  every minute and asks before switching; keeping the current zone saves an override.
 
 <p align="center">
   <img src="docs/screenshots/calendar-week-light.png" alt="Overlook calendar week view" width="920">

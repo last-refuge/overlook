@@ -45,6 +45,9 @@ pub struct Prefs {
     // General
     pub startup_module: StartupModule,
     pub clock_24h: bool,
+    /// None follows the system with confirmation when it changes. An override is
+    /// normally an IANA name; a kept anonymous system zone retains its TZif rules.
+    pub time_zone: Option<crate::tz::ZoneDefinition>,
     pub week_starts_monday: bool,
     pub new_mail_notifications: NewMailNotifications,
     /// On Omarchy, also show Overlook's messages (sent, errors, warnings) as desktop notifications.
@@ -79,6 +82,7 @@ impl Default for Prefs {
         Self {
             startup_module: StartupModule::Mail,
             clock_24h: false,
+            time_zone: None,
             week_starts_monday: true,
             new_mail_notifications: NewMailNotifications::FocusedOnly,
             omarchy_notifications: true,
@@ -227,6 +231,10 @@ mod tests {
         assert!(p.clock_24h);
         assert_eq!(p.sync_interval_secs, 30);
         assert_eq!(p.new_mail_notifications, NewMailNotifications::FocusedOnly);
+        assert_eq!(p.time_zone, None);
+        let custom = Prefs { time_zone: Some(crate::tz::ZoneDefinition::Named("America/Toronto".into())), ..p };
+        let restored: Prefs = serde_json::from_str(&serde_json::to_string(&custom).unwrap()).unwrap();
+        assert_eq!(restored.time_zone, custom.time_zone);
     }
 
     #[test]

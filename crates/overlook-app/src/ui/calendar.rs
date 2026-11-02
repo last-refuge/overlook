@@ -42,6 +42,8 @@ const GUTTER_PX: f32 = 56.;
 const AGENDA_DAYS: i32 = 14;
 
 pub struct NewEvent {
+    /// Keep typed event times in their labeled zone while the system/display zone changes.
+    pub time_zone: tz::TimeZone,
     pub title: Entity<InputState>,
     pub date: Entity<InputState>,
     pub end_date: Entity<InputState>,
@@ -151,7 +153,7 @@ impl MailWindow {
         }
         self.cal_status = crate::sync::calendar_status(&self.store, &self.account.id);
         self.caldav_connection = self.store.calendar_connection(&self.account.id).ok().flatten();
-        self.caldav_cached = self.caldav_connection.as_ref().is_some_and(|c| self.store.caldav_range_cached(&c.id, from, to, &format!("{:?}", tz::system_zone())).unwrap_or(false));
+        self.caldav_cached = self.caldav_connection.as_ref().is_some_and(|c| self.store.caldav_range_cached(&c.id, from, to, &tz::cache_key()).unwrap_or(false));
         self.caldav_last_sync = self.caldav_connection.as_ref().and_then(|c| self.store.caldav_last_sync(&c.id).ok().flatten());
         self.caldav_changes = self.store.caldav_changes(&self.account.id).unwrap_or_default();
         self.caldav_previews = self.caldav_changes.iter().filter_map(|change| {
@@ -159,7 +161,7 @@ impl MailWindow {
         }).collect();
         // Date-only and floating projections depend on the local zone. Preserve them on
         // disk, but don't present an old-zone projection as the current calendar.
-        if self.caldav_connection.as_ref().is_some_and(|c| !self.store.caldav_timezone_matches(&c.id, &format!("{:?}", tz::system_zone())).unwrap_or(false)) {
+        if self.caldav_connection.as_ref().is_some_and(|c| !self.store.caldav_timezone_matches(&c.id, &tz::cache_key()).unwrap_or(false)) {
             self.cal_events.clear();
         }
         if let Some(sel) = &self.cal_selected {
@@ -273,7 +275,7 @@ impl MailWindow {
         let horizon = now_ms + 2 * 3_600_000;
         let accounts = self.accounts.clone();
         for account in accounts {
-            if self.store.calendar_connection(&account.id).ok().flatten().is_some_and(|c| !self.store.caldav_timezone_matches(&c.id, &format!("{:?}", tz::system_zone())).unwrap_or(false)) { continue; }
+            if self.store.calendar_connection(&account.id).ok().flatten().is_some_and(|c| !self.store.caldav_timezone_matches(&c.id, &tz::cache_key()).unwrap_or(false)) { continue; }
             let calendars = self.store.calendars(&account.id).unwrap_or_default();
             let Ok(events) = self.store.events_starting_between(&account.id, now_ms - 60_000, horizon) else { continue };
             for event in events {
@@ -385,7 +387,7 @@ impl MailWindow {
         let location = cx.new(|cx| InputState::new(window, cx).placeholder("Add a location").default_value(event.location.clone().unwrap_or_default()));
         let description = cx.new(|cx| TextareaState::new(window, cx).placeholder("Add a description").default_value(event.description.clone().unwrap_or_default()));
         title.update(cx, |s, cx| s.focus(window, cx));
-        self.new_event = Some(NewEvent { title, date, end_date, start, end, location, description, guests, add_meet, availability: Vec::new(), checking: false, calendar: Some(event.calendar_id.clone()), all_day: event.all_day, error: None, editing: Some(id), original: Some(event), scope });
+        self.new_event = Some(NewEvent { time_zone: tz::current_zone(), title, date, end_date, start, end, location, description, guests, add_meet, availability: Vec::new(), checking: false, calendar: Some(event.calendar_id.clone()), all_day: event.all_day, error: None, editing: Some(id), original: Some(event), scope });
         cx.notify();
     }
 
@@ -437,7 +439,7 @@ impl MailWindow {
         }
         let st = tz::parse_clock(form.start.read(cx).value().trim())?;
         let et = tz::parse_clock(form.end.read(cx).value().trim())?;
-        let (s, e) = (tz::local_datetime(date, st), tz::local_datetime(end_date, et));
+        let (Some(s), Some(e)) = (tz::local_datetime_in(date, st, &form.time_zone), tz::local_datetime_in(end_date, et, &form.time_zone)) else { return None };
         (e > s).then_some((s, e))
     }
 
@@ -526,7 +528,7 @@ impl MailWindow {
         title.update(cx, |s, cx| s.focus(window, cx));
         self.cal_selected = None;
         self.cal_scope_prompt = None;
-        self.new_event = Some(NewEvent { title, date, end_date, start, end, location, description, guests, add_meet: false, availability: Vec::new(), checking: false, calendar, all_day: false, error: None, editing: None, original: None, scope: RecurrenceScope::This });
+        self.new_event = Some(NewEvent { time_zone: tz::current_zone(), title, date, end_date, start, end, location, description, guests, add_meet: false, availability: Vec::new(), checking: false, calendar, all_day: false, error: None, editing: None, original: None, scope: RecurrenceScope::This });
         cx.notify();
     }
 
@@ -551,6 +553,7 @@ impl MailWindow {
         let all_day = form.all_day;
         let editing = form.editing.clone();
         let original = form.original.clone();
+        let time_zone = form.time_zone.clone();
         let calendar = form.calendar.clone().and_then(|id| self.calendars.iter().find(|c| c.id == id).cloned());
         let fail = |msg: &str, this: &mut Self, cx: &mut Context<Self>| {
             if let Some(f) = this.new_event.as_mut() {
@@ -570,8 +573,8 @@ impl MailWindow {
         } else {
             let Some(st) = tz::parse_clock(&start_text) else { return fail("Enter a start time like 9:30 AM.", self, cx) };
             let Some(et) = tz::parse_clock(&end_text) else { return fail("Enter an end time like 10:00 AM.", self, cx) };
-            let s = tz::local_datetime(date, st);
-            let e = tz::local_datetime(end_date, et);
+            let Some(s) = tz::local_datetime_in(date, st, &time_zone) else { return fail("Choose a valid start time in the event’s time zone.", self, cx) };
+            let Some(e) = tz::local_datetime_in(end_date, et, &time_zone) else { return fail("Choose a valid end time in the event’s time zone.", self, cx) };
             if e <= s {
                 return fail("The end time must be after the start time.", self, cx);
             }
@@ -1542,6 +1545,7 @@ impl MailWindow {
                 cx.notify();
             }))))
             .when(!form.all_day, |d| d.child(h_flex().gap(px(10.)).child(div().flex_1().child(field("Start", Input::new(&form.start).aria_label("Event start time").into_any_element()))).child(div().flex_1().child(field("End", Input::new(&form.end).aria_label("Event end time").into_any_element())))))
+            .when(!form.all_day, |d| d.child(div().text_size(px(12.)).text_color(p.muted).child(format!("Times in {}", tz::zone_label(&form.time_zone)))))
             .child(field("Location", Input::new(&form.location).aria_label("Event location").into_any_element()))
             .when(!caldav,|d|d.child(field(
                 "Guests",

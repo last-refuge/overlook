@@ -225,8 +225,8 @@ impl MailWindow {
             data: self.list_data_generation,
             view: self.view.clone(),
             searching: !self.search_query.is_empty(),
-            today: overlook_core::time::local_day(overlook_core::time::now(), self.utc_offset),
-            utc_offset: self.utc_offset,
+            today: overlook_core::time::local_day(overlook_core::time::now(), &self.time_zone),
+            time_zone_revision: self.time_zone_revision,
         };
         if self.rows_key.borrow().as_ref() != Some(&key) {
             let rows = self.list_rows();
@@ -282,7 +282,7 @@ impl MailWindow {
             }
             _ => {
                 let now = overlook_core::time::now();
-                let groups: Vec<DayGroup> = self.conversations.iter().map(|c| day_group(c.latest, now, self.utc_offset)).collect();
+                let groups: Vec<DayGroup> = self.conversations.iter().map(|c| day_group(c.latest, now, &self.time_zone)).collect();
                 let mut current: Option<&DayGroup> = None;
                 for (i, c) in self.conversations.iter().enumerate() {
                     let group = &groups[i];
@@ -303,7 +303,7 @@ impl MailWindow {
         let selected = self.selected.as_ref() == Some(&c.id);
         let unread = c.is_unread();
         let now = overlook_core::time::now();
-        let time = relative_label(c.latest, now, self.utc_offset);
+        let time = relative_label(c.latest, now, &self.time_zone);
         let who = c.participants.first().cloned().unwrap_or_else(|| self.owner());
         let label_name = c
             .label_ids
@@ -486,7 +486,7 @@ impl MailWindow {
                             .items_center()
                             .gap(px(8.))
                             .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child(recipients))
-                            .child(div().text_size(px(11.)).text_color(p.muted).child(relative_label(d.updated_at, now, self.utc_offset))),
+                            .child(div().text_size(px(11.)).text_color(p.muted).child(relative_label(d.updated_at, now, &self.time_zone))),
                     )
                     .child(div().truncate().text_size(px(13.)).child(d.display_subject()))
                     .child(div().truncate().text_size(px(12.)).text_color(p.muted).child(if preview.is_empty() { "Draft in progress".to_owned() } else { preview }))

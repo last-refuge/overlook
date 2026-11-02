@@ -15,6 +15,7 @@ mod signature;
 mod reader;
 mod sidebar;
 mod widgets;
+mod time_zone;
 
 use overlook_provider::gmail::api::SessionExpiry;
 use crate::assets::icon;
@@ -307,7 +308,7 @@ struct RowsKey {
     searching: bool,
     /// Today, because the day groups ("Today", "Yesterday") move at midnight.
     today: i64,
-    utc_offset: i32,
+    time_zone_revision: u64,
 }
 
 /// The settings that decide how tall a row is.
@@ -423,7 +424,10 @@ pub struct MailWindow {
     signin: Option<SignIn>,
     /// The account whose mail the window shows.
     account: Account,
-    utc_offset: i32,
+    time_zone: overlook_core::tz::TimeZone,
+    time_zone_revision: u64,
+    time_zone_pending: bool,
+    time_zone_prompt: Option<overlook_core::tz::DetectedZone>,
     outgoing_dir: PathBuf,
 
     view: MailboxView,
@@ -636,6 +640,7 @@ impl MailWindow {
         crate::notify::set_mirror(prefs.omarchy_notifications);
         let reminders_enabled = prefs.event_reminders;
         overlook_core::tz::set_clock_24h(prefs.clock_24h);
+        overlook_core::tz::set_override(prefs.time_zone.as_ref()).ok();
         let update_last_check = store.setting::<i64>("update.last_check").ok().flatten().unwrap_or(0);
         let update_dismissed = store.setting::<String>("update.dismissed").ok().flatten();
         let account_prefs: HashMap<AccountId, AccountPrefs> = accounts
@@ -669,7 +674,10 @@ impl MailWindow {
             removing_accounts: HashSet::new(),
             signin: None,
             account,
-            utc_offset: overlook_core::time::local_utc_offset_minutes(),
+            time_zone: overlook_core::tz::current_zone(),
+            time_zone_revision: overlook_core::tz::revision(),
+            time_zone_pending: false,
+            time_zone_prompt: None,
             outgoing_dir,
             view: MailboxView::Kind(LabelKind::Inbox),
             filter: ListFilter::All,
@@ -815,6 +823,7 @@ impl MailWindow {
         // IMAP IDLE: one thread per account asks for a sync the moment the Inbox changes.
         this.watch_idle_events(idle_rx, window, cx);
         this.refresh_idle_watchers();
+        this.watch_system_time_zone(window, cx);
         // `OVERLOOK_SIGN_IN=gmail` opens the Google sign-in immediately (first-run helper).
         match std::env::var("OVERLOOK_SIGN_IN").as_deref() {
             Ok("gmail") => this.start_google_sign_in(None, window, cx),
@@ -1712,7 +1721,7 @@ impl MailWindow {
             subject = escape_html(&message.subject),
             from = escape_html(&message.from.to_header()),
             to = escape_html(&to),
-            date = escape_html(&overlook_core::time::format_full(message.date, self.utc_offset)),
+            date = escape_html(&overlook_core::time::format_full(message.date, &self.time_zone)),
         );
         let dir = crate::updater::cache_dir().join("print");
         let path = dir.join(format!("{}.html", message.id.as_str().replace([':', '/'], "_")));
@@ -3151,7 +3160,7 @@ impl MailWindow {
             SyncState::SyncFailed(reason) => (p.warning, format!("Sync failed: {reason}")),
         };
         let last = status.last_successful_sync.map(|ts| {
-            let (_, t, _) = overlook_core::time::civil(ts, self.utc_offset);
+            let (_, t, _) = overlook_core::time::civil_in_zone(ts, &self.time_zone);
             format!("Last synced {}", format_clock(t))
         });
         let unread: usize = self.conversations.iter().filter(|c| c.is_unread()).count();
@@ -3472,6 +3481,7 @@ impl Render for MailWindow {
             .child(self.render_header(cx))
             .children(self.render_update_banner(cx))
             .children(self.render_banner(cx))
+            .children(self.render_time_zone_prompt(cx))
             .child(div().flex_1().min_h_0().child(self.render_body(cx)))
             .child(self.render_status_bar(cx))
             .when(self.settings.is_some(), |d| d.child(self.render_settings(cx)))

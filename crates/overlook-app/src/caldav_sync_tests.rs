@@ -63,7 +63,7 @@ fn reference_server_round_trip() {
     assert_eq!(tz::local_date(day.start).to_string(), "2026-10-24");
     assert_eq!(tz::local_date(day.end).to_string(), "2026-10-27");
     let checkpoints = store
-        .caldav_checkpoints(&connection, from, to, &format!("{:?}", tz::system_zone()))
+        .caldav_checkpoints(&connection, from, to, &tz::cache_key())
         .unwrap();
     assert_eq!(checkpoints.len(), 2);
     let unchanged = reference_client(address)
@@ -299,7 +299,7 @@ fn collection_checkpoints_survive_restart_and_recover_without_losing_events() {
     let store = Store::open(&path).unwrap();
     let (account, connection) = connect(&store, &server);
     let (from, to) = range();
-    let zone = format!("{:?}", tz::system_zone());
+    let zone = tz::cache_key();
     let checkpoint = store
         .caldav_checkpoints(&connection, from, to, &zone)
         .unwrap();

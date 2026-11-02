@@ -124,11 +124,11 @@ impl CalDavClient {
                 "Choose a calendar range shorter than 500 days.",
             ));
         }
-        let zone = tz::system_zone();
+        let (zone, timezone) = tz::zone_with_cache_key();
         let mut snapshot = CalDavSnapshot {
             from,
             to,
-            timezone: format!("{zone:?}"),
+            timezone,
             calendars: Vec::new(),
         };
         let mut checkpoints = Vec::new();

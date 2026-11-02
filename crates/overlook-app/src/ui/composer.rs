@@ -637,7 +637,7 @@ impl MailWindow {
         let saved_text = match (c.dirty, c.last_saved) {
             (true, _) => "Saving…".to_owned(),
             (false, Some(ts)) => {
-                let (_, time, _) = overlook_core::time::civil(ts, self.utc_offset);
+                let (_, time, _) = overlook_core::time::civil_in_zone(ts, &self.time_zone);
                 format!("{} · {}", draft_state_label(&c.draft.state), format_clock(time))
             }
             (false, None) => "Not saved yet".to_owned(),
@@ -933,7 +933,7 @@ impl MailWindow {
         }
         let source = c.source.as_ref()?;
         let who = source.from.display_name();
-        let when = overlook_core::time::format_full(source.date, self.utc_offset);
+        let when = overlook_core::time::format_full(source.date, &self.time_zone);
         let label = match c.draft.kind {
             DraftKind::Forward => format!("Forwarding the message from {who} · {when}"),
             _ => format!("Quoting {who} · {when}"),

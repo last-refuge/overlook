@@ -65,7 +65,7 @@ impl Store {
             if let Some(change)=read(tx,&event.calendar_id,&href)? {
                 if change.state!=CalDavChangeState::Pending {return Err(invalid("This event has an upload being checked or a conflict. Review calendar changes before editing it again."));} return Ok(change);
             }
-            Ok(CalDavChange{id:OperationId::generate(),connection_id:connection.id,generation:connection.generation,account_id:event.account_id.clone(),calendar_id:event.calendar_id.clone(),href,revision:0,state:CalDavChangeState::Pending,base,desired:None,edits:vec![],remote:None,note:None,timezone:format!("{:?}",tz::system_zone())})
+            Ok(CalDavChange{id:OperationId::generate(),connection_id:connection.id,generation:connection.generation,account_id:event.account_id.clone(),calendar_id:event.calendar_id.clone(),href,revision:0,state:CalDavChangeState::Pending,base,desired:None,edits:vec![],remote:None,note:None,timezone:tz::cache_key()})
         })
     }
 
@@ -77,7 +77,7 @@ impl Store {
     ) -> Result<()> {
         self.with_tx(|tx| {
             if !connection_current(tx,token)? {return Err(invalid("Calendar settings changed."));}
-            if token.state!=CalDavChangeState::Pending || token.timezone!=format!("{:?}",tz::system_zone()) {return Err(invalid("Refresh this calendar before saving another change."));}
+            if token.state!=CalDavChangeState::Pending || token.timezone!=tz::cache_key() {return Err(invalid("Refresh this calendar before saving another change."));}
             let writable:bool=tx.query_row("SELECT can_edit AND account_id=?2 FROM calendars WHERE id=?1",params![token.calendar_id.0,token.account_id.0],|r|r.get(0))?;
             if !writable {return Err(invalid("This calendar is read-only."));}
             if token.revision==0 {

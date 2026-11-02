@@ -11,9 +11,11 @@ use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::combobox::{Combobox, ComboboxEvent, ComboboxState};
+use gpui_kit::component::searchable_list::{SearchableListItem, SearchableVec};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{Disableable, Sizable};
+use gpui_kit::component::{Disableable, Sizable, IndexPath};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use overlook_core::*;
@@ -73,13 +75,39 @@ pub struct SettingsState {
     pub attachments_dir: Entity<InputState>,
     pub work_start: Entity<InputState>,
     pub work_end: Entity<InputState>,
+    pub time_zone: Entity<ComboboxState<SearchableVec<ZoneChoice>>>,
     pub caldav: Option<super::calendar_setup::CalendarSetup>,
     pub _subscriptions: Vec<Subscription>,
 }
 
+#[derive(Clone)]
+pub struct ZoneChoice { definition: Option<overlook_core::tz::ZoneDefinition>, title: SharedString }
+impl SearchableListItem for ZoneChoice {
+    type Value = Option<overlook_core::tz::ZoneDefinition>;
+    fn title(&self) -> SharedString { self.title.clone() }
+    fn value(&self) -> &Self::Value { &self.definition }
+}
+
+pub(super) fn time_zone_choices(selected: &Option<overlook_core::tz::ZoneDefinition>) -> Vec<ZoneChoice> {
+    let mut definitions = vec![None];
+    definitions.extend(overlook_core::tz::available_zone_names().iter().map(|name| Some(overlook_core::tz::ZoneDefinition::Named(name.clone()))));
+    if selected.is_some() && !definitions.contains(selected) { definitions.push(selected.clone()); }
+    definitions.into_iter().map(|definition| {
+        let title = match &definition {
+            None => "Follow system".into(),
+            Some(overlook_core::tz::ZoneDefinition::Named(name)) => name.replace('_', " ").into(),
+            Some(definition) => format!("{} (kept)", definition.resolve().map(|zone| overlook_core::tz::zone_label(&zone)).unwrap_or_else(|_| "Local time".into())).into(),
+        };
+        ZoneChoice { definition, title }
+    }).collect()
+}
+
 impl MailWindow {
     pub(crate) fn save_prefs(&mut self, cx: &mut Context<Self>) {
-        self.save_setting("prefs", &self.prefs);
+        let (store, prefs) = (self.store.clone(), self.prefs.clone());
+        crate::persist::later(move || {
+            if let Err(error) = store.save_preferences(&prefs) { tracing::warn!("could not save preferences: {error}"); }
+        });
         overlook_core::tz::set_clock_24h(self.prefs.clock_24h);
         crate::notify::set_mirror(self.prefs.omarchy_notifications);
         self.reminders_enabled = self.prefs.event_reminders;
@@ -265,8 +293,16 @@ impl MailWindow {
         let attachments_dir = cx.new(|cx| InputState::new(window, cx).placeholder("~/Downloads").default_value(self.prefs.attachments_dir.clone().unwrap_or_default()));
         let work_start = cx.new(|cx| InputState::new(window, cx).placeholder("8:00 AM").default_value(hour_text(self.prefs.work_start_hour)));
         let work_end = cx.new(|cx| InputState::new(window, cx).placeholder("6:00 PM").default_value(hour_text(self.prefs.work_end_hour)));
+        let zones = time_zone_choices(&self.prefs.time_zone);
+        let selected = zones.iter().position(|choice| choice.definition == self.prefs.time_zone).unwrap_or(0);
+        let time_zone = cx.new(|cx| ComboboxState::new(SearchableVec::new(zones), vec![IndexPath::default().row(selected)], window, cx).searchable(true));
 
         let mut subs = Vec::new();
+        subs.push(cx.subscribe_in(&time_zone, window, |this, _, event: &ComboboxEvent<SearchableVec<ZoneChoice>>, window, cx| {
+            if let ComboboxEvent::Confirm(values) = event {
+                if let Some(name) = values.first().filter(|name| **name != this.prefs.time_zone) { this.change_time_zone(name.clone(), window, cx); }
+            }
+        }));
         let for_account = acct.id.clone();
         subs.push(cx.subscribe_in(&name_input, window, move |this, state, event: &InputEvent, _window, cx| {
             if matches!(event, InputEvent::Change) {
@@ -344,6 +380,7 @@ impl MailWindow {
             attachments_dir,
             work_start,
             work_end,
+            time_zone,
             caldav,
             _subscriptions: subs,
         });
@@ -654,6 +691,8 @@ impl MailWindow {
     fn render_settings_general(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let prefs = self.prefs.clone();
         let appearance = self.appearance;
+        let system_zone = self.time_zone_prompt.as_ref().map(|zone| zone.zone().clone()).unwrap_or_else(overlook_core::tz::system_zone);
+        let time_zone_hint = format!("System: {}. {}", overlook_core::tz::zone_label(&system_zone), if prefs.time_zone.is_some() { "Your override stays active until you select Follow system." } else { "Checks every minute and asks before changing." });
         v_flex()
             .gap(px(22.))
             .child(section("Appearance", None))
@@ -683,6 +722,11 @@ impl MailWindow {
                 choice(&[("On the right", ReadingPane::Right), ("Below the list", ReadingPane::Bottom)], self.reading_pane, cx, |this, v, _w, cx| this.set_reading_pane(v, cx)),
             ))
             .child(section("Start-up and time", None))
+            .child(setting_row(
+                "Time zone",
+                &time_zone_hint,
+                Combobox::new(&self.settings.as_ref().expect("settings is open").time_zone).small().w(px(260.)).disabled(self.time_zone_pending).placeholder("Time zone").menu_width(px(320.)).menu_max_h(px(280.)).search_placeholder("Search city or time zone").into_any_element(),
+            ))
             .child(setting_row(
                 "Open Overlook in",
                 "",

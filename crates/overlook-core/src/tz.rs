@@ -3,15 +3,18 @@
 
 use crate::time::Timestamp;
 use jiff::civil::{Date, Time};
-use jiff::tz::TimeZone;
+pub use jiff::tz::TimeZone;
 use jiff::{Timestamp as JTimestamp, ToSpan, Zoned};
 
-pub fn system_zone() -> TimeZone {
-    TimeZone::try_system().unwrap_or(TimeZone::UTC)
-}
+mod settings;
+pub use settings::{available_zone_names, cache_key, current_definition, current_zone, detect_system_zone, revision, set_override, system_definition, system_zone, update_system_zone, zone_label, zone_with_cache_key, DetectedZone, ZoneDefinition};
 
 pub fn zoned(ts: Timestamp) -> Zoned {
-    JTimestamp::from_millisecond(ts).unwrap_or(JTimestamp::UNIX_EPOCH).to_zoned(system_zone())
+    in_zone(ts, &current_zone())
+}
+
+pub fn in_zone(ts: Timestamp, zone: &TimeZone) -> Zoned {
+    JTimestamp::from_millisecond(ts).unwrap_or(JTimestamp::UNIX_EPOCH).to_zoned(zone.clone())
 }
 
 pub fn to_millis(z: &Zoned) -> Timestamp {
@@ -26,12 +29,12 @@ pub fn local_date(ts: Timestamp) -> Date {
 /// Midnight at the start of the local day containing `ts`.
 pub fn day_start(ts: Timestamp) -> Timestamp {
     let z = zoned(ts);
-    z.date().to_zoned(system_zone()).map(|d| to_millis(&d)).unwrap_or(ts)
+    z.date().to_zoned(current_zone()).map(|d| to_millis(&d)).unwrap_or(ts)
 }
 
 /// Midnight at the start of a local date.
 pub fn date_start(date: Date) -> Timestamp {
-    date.to_zoned(system_zone()).map(|d| to_millis(&d)).unwrap_or(0)
+    date.to_zoned(current_zone()).map(|d| to_millis(&d)).unwrap_or(0)
 }
 
 /// Start of the week (Monday by default) containing `ts`.
@@ -61,10 +64,27 @@ pub fn add_days(ts: Timestamp, days: i32) -> Timestamp {
 
 /// Combines a local date and time into a timestamp.
 pub fn local_datetime(date: Date, time: Time) -> Timestamp {
+    local_datetime_in(date, time, &current_zone()).unwrap_or(0)
+}
+
+pub fn local_datetime_in(date: Date, time: Time, zone: &TimeZone) -> Option<Timestamp> {
     date.at(time.hour(), time.minute(), time.second(), 0)
-        .to_zoned(system_zone())
-        .map(|z| to_millis(&z))
-        .unwrap_or(0)
+        .to_zoned(zone.clone())
+        .ok().map(|z| to_millis(&z))
+}
+
+/// All-day dates are civil dates, not elapsed UTC hours. Keep their dates intact
+/// when the display zone changes, including pending local event edits.
+pub fn reproject_all_day(event: &mut crate::Event, old: &TimeZone, new: &TimeZone) -> Result<(), String> {
+    if !event.all_day { return Ok(()); }
+    let project = |ts| in_zone(ts, old).date().to_zoned(new.clone()).map(|z| to_millis(&z))
+        .map_err(|_| "Could not convert an all-day calendar date.".to_owned());
+    let (start, end) = (project(event.start)?, project(event.end)?);
+    let original = event.original_start.map(project).transpose()?;
+    event.start = start;
+    event.end = end;
+    event.original_start = original;
+    Ok(())
 }
 
 /// Minutes since local midnight.
@@ -213,5 +233,17 @@ mod tests {
         assert!(parse_rfc3339("2026-10-12T17:00:00Z").is_some());
         assert_eq!(parse_date("2026-10-12"), Some(Date::constant(2026, 10, 12)));
         assert!(to_rfc3339(0).starts_with("1970-01-01T00:00:00"));
+    }
+
+    #[test]
+    fn an_open_event_editors_zone_keeps_the_same_instant_after_travel() {
+        let toronto = TimeZone::get("America/Toronto").unwrap();
+        let phoenix = TimeZone::get("America/Phoenix").unwrap();
+        let date = Date::constant(2026, 11, 2);
+        let time = Time::constant(9, 30, 0, 0);
+        let entered = local_datetime_in(date, time, &toronto).unwrap();
+        assert_eq!(in_zone(entered, &phoenix).hour(), 7);
+        assert_eq!(in_zone(entered, &toronto).hour(), 9);
+        assert_ne!(entered, local_datetime_in(date, time, &phoenix).unwrap());
     }
 }

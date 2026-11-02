@@ -7,7 +7,7 @@
 //! pretends to be a real account: the account is labelled "Sample account".
 
 use crate::{AppliedChanges, BoxFuture, CalendarProvider, EventChanges, MailProvider, MailboxSnapshot, ProviderError, RemoteChanges, SendContext, SendOutcome, SentReceipt};
-use overlook_core::time::{days_from_civil, Timestamp};
+use overlook_core::time::Timestamp;
 use overlook_core::*;
 use std::collections::{BTreeSet, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -518,10 +518,11 @@ pub fn sample_mailbox(account: &Account, now: Timestamp) -> MailboxSnapshot {
 
     // Anchor "today" at the local calendar day of `now` and place messages at fixed clock
     // times, like the design preview.
-    let offset = overlook_core::time::local_utc_offset_minutes();
-    let (today, _, _) = overlook_core::time::civil(now, offset);
-    let day_start = days_from_civil(today.year, today.month, today.day) * 86_400_000 - i64::from(offset) * 60_000;
-    let at = |days_ago: i64, hour: i64, minute: i64| day_start - days_ago * 86_400_000 + hour * 3_600_000 + minute * 60_000;
+    let at = |days_ago: i64, hour: i64, minute: i64| {
+        let day = tz::local_date(tz::add_days(now, -(days_ago as i32)));
+        let clock = tz::parse_clock(&format!("{hour:02}:{minute:02}")).expect("sample clock");
+        tz::local_datetime(day, clock)
+    };
 
     let me = Address::named(&account.display_name, &account.email);
     let maya = Address::named("Maya Chen", "maya@northstar.example");

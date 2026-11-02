@@ -85,16 +85,21 @@ pub fn event_color_hex(color_id: &str) -> Option<&'static str> {
     })
 }
 
-fn parse_when(v: Option<&Value>) -> Option<(Timestamp, bool)> {
+fn parse_when_in_zone(v: Option<&Value>, zone: &tz::TimeZone) -> Option<(Timestamp, bool)> {
     let v = v?;
     if let Some(dt) = v.get("dateTime").and_then(|d| d.as_str()) {
         return tz::parse_rfc3339(dt).map(|t| (t, false));
     }
     let date = v.get("date").and_then(|d| d.as_str())?;
-    tz::parse_date(date).map(|d| (tz::date_start(d), true))
+    let date = tz::parse_date(date)?.to_zoned(zone.clone()).ok()?;
+    Some((tz::to_millis(&date), true))
 }
 
 pub fn event_from_json(account: &Account, calendar: &Calendar, v: &Value) -> Option<Event> {
+    event_from_json_in_zone(account, calendar, v, &tz::current_zone())
+}
+
+fn event_from_json_in_zone(account: &Account, calendar: &Calendar, v: &Value, zone: &tz::TimeZone) -> Option<Event> {
     let id = v.get("id")?.as_str()?;
     let status = match v.get("status").and_then(|s| s.as_str()).unwrap_or("confirmed") {
         "cancelled" => EventStatus::Cancelled,
@@ -131,12 +136,12 @@ pub fn event_from_json(account: &Account, calendar: &Calendar, v: &Value) -> Opt
             pending: false,
         });
     }
-    let (start, all_day) = parse_when(v.get("start"))?;
+    let (start, all_day) = parse_when_in_zone(v.get("start"), zone)?;
     let reminders = match v.get("reminders") {
         Some(r) if r.get("useDefault").and_then(|u| u.as_bool()) == Some(false) => Some(popup_minutes(r.get("overrides"))),
         _ => None,
     };
-    let (end, _) = parse_when(v.get("end")).unwrap_or((start + 3_600_000, all_day));
+    let (end, _) = parse_when_in_zone(v.get("end"), zone).unwrap_or((start + 3_600_000, all_day));
     let attendees: Vec<Attendee> = v
         .get("attendees")
         .and_then(|a| a.as_array())
@@ -194,7 +199,7 @@ pub fn event_from_json(account: &Account, calendar: &Calendar, v: &Value) -> Opt
         html_link: v.get("htmlLink").and_then(|s| s.as_str()).map(str::to_owned),
         conference_url,
         recurring_event_id: v.get("recurringEventId").and_then(|s| s.as_str()).map(str::to_owned),
-        original_start: parse_when(v.get("originalStartTime")).map(|(t, _)| t),
+        original_start: parse_when_in_zone(v.get("originalStartTime"), zone).map(|(t, _)| t),
         wants_conference: false,
         updated: v.get("updated").and_then(|s| s.as_str()).and_then(tz::parse_rfc3339).unwrap_or(0),
         event_type: v.get("eventType").and_then(|t| t.as_str()).map(|t| match t {
@@ -211,9 +216,13 @@ pub fn event_from_json(account: &Account, calendar: &Calendar, v: &Value) -> Opt
 
 /// Event body for insert/patch.
 pub fn event_to_json(event: &Event) -> Value {
+    event_to_json_in_zone(event, &tz::current_zone())
+}
+
+fn event_to_json_in_zone(event: &Event, zone: &tz::TimeZone) -> Value {
     let when = |ts: Timestamp| -> Value {
         if event.all_day {
-            json!({ "date": tz::local_date(ts).to_string() })
+            json!({ "date": tz::in_zone(ts, zone).date().to_string() })
         } else {
             json!({ "dateTime": tz::to_rfc3339(ts) })
         }
@@ -312,6 +321,7 @@ impl CalendarProvider for GoogleCalendarProvider {
         let calendar = calendar.clone();
         let sync_token = sync_token.map(str::to_owned);
         Box::pin(async move {
+            let zone = tz::current_zone();
             let mut changes = EventChanges::default();
             let mut page: Option<String> = None;
             let now = overlook_core::time::now();
@@ -340,7 +350,7 @@ impl CalendarProvider for GoogleCalendarProvider {
                     Err(e) => return Err(e.into()),
                 };
                 for item in v.get("items").and_then(|i| i.as_array()).into_iter().flatten() {
-                    if let Some(event) = event_from_json(&account, &calendar, item) {
+                    if let Some(event) = event_from_json_in_zone(&account, &calendar, item, &zone) {
                         if event.status == EventStatus::Cancelled {
                             changes.deleted.push(event.id);
                         } else {
@@ -377,11 +387,16 @@ impl CalendarProvider for GoogleCalendarProvider {
     }
 
     fn create_event(&self, account: &Account, calendar: &Calendar, event: &Event) -> BoxFuture<'_, Result<Event, ProviderError>> {
+        self.create_event_in_zone(account, calendar, event, &tz::current_zone())
+    }
+
+    fn create_event_in_zone(&self, account: &Account, calendar: &Calendar, event: &Event, zone: &tz::TimeZone) -> BoxFuture<'_, Result<Event, ProviderError>> {
         let account = account.clone();
         let calendar = calendar.clone();
         let event = event.clone();
+        let zone = zone.clone();
         Box::pin(async move {
-            let mut body = event_to_json(&event);
+            let mut body = event_to_json_in_zone(&event, &zone);
             if let Some(pid) = &event.provider_id {
                 body["id"] = Value::String(pid.0.clone());
             }
@@ -395,20 +410,12 @@ impl CalendarProvider for GoogleCalendarProvider {
                 }
                 Err(e) => return Err(e.into()),
             };
-            event_from_json(&account, &calendar, &v).ok_or_else(|| ProviderError::Rejected("Google returned an unreadable event".into()))
+            event_from_json_in_zone(&account, &calendar, &v, &zone).ok_or_else(|| ProviderError::Rejected("Google returned an unreadable event".into()))
         })
     }
 
     fn update_event(&self, account: &Account, calendar: &Calendar, event: &Event) -> BoxFuture<'_, Result<Event, ProviderError>> {
-        let account = account.clone();
-        let calendar = calendar.clone();
-        let event = event.clone();
-        Box::pin(async move {
-            let Some(pid) = event.provider_id.clone() else { return Err(ProviderError::Rejected("event has no Google id".into())) };
-            let url = Self::events_url(&calendar, &format!("/{}?sendUpdates=all&conferenceDataVersion=1", url_encode(&pid.0)));
-            let v = self.client.patch_url(&url, &event_to_json(&event))?;
-            event_from_json(&account, &calendar, &v).ok_or_else(|| ProviderError::Rejected("Google returned an unreadable event".into()))
-        })
+        self.update_event_scoped_in_zone(account, calendar, event, RecurrenceScope::This, &tz::current_zone())
     }
 
     fn delete_event(&self, _account: &Account, calendar: &Calendar, provider_id: &ProviderId) -> BoxFuture<'_, Result<(), ProviderError>> {
@@ -424,13 +431,22 @@ impl CalendarProvider for GoogleCalendarProvider {
     }
 
     fn update_event_scoped(&self, account: &Account, calendar: &Calendar, event: &Event, scope: RecurrenceScope) -> BoxFuture<'_, Result<Event, ProviderError>> {
-        let (Some(master_id), true) = (event.recurring_event_id.clone(), scope != RecurrenceScope::This) else {
-            return self.update_event(account, calendar, event);
-        };
+        self.update_event_scoped_in_zone(account, calendar, event, scope, &tz::current_zone())
+    }
+
+    fn update_event_scoped_in_zone(&self, account: &Account, calendar: &Calendar, event: &Event, scope: RecurrenceScope, zone: &tz::TimeZone) -> BoxFuture<'_, Result<Event, ProviderError>> {
+        let master_id = event.recurring_event_id.clone().filter(|_| scope != RecurrenceScope::This);
         let account = account.clone();
         let calendar = calendar.clone();
         let event = event.clone();
+        let zone = zone.clone();
         Box::pin(async move {
+            let Some(master_id) = master_id else {
+                let Some(pid) = event.provider_id.clone() else { return Err(ProviderError::Rejected("event has no Google id".into())) };
+                let url = Self::events_url(&calendar, &format!("/{}?sendUpdates=all&conferenceDataVersion=1", url_encode(&pid.0)));
+                let v = self.client.patch_url(&url, &event_to_json_in_zone(&event, &zone))?;
+                return event_from_json_in_zone(&account, &calendar, &v, &zone).ok_or_else(|| ProviderError::Rejected("Google returned an unreadable event".into()));
+            };
             let master_url = Self::events_url(&calendar, &format!("/{}", url_encode(&master_id)));
             let master = self.client.get_url(&master_url)?;
             let recurrence: Vec<String> = master.get("recurrence").and_then(|r| r.as_array()).map(|a| a.iter().filter_map(|l| l.as_str().map(str::to_owned)).collect()).unwrap_or_default();
@@ -438,13 +454,13 @@ impl CalendarProvider for GoogleCalendarProvider {
             // own schedule shifted by however much this occurrence moved.
             let delta = event.start - event.split_point();
             let duration = event.end - event.start;
-            let mut body = event_to_json(&event);
+            let mut body = event_to_json_in_zone(&event, &zone);
             match scope {
                 RecurrenceScope::All => {
-                    let (master_start, _) = parse_when(master.get("start")).unwrap_or((event.start, event.all_day));
+                    let (master_start, _) = parse_when_in_zone(master.get("start"), &zone).unwrap_or((event.start, event.all_day));
                     let start = master_start + delta;
                     let shifted = Event { start, end: start + duration, ..event.clone() };
-                    let when = event_to_json(&shifted);
+                    let when = event_to_json_in_zone(&shifted, &zone);
                     body["start"] = when["start"].clone();
                     body["end"] = when["end"].clone();
                     let url = Self::events_url(&calendar, &format!("/{}?sendUpdates=all&conferenceDataVersion=1", url_encode(&master_id)));
@@ -591,5 +607,22 @@ mod tests {
         assert_eq!(body["start"]["date"], "2026-10-20");
         let body = event_to_json(&timed);
         assert!(body["start"]["dateTime"].as_str().unwrap().contains("2026-10-14T16:00:00"));
+    }
+
+    #[test]
+    fn an_all_day_request_and_response_use_the_saved_zone() {
+        let calendar = calendar_from_json(&account().id, &json!({"id":"primary","summary":"Test"}), 0).unwrap();
+        let tokyo = tz::TimeZone::get("Asia/Tokyo").unwrap();
+        let phoenix = tz::TimeZone::get("America/Phoenix").unwrap();
+        let response = json!({"id":"day","start":{"date":"2026-11-02"},"end":{"date":"2026-11-03"},"originalStartTime":{"date":"2026-11-02"}});
+        let saved = event_from_json_in_zone(&account(), &calendar, &response, &tokyo).unwrap();
+        let body = event_to_json_in_zone(&saved, &tokyo);
+        assert_eq!(body["start"]["date"], "2026-11-02");
+        assert_eq!(body["end"]["date"], "2026-11-03");
+        // Reading the same timestamp in the new display zone would send the wrong date.
+        assert_eq!(event_to_json_in_zone(&saved, &phoenix)["start"]["date"], "2026-11-01");
+        let returned = event_from_json_in_zone(&account(), &calendar, &response, &tokyo).unwrap();
+        assert_eq!(returned.start, saved.start);
+        assert_eq!(returned.original_start, saved.original_start);
     }
 }

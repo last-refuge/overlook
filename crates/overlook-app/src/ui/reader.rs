@@ -515,7 +515,7 @@ impl MailWindow {
                     .child(div().text_size(px(13.)).font_weight(if m.is_read { FontWeight::MEDIUM } else { FontWeight::SEMIBOLD }).child(who.display_name()))
                     .child(div().truncate().text_size(px(12.)).text_color(p.muted).child(m.snippet.clone())),
             )
-            .child(div().text_size(px(11.)).text_color(p.muted).child(relative_label(m.date, now, self.utc_offset)))
+            .child(div().text_size(px(11.)).text_color(p.muted).child(relative_label(m.date, now, &self.time_zone)))
             .on_click(cx.listener(move |this, _, _window, cx| {
                 if !this.expanded.insert(id.clone()) {
                     this.expanded.remove(&id);
@@ -582,7 +582,7 @@ impl MailWindow {
                         div()
                             .text_size(px(12.))
                             .text_color(p.muted)
-                            .child(format_full(m.date, self.utc_offset)),
+                            .child(format_full(m.date, &self.time_zone)),
                     )
                     .child(
                         Button::new(SharedString::from(format!("mmenu-{}", m.id)))
@@ -853,7 +853,7 @@ impl MailWindow {
         let when = match &event {
             Some(e) if e.all_day => format!("{} · All day", overlook_core::tz::format_day(e.start)),
             Some(e) => format!("{} · {} – {}", overlook_core::tz::zoned(e.start).strftime("%A, %B %-d"), overlook_core::tz::format_clock(e.start), overlook_core::tz::format_clock(e.end)),
-            None => match inv.start {
+            None => match inv.start_in_zone(&self.time_zone) {
                 Some(s) if inv.all_day => format!("{} · All day", overlook_core::tz::format_day(s)),
                 Some(s) => format!("{} · {}", overlook_core::tz::zoned(s).strftime("%A, %B %-d"), overlook_core::tz::format_clock(s)),
                 None => String::new(),

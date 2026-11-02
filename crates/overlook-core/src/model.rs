@@ -755,7 +755,7 @@ fn strip_prefixes(subject: &str) -> String {
 pub fn quote_header(source: &Message) -> String {
     format!(
         "On {}, {} wrote:",
-        crate::time::format_full(source.date, crate::time::local_utc_offset_minutes()),
+        crate::time::format_full(source.date, &crate::tz::current_zone()),
         source.from.to_header()
     )
 }
@@ -765,7 +765,7 @@ pub fn forward_header(source: &Message) -> String {
     format!(
         "---------- Forwarded message ----------\nFrom: {}\nDate: {}\nSubject: {}\nTo: {}",
         source.from.to_header(),
-        crate::time::format_full(source.date, crate::time::local_utc_offset_minutes()),
+        crate::time::format_full(source.date, &crate::tz::current_zone()),
         source.subject,
         source.to.iter().map(Address::to_header).collect::<Vec<_>>().join(", ")
     )
