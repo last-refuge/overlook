@@ -1192,6 +1192,10 @@ impl Actor {
                 let mut p = json!({"type":kind,"key":key,"code":code,"modifiers":modifiers & 15,"windowsVirtualKeyCode":virtual_key});
                 if let Some(text) = text {
                     p["text"] = json!(text);
+                } else if kind == "keyDown" && key == "Enter" && modifiers & 7 == 0 {
+                    // Chromium's default summary/button activation needs the
+                    // Enter character as well as the physical key code.
+                    p["text"] = json!("\r");
                 }
                 self.cdp.call("Input.dispatchKeyEvent", p)?;
                 if kind != "keyUp" && (key == "Tab" || modifiers & 8 != 0) {
@@ -2591,6 +2595,40 @@ mod tests {
                 .unwrap(),
             360
         );
+    }
+
+    #[test]
+    #[ignore = "runs real sandboxed Chromium with synthetic thread history"]
+    fn chromium_thread_history_expands_and_collapses_with_pointer_and_keyboard() {
+        use overlook_core::thread_history::{HistoryBody, HistoryMessage};
+        let old = "<p>The synthetic project update is ready for the team to review.</p><div style='height:2400px'>Earlier discussion</div>";
+        let source = format!("<p>Thanks, we will review the update.</p><div id=divRplyFwdMsg>From: Test sender<br>Sent: Monday</div>{old}");
+        let messages = [
+            HistoryMessage { id: "old".into(), subject: "Test".into(), body: HistoryBody::Html(old.into()) },
+            HistoryMessage { id: "reply".into(), subject: "Re: Test".into(), body: HistoryBody::Html(source) },
+        ];
+        let folded = overlook_core::thread_history::prepare(&messages, || true).remove(&overlook_core::MessageId::from("reply")).unwrap();
+        let document = overlook_core::browser::prepare_document(&folded);
+        let mut actor = Actor::start(Arc::new(AtomicBool::new(false)), false).unwrap();
+        actor.load(&document.html, false).unwrap();
+        actor.refresh_layout(&|_| {}).unwrap();
+        let closed = actor.document_height;
+        assert!(closed < 300);
+        let point = actor.cdp.eval("(()=>{const r=document.querySelector('summary').getBoundingClientRect();return [r.x+10,r.y+10]})()".into()).unwrap();
+        let (x,y) = (point[0].as_f64().unwrap(),point[1].as_f64().unwrap());
+        for (kind,buttons) in [("mousePressed",1),("mouseReleased",0)] {
+            actor.input(Input::Mouse(kind.into(), x, y, "left".into(), buttons, 1), &|_| {}).unwrap();
+        }
+        actor.refresh_layout(&|_| {}).unwrap();
+        assert!(actor.document_height > closed + 2000);
+        assert_eq!(actor.cdp.eval("document.querySelector('details').open".into()).unwrap(), true);
+        // The summary remains keyboard-operable with sender scripts disabled.
+        assert_eq!(actor.cdp.eval("document.activeElement.localName".into()).unwrap(), "summary");
+        actor.input(Input::Key("keyDown".into(), "Enter".into(), "Enter".into(), 0, None), &|_| {}).unwrap();
+        actor.input(Input::Key("keyUp".into(), "Enter".into(), "Enter".into(), 0, None), &|_| {}).unwrap();
+        actor.refresh_layout(&|_| {}).unwrap();
+        assert_eq!(actor.cdp.eval("document.querySelector('details').open".into()).unwrap(), false);
+        assert_eq!(actor.document_height, closed);
     }
 
     #[test]

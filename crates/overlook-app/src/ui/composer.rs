@@ -23,14 +23,15 @@ use std::time::{Duration, Instant};
 /// A bounded opening reveal, not a sticky scroll-to-composer mode.
 struct ComposerReveal {
     until: Instant,
-    focus_to: bool,
+    last_layout: Option<(Pixels, Pixels, Pixels)>,
+    stable_since: Instant,
 }
 
-/// Reveal the beginning of a field, even when the editor is taller than the pane.
+/// Position the whole composer prominently, while keeping its beginning visible
+/// when a short pane cannot fit every control. Scroll extents are layout-derived.
 fn reveal_offset(offset: Pixels, top: Pixels, height: Pixels, viewport: Pixels, max: Pixels) -> Pixels {
-    let bottom = top + height.min(viewport);
-    let delta = if top < px(0.) { -top } else if bottom > viewport { viewport - bottom } else { px(0.) };
-    (offset + delta).min(px(0.)).max(-max)
+    let target = ((viewport - height) * 0.5).max(px(12.));
+    (offset + target - top).min(px(0.)).max(-max)
 }
 
 pub struct Composer {
@@ -49,6 +50,7 @@ pub struct Composer {
     pub signature_view: Option<SharedString>,
     pub show_cc: bool,
     pub show_bcc: bool,
+    pub show_headers: bool,
     pub dirty: bool,
     pub last_saved: Option<i64>,
     pub save_generation: u64,
@@ -136,11 +138,6 @@ impl MailWindow {
             _ => {}
         }));
 
-        let focus_to = draft.to.is_empty();
-        let reveal = (draft.kind != DraftKind::New && self.selected.is_some()).then(|| ComposerReveal {
-            until: Instant::now() + Duration::from_secs(2),
-            focus_to,
-        });
         let show_cc = !draft.cc.is_empty();
         let show_bcc = !draft.bcc.is_empty();
         self.composer = Some(Composer {
@@ -157,6 +154,7 @@ impl MailWindow {
             signature_view,
             show_cc,
             show_bcc,
+            show_headers: false,
             dirty: false,
             last_saved,
             save_generation: 0,
@@ -166,57 +164,99 @@ impl MailWindow {
             error: None,
             attaching: false,
             _subscriptions: subs,
-            reveal,
+            reveal: None,
         });
-        if focus_to {
-            to.update(cx, |s, cx| s.focus(window, cx));
-        } else {
-            body.update(cx, |s, cx| s.focus(window, cx));
-        }
-        cx.notify();
+        self.reveal_current_composer(window, cx);
     }
 
     pub(super) fn cancel_composer_reveal(&mut self) {
         if let Some(c) = self.composer.as_mut() { c.reveal = None; }
     }
 
-    /// Measure the actual field in prepaint, then scroll only after the scroll
-    /// handle has its final layout bounds. Re-measure briefly as browser height
-    /// settles. Closing/replacing the draft or user scrolling cancels callbacks.
-    fn composer_reveal_anchor(&self, focus_to: bool, cx: &Context<Self>) -> AnyElement {
-        let Some(c) = self.composer.as_ref() else { return div().into_any_element() };
-        if !c.reveal.as_ref().is_some_and(|r| r.focus_to == focus_to) {
-            return div().into_any_element();
+    pub(super) fn composer_is_inline(&self) -> bool {
+        self.composer.as_ref().is_some_and(|c| c.draft.kind != DraftKind::New
+            && self.selected.is_some() && c.draft.conversation_id.as_ref() == self.selected.as_ref())
+    }
+
+    pub(super) fn reuse_reply(&mut self, kind: DraftKind, source: &Message, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let replies = |kind| matches!(kind, DraftKind::Reply | DraftKind::ReplyAll);
+        let Some(current) = self.composer.as_ref().filter(|c| c.draft.in_reply_to.as_ref() == Some(&source.id)
+            && (c.draft.kind == kind || (replies(c.draft.kind) && replies(kind)))) else { return false };
+        if current.draft.kind != kind {
+            self.sync_composer_fields(cx);
+            let targets = Draft::in_response_to_with(self.account.id.clone(), kind, source, &self.owner(), now(), self.prefs.quote_on_reply);
+            let join = |list: &[Address]| list.iter().map(Address::to_header).collect::<Vec<_>>().join(", ");
+            let c = self.composer.as_mut().expect("the existing draft is being reused");
+            c.draft.kind = kind;
+            c.to.update(cx, |input, cx| input.set_value(join(&targets.to), window, cx));
+            c.cc.update(cx, |input, cx| input.set_value(join(&targets.cc), window, cx));
+            c.show_cc = !targets.cc.is_empty();
+            self.composer_changed(window, cx);
         }
+        self.reveal_current_composer(window, cx);
+        true
+    }
+
+    fn reader_composer_index(&self) -> usize {
+        self.composer.as_ref().and_then(|c| c.draft.in_reply_to.as_ref())
+            .and_then(|source| self.thread.iter().position(|m| &m.id == source))
+            .map_or(1 + self.thread.len(), |index| 2 + index)
+    }
+
+    fn begin_composer_reveal(&mut self) {
+        let inline = self.composer_is_inline();
+        let Some(c) = self.composer.as_mut() else { return };
+        c.reveal = inline.then(|| ComposerReveal {
+            until: Instant::now() + Duration::from_secs(8),
+            last_layout: None,
+            stable_since: Instant::now(),
+        });
+        if inline { self.reader_scroll.scroll_to_top_of_item(self.reader_composer_index()); }
+    }
+
+    pub(super) fn reveal_current_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.begin_composer_reveal();
+        let Some(c) = self.composer.as_mut() else { return };
+        if c.to.read(cx).value().trim().is_empty() {
+            c.to.update(cx, |state, cx| state.focus(window, cx));
+        } else {
+            c.body.update(cx, |state, cx| state.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    /// This anchor lives on the viewport, so it prepaints even when the reply is
+    /// thousands of pixels offscreen. The reply is a direct, measured scroll child.
+    /// Late browser/history layout is followed only during opening and stops on input.
+    pub(super) fn composer_reveal_anchor(&self, cx: &Context<Self>) -> AnyElement {
+        let Some(c) = self.composer.as_ref().filter(|c| c.reveal.is_some()) else { return div().into_any_element() };
         let body = c.body.entity_id();
         let view = cx.entity().downgrade();
-        let scroll = self.reader_scroll.clone();
-        canvas(move |bounds, window, _| {
-            let measured_offset = scroll.offset().y;
+        canvas(move |_, window, _| {
             let view = view.clone();
             window.on_next_frame(move |_, cx| {
-                let _ = view.update(cx, |this, cx| {
-                    let Some(c) = this.composer.as_mut().filter(|c| c.body.entity_id() == body) else { return };
-                    let Some(reveal) = c.reveal.as_ref() else { return };
-                    if Instant::now() >= reveal.until {
-                        c.reveal = None;
-                        return;
-                    }
+                view.update(cx, |this, cx| {
+                    let ready = !this.thread_history_pending && this.browser_bodies.borrow().values().all(|(_, _, body)| body.read(cx).layout_is_ready());
                     let viewport = this.reader_scroll.bounds();
-                    let offset = this.reader_scroll.offset();
-                    if viewport.size.height > px(0.) {
-                        let top = bounds.top() - viewport.top() + offset.y - measured_offset;
-                        let next = reveal_offset(offset.y, top, bounds.size.height, viewport.size.height, this.reader_scroll.max_offset().y);
-                        if next != offset.y {
-                            this.reader_scroll.set_offset(point(offset.x, next));
+                    let bounds = this.reader_scroll.bounds_for_item(this.reader_composer_index());
+                    let Some(c) = this.composer.as_mut().filter(|c| c.body.entity_id() == body) else { return };
+                    let Some(reveal) = c.reveal.as_mut() else { return };
+                    if let Some(bounds) = bounds.filter(|_| viewport.size.height > px(0.)) {
+                        let layout = (bounds.top() - viewport.top(), bounds.size.height, viewport.size.height);
+                        if reveal.last_layout != Some(layout) {
+                            reveal.last_layout = Some(layout);
+                            reveal.stable_since = Instant::now();
                         }
+                        let offset = this.reader_scroll.offset();
+                        let top = bounds.top() - viewport.top() + offset.y;
+                        let next = reveal_offset(offset.y, top, bounds.size.height, viewport.size.height, this.reader_scroll.max_offset().y);
+                        if next != offset.y { this.reader_scroll.set_offset(point(offset.x, next)); }
                     }
-                    // Drives only the bounded opening interval; never re-focuses
-                    // after the user has chosen another field or control.
-                    // notify schedules the next render. request_animation_frame
-                    // is render-phase-only and would panic in this callback.
+                    if Instant::now() >= reveal.until || (ready && reveal.last_layout.is_some() && reveal.stable_since.elapsed() >= Duration::from_millis(200)) {
+                        c.reveal = None;
+                    }
                     cx.notify();
-                });
+                }).ok();
             });
         }, |_, _, _, _| {}).absolute().inset_0().into_any_element()
     }
@@ -228,7 +268,7 @@ impl MailWindow {
             let mut v = vec![c.to.clone()];
             if c.show_cc { v.push(c.cc.clone()); }
             if c.show_bcc { v.push(c.bcc.clone()); }
-            v.push(c.subject.clone());
+            if !self.composer_is_inline() || c.show_headers { v.push(c.subject.clone()); }
             v
         };
         let focused = order.iter().position(|s| s.read(cx).focus_handle(cx).is_focused(window));
@@ -633,7 +673,9 @@ impl MailWindow {
             DraftKind::ReplyAll => "Reply all",
             DraftKind::Forward => "Forward",
         };
-        let inline = c.draft.kind != DraftKind::New;
+        let inline = self.composer_is_inline();
+        let extra_headers = (if c.show_headers { 80. } else { 0. }) + (if c.show_cc { 40. } else { 0. }) + (if c.show_bcc { 40. } else { 0. });
+        let editor_height = (self.reader_scroll.bounds().size.height - px(230. + extra_headers + if c.signature_view.is_some() { 100. } else { 0. })).min(px(220.)).max(px(96.));
         let saved_text = match (c.dirty, c.last_saved) {
             (true, _) => "Saving…".to_owned(),
             (false, Some(ts)) => {
@@ -724,6 +766,26 @@ impl MailWindow {
                 .child(e)
         });
 
+        let heading: AnyElement = if inline && matches!(c.draft.kind, DraftKind::Reply | DraftKind::ReplyAll) {
+            let draft_id = c.draft.id.clone();
+            let this = cx.entity().downgrade();
+            Button::new("reply-mode").ghost().small().label(title).icon(icon("chevron-down").size(px(12.)))
+                .accessibility_label("Reply type").tooltip("Switch between Reply and Reply all")
+                .dropdown_menu(move |mut menu, _, _| {
+                    for (label, kind) in [("Reply", DraftKind::Reply), ("Reply all", DraftKind::ReplyAll)] {
+                        let this = this.clone(); let draft_id = draft_id.clone();
+                        menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                            this.update(cx, |this, cx| {
+                                if let Some(source) = this.composer.as_ref().filter(|c| c.draft.id == draft_id).and_then(|c| c.source.clone()) {
+                                    this.reuse_reply(kind, &source, window, cx);
+                                }
+                            }).ok();
+                        }));
+                    }
+                    menu
+                }).into_any_element()
+        } else { div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child(title).into_any_element() };
+
         v_flex()
             .when(inline, |d| d.mx(px(28.)).mt(px(18.)).mb(px(28.)).rounded(px(10.)).border_1().border_color(p.divider))
             .when(!inline, |d| d.size_full())
@@ -736,7 +798,7 @@ impl MailWindow {
                     .h(px(46.))
                     .border_b_1()
                     .border_color(p.divider)
-                    .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child(title))
+                    .child(heading)
                     .child(div().flex_1())
                     .child(
                         h_flex()
@@ -757,10 +819,10 @@ impl MailWindow {
                             .on_click(cx.listener(|this, _, window, cx| this.close_composer(window, cx))),
                     ),
             )
-            .child(field_row(
+            .when(!inline || c.show_headers, |d| d.child(field_row(
                 "From",
                 div().text_size(px(13.)).child(format!("{} <{}>", owner.display_name(), owner.email)).into_any_element(),
-            ))
+            )))
             .child(
                 h_flex()
                     .items_center()
@@ -770,8 +832,7 @@ impl MailWindow {
                     .border_b_1()
                     .border_color(p.divider)
                     .child(field_label("To"))
-                    .child(div().relative().flex_1().min_w_0().child(Input::new(&c.to).appearance(false))
-                        .child(self.composer_reveal_anchor(true, cx)))
+                    .child(div().relative().flex_1().min_w_0().child(Input::new(&c.to).appearance(false)))
                     .when(!c.show_cc, |d| {
                         d.child(Button::new("show-cc").ghost().xsmall().label("Cc").on_click(cx.listener(|this, _, _w, cx| {
                             if let Some(c) = this.composer.as_mut() { c.show_cc = true; }
@@ -783,20 +844,27 @@ impl MailWindow {
                             if let Some(c) = this.composer.as_mut() { c.show_bcc = true; }
                             cx.notify();
                         })))
-                    }),
+                    })
+                    .when(inline, |d| d.child(Button::new("compose-details").ghost().xsmall().label(if c.show_headers { "Hide details" } else { "Details" })
+                        .tooltip("Show or hide From and Subject")
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            if let Some(c) = this.composer.as_mut() { c.show_headers = !c.show_headers; }
+                            this.begin_composer_reveal();
+                            cx.notify();
+                        })))),
             )
             .when(suggestion_field == Some(RecipientField::To), |d| d.children(suggestions.take()))
             .when(c.show_cc, |d| d.child(field_row("Cc", Input::new(&c.cc).appearance(false).into_any_element()))
                 .when(suggestion_field == Some(RecipientField::Cc), |d| d.children(suggestions.take())))
             .when(c.show_bcc, |d| d.child(field_row("Bcc", Input::new(&c.bcc).appearance(false).into_any_element()))
                 .when(suggestion_field == Some(RecipientField::Bcc), |d| d.children(suggestions.take())))
-            .child(field_row("Subject", Input::new(&c.subject).appearance(false).into_any_element()))
+            .when(!inline || c.show_headers, |d| d.child(field_row("Subject", Input::new(&c.subject).appearance(false).into_any_element())))
             .child(self.render_format_toolbar(c, &p, cx))
             .child(if c.preview {
                 div()
                     .id("composer-preview")
-                    .flex_1()
-                    .min_h(px(if inline { 180. } else { 240. }))
+                    .when(inline, |d| d.flex_none().h(editor_height))
+                    .when(!inline, |d| d.flex_1().min_h(px(240.)))
                     .overflow_y_scroll()
                     .px(px(16.))
                     .py(px(12.))
@@ -813,12 +881,11 @@ impl MailWindow {
             } else {
                 div()
                     .relative()
-                    .flex_1()
-                    .min_h(px(if inline { 180. } else { 240. }))
+                    .when(inline, |d| d.flex_none().h(editor_height))
+                    .when(!inline, |d| d.flex_1().min_h(px(240.)))
                     .px(px(10.))
                     .py(px(6.))
                     .child(Editor::new(&c.body).appearance(false).bordered(false).h_full().font_family("Inter").text_size(px(14.)).line_height(px(22.)))
-                    .child(self.composer_reveal_anchor(false, cx))
                     .into_any_element()
             })
             .children(self.render_signature_block(c, &p, cx))
@@ -1200,26 +1267,25 @@ mod tests {
     use std::prelude::v1::test;
 
     #[test]
-    fn reveal_long_message_editor_precisely() {
-        assert_eq!(reveal_offset(px(0.), px(100_000.), px(180.), px(600.), px(100_500.)), px(-99_580.));
+    fn long_thread_reveal_brings_the_whole_reply_into_view() {
+        let next = reveal_offset(px(0.), px(100_000.), px(480.), px(800.), px(101_000.));
+        let top = px(100_000.) + next;
+        assert_eq!(top, px(160.));
+        assert!(top >= px(0.) && top + px(480.) <= px(800.));
     }
 
     #[test]
-    fn reveal_is_minimal_and_clamped() {
-        // Already visible: no scroll. Above: align the field's beginning.
-        assert_eq!(reveal_offset(px(-500.), px(100.), px(180.), px(600.), px(1000.)), px(-500.));
-        assert_eq!(reveal_offset(px(-500.), px(-40.), px(180.), px(600.), px(1000.)), px(-460.));
-        // Tall editors reveal their beginning rather than their footer/quote.
-        assert_eq!(reveal_offset(px(0.), px(800.), px(2000.), px(600.), px(3000.)), px(-800.));
-        assert_eq!(reveal_offset(px(0.), px(800.), px(180.), px(600.), px(300.)), px(-300.));
+    fn short_panes_keep_the_reply_header_visible_and_respect_scroll_extents() {
+        assert_eq!(reveal_offset(px(0.), px(800.), px(2000.), px(600.), px(3000.)), px(-788.));
+        assert_eq!(reveal_offset(px(0.), px(800.), px(480.), px(600.), px(300.)), px(-300.));
+        assert_eq!(reveal_offset(px(0.), px(0.), px(480.), px(800.), px(300.)), px(0.));
     }
 
     #[test]
-    fn reveal_tracks_height_settling_without_a_fixed_scroll_distance() {
-        let first = reveal_offset(px(0.), px(10_000.), px(180.), px(600.), px(20_000.));
-        // The browser body grows 4,000px after the initial reveal.
-        let settled = reveal_offset(first, px(14_000.) + first, px(180.), px(600.), px(20_000.));
-        assert_eq!(settled, px(-13_580.));
+    fn late_browser_layout_keeps_the_reply_visible() {
+        let first = reveal_offset(px(0.), px(10_000.), px(480.), px(800.), px(20_000.));
+        let next = reveal_offset(first, px(14_000.) + first, px(480.), px(800.), px(20_000.));
+        assert_eq!(px(14_000.) + next, px(160.));
     }
 }
 

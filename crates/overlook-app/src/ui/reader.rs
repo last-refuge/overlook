@@ -13,20 +13,61 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use gpui_kit::base::{h_flex, v_flex};
 use overlook_core::sanitize::text_to_html;
-use overlook_core::time::{format_full, relative_label};
+use overlook_core::time::format_full;
 use overlook_core::*;
 use overlook_store::MailboxView;
 
 impl MailWindow {
+    pub(super) fn prepare_thread_history(&mut self, cx: &mut Context<Self>) {
+        use overlook_core::thread_history::{HistoryBody, HistoryMessage, MAX_MESSAGES, MAX_THREAD_BYTES};
+        self.thread_history_task = None;
+        self.thread_history.clear();
+        self.thread_history_pending = false;
+        let generation = self.thread_history_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let token = self.thread_history_generation.clone();
+        let mut bytes = 0;
+        let mut input = Vec::new();
+        for message in self.thread.iter().rev().take(MAX_MESSAGES) {
+            let size = message.body.html.as_ref().or(message.body.text.as_ref()).map_or(0, String::len);
+            if size > overlook_core::browser::MAX_SOURCE_BYTES || bytes + size > MAX_THREAD_BYTES { continue; }
+            let body = if let Some(html) = &message.body.html { HistoryBody::Html(html.clone()) }
+                else if let Some(text) = &message.body.text { HistoryBody::Text(text.clone()) }
+                else { continue };
+            bytes += size;
+            input.push(HistoryMessage { id: message.id.clone(), subject: message.subject.clone(), body });
+        }
+        input.reverse();
+        if input.len() < 2 { return; }
+        self.thread_history_pending = true;
+        self.thread_history_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx.background_spawn(async move {
+                overlook_core::thread_history::prepare(&input, || token.load(std::sync::atomic::Ordering::Relaxed) == generation)
+            }).await;
+            this.update(cx, |this, cx| {
+                if this.thread_history_generation.load(std::sync::atomic::Ordering::Relaxed) == generation {
+                    this.thread_history = result;
+                    this.thread_history_pending = false;
+                    cx.notify();
+                }
+            }).ok();
+        }));
+    }
+
     fn prune_browser_bodies(&self) {
         let mut active = std::collections::HashSet::new();
-        if let Some(summary) = self.selected_summary() {
-            for m in &self.thread {
-                if m.id == summary.latest_message_id || self.expanded.contains(&m.id) {
-                    active.insert(format!("message-{}", m.id));
-                }
+        let reserved = self.composer.as_ref().map_or(0, |c| usize::from(c.preview) + usize::from(c.quote_shown && c.draft.include_quote));
+        let reading = self.outbox_selected.is_none() && (self.composer.is_none() || self.composer_is_inline());
+        if let Some(summary) = self.selected_summary().filter(|_| reading) {
+            active.insert(format!("message-{}", summary.latest_message_id));
+            if let Some(source) = self.composer.as_ref().and_then(|c| c.draft.in_reply_to.as_ref()).filter(|id| self.expanded.contains(id)) {
+                active.insert(format!("message-{source}"));
+            }
+            for message in self.thread.iter().rev().filter(|m| self.expanded.contains(&m.id)) {
+                if active.len() >= 4 - reserved { break; }
+                active.insert(format!("message-{}", message.id));
             }
         }
+        *self.live_browser_messages.borrow_mut() = active.clone();
         if let Some(c) = &self.composer {
             if c.preview { active.insert(format!("preview-{}", c.draft.id)); }
             if c.quote_shown && c.draft.include_quote { active.insert(format!("quote-{}", c.draft.id)); }
@@ -41,6 +82,9 @@ impl MailWindow {
         &self, key: String, source: &str, original: Option<&Message>,
         allow_remote: bool, dark: bool, cx: &mut Context<Self>,
     ) -> (AnyElement, usize) {
+        if key.starts_with("message-") && !self.live_browser_messages.borrow().contains(&key) {
+            return (self.message_text_fallback(original, &key, cx), 0);
+        }
         use std::hash::{Hash, Hasher};
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         source.hash(&mut hash);
@@ -70,7 +114,7 @@ impl MailWindow {
             return (view.clone().into_any_element(), *count);
         }
         if cache.len() >= 4 {
-            return (div().p_3().child("Collapse another message to load this browser-rendered body (four live documents maximum).").into_any_element(), 0);
+            return (self.message_text_fallback(original, &key, cx), 0);
         }
         let (html, count) = self.browser_document(source, original, cx.palette());
         let native_scroll = (key.starts_with("message-") || key.starts_with("outbox-")).then(|| self.reader_scroll.clone());
@@ -88,6 +132,32 @@ impl MailWindow {
         });
         cache.insert(key, (fingerprint, count, view.clone()));
         (view.into_any_element(), count)
+    }
+
+    fn message_text_fallback(&self, message: Option<&Message>, key: &str, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(message) = message {
+            // Expanding a long thread must never replace readable content with
+            // a browser-process limit. Keep the full text and its files available.
+            if message.body.text.is_some() { return self.native_text_body(message); }
+            let id = message.id.clone();
+            return v_flex().gap(px(8.)).child(message.snippet.clone())
+                .child(Button::new(SharedString::from(format!("read-{key}"))).small().label("Read message")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.cancel_composer_reveal();
+                        this.expanded.clear();
+                        this.expanded.insert(id.clone());
+                        if let Some(index) = this.reader_message_index(&id) { this.reader_scroll.scroll_to_top_of_item(index); }
+                        cx.notify();
+                    }))).into_any_element();
+        }
+        div().p_3().child("Close an open preview, then try again.").into_any_element()
+    }
+
+    fn reader_message_index(&self, id: &MessageId) -> Option<usize> {
+        let index = self.thread.iter().position(|m| &m.id == id)?;
+        let composer_before = self.composer_is_inline() && self.composer.as_ref().and_then(|c| c.draft.in_reply_to.as_ref())
+            .and_then(|source| self.thread.iter().position(|m| &m.id == source)).is_some_and(|source| source < index);
+        Some(1 + index + usize::from(composer_before))
     }
 
     /// The document Chromium renders for a body: prepared, with inline images resolved.
@@ -132,10 +202,8 @@ impl MailWindow {
         let p = *cx.palette();
         let container = v_flex().size_full().bg(p.message_surface()).min_w_0();
 
-        if let Some(composer) = &self.composer {
-            if composer.draft.kind == DraftKind::New || self.selected.is_none() {
-                return container.child(self.render_composer(cx)).into_any_element();
-            }
+        if self.composer.is_some() && !self.composer_is_inline() {
+            return container.child(self.render_composer(cx)).into_any_element();
         }
 
         if let Some(item) = self.outbox_selected.as_ref().and_then(|id| self.outbox.iter().find(|d| &d.id == id)) {
@@ -181,10 +249,12 @@ impl MailWindow {
         let (in_trash, in_inbox) = self.thread_state();
         let toolbar = h_flex()
             .items_center()
+            .flex_wrap()
             .gap(px(2.))
-            .h(px(48.))
+            .min_h(px(48.))
+            .flex_none()
             .px(px(12.))
-            .overflow_hidden()
+            .py(px(6.))
             .border_b_1()
             .border_color(p.divider)
             .when(in_trash, |bar| {
@@ -284,6 +354,17 @@ impl MailWindow {
             .child(toolbar_button("reply-all", "Reply all", "Reply all (Ctrl Shift R)", cx.listener(|this, _, window, cx| this.reply(DraftKind::ReplyAll, window, cx))))
             .child(toolbar_button("forward", "Forward", "Forward (Ctrl F)", cx.listener(|this, _, window, cx| this.reply(DraftKind::Forward, window, cx))))
             .child(div().w(px(2.)))
+            .when(self.thread.len() > 1, |bar| bar.child(
+                Button::new("latest-message").ghost().small().icon(icon("arrow-down-to-line").size(px(16.)))
+                    .tooltip("Jump to latest message").accessibility_label("Jump to latest message")
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.cancel_composer_reveal();
+                        if let Some(index) = this.selected_summary().and_then(|s| this.reader_message_index(&s.latest_message_id)) {
+                            this.reader_scroll.scroll_to_top_of_item(index);
+                            cx.notify();
+                        }
+                    }))
+            ))
             .child(
                 Button::new("prev-conv")
                     .ghost()
@@ -324,6 +405,7 @@ impl MailWindow {
             .child(
                 h_flex()
                     .items_center()
+                    .flex_wrap()
                     .gap(px(8.))
                     .text_size(px(12.))
                     .text_color(p.muted)
@@ -368,72 +450,25 @@ impl MailWindow {
             .child(divider(&p));
 
         let latest_id = summary.latest_message_id.clone();
-        let mut messages = v_flex().px(px(28.)).gap(px(6.));
+        let composing = self.composer_is_inline();
+        let mut reply = composing.then(|| self.render_composer(cx).into_any_element());
+        let source = self.composer.as_ref().and_then(|c| c.draft.in_reply_to.as_ref());
+        let mut messages = Vec::with_capacity(self.thread.len() + 1);
         for m in &self.thread {
             let expanded = m.id == latest_id || self.expanded.contains(&m.id);
-            messages = messages.child(if expanded {
+            messages.push(div().flex_none().mx(px(24.)).my(px(4.)).child(if expanded {
                 self.render_message_expanded(m, cx).into_any_element()
             } else {
                 self.render_message_collapsed(m, cx).into_any_element()
-            });
-        }
-
-        let reply_area: AnyElement = match &self.composer {
-            Some(c) if c.draft.conversation_id.as_ref() == Some(&summary.id) => self.render_composer(cx).into_any_element(),
-            _ => {
-                let who = summary.participants.first().map(Address::display_name).unwrap_or_else(|| "sender".into());
-                v_flex()
-                    .mx(px(28.))
-                    .mt(px(18.))
-                    .mb(px(28.))
-                    .rounded(px(10.))
-                    .border_1()
-                    .border_color(p.divider)
-                    .child(
-                        div()
-                            .id("reply-box")
-                            .h_flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .px(px(14.))
-                            .h(px(46.))
-                            .text_size(px(13.))
-                            .text_color(p.muted)
-                            .cursor_text()
-                            .child(icon("corner-up-left").size(px(16.)).text_color(p.muted))
-                            .child(format!("Reply to {who}…"))
-                            .on_click(cx.listener(|this, _, window, cx| this.reply_default(window, cx))),
-                    )
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap(px(4.))
-                            .px(px(8.))
-                            .py(px(6.))
-                            .border_t_1()
-                            .border_color(p.divider)
-                            .child(
-                                Button::new("reply-btn")
-                                    .ghost()
-                                    .small()
-                                    .icon(icon("reply").size(px(15.)))
-                                    .label("Reply")
-                                    .on_click(cx.listener(|this, _, window, cx| this.reply(DraftKind::Reply, window, cx))),
-                            )
-                            .child(
-                                Button::new("forward-btn")
-                                    .ghost()
-                                    .small()
-                                    .icon(icon("forward").size(px(15.)))
-                                    .label("Forward")
-                                    .on_click(cx.listener(|this, _, window, cx| this.reply(DraftKind::Forward, window, cx))),
-                            )
-                            .child(div().flex_1())
-                            .child(kbd("Ctrl R", &p)),
-                    )
-                    .into_any_element()
+            }).into_any_element());
+            if source == Some(&m.id) {
+                if let Some(reply) = reply.take() { messages.push(div().flex_none().w_full().child(reply).into_any_element()); }
             }
-        };
+        }
+        // A saved draft can outlive its source message. Keep it accessible below
+        // the remaining conversation in that case.
+        if let Some(reply) = reply.take() { messages.push(div().flex_none().w_full().child(reply).into_any_element()); }
+        let reply_space = if composing { (self.reader_scroll.bounds().size.height * 0.3).max(px(28.)) } else { px(20.) };
 
         container
             .child(toolbar)
@@ -447,10 +482,14 @@ impl MailWindow {
                     .child(
                         v_flex().id("reader-scroll-area").size_full()
                             .overflow_y_scroll().lock_scroll_axis().track_scroll(&self.reader_scroll)
-                            .child(v_flex().w_full().flex_none().h_auto().min_h_full()
-                                .child(header).child(messages).child(reply_area))
+                            // Direct scroll children give GPUI real, measurable targets
+                            // even when a long browser body is completely offscreen.
+                            .child(header.flex_none())
+                            .children(messages)
+                            .child(div().flex_none().h(reply_space))
                     )
                     .vertical_scrollbar(&self.reader_scroll)
+                    .child(self.composer_reveal_anchor(cx))
                     // Capture before the inner scroller/editor consumes input.
                     .child(canvas(|_, _, _| {}, {
                         let view = cx.entity().downgrade();
@@ -492,7 +531,7 @@ impl MailWindow {
     fn render_message_collapsed(&self, m: &Message, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *cx.palette();
         let id = m.id.clone();
-        let now = overlook_core::time::now();
+        let full_date = format_full(m.date, &self.time_zone);
         let who = if m.is_outgoing { Address::named("You", &self.account.email) } else { m.from.clone() };
         let owner = self.owner();
         div()
@@ -500,11 +539,12 @@ impl MailWindow {
             .h_flex()
             .items_center()
             .gap(px(12.))
-            .px(px(6.))
+            .px(px(14.))
             .py(px(10.))
             .rounded(px(8.))
-            .border_b_1()
+            .border_1()
             .border_color(p.divider)
+            .bg(p.message_surface())
             .cursor_pointer()
             .hover(|d| d.bg(p.hover))
             .child(if m.is_outgoing { owner_avatar(&owner, 28., &p) } else { avatar(&who, 28., &p) })
@@ -512,10 +552,12 @@ impl MailWindow {
                 v_flex()
                     .flex_1()
                     .min_w_0()
-                    .child(div().text_size(px(13.)).font_weight(if m.is_read { FontWeight::MEDIUM } else { FontWeight::SEMIBOLD }).child(who.display_name()))
+                    .child(div().truncate().text_size(px(13.)).font_weight(if m.is_read { FontWeight::MEDIUM } else { FontWeight::SEMIBOLD }).child(who.display_name()))
                     .child(div().truncate().text_size(px(12.)).text_color(p.muted).child(m.snippet.clone())),
             )
-            .child(div().text_size(px(11.)).text_color(p.muted).child(relative_label(m.date, now, &self.time_zone)))
+            .when(m.attachments.iter().any(|a| !embedded_in_body(a, &m.body)), |d| d.child(icon("paperclip").size(px(13.)).text_color(p.muted)))
+            .when(m.is_starred, |d| d.child(icon("star").size(px(13.)).text_color(p.warning)))
+            .child(div().id(SharedString::from(format!("message-date-{}", m.id))).flex_none().text_size(px(11.)).text_color(p.muted).child(format!("{} · {}", overlook_core::tz::zoned(m.date).strftime("%b %-d"), overlook_core::tz::format_clock(m.date))).tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(full_date.clone()).build(window, cx)))
             .on_click(cx.listener(move |this, _, _window, cx| {
                 if !this.expanded.insert(id.clone()) {
                     this.expanded.remove(&id);
@@ -526,13 +568,15 @@ impl MailWindow {
 
     fn render_message_expanded(&self, m: &Message, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *cx.palette();
+        let rich_body = self.live_browser_messages.borrow().contains(&format!("message-{}", m.id));
+        let attachments: Vec<&Attachment> = m.attachments.iter().filter(|a| !rich_body || !embedded_in_body(a, &m.body)).collect();
         let who = if m.is_outgoing { Address::named("You", &self.account.email) } else { m.from.clone() };
         let owner = self.owner();
         let allow_remote = self.remote_allowed.contains(&m.id) || self.prefs.remote_images == RemoteImages::Allow;
         let (body_view, remote_resources) = if m.body.html.is_none() && m.body.text.as_deref().is_some_and(|t| !t.trim().is_empty()) {
             (self.native_text_body(m), 0)
         } else {
-            let html = Self::message_source(m);
+            let html = self.thread_history.get(&m.id).cloned().unwrap_or_else(|| Self::message_source(m));
             self.browser_message_body(format!("message-{}", m.id), &html, Some(m), allow_remote, p.is_dark(), cx)
         };
         let sender_email = if m.is_outgoing { self.account.email.clone() } else { m.from.email.clone() };
@@ -543,13 +587,18 @@ impl MailWindow {
         let t = cx.entity().downgrade();
 
         v_flex()
-            .pt(px(10.))
-            .pb(px(6.))
+            .px(px(16.))
+            .py(px(14.))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(p.divider)
+            .bg(p.message_surface())
             .gap(px(14.))
             .child(
                 h_flex()
                     .id(SharedString::from(format!("mhead-{}", m.id)))
-                    .items_center()
+                    .items_start()
+                    .flex_wrap()
                     .gap(px(12.))
                     .when(!is_latest, |d| d.cursor_pointer())
                     .on_click(cx.listener(move |this, _, _w, cx| {
@@ -562,11 +611,12 @@ impl MailWindow {
                     .child(
                         v_flex()
                             .flex_1()
-                            .min_w_0()
+                            .min_w(px(160.))
                             .child({
                                 let sender = div()
                                     .id(SharedString::from(format!("sender-{}", m.id)))
                                     .flex()
+                                    .flex_wrap()
                                     .items_baseline()
                                     .gap(px(6.))
                                     .text_size(px(14.))
@@ -578,12 +628,9 @@ impl MailWindow {
                             })
                             .child(self.render_recipients(m, cx)),
                     )
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(p.muted)
-                            .child(format_full(m.date, &self.time_zone)),
-                    )
+                    .child(v_flex().items_end().gap(px(4.))
+                        .child(self.message_reply_actions(m, true, cx))
+                        .child(div().text_size(px(11.)).text_color(p.muted).child(format!("{} · {}", overlook_core::tz::zoned(m.date).strftime("%b %-d, %Y"), overlook_core::tz::format_clock(m.date)))))
                     .child(
                         Button::new(SharedString::from(format!("mmenu-{}", m.id)))
                             .ghost()
@@ -657,7 +704,7 @@ impl MailWindow {
                 )
             })
             .child(div().w_full().min_w_0().child(body_view))
-            .when(!m.attachments.is_empty(), |d| {
+            .when(!attachments.is_empty(), |d| {
                 d.child(
                     v_flex()
                         .gap(px(10.))
@@ -666,16 +713,38 @@ impl MailWindow {
                             div()
                                 .text_size(px(12.))
                                 .font_weight(FontWeight::MEDIUM)
-                                .child(format!("{} attachment{}", m.attachments.len(), if m.attachments.len() == 1 { "" } else { "s" })),
+                                .child(format!("{} attachment{}", attachments.len(), if attachments.len() == 1 { "" } else { "s" })),
                         )
                         .child(
                             h_flex()
                                 .flex_wrap()
                                 .gap(px(10.))
-                                .children(m.attachments.iter().map(|a| self.render_attachment(a, cx))),
+                                .children(attachments.into_iter().map(|a| self.render_attachment(a, cx))),
                         ),
                 )
             })
+            .child(self.message_reply_actions(m, false, cx))
+    }
+
+    fn message_reply_actions(&self, message: &Message, compact: bool, cx: &mut Context<Self>) -> AnyElement {
+        h_flex().items_center().flex_wrap().gap(px(6.)).children([
+            ("reply", "Reply", DraftKind::Reply),
+            ("reply-all", "Reply all", DraftKind::ReplyAll),
+            ("forward", "Forward", DraftKind::Forward),
+        ].into_iter().map(|(glyph, label, kind)| {
+            let source_id = message.id.clone();
+            Button::new(SharedString::from(format!("message-{glyph}-{}-{compact}", message.id)))
+                .small().icon(icon(glyph).size(px(if compact { 14. } else { 15. })))
+                .when(compact, |b| b.ghost().xsmall())
+                .when(!compact, |b| b.label(label))
+                .tooltip(format!("{label} to this message")).accessibility_label(label)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    if let Some(source) = this.thread.iter().find(|m| m.id == source_id).cloned() {
+                        this.reply_to(kind, source, window, cx);
+                    }
+                }))
+        })).into_any_element()
     }
 
     /// Replaces `cid:` image references with the downloaded attachment as a `data:` URL,
@@ -996,6 +1065,14 @@ impl MailWindow {
     }
 }
 
+/// Keep actual files and orphaned inline parts available. A referenced logo is
+/// already drawn in the body and should not become a duplicate attachment card.
+fn embedded_in_body(attachment: &Attachment, body: &Body) -> bool {
+    if !attachment.is_inline_image() { return false; }
+    let (Some(cid), Some(html)) = (attachment.content_id.as_deref(), body.html.as_deref()) else { return false };
+    ["\"", "'"].iter().any(|quote| html.contains(&format!("src={quote}cid:{cid}{quote}")))
+}
+
 fn toolbar_button(
     icon_name: &'static str,
     label: &'static str,
@@ -1130,6 +1207,16 @@ fn plain_text_html(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inline_images_are_not_duplicated_but_orphans_remain_accessible() {
+        let image = overlook_core::Attachment { id: "image".into(), message_id: "message".into(), filename: "logo.png".into(), mime_type: "image/png".into(), size_bytes: 12, local_path: None, provider_id: None, content_id: Some("logo@example.test".into()) };
+        for html in ["<img src=\"cid:logo@example.test\">", "<img src='cid:logo@example.test'>"] {
+            assert!(super::embedded_in_body(&image, &overlook_core::Body { html: Some(html.into()), text: None }));
+        }
+        assert!(!super::embedded_in_body(&image, &overlook_core::Body { html: Some("<p>No logo here.</p>".into()), text: None }));
+        assert!(!super::embedded_in_body(&image, &overlook_core::Body::default()));
+    }
+
     #[test]
     fn plain_text_keeps_lines_escapes_markup_and_links_urls() {
         let html = super::plain_text_html("Hi <b>&\nSee https://example.com/a?b=1&c=2.\n\nBye");
