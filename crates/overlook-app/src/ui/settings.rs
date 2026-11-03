@@ -77,7 +77,51 @@ pub struct SettingsState {
     pub work_end: Entity<InputState>,
     pub time_zone: Entity<ComboboxState<SearchableVec<ZoneChoice>>>,
     pub caldav: Option<super::calendar_setup::CalendarSetup>,
+    /// Filters every page's settings by name; non-empty shows results instead of a page.
+    pub search: Entity<InputState>,
+    /// The setting a search result jumped to: scrolled into view and briefly highlighted.
+    pub scroll_target: Option<ScrollTarget>,
     pub _subscriptions: Vec<Subscription>,
+}
+
+/// Where a search result should land. `key` is the row or section text to scroll to;
+/// `fallback` (the entry's section title) is used when that row is not on screen, such
+/// as automatic replies on an account without them.
+#[derive(Clone)]
+pub struct ScrollTarget {
+    key: &'static str,
+    fallback: &'static str,
+    anchor: ScrollAnchor,
+    fallback_anchor: ScrollAnchor,
+    found: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+thread_local! {
+    /// The scroll target and highlight colour while the settings page renders. The row
+    /// helpers (`setting_row`, `section`, `scroll_target`) are free functions called from
+    /// every page, so they read this instead of taking the target as an argument.
+    static RENDER_TARGET: std::cell::RefCell<Option<(ScrollTarget, Hsla)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Marks `element` as the place the current search result lands, when `key` names it.
+fn scroll_target(key: &str, element: impl IntoElement) -> AnyElement {
+    RENDER_TARGET.with_borrow(|target| {
+        let Some((t, highlight)) = target.as_ref() else { return element.into_any_element() };
+        let anchor = if key == t.key {
+            t.found.set(true);
+            t.anchor.clone()
+        } else if key == t.fallback {
+            t.fallback_anchor.clone()
+        } else {
+            return element.into_any_element();
+        };
+        div()
+            .id("settings-scroll-target")
+            .anchor_scroll(Some(anchor))
+            .when(key == t.key, |d| d.mx(px(-10.)).px(px(10.)).my(px(-6.)).py(px(6.)).rounded(px(8.)).bg(*highlight))
+            .child(element)
+            .into_any_element()
+    })
 }
 
 #[derive(Clone)]
@@ -297,7 +341,20 @@ impl MailWindow {
         let selected = zones.iter().position(|choice| choice.definition == self.prefs.time_zone).unwrap_or(0);
         let time_zone = cx.new(|cx| ComboboxState::new(SearchableVec::new(zones), vec![IndexPath::default().row(selected)], window, cx).searchable(true));
 
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search settings"));
+
         let mut subs = Vec::new();
+        subs.push(cx.subscribe_in(&search, window, |this, state, event: &InputEvent, window, cx| match event {
+            InputEvent::Change => {
+                if let Some(s) = this.settings.as_ref() { s.scroll.set_offset(point(px(0.), px(0.))); }
+                cx.notify();
+            }
+            InputEvent::PressEnter { .. } => {
+                let query = state.read(cx).value().to_string();
+                if let Some(&first) = search_settings(&query).first() { this.open_settings_result(first.page, Some(first), window, cx); }
+            }
+            _ => {}
+        }));
         subs.push(cx.subscribe_in(&time_zone, window, |this, _, event: &ComboboxEvent<SearchableVec<ZoneChoice>>, window, cx| {
             if let ComboboxEvent::Confirm(values) = event {
                 if let Some(name) = values.first().filter(|name| **name != this.prefs.time_zone) { this.change_time_zone(name.clone(), window, cx); }
@@ -382,6 +439,8 @@ impl MailWindow {
             work_end,
             time_zone,
             caldav,
+            search,
+            scroll_target: None,
             _subscriptions: subs,
         });
         self.load_vacation(acct.id, window, cx);
@@ -401,9 +460,71 @@ impl MailWindow {
     fn set_settings_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
         if let Some(s) = self.settings.as_mut() {
             s.page = page;
+            s.scroll_target = None;
             s.scroll.set_offset(point(px(0.), px(0.)));
         }
         cx.notify();
+    }
+
+    /// The settings search query, trimmed; empty when nothing is typed.
+    pub(crate) fn settings_query(&self, cx: &App) -> String {
+        self.settings.as_ref().map(|s| s.search.read(cx).value().trim().to_owned()).unwrap_or_default()
+    }
+
+    /// Clears the settings search. Returns whether there was anything to clear, so Escape
+    /// empties the search before it closes the dialog.
+    pub(crate) fn clear_settings_search(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.settings_query(cx).is_empty() { return false; }
+        if let Some(search) = self.settings.as_ref().map(|s| s.search.clone()) {
+            search.update(cx, |s, cx| s.set_value("", window, cx));
+        }
+        cx.notify();
+        true
+    }
+
+    /// Ctrl F / F3: put the cursor in the search box with any earlier query selected.
+    fn focus_settings_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(search) = self.settings.as_ref().map(|s| s.search.clone()) else { return };
+        search.update(cx, |s, cx| {
+            s.focus(window, cx);
+            s.select_all(window, cx);
+        });
+    }
+
+    /// Leaves search for `page`; with an `entry`, scrolls to that setting and highlights it.
+    fn open_settings_result(&mut self, page: SettingsPage, entry: Option<&'static SettingEntry>, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_settings_search(window, cx);
+        if let Some(focus) = self.settings.as_ref().map(|s| s.focus.clone()) { focus.focus(window, cx); }
+        self.set_settings_page(page, cx);
+        let (Some(entry), Some(state)) = (entry, self.settings.as_mut()) else { return };
+        let target = ScrollTarget {
+            key: entry.anchor(),
+            fallback: entry.section,
+            anchor: ScrollAnchor::for_handle(state.scroll.clone()),
+            fallback_anchor: ScrollAnchor::for_handle(state.scroll.clone()),
+            found: Default::default(),
+        };
+        state.scroll_target = Some(target.clone());
+        let found = target.found.clone();
+        // The anchors learn their position when the new page is laid out. Wait a frame past
+        // that layout before choosing the row or its section, then draw at the new offset.
+        window.on_next_frame(move |window, _| {
+            window.on_next_frame(move |window, cx| {
+                if target.found.get() { target.anchor.scroll_to(window, cx) } else { target.fallback_anchor.scroll_to(window, cx) }
+                window.on_next_frame(|window, _| window.refresh());
+            });
+        });
+        // The highlight fades once the eye has found it, unless another jump replaced it.
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(1800)).await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(s) = this.settings.as_mut().filter(|s| s.scroll_target.as_ref().is_some_and(|t| std::rc::Rc::ptr_eq(&t.found, &found))) {
+                    s.scroll_target = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn set_settings_account(&mut self, id: AccountId, window: &mut Window, cx: &mut Context<Self>) {
@@ -416,6 +537,9 @@ impl MailWindow {
         let p = *cx.palette();
         let Some(state) = self.settings.as_ref() else { return div().into_any_element() };
         let page = state.page;
+        let query = self.settings_query(cx);
+        let results = search_settings(&query);
+        let searching = !query.is_empty();
 
         let nav = {
             let p = cx.palette().navigation_palette();
@@ -429,9 +553,11 @@ impl MailWindow {
             .border_color(p.divider)
             .p(px(12.))
             .gap(px(2.))
-            .child(div().px(px(10.)).pt(px(6.)).pb(px(14.)).text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).child("Settings"))
+            .child(div().px(px(10.)).pt(px(6.)).pb(px(10.)).text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).child("Settings"))
+            .child(div().pb(px(10.)).child(Input::new(&state.search).small().prefix(icon("search").size(px(14.)).text_color(p.muted)).cleanable(true)))
             .children(SettingsPage::ALL.iter().map(|&pg| {
-                let active = pg == page;
+                let active = pg == page && !searching;
+                let matches = results.iter().filter(|r| r.page == pg).count();
                 h_flex()
                     .id(SharedString::from(format!("settings-nav-{}", pg.label())))
                     .focusable()
@@ -451,24 +577,28 @@ impl MailWindow {
                     .when(!active, |d| d.hover(|d| d.bg(p.hover)))
                     .focus_visible(|d| d.bg(p.selection).border_1().border_color(p.accent))
                     .child(icon(pg.icon()).size(px(16.)).text_color(if active { p.accent } else { p.muted }))
-                    .child(pg.label())
-                    .on_click(cx.listener(move |this, _, _w, cx| this.set_settings_page(pg, cx)))
-                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                    .child(div().flex_1().child(pg.label()))
+                    .when(searching, |d| d.when(matches == 0, |d| d.opacity(0.45)).when(matches > 0, |d| d.child(div().text_size(px(11.)).text_color(p.muted).child(matches.to_string()))))
+                    .on_click(cx.listener(move |this, _, window, cx| this.open_settings_result(pg, None, window, cx)))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                         if matches!(event.keystroke.key.as_str(), "enter" | "space") && !event.keystroke.modifiers.control && !event.keystroke.modifiers.alt && !event.keystroke.modifiers.platform {
-                            this.set_settings_page(pg, cx);
+                            this.open_settings_result(pg, None, window, cx);
                             cx.stop_propagation();
                         }
                     }))
             }))
         };
 
-        let content: AnyElement = match page {
+        RENDER_TARGET.set(state.scroll_target.clone().filter(|_| !searching).map(|t| (t, p.selection)));
+        let content: AnyElement = if searching { self.render_settings_results(&query, &results, cx) } else { match page {
             SettingsPage::Accounts => self.render_settings_accounts(state, cx).into_any_element(),
             SettingsPage::General => self.render_settings_general(cx).into_any_element(),
             SettingsPage::Mail => self.render_settings_mail(state, cx).into_any_element(),
             SettingsPage::Calendar => self.render_settings_calendar(state, cx).into_any_element(),
             SettingsPage::About => self.render_settings_about(cx).into_any_element(),
-        };
+        } };
+        RENDER_TARGET.set(None);
+        let title: SharedString = if searching { format!("Results for “{query}”").into() } else { page.label().into() };
 
         div()
             .id("settings-overlay")
@@ -484,7 +614,9 @@ impl MailWindow {
             .child(
                 h_flex()
                     .id("settings-dialog")
+                    .key_context(super::SETTINGS_CONTEXT)
                     .track_focus(&state.focus)
+                    .on_action(cx.listener(|this, _: &super::FocusSettingsSearch, window, cx| this.focus_settings_search(window, cx)))
                     .tab_group()
                     .role(gpui::Role::Dialog)
                     .aria_label("Settings")
@@ -527,7 +659,7 @@ impl MailWindow {
                                     .px(px(24.))
                                     .border_b_1()
                                     .border_color(p.divider)
-                                    .child(div().flex_1().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(page.label()))
+                                    .child(div().flex_1().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).truncate().child(title))
                                     .child(kbd("Esc", &p))
                                     .child(Button::new("settings-close").ghost().small().icon(icon("x").size(px(16.))).ml(px(8.)).on_click(cx.listener(|this, _, window, cx| this.close_settings(window, cx)))),
                             )
@@ -535,6 +667,52 @@ impl MailWindow {
                                 .child(div().flex_none().child(content)).overflow_y_scroll().track_scroll(&state.scroll).vertical_scrollbar(&state.scroll)),
                     ),
             )
+            .into_any_element()
+    }
+
+    fn render_settings_results(&self, query: &str, results: &[&'static SettingEntry], cx: &mut Context<Self>) -> AnyElement {
+        let p = *cx.palette();
+        if results.is_empty() {
+            return v_flex()
+                .gap(px(4.))
+                .child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child(format!("No settings match “{query}”.")))
+                .child(div().text_size(px(12.)).text_color(p.muted).child("Try a shorter word, such as “theme”, “signature” or “reminder”."))
+                .into_any_element();
+        }
+        v_flex()
+            .gap(px(4.))
+            .children(results.iter().enumerate().map(|(i, &entry)| {
+                let pg = entry.page;
+                v_flex()
+                    .id(SharedString::from(format!("settings-result-{i}")))
+                    .focusable()
+                    .tab_stop(true)
+                    .role(gpui::Role::Button)
+                    .aria_label(entry.label)
+                    .gap(px(2.))
+                    .px(px(12.))
+                    .py(px(9.))
+                    .rounded(px(8.))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(p.hover))
+                    .focus_visible(|d| d.bg(p.selection).border_1().border_color(p.accent))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(icon(pg.icon()).size(px(14.)).text_color(p.muted))
+                            .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child(entry.label))
+                            .child(div().flex_none().text_size(px(11.)).text_color(p.muted).child(format!("{} › {}", pg.label(), entry.section))),
+                    )
+                    .when(!entry.description.is_empty(), |d| d.child(div().pl(px(22.)).text_size(px(12.)).text_color(p.muted).truncate().child(entry.description)))
+                    .on_click(cx.listener(move |this, _, window, cx| this.open_settings_result(pg, Some(entry), window, cx)))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") && !event.keystroke.modifiers.control && !event.keystroke.modifiers.alt && !event.keystroke.modifiers.platform {
+                            this.open_settings_result(pg, Some(entry), window, cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+            }))
             .into_any_element()
     }
 
@@ -611,7 +789,7 @@ impl MailWindow {
                     })))
                     .into_any_element(),
             ))
-            .children(state.caldav.as_ref().map(|form| self.render_calendar_setup(form, cx)))
+            .children(state.caldav.as_ref().map(|form| scroll_target("Calendar server", self.render_calendar_setup(form, cx))))
             .child(section("Signatures", Some("Added below your message, above anything you are replying to. Write HTML below, use the buttons for the basics, or paste HTML from elsewhere. Pictures you insert or paste are sent with the message.")))
             .child({
                 let acct_id = account.id.clone();
@@ -977,7 +1155,7 @@ impl MailWindow {
             .child(setting_row("Sign-in tokens", "Stored in the system keyring (Secret Service), never in files.", div().into_any_element()))
             .child(section("Keyboard", None))
             .child(div().text_size(px(12.)).text_color(p.muted).line_height(px(20.)).child(
-                "Ctrl N new message · Ctrl E search · Ctrl R reply · Ctrl Shift R reply all · Ctrl F forward · Ctrl Enter send · Ctrl U toggle read · J/K move · E archive or move to Inbox · Delete · S star · Ctrl 1 Mail · Ctrl 2 Calendar · Ctrl Shift A new event · Ctrl , settings · in the calendar: ← → T D W M A",
+                "Ctrl N new message · Ctrl E search · Ctrl R reply · Ctrl Shift R reply all · Ctrl F forward · Ctrl Enter send · Ctrl U toggle read · J/K move · E archive or move to Inbox · Delete · S star · Ctrl 1 Mail · Ctrl 2 Calendar · Ctrl Shift A new event · Ctrl , settings · in settings: Ctrl F or F3 search · in the calendar: ← → T D W M A",
             ))
     }
 }
@@ -1138,15 +1316,15 @@ impl MailWindow {
 }
 
 fn section(title: &str, description: Option<&str>) -> Div {
-    v_flex()
+    div().child(scroll_target(title, v_flex()
         .gap(px(2.))
         .pt(px(6.))
         .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child(title.to_owned()))
-        .children(description.map(|d| div().text_size(px(12.)).child(d.to_owned()).opacity(0.7)))
+        .children(description.map(|d| div().text_size(px(12.)).child(d.to_owned()).opacity(0.7)))))
 }
 
 fn setting_row(label: &str, description: &str, control: AnyElement) -> Div {
-    h_flex()
+    div().child(scroll_target(label, h_flex()
         .items_center()
         .gap(px(24.))
         .child(
@@ -1157,7 +1335,7 @@ fn setting_row(label: &str, description: &str, control: AnyElement) -> Div {
                 .child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child(label.to_owned()))
                 .when(!description.is_empty(), |d| d.child(div().text_size(px(12.)).opacity(0.7).child(description.to_owned()))),
         )
-        .child(div().flex_none().child(control))
+        .child(div().flex_none().child(control))))
 }
 
 /// Segmented choice control.
@@ -1179,4 +1357,139 @@ fn choice<T: Copy + PartialEq + 'static>(
                 .on_click(cx.listener(move |this, _, window, cx| on_select(this, value, window, cx)))
         }))
         .into_any_element()
+}
+
+// ---------------------------------------------------------------- search
+
+/// One searchable setting. Keep in step with the render functions above: a row added
+/// there should get an entry here so search can find it.
+pub(crate) struct SettingEntry {
+    pub page: SettingsPage,
+    pub section: &'static str,
+    pub label: &'static str,
+    pub description: &'static str,
+    /// Extra words people might search for that the label does not contain.
+    pub keywords: &'static str,
+}
+
+impl SettingEntry {
+    /// The row or section text this entry scrolls to. Usually the label; a few entries
+    /// name a setting whose row reads differently, or that has no row of its own.
+    fn anchor(&self) -> &'static str {
+        match self.label {
+            "Add account" => "Your accounts",
+            "Check for updates" => "Updates",
+            "Keyboard shortcuts" => "Keyboard",
+            label => label,
+        }
+    }
+}
+
+const fn entry(page: SettingsPage, section: &'static str, label: &'static str, description: &'static str, keywords: &'static str) -> SettingEntry {
+    SettingEntry { page, section, label, description, keywords }
+}
+
+use SettingsPage::{About as AB, Accounts as AC, Calendar as CA, General as GE, Mail as MA};
+
+pub(crate) static SETTINGS_INDEX: &[SettingEntry] = &[
+    entry(AC, "Your accounts", "Add account", "Mail and calendar accounts on this device.", "gmail imap pop3 new"),
+    entry(AC, "Account", "Your name", "Shown as the sender on messages you write.", "display name from sender"),
+    entry(AC, "Account", "Status", "Sync state, sign-in and server settings.", "sync now sign in server settings connection password"),
+    entry(AC, "Account", "Calendar server", "CalDAV calendars for this account.", "caldav calendar"),
+    entry(AC, "Signatures", "Signatures", "Added below your message, above anything you are replying to.", "signature html picture image"),
+    entry(AC, "Signatures", "Use for new messages", "Default signature for new messages.", "signature default"),
+    entry(AC, "Signatures", "Use for replies and forwards", "Default signature for replies and forwards.", "signature default reply forward"),
+    entry(AC, "Automatic replies", "Send automatic replies", "An out-of-office reply sent for you while it is on.", "vacation out of office away autoresponder"),
+    entry(AC, "Automatic replies", "Only reply to people in my contacts", "", "vacation out of office"),
+    entry(AC, "Contacts", "Contacts", "For recipient suggestions and sender cards.", "address book sync contacts google"),
+    entry(AC, "Sign out", "Sign out of this account", "Deletes the stored sign-in.", "log out logout revoke keyring"),
+    entry(AC, "Remove", "Remove this account from this device", "Deletes downloaded mail, events, drafts, and stored sign-in.", "delete account"),
+    entry(GE, "Appearance", "Theme", "Follow system picks Light or Dark from your desktop setting.", "dark light mode appearance colors omarchy"),
+    entry(GE, "Appearance", "Density", "Compact fits more messages on screen.", "compact comfortable spacing"),
+    entry(GE, "Appearance", "Reading pane", "On the right or below the list.", "layout preview pane bottom right"),
+    entry(GE, "Start-up and time", "Time zone", "Follow the system or choose a zone.", "timezone tz city"),
+    entry(GE, "Start-up and time", "Open Overlook in", "Mail, Calendar, or the last used module.", "startup launch start"),
+    entry(GE, "Start-up and time", "Time format", "12-hour or 24-hour clock.", "clock 24h 12h am pm"),
+    entry(GE, "Start-up and time", "Week starts on", "Monday or Sunday.", "first day week"),
+    entry(GE, "Notifications", "Show in Omarchy notifications", "Messages also appear in Omarchy’s notification center.", "omarchy notification center"),
+    entry(GE, "Notifications", "New mail", "Desktop notification when new mail arrives.", "notifications alert focused"),
+    entry(GE, "Notifications", "Event reminders", "Desktop notification before events start.", "notifications alert reminder"),
+    entry(GE, "Synchronization", "Check for changes every", "How often Overlook looks for new mail and events.", "sync interval refresh poll frequency"),
+    entry(MA, "Layout", "Focused Inbox", "Sort the Inbox into Focused and Other.", "other inbox sort"),
+    entry(MA, "Layout", "Sender pictures", "Show initials next to each conversation.", "avatars initials photos"),
+    entry(MA, "Layout", "Message preview text", "Show the first line of each conversation in the list.", "snippet preview"),
+    entry(MA, "Reading", "Mark as read", "When a conversation is opened in the reading pane.", "unread read"),
+    entry(MA, "Reading", "Remote content", "Remote images and fonts can reveal when you open a message.", "images privacy tracking block load"),
+    entry(MA, "Compose and reply", "Undo send", "A sent message waits this long in the Outbox before it leaves.", "delay outbox cancel"),
+    entry(MA, "Compose and reply", "Default reply", "What the reply box and Ctrl R do.", "reply all"),
+    entry(MA, "Compose and reply", "Quote the original message in replies", "", "quote quoting reply"),
+    entry(MA, "Attachments", "Save attachments to", "Folder offered first when you save an attachment.", "downloads folder directory files"),
+    entry(MA, "Download", "Inbox messages to download", "Newest messages fetched for each account.", "sync history count offline"),
+    entry(CA, "Working hours", "Working hours", "Hours outside this range are shaded in Day and Week views.", "work start end business"),
+    entry(CA, "Events", "Default event length", "", "duration meeting minutes"),
+    entry(CA, "Events", "Default reminder", "Used when an event or calendar sets no reminder of its own.", "alert notification alarm"),
+    entry(CA, "Events", "Show declined events", "", "declined rsvp hide"),
+    entry(CA, "Events", "Event reminders", "Desktop notification before events start.", "notifications alert"),
+    entry(AB, "Updates", "Check for updates", "From the project’s GitHub releases.", "update version upgrade automatic"),
+    entry(AB, "Links", "Source", "github.com/last-refuge/overlook", "github repository code website"),
+    entry(AB, "On this device", "Mail, events, drafts, and attachments", "Open the data folder.", "data folder storage location"),
+    entry(AB, "On this device", "Back up mail", "Copies the database and messages to a folder you choose.", "backup export restore"),
+    entry(AB, "On this device", "Google OAuth client", "", "oauth client config google"),
+    entry(AB, "On this device", "Sign-in tokens", "Stored in the system keyring.", "keyring secret service tokens"),
+    entry(AB, "Keyboard", "Keyboard shortcuts", "", "keys shortcuts hotkeys keybindings"),
+];
+
+/// Settings whose label, section, page, description or keywords contain every word of
+/// `query` (case-insensitive). Label matches come first; otherwise index order is kept.
+pub(crate) fn search_settings(query: &str) -> Vec<&'static SettingEntry> {
+    let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    if terms.is_empty() { return Vec::new(); }
+    let mut hits: Vec<(bool, &'static SettingEntry)> = SETTINGS_INDEX
+        .iter()
+        .filter_map(|e| {
+            let haystack = format!("{} {} {} {} {}", e.label, e.section, e.page.label(), e.description, e.keywords).to_lowercase();
+            terms.iter().all(|t| haystack.contains(t.as_str())).then(|| {
+                let label = e.label.to_lowercase();
+                (terms.iter().all(|t| label.contains(t.as_str())), e)
+            })
+        })
+        .collect();
+    hits.sort_by_key(|(in_label, _)| !*in_label);
+    hits.into_iter().map(|(_, e)| e).collect()
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::{search_settings, SettingsPage};
+
+    #[test]
+    fn empty_query_finds_nothing() {
+        assert!(search_settings("").is_empty());
+        assert!(search_settings("   ").is_empty());
+    }
+
+    #[test]
+    fn matches_label_case_insensitively() {
+        let hits = search_settings("THEME");
+        assert_eq!(hits.first().map(|e| e.label), Some("Theme"));
+    }
+
+    #[test]
+    fn matches_keywords() {
+        let hits = search_settings("vacation");
+        assert!(hits.iter().any(|e| e.label == "Send automatic replies"));
+        assert!(search_settings("dark").iter().any(|e| e.label == "Theme"));
+    }
+
+    #[test]
+    fn every_word_must_match() {
+        assert!(search_settings("signature reply").iter().all(|e| e.page == SettingsPage::Accounts));
+        assert!(search_settings("theme zzzz").is_empty());
+    }
+
+    #[test]
+    fn label_matches_rank_first() {
+        let hits = search_settings("reminder");
+        assert!(hits[0].label.to_lowercase().contains("reminder"));
+    }
 }

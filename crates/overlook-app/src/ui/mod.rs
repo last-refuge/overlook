@@ -101,12 +101,14 @@ actions!(
         TogglePreview,
         ToggleMessageHistory,
         PopOutComposer,
+        FocusSettingsSearch,
     ]
 );
 
 const WINDOW_CONTEXT: &str = "MailWindow";
 const LIST_CONTEXT: &str = "MessageList";
 const CALENDAR_CONTEXT: &str = "CalendarView";
+const SETTINGS_CONTEXT: &str = "SettingsDialog";
 
 /// Incoming, unread Inbox messages in `next` that `previous` did not have, newest first,
 /// filtered by the new-mail preference (Focused only follows the Focused Inbox split).
@@ -204,6 +206,9 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("s", ToggleStar, Some(LIST_CONTEXT)),
         KeyBinding::new("u", ToggleRead, Some(LIST_CONTEXT)),
         KeyBinding::new("enter", OpenSelected, Some(LIST_CONTEXT)),
+        // Inside Settings, find keys search settings instead of forwarding mail.
+        KeyBinding::new("ctrl-f", FocusSettingsSearch, Some(SETTINGS_CONTEXT)),
+        KeyBinding::new("f3", FocusSettingsSearch, Some(SETTINGS_CONTEXT)),
     ]);
 }
 
@@ -2828,7 +2833,9 @@ impl MailWindow {
             self.quick_look = None;
             cx.notify();
         } else if self.settings.is_some() {
-            self.close_settings(window, cx);
+            if !self.clear_settings_search(window, cx) {
+                self.close_settings(window, cx);
+            }
         } else if self.composer.is_some() {
             self.close_composer(window, cx);
         } else if self.contact_form.is_some() {
