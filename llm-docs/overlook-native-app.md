@@ -28,9 +28,37 @@ OVERLOOK_DATA_DIR=/tmp/overlook-demo cargo run -p overlook
 
 On first launch Overlook seeds a **Sample account** (“Jason Alexander <jason@example.com>”) with the fictional mailbox from the design preview. The account is labelled as a sample everywhere; its connection is simulated and starts **disconnected**.
 
+## App rail and toolbar (2 November 2026)
+
+Mail, Calendar, and Contacts live in a 48-pixel, icon-only rail. Icons are 21 pixels with
+selected-state highlighting, accessible names and shortcut tooltips; Settings stays at the bottom.
+`Ctrl 1/2/3` continues to switch modules. The title bar keeps account access and contextual search;
+`Ctrl E` focuses mail/contact search or opens calendar commands.
+
+The contextual toolbar owns mail filing/reply actions, calendar creation/navigation/view/edit actions,
+and contact creation/mail/edit actions. Per-message reply controls remain beside the message. On
+smaller windows, secondary labels collapse and less frequent mail actions stay in More. Appearance,
+layout and Sync remain common controls. All commands reuse the existing action and capability paths.
+
+The command strip is customizable per module and profile. Drag a button (or its hover handle) before
+another button to reorder it, drop it on More to hide it there, or drag a row from More onto the strip
+to show it. More → Customize toolbar exposes both saved lists with earlier/later and show/hide
+buttons, plus Reset this toolbar. Enter/Space activates the focused control; Done/Escape ends editing.
+While customizing, strip buttons are drag targets rather than executing commands. The drop markers
+show insertion positions, including the empty trailing area. Each completed edit is queued through
+the existing ordered settings writer under `toolbar.layouts`; resizing only temporarily overflows
+the saved strip into More. New/unknown commands and duplicates are normalized by the pure
+`overlook_core::toolbar` model, and reset affects only the current module. Both surfaces render and
+execute the same command definitions, including dropdowns and disabled states.
+
+The original SVG artwork in `branding/icons/` uses two-tone shapes and palette-derived colors for all
+seven built-in themes. Resource paths include the resolved theme and normal/on-action contrast
+context, so GPUI's image cache cannot retain the previous theme's colors. The sources have 128-pixel
+intrinsic dimensions and render through `img` to preserve RGB gradients.
+
 ## Focused Inbox
 
-A local view, not a Gmail feature. `overlook_core::focus::classify_focus` puts a conversation in Focused when the user said so (per-message override or per-sender rule), when the sender is someone the user has written to, or when Gmail marks the mail personal or important; promotions, social, forums, and updates go to Other, as do obvious automated senders when Gmail gives no hint. The Inbox shows Focused/Other tabs with a filter menu; the reader toolbar offers Move to Other/Focused with an "always from this sender" rule. Toggle in the layout menu. Schema v2 stores category, importance, and overrides.
+A local view, not a Gmail feature. `overlook_core::focus::classify_focus` puts a conversation in Focused when the user said so (per-message override or per-sender rule), when the sender is someone the user has written to, or when Gmail marks the mail personal or important; promotions, social, forums, and updates go to Other, as do obvious automated senders when Gmail gives no hint. The Inbox shows Focused/Other tabs with a filter menu; the mail toolbar’s More menu offers Move to Other/Focused with an "always from this sender" rule. Toggle in the layout menu. Schema v2 stores category, importance, and overrides.
 
 ## Attachments
 
@@ -49,7 +77,7 @@ Google Calendar on the same OAuth client, with the `calendar.events` and `calend
 
 ## Settings
 
-`Ctrl ,` or the gear in the header opens a Settings dialog (an overlay with a page list). Every control writes immediately and is applied without restart. Preferences live in `overlook_core::prefs` (`Prefs` per profile under the `prefs` setting, `AccountPrefs` per account under `account_prefs:<id>`).
+`Ctrl ,` or the gear at the bottom of the app rail opens a Settings dialog (an overlay with a page list). Every control writes immediately and is applied without restart. Preferences live in `overlook_core::prefs` (`Prefs` per profile under the `prefs` setting, `AccountPrefs` per account under `account_prefs:<id>`).
 
 - **Accounts**: account list, an "Add account" menu (Gmail sign-in, IMAP, POP3), your name (the sender name on outgoing mail), status with Sign in again (Gmail) or Update password (IMAP, POP3) / Sync now, **Server settings…** for IMAP and POP3 accounts, **signature** (plain text) with "include in new messages" and "include in replies and forwards" toggles, remove account from this device.
 - **IMAP accounts** (`crates/overlook-app/src/ui/account_setup.rs`): step 1 asks for name, address and password; Continue looks the domain up (built-in presets for the common providers, then Thunderbird's ISPDB, then `mail.<domain>`) and fills step 2, where host / port / security (SSL/TLS, STARTTLS, none for localhost only) and user name for IMAP and SMTP can be changed, "use the same password for sending" toggled, and **Test connection** probes both servers off the UI thread and shows the server's own error text. Saving writes the account, its server settings (store) and passwords (keyring), builds the provider and starts the first download. Folders appear as labels (Inbox, Sent, Trash, Spam, Archive by SPECIAL-USE or name, or by the **Folders on the server** overrides in step 2: Archive, Sent and Trash folder paths, and "Delete permanently when the server has no Trash folder"; everything else as a user label); mail is read over IMAP with the sync interval from General, and a second connection per account sits in `IDLE` on the Inbox so new mail triggers a sync within seconds (servers without `IDLE` are polled; the thread reconnects with backoff and stops on a refused password). On servers with `CONDSTORE`/`QRESYNC` a quiet change cycle is one `EXAMINE` per folder; otherwise flags and deletions are diffed with `UID FETCH (FLAGS)` and `UID SEARCH ALL`. The folder list is re-read hourly. Mailbox changes go to the server on the next sync: read and star are `UID STORE` flags; archive, delete, restore and label changes are moves between folders (`UID MOVE`, or copy + expunge on servers without it), and the Archive folder is created the first time it is needed. Sending goes over SMTP (the outgoing password from the keyring, or the incoming one when "use the same password" was chosen) and the message is appended to the server's Sent folder; when the connection drops after the message left, the Outbox item reads "Delivery uncertain" and offers **Send again** and **Discard** instead of resending on its own. `OVERLOOK_SIGN_IN=imap` opens the dialog at launch.

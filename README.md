@@ -32,6 +32,10 @@ and you can read, search, write, and file mail with no connection at all.
 
 - **Mail the Outlook way.** Account and folder sidebar, message list with day groups, a generous reading
   pane you can move below the list, comfortable and compact density, resizable panes that remember their size.
+  A slim icon rail switches between Mail, Calendar, and Contacts; the toolbar keeps each module's actions
+  close at hand, with crisp two-tone icons that follow your color scheme.
+  Drag toolbar buttons into your preferred order or between the strip and More; each module remembers
+  your layout. More → Customize toolbar also offers keyboard controls and a reset option.
 - **Focused Inbox.** The Inbox splits into Focused and Other from Gmail's own hints, who you write to, and
   your choices: *Move to Other*, or *Always move messages from this sender*. Local, private, and reversible.
 - **Reading that respects you.** Received HTML uses isolated Chromium layout inside the native shell;
