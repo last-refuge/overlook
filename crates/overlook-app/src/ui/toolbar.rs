@@ -1,5 +1,6 @@
 //! Customizable command strip and its overflow. Both surfaces execute the same commands.
 use super::*;
+use super::shell::{header_height, HEADER_CONTROL_HEIGHT};
 use crate::assets::{color_icon, color_icon_on_action, ColorIcon as C};
 use gpui_kit::base::actions::Confirm;
 use gpui_kit::component::button::ButtonCustomVariant;
@@ -341,7 +342,7 @@ impl MailWindow {
         let button = Button::new(SharedString::from(format!("toolbar-{action:?}")))
             .ghost()
             .small()
-            .h(px(34.))
+            .h(px(if in_more { 34. } else { HEADER_CONTROL_HEIGHT }))
             .px(px(8.))
             .flex_none()
             .accessibility_label(label.clone())
@@ -506,11 +507,10 @@ impl MailWindow {
         let toolbar = h_flex()
             .w_full()
             .flex_none()
-            .min_h(px(54.))
+            .h(px(header_height(self.density)))
             .items_center()
             .gap(px(2.))
             .px(px(8.))
-            .py(px(7.))
             .rounded(px(8.))
             .bg(p.message_surface())
             .shadow_sm()
@@ -529,7 +529,7 @@ impl MailWindow {
                     .id("toolbar-drop-end")
                     .flex_1()
                     .min_w(px(22.))
-                    .h(px(34.))
+                    .h(px(HEADER_CONTROL_HEIGHT))
                     .rounded(px(5.))
                     .can_drop(move |value, _, _| {
                         value
@@ -566,7 +566,7 @@ impl MailWindow {
         let trigger = Button::new("toolbar-more-button")
             .ghost()
             .small()
-            .h(px(34.))
+            .h(px(HEADER_CONTROL_HEIGHT))
             .w(px(36.))
             .icon(icon("ellipsis").size(px(19.)))
             .accessibility_label("More actions and toolbar customization")

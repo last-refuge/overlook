@@ -4,6 +4,17 @@ use super::*;
 use crate::assets::{color_icon, ColorIcon as C};
 
 pub(super) const RAIL_WIDTH: f32 = 48.;
+/// The title bar and the command toolbar share one control size and one vertical inset so
+/// their contents sit on the same rhythm; the inset follows the density setting.
+pub(super) const HEADER_CONTROL_HEIGHT: f32 = 36.;
+
+pub(super) fn header_height(density: Density) -> f32 {
+    let inset = match density {
+        Density::Comfortable => 8.,
+        Density::Compact => 4.,
+    };
+    HEADER_CONTROL_HEIGHT + inset * 2.
+}
 
 impl MailWindow {
     pub(super) fn render_app_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -17,7 +28,7 @@ impl MailWindow {
             .border_r_1()
             .border_color(p.divider.opacity(0.6))
             .child(
-                div().h(px(52.)).w_full().flex_none().child(
+                div().h(px(header_height(self.density))).w_full().flex_none().child(
                     div()
                         .size_full()
                         .flex()
@@ -120,7 +131,7 @@ impl MailWindow {
             Module::Calendar => Button::new("calendar-commands")
                 .ghost()
                 .w_full()
-                .h(px(36.))
+                .h(px(HEADER_CONTROL_HEIGHT))
                 .justify_start()
                 .bg(p.message_surface())
                 .icon(icon("search").size(px(16.)))
@@ -129,7 +140,7 @@ impl MailWindow {
                 .on_click(cx.listener(|this, _, window, cx| this.open_palette(window, cx)))
                 .into_any_element(),
         };
-        TitleBar::new().h(px(52.)).bg(p.surface).child(
+        TitleBar::new().h(px(header_height(self.density))).bg(p.surface).child(
             h_flex()
                 .size_full()
                 .items_center()
@@ -150,7 +161,7 @@ impl MailWindow {
                 .child(
                     Button::new("account-settings")
                         .ghost()
-                        .size(px(36.))
+                        .size(px(HEADER_CONTROL_HEIGHT))
                         .p(px(3.))
                         .rounded_full()
                         .accessibility_label("Account settings")
