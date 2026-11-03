@@ -275,14 +275,6 @@ impl MailWindow {
             .text_color(p.foreground)
             .p(px(10.))
             .gap(px(12.))
-            .child(
-                Button::new("new-contact")
-                    .primary()
-                    .w_full()
-                    .icon(icon("user-plus").size(px(15.)))
-                    .label("New contact")
-                    .on_click(cx.listener(|this, _, window, cx| this.start_new_contact(None, window, cx))),
-            )
             .child(v_flex().gap(px(2.)).child(item("All", total, ContactFilter::All, "users", cx)).child(item("Google Contacts", book, ContactFilter::AddressBook, "book-user", cx)).child(item("Other contacts", other, ContactFilter::Other, "user-round", cx)))
             .child(div().flex_1())
             .when(!writable, |d| {
@@ -311,13 +303,11 @@ impl MailWindow {
             .h_full()
             .border_r_1()
             .border_color(p.divider)
-            .child(
-                div()
-                    .p(px(12.))
-                    .border_b_1()
-                    .border_color(p.divider)
-                    .child(Input::new(&self.contact_search).prefix(icon("search").size(px(15.)).text_color(p.muted)).cleanable(true)),
-            )
+            .child(h_flex().items_center().h(px(52.)).px(px(16.)).gap(px(8.)).border_b_1().border_color(p.divider)
+                .child(div().flex_1().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child(match self.contact_filter {
+                    ContactFilter::All => "All contacts", ContactFilter::AddressBook => "Address book", ContactFilter::Other => "Other contacts",
+                }))
+                .child(div().text_size(px(12.)).text_color(p.muted).child(visible.len().to_string())))
             .child(
                 div()
                     .id("contact-list")
@@ -386,10 +376,6 @@ impl MailWindow {
     fn render_contact_detail(&self, c: &Contact, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *cx.palette();
         let who = c.address();
-        let compose = who.clone();
-        let edit_id = c.id.clone();
-        let del_id = c.id.clone();
-        let search_from = (!c.email.is_empty()).then(|| format!("from:{}", c.email));
         let row = |icon_name: &'static str, text: String| {
             h_flex().items_center().gap(px(10.)).text_size(px(13.)).child(icon(icon_name).size(px(15.)).text_color(p.muted)).child(div().child(text))
         };
@@ -418,28 +404,6 @@ impl MailWindow {
                             })))
                             .child(div().text_size(px(11.)).text_color(p.muted).child(if c.pending { "Saved on this device, waiting to sync" } else if c.in_address_book { "In your Google Contacts" } else { "Someone you have corresponded with" })),
                     ),
-            )
-            .child(
-                h_flex()
-                    .gap(px(6.))
-                    .when(!c.email.is_empty(), |r| r.child(Button::new("contact-compose").small().icon(icon("pen-line").size(px(14.))).label("New message").on_click(cx.listener(move |this, _, window, cx| this.compose_to_contact(compose.clone(), window, cx)))))
-                    .when_some(search_from, |r, q| {
-                        r.child(Button::new("contact-mail").ghost().small().icon(icon("search").size(px(14.))).label("Mail from them").on_click(cx.listener(move |this, _, window, cx| {
-                            this.set_module(super::calendar::Module::Mail, window, cx);
-                            let input = this.search_input.clone();
-                            let q = q.clone();
-                            input.update(cx, |s, cx| s.set_value(q.clone(), window, cx));
-                            this.set_search(q, window, cx);
-                        })))
-                    })
-                    .when(c.is_editable(), |r| {
-                        r.child(Button::new("contact-edit").ghost().small().icon(icon("pencil").size(px(14.))).label("Edit").on_click(cx.listener(move |this, _, window, cx| this.start_edit_contact(edit_id.clone(), window, cx))))
-                            .child(Button::new("contact-delete").ghost().small().icon(icon("trash").size(px(14.)).text_color(p.error)).label("Delete").on_click(cx.listener(move |this, _, window, cx| this.delete_contact(del_id.clone(), window, cx))))
-                    })
-                    .when(!c.is_editable(), |r| {
-                        let who = who.clone();
-                        r.child(Button::new("contact-add").ghost().small().icon(icon("user-plus").size(px(14.))).label("Add to Google Contacts").on_click(cx.listener(move |this, _, window, cx| this.start_new_contact(Some(who.clone()), window, cx))))
-                    }),
             )
             .child(divider(&p))
             .child(

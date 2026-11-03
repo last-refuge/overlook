@@ -15,7 +15,6 @@ use gpui_kit::base::{h_flex, v_flex};
 use overlook_core::sanitize::text_to_html;
 use overlook_core::time::format_full;
 use overlook_core::*;
-use overlook_store::MailboxView;
 
 impl MailWindow {
     pub(super) fn prepare_thread_history(&mut self, cx: &mut Context<Self>) {
@@ -153,7 +152,7 @@ impl MailWindow {
         div().p_3().child("Close an open preview, then try again.").into_any_element()
     }
 
-    fn reader_message_index(&self, id: &MessageId) -> Option<usize> {
+    pub(super) fn reader_message_index(&self, id: &MessageId) -> Option<usize> {
         let index = self.thread.iter().position(|m| &m.id == id)?;
         let composer_before = self.composer_is_inline() && self.composer.as_ref().and_then(|c| c.draft.in_reply_to.as_ref())
             .and_then(|source| self.thread.iter().position(|m| &m.id == source)).is_some_and(|source| source < index);
@@ -244,144 +243,6 @@ impl MailWindow {
                 .into_any_element();
         };
 
-        let selected_ids: Vec<MessageId> = self.thread.iter().map(|m| m.id.clone()).collect();
-        let unread_any = self.thread.iter().any(|m| !m.is_read);
-        let (in_trash, in_inbox) = self.thread_state();
-        let toolbar = h_flex()
-            .items_center()
-            .flex_wrap()
-            .gap(px(2.))
-            .min_h(px(48.))
-            .flex_none()
-            .px(px(12.))
-            .py(px(6.))
-            .border_b_1()
-            .border_color(p.divider)
-            .when(in_trash, |bar| {
-                bar.child(toolbar_button("inbox", "Restore", "Restore to Inbox (E)", cx.listener({
-                    let ids = selected_ids.clone();
-                    move |this, _, window, cx| this.restore(ids.clone(), window, cx)
-                })))
-            })
-            .when(!in_trash && !in_inbox, |bar| {
-                bar.child(toolbar_button("inbox", "Move to Inbox", "Move to Inbox (E)", cx.listener({
-                    let ids = selected_ids.clone();
-                    move |this, _, window, cx| this.move_to_inbox(ids.clone(), window, cx)
-                })))
-            })
-            .when(!in_trash && in_inbox, |bar| {
-                bar.child(toolbar_button("archive", "Archive", "Archive (E)", cx.listener({
-                    let ids = selected_ids.clone();
-                    move |this, _, window, cx| this.archive(ids.clone(), window, cx)
-                })))
-            })
-            .when(!in_trash, |bar| {
-                bar.child(toolbar_button("trash", "Delete", "Delete (Del)", cx.listener({
-                    let ids = selected_ids.clone();
-                    move |this, _, window, cx| this.trash(ids.clone(), window, cx)
-                })))
-            })
-            .child({
-                let labels: Vec<(LabelId, String)> = self.labels.iter().filter(|l| l.kind == LabelKind::User).map(|l| (l.id.clone(), l.name.clone())).collect();
-                let ids = selected_ids.clone();
-                let t = cx.entity().downgrade();
-                Button::new("move-to")
-                    .ghost()
-                    .small()
-                    .icon(icon("folder-input").size(px(16.)))
-                    .label("Move to")
-                    .dropdown_menu(move |mut menu, _window, _cx| {
-                        for (label, view) in [("Inbox", MailboxView::Kind(LabelKind::Inbox)), ("Archive", MailboxView::Kind(LabelKind::Archive)), ("Trash", MailboxView::Kind(LabelKind::Trash))] {
-                            let t = t.clone();
-                            let ids = ids.clone();
-                            menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                                let drag = super::ConversationDrag { mail: super::DraggedMail::Messages(ids.clone()), title: String::new(), count: 0 };
-                                let _ = t.update(cx, |this, cx| this.drop_on_view(drag, view.clone(), window, cx));
-                            }));
-                        }
-                        if !labels.is_empty() {
-                            menu = menu.separator().label("Labels");
-                        }
-                        for (id, name) in &labels {
-                            let t = t.clone();
-                            let ids = ids.clone();
-                            let id = id.clone();
-                            menu = menu.item(PopupMenuItem::new(name.clone()).on_click(move |_, window, cx| {
-                                let _ = t.update(cx, |this, cx| this.move_to_label(ids.clone(), id.clone(), window, cx));
-                            }));
-                        }
-                        menu
-                    })
-            })
-            .child(toolbar_button(
-                if unread_any { "mail-open" } else { "mail" },
-                if unread_any { "Mark read" } else { "Mark unread" },
-                "Toggle read (Ctrl U)",
-                cx.listener({
-                    let ids = selected_ids.clone();
-                    move |this, _, window, cx| this.set_read(ids.clone(), unread_any, window, cx)
-                }),
-            ))
-            .when(self.focused_enabled && self.view == overlook_store::MailboxView::Kind(LabelKind::Inbox), |bar| {
-                let in_focused = self.inbox_tab == FocusTab::Focused;
-                let target = if in_focused { "Other" } else { "Focused" };
-                let sender = self.thread.iter().filter(|m| !m.is_outgoing).max_by_key(|m| m.date).map(|m| m.from.display_name());
-                let t = cx.entity().downgrade();
-                bar.child(
-                    Button::new("move-focus")
-                        .ghost()
-                        .small()
-                        .icon(icon("arrow-right-left").size(px(16.)))
-                        .label(format!("Move to {target}"))
-                        .dropdown_menu(move |menu, _window, _cx| {
-                            let a = t.clone();
-                            let b = t.clone();
-                            let move_to = !in_focused;
-                            let mut menu = menu.item(PopupMenuItem::new(format!("Move this conversation to {target}")).on_click(move |_, window, cx| {
-                                let _ = a.update(cx, |this, cx| this.move_focus(move_to, false, window, cx));
-                            }));
-                            if let Some(name) = &sender {
-                                menu = menu.item(PopupMenuItem::new(format!("Always move messages from {name} to {target}")).on_click(move |_, window, cx| {
-                                    let _ = b.update(cx, |this, cx| this.move_focus(move_to, true, window, cx));
-                                }));
-                            }
-                            menu
-                        }),
-                )
-            })
-            .child(div().flex_1())
-            .child(toolbar_button("reply", "Reply", "Reply (Ctrl R)", cx.listener(|this, _, window, cx| this.reply(DraftKind::Reply, window, cx))))
-            .child(toolbar_button("reply-all", "Reply all", "Reply all (Ctrl Shift R)", cx.listener(|this, _, window, cx| this.reply(DraftKind::ReplyAll, window, cx))))
-            .child(toolbar_button("forward", "Forward", "Forward (Ctrl F)", cx.listener(|this, _, window, cx| this.reply(DraftKind::Forward, window, cx))))
-            .child(div().w(px(2.)))
-            .when(self.thread.len() > 1, |bar| bar.child(
-                Button::new("latest-message").ghost().small().icon(icon("arrow-down-to-line").size(px(16.)))
-                    .tooltip("Jump to latest message").accessibility_label("Jump to latest message")
-                    .on_click(cx.listener(|this, _, _window, cx| {
-                        this.cancel_composer_reveal();
-                        if let Some(index) = this.selected_summary().and_then(|s| this.reader_message_index(&s.latest_message_id)) {
-                            this.reader_scroll.scroll_to_top_of_item(index);
-                            cx.notify();
-                        }
-                    }))
-            ))
-            .child(
-                Button::new("prev-conv")
-                    .ghost()
-                    .small()
-                    .icon(icon("chevron-left").size(px(16.)))
-                    .tooltip("Previous (K)")
-                    .on_click(cx.listener(|this, _, window, cx| this.move_selection(-1, window, cx))),
-            )
-            .child(
-                Button::new("next-conv")
-                    .ghost()
-                    .small()
-                    .icon(icon("chevron-right").size(px(16.)))
-                    .tooltip("Next (J)")
-                    .on_click(cx.listener(|this, _, window, cx| this.move_selection(1, window, cx))),
-            );
-
         let labels: Vec<String> = summary
             .label_ids
             .iter()
@@ -471,7 +332,6 @@ impl MailWindow {
         let reply_space = if composing { (self.reader_scroll.bounds().size.height * 0.3).max(px(28.)) } else { px(20.) };
 
         container
-            .child(toolbar)
             .child(
                 v_flex()
                     .id("reader-scroll")
@@ -1071,21 +931,6 @@ fn embedded_in_body(attachment: &Attachment, body: &Body) -> bool {
     if !attachment.is_inline_image() { return false; }
     let (Some(cid), Some(html)) = (attachment.content_id.as_deref(), body.html.as_deref()) else { return false };
     ["\"", "'"].iter().any(|quote| html.contains(&format!("src={quote}cid:{cid}{quote}")))
-}
-
-fn toolbar_button(
-    icon_name: &'static str,
-    label: &'static str,
-    tooltip: &'static str,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> Button {
-    Button::new(SharedString::from(format!("tb-{icon_name}-{label}")))
-        .ghost()
-        .small()
-        .icon(icon(icon_name).size(px(16.)))
-        .label(label)
-        .tooltip(tooltip)
-        .on_click(on_click)
 }
 
 fn attachment_card(a: &Attachment, p: &crate::theme::Palette, downloading: bool, thumbnail: Option<std::path::PathBuf>) -> Div {

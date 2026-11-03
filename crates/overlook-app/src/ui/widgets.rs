@@ -78,11 +78,6 @@ pub fn segment(id: impl Into<ElementId>, label: impl Into<SharedString>, selecte
     segment_base(id, selected, p).child(label.into())
 }
 
-/// A [`segment`] with an icon before its label.
-pub fn segment_with_icon(id: impl Into<ElementId>, icon: impl IntoElement, label: impl Into<SharedString>, selected: bool, p: &Palette) -> Stateful<Div> {
-    segment_base(id, selected, p).child(icon).child(label.into())
-}
-
 fn segment_base(id: impl Into<ElementId>, selected: bool, p: &Palette) -> Stateful<Div> {
     h_flex()
         .id(id)

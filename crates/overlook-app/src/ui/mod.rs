@@ -15,6 +15,8 @@ mod settings;
 mod signature;
 mod reader;
 mod sidebar;
+mod shell;
+mod toolbar;
 mod widgets;
 mod time_zone;
 
@@ -35,7 +37,6 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{
     h_resizable, resizable_panel, v_resizable, ResizableState, Sizable, TitleBar, WindowExt,
@@ -528,6 +529,9 @@ pub struct MailWindow {
     appearance: AppearancePreference,
     density: Density,
     reading_pane: ReadingPane,
+    toolbar_layouts: overlook_core::toolbar::ToolbarLayouts,
+    toolbar_more_open: bool,
+    toolbar_editing: bool,
     /// Sidebar sections the user collapsed ("favorites", "labels"); persisted.
     collapsed_sections: HashSet<String>,
     /// Focused Inbox: enabled per profile, with the selected tab.
@@ -651,6 +655,7 @@ impl MailWindow {
 
         let density = store.setting::<Density>("density").ok().flatten().unwrap_or_default();
         let reading_pane = store.setting::<ReadingPane>("reading_pane").ok().flatten().unwrap_or_default();
+        let toolbar_layouts = store.setting::<overlook_core::toolbar::ToolbarLayouts>("toolbar.layouts").ok().flatten().unwrap_or_default();
         let sidebar_width = store.setting::<f32>("panes.sidebar").ok().flatten().unwrap_or(232.);
         let collapsed_sections: HashSet<String> = store.setting::<Vec<String>>("sidebar.collapsed").ok().flatten().unwrap_or_default().into_iter().collect();
         let focused_enabled = store.setting::<bool>("focused_inbox").ok().flatten().unwrap_or(true);
@@ -760,6 +765,9 @@ impl MailWindow {
             appearance,
             density,
             reading_pane,
+            toolbar_layouts,
+            toolbar_more_open: false,
+            toolbar_editing: false,
             collapsed_sections,
             focused_enabled,
             inbox_tab: FocusTab::Focused,
@@ -2717,7 +2725,8 @@ impl MailWindow {
             self.format_link(window, cx);
             return;
         }
-        let input = self.search_input.clone();
+        if self.module == Module::Calendar { self.open_palette(window, cx); return; }
+        let input = if self.module == Module::Contacts { self.contact_search.clone() } else { self.search_input.clone() };
         input.update(cx, |s, cx| {
             s.focus(window, cx);
             s.select_all(window, cx);
@@ -3027,163 +3036,6 @@ impl MailWindow {
 
     // ---------------------------------------------------------------- header
 
-    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = *cx.palette();
-        let owner = self.owner();
-        let appearance = self.appearance;
-        let reading_pane = self.reading_pane;
-        let density = self.density;
-        let focused_enabled = self.focused_enabled;
-        let reminders_enabled = self.reminders_enabled;
-        let this = cx.entity().downgrade();
-        let this2 = cx.entity().downgrade();
-
-        let appearance_icon = if p.is_dark() { "moon" } else { "sun" };
-
-        TitleBar::new()
-            .h(px(64.))
-            .bg(p.surface)
-            .border_b_1()
-            .border_color(p.divider)
-            .child(
-                h_flex()
-                    .size_full()
-                    .items_center()
-                    .gap(px(20.))
-                    .pl(px(10.))
-                    .pr(px(8.))
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap(px(10.))
-                            .w(px(214.))
-                            .flex_none()
-                            .child(brand_tile(30.))
-                            .child(
-                                div()
-                                    .font_family("Source Serif 4 Display")
-                                    .text_size(px(22.))
-                                    .line_height(px(30.))
-                                    .text_color(p.foreground)
-                                    .child("Overlook"),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap(px(2.))
-                            .p(px(3.))
-                            .rounded(px(8.))
-                            .bg(p.sidebar)
-                            .border_1()
-                            .border_color(p.divider)
-                            .child(
-                                segment_with_icon("module-mail", icon("mail").size(px(15.)), "Mail", self.module == Module::Mail, &p)
-                                    .tooltip(|window, cx| Tooltip::new("Mail (Ctrl 1)").build(window, cx))
-                                    .on_click(cx.listener(|this, _, window, cx| this.set_module(Module::Mail, window, cx))),
-                            )
-                            .child(
-                                segment_with_icon("module-calendar", icon("calendar").size(px(15.)), "Calendar", self.module == Module::Calendar, &p)
-                                    .tooltip(|window, cx| Tooltip::new("Calendar (Ctrl 2)").build(window, cx))
-                                    .on_click(cx.listener(|this, _, window, cx| this.set_module(Module::Calendar, window, cx))),
-                            )
-                            .child(
-                                segment_with_icon("module-contacts", icon("users").size(px(15.)), "Contacts", self.module == Module::Contacts, &p)
-                                    .tooltip(|window, cx| Tooltip::new("Contacts (Ctrl 3)").build(window, cx))
-                                    .on_click(cx.listener(|this, _, window, cx| this.set_module(Module::Contacts, window, cx))),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .max_w(px(480.))
-                            .h(px(37.))
-                            .child(
-                                Input::new(&self.search_input)
-                                    .prefix(icon("search").size(px(16.)).text_color(p.muted))
-                                    .suffix(kbd("Ctrl E", &p))
-                                    .cleanable(true),
-                            ),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("appearance-menu")
-                            .ghost()
-                            .icon(icon(appearance_icon).size(px(17.)))
-                            .tooltip(format!("Appearance: {}", appearance.label()))
-                            .dropdown_menu(move |menu, window, _cx| {
-                                let system = theme::system_appearance(window.appearance());
-                                let mut menu = menu.label("Appearance");
-                                for pref in AppearancePreference::ALL {
-                                    let this = this.clone();
-                                    let label = if pref == AppearancePreference::FollowSystem {
-                                        match system {
-                                            SystemAppearance::Dark => "Follow system (currently Dark)".to_owned(),
-                                            SystemAppearance::Light => "Follow system (currently Light)".to_owned(),
-                                            SystemAppearance::Unknown => "Follow system".to_owned(),
-                                        }
-                                    } else {
-                                        pref.label().to_owned()
-                                    };
-                                    menu = menu.item(PopupMenuItem::new(label).checked(pref == appearance).on_click(
-                                        move |_, window, cx| {
-                                            let _ = this.update(cx, |this, cx| this.set_appearance(pref, window, cx));
-                                        },
-                                    ));
-                                }
-                                menu
-                            }),
-                    )
-                    .child(
-                        Button::new("view-menu")
-                            .ghost()
-                            .icon(icon("panels-top-left").size(px(17.)))
-                            .tooltip("Layout")
-                            .dropdown_menu(move |menu, _window, _cx| {
-                                let a = this2.clone();
-                                let b = this2.clone();
-                                let c = this2.clone();
-                                let d = this2.clone();
-                                let r = this2.clone();
-                                menu.label("Reading pane")
-                                    .item(PopupMenuItem::new("On the right").checked(reading_pane == ReadingPane::Right).on_click(move |_, _w, cx| {
-                                        let _ = a.update(cx, |this, cx| this.set_reading_pane(ReadingPane::Right, cx));
-                                    }))
-                                    .item(PopupMenuItem::new("Below the list").checked(reading_pane == ReadingPane::Bottom).on_click(move |_, _w, cx| {
-                                        let _ = b.update(cx, |this, cx| this.set_reading_pane(ReadingPane::Bottom, cx));
-                                    }))
-                                    .separator()
-                                    .label("Density")
-                                    .item(PopupMenuItem::new(if density == Density::Compact { "Comfortable" } else { "Compact" }).on_click(move |_, window, cx| {
-                                        let _ = c.update(cx, |this, cx| this.toggle_density(window, cx));
-                                    }))
-                                    .separator()
-                                    .label("Inbox")
-                                    .item(PopupMenuItem::new("Focused Inbox").checked(focused_enabled).on_click(move |_, _w, cx| {
-                                        let _ = d.update(cx, |this, cx| this.toggle_focused_inbox(cx));
-                                    }))
-                                    .separator()
-                                    .label("Calendar")
-                                    .item(PopupMenuItem::new("Event reminders").checked(reminders_enabled).on_click(move |_, _w, cx| {
-                                        let _ = r.update(cx, |this, cx| {
-                                            this.reminders_enabled = !this.reminders_enabled;
-                                            this.save_setting("reminders", &this.reminders_enabled);
-                                            cx.notify();
-                                        });
-                                    }))
-                            }),
-                    )
-                    .child(
-                        Button::new("open-settings")
-                            .ghost()
-                            .icon(icon("settings").size(px(17.)))
-                            .tooltip("Settings (Ctrl ,)")
-                            .on_click(cx.listener(|this, _, window, cx| this.open_settings(SettingsPage::General, window, cx))),
-                    )
-                    .child(owner_avatar(&owner, 29., &p).ml(px(6.)).mr(px(8.))),
-            )
-    }
-
     // ------------------------------------------------------------ status bar
 
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3460,7 +3312,7 @@ impl Focusable for MailWindow {
 }
 
 impl Render for MailWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.composer_owner.is_some() { return self.render_composer_window(cx).into_any_element(); }
         crate::watchdog::mark("render");
         if !self.first_frame_logged {
@@ -3521,12 +3373,16 @@ impl Render for MailWindow {
             .font_family("Inter")
             .text_size(px(13.))
             .relative()
-            .child(self.render_header(cx))
-            .children(self.render_update_banner(cx))
-            .children(self.render_banner(cx))
-            .children(self.render_time_zone_prompt(cx))
-            .child(div().flex_1().min_h_0().child(self.render_body(cx)))
-            .child(self.render_status_bar(cx))
+            .child(h_flex().size_full().min_h_0()
+                .child(self.render_app_rail(cx))
+                .child(v_flex().flex_1().min_w_0().h_full()
+                    .child(self.render_header(cx))
+                    .child(self.render_app_toolbar(window.viewport_size().width - px(shell::RAIL_WIDTH), cx))
+                    .children(self.render_update_banner(cx))
+                    .children(self.render_banner(cx))
+                    .children(self.render_time_zone_prompt(cx))
+                    .child(div().flex_1().min_h_0().child(self.render_body(cx)))
+                    .child(self.render_status_bar(cx))))
             .when(self.settings.is_some(), |d| d.child(self.render_settings(cx)))
             .when(self.account_setup.is_some(), |d| d.child(self.render_account_setup(cx)))
             .when(self.quick_look.is_some(), |d| d.child(self.render_quick_look(cx)))
