@@ -801,7 +801,6 @@ impl MailWindow {
             });
         let footer = v_flex()
             .gap(px(8.))
-            .pt(px(6.))
             .children(message.map(|(text, color)| div().w_full().text_size(px(12.)).text_color(color).child(text)))
             .child(buttons);
 
@@ -843,7 +842,11 @@ impl MailWindow {
                             .child(kbd("Esc", &p))
                             .child(Button::new("setup-close").ghost().small().icon(icon("x").size(px(16.))).ml(px(8.)).on_click(cx.listener(|this, _, window, cx| this.close_account_setup(window, cx)))),
                     )
-                    .child(v_flex().id("account-setup-content").flex_1().min_h_0().p(px(20.)).gap(px(14.)).child(body).child(footer).overflow_y_scrollbar()),
+                    // Only the body scrolls; the footer stays pinned below it so test
+                    // results and errors can never push the buttons out of view. The body
+                    // must not shrink, or the scroll area never sees it overflow.
+                    .child(v_flex().id("account-setup-content").flex_1().min_h_0().p(px(20.)).child(div().flex_none().child(body)).overflow_y_scrollbar())
+                    .child(div().flex_none().px(px(20.)).pb(px(16.)).pt(px(10.)).border_t_1().border_color(p.divider).child(footer)),
             )
             .into_any_element()
     }
