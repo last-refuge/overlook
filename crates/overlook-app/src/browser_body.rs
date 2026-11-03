@@ -801,7 +801,7 @@ impl Render for BrowserBody {
         let placeholder = (!self.has_rendered && self.error.is_none() && self.tiles.cached.is_empty())
             .then(|| self.placeholder.clone())
             .flatten()
-            .map(|text| div().absolute().inset_0().px(px(16.)).py(px(12.)).text_size(px(14.)).line_height(px(21.)).child(text));
+            .map(|text| div().absolute().inset_0().px(px(8.)).py(px(8.)).text_size(px(14.)).line_height(px(21.)).child(text));
         let content = {
             div()
                 .size_full()

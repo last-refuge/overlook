@@ -2,6 +2,7 @@
 use super::*;
 use crate::assets::{color_icon, color_icon_on_action, ColorIcon as C};
 use gpui_kit::base::actions::Confirm;
+use gpui_kit::component::button::ButtonCustomVariant;
 use gpui_kit::component::{popover::Popover, scroll::ScrollableElement, Disableable};
 use overlook_core::toolbar::{
     ToolbarAction as A, ToolbarArea as Area, ToolbarLayout, ToolbarModule as M,
@@ -353,7 +354,19 @@ impl MailWindow {
             .when(command.selected, |b| {
                 b.bg(p.selection).text_color(p.selection_text)
             })
-            .when(command.primary && !in_more, |b| b.primary())
+            .when(command.primary && !in_more, |b| {
+                if action == A::NewMessage && p.resolved == ResolvedTheme::Alexander {
+                    b.custom(ButtonCustomVariant::new(cx)
+                        .color(rgb(0x3E687E).into())
+                        .foreground(p.on_action)
+                        .hover(rgb(0x375C6F).into())
+                        .active(rgb(0x2F4F60).into()))
+                        // Custom variants tint the normal fill; this action stays solid.
+                        .bg(rgb(0x3E687E))
+                } else {
+                    b.primary()
+                }
+            })
             .when(in_more, |b| b.w_full().justify_start())
             .child(
                 h_flex()
@@ -490,16 +503,17 @@ impl MailWindow {
         let overflow = layout.strip[visible..].to_vec();
         let before = overflow.first().copied();
         let module = M::from(self.module);
-        h_flex()
+        let toolbar = h_flex()
+            .w_full()
             .flex_none()
             .min_h(px(54.))
             .items_center()
             .gap(px(2.))
-            .px(px(12.))
+            .px(px(8.))
             .py(px(7.))
+            .rounded(px(8.))
             .bg(p.message_surface())
-            .border_b_1()
-            .border_color(p.divider.opacity(0.7))
+            .shadow_sm()
             .children(
                 layout.strip[..visible]
                     .iter()
@@ -537,7 +551,12 @@ impl MailWindow {
                         )
                     }),
             )
-            .child(self.toolbar_more(overflow, cx))
+            .child(self.toolbar_more(overflow, cx));
+
+        // The outer inset replaces inner padding so commands stay aligned with the title.
+        div().w_full().flex_none().px(px(4.)).pt(px(3.))
+            .bg(p.navigation_palette().sidebar)
+            .child(toolbar)
     }
 
     fn toolbar_more(&self, overflow: Vec<A>, cx: &mut Context<Self>) -> impl IntoElement {

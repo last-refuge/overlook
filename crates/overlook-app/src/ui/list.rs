@@ -210,8 +210,6 @@ impl MailWindow {
             .track_focus(&self.list_focus)
             .size_full()
             .bg(p.list_surface())
-            .border_r_1()
-            .border_color(p.divider)
             .child(header)
             .children(coverage)
             .child(body)

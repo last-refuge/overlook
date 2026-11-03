@@ -86,10 +86,14 @@ printing projection; it is not yet guaranteed to match the new inline surface.
 - Remote consent remains an explicit per-message choice or the global **Remote
   content** preference. The legacy persisted preference key remains compatible.
 
-White is the fallback browser paper in every non-dark shell theme. Dark uses
-Chromium dark-mode emulation; sender-authored colors need not match the shell
-palette exactly. Fonts depend on installed system fonts and consent for authored
-remote fonts. Animation/transition playback is suppressed. Full DOM accessibility
+Email paper stays white with dark default text in every shell theme. Mail rendering
+uses Chromium's light color scheme, including previews, quoted history and Outbox;
+a Dark app theme does not invert sender content. Sender-authored colors still take
+precedence. A native white surface adds 20px horizontal and 16px vertical gutters
+outside the document, with matching light paper for plain text, loading and fallback
+content. The surrounding app and message controls retain the selected theme. Fonts
+depend on installed system fonts and consent for authored remote fonts.
+Animation/transition playback is suppressed. Full DOM accessibility
 bridging is not implemented yet.
 
 ## Runtime and packaging

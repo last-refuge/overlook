@@ -42,6 +42,10 @@ pub struct Palette {
 
 impl Global for Palette {}
 
+/// Email paper is independent of the app chrome, including its Dark color scheme.
+pub const EMAIL_PAPER: u32 = 0xFFFFFF;
+pub const EMAIL_INK: u32 = 0x20242B;
+
 fn c(hex: u32) -> Hsla {
     Rgba::from(gpui_kit::rgb(hex)).into()
 }
@@ -116,7 +120,7 @@ impl Palette {
             ResolvedTheme::Gray => [0xE5E7EB, 0xF3F4F6, 0xD1D5DB, 0x1F2937, 0x4B5563, 0xB8BEC7, 0x6B7280, 0xDDE1E7, 0x374151, 0xCDD5DF, 0x1F2937, 0x805015],
             ResolvedTheme::Blue => [0xEDF4FC, 0xF8FBFF, 0xDCE9F8, 0x172D4D, 0x4E6480, 0xC7D6E8, 0x657F9F, 0xE2EDFA, 0x245A96, 0xD3E4F8, 0x193F70, 0x805015],
             ResolvedTheme::White => [0xFFFFFF, 0xFFFFFF, 0xFAFAFA, 0x20242B, 0x59616D, 0xE0E3E7, 0x767D87, 0xF0F2F5, 0x374151, 0xE5E9EF, 0x20242B, 0x805015],
-            ResolvedTheme::Alexander => [0xDFE3E8, 0xFFFFFF, 0xE3E6EB, 0x182B46, 0x48596C, 0xB8C2CF, 0x63748A, 0xECEEF1, 0x1F57A5, 0xCCE8FF, 0x17314D, 0x1F57A5],
+            ResolvedTheme::Alexander => [0xE3E9EE, 0xFFFFFF, 0xE0E7ED, 0x182B46, 0x48596C, 0xC3CFD9, 0x63748A, 0xEAF0F4, 0x1F57A5, 0xE0EAF0, 0x17314D, 0x1F57A5],
             ResolvedTheme::Pink => [0xFCF0F5, 0xFFFAFC, 0xF5DFE9, 0x402536, 0x765364, 0xE8C9D8, 0xA06A84, 0xF6E4ED, 0x963D68, 0xF0D4E2, 0x692C4B, 0x805015],
         };
         let [background, surface, sidebar, foreground, muted, divider, control_border, hover, action, selection, selection_text, focus] = colors.map(c);
@@ -129,9 +133,9 @@ impl Palette {
             ..Self::light()
         };
         if theme == ResolvedTheme::Alexander {
-            // Outlook-style light blue marks selected folders and messages; avatars stay gray.
+            // Washed-out blue marks selected folders and messages; avatars stay gray.
             palette.avatar = c(0xDDE0E4);
-            palette.chip = c(0xECEEF1);
+            palette.chip = palette.hover;
             palette.brand_accent = c(0xFF9F0A);
             palette.label_amber = c(0xFF9F0A);
         }
@@ -139,11 +143,11 @@ impl Palette {
     }
 
     /// Navigation has its own contrast context, independent of white mail surfaces.
-    /// Keep generic segmented controls light while the left navigation is navy.
+    /// Alexander shares its custom blue across navigation and matching pane gutters.
     pub fn navigation_palette(&self) -> Self {
         let mut p = *self;
         if self.resolved == ResolvedTheme::Alexander {
-            p.sidebar = c(0x142433);
+            p.sidebar = c(0x1F343F);
             p.foreground = c(0xF3F5F7);
             p.muted = c(0xBFCAD7);
             p.hover = c(0x3A4758);
@@ -176,13 +180,9 @@ impl Palette {
         if self.resolved == ResolvedTheme::Light { c(0xE3EBE0) } else { self.background }
     }
 
-    /// Theme defaults only; sender-authored HTML colors still take precedence.
+    /// Keep mail on light paper in every shell theme; sender-authored colors still win.
     pub fn prepare_browser_document(&self, source: &str) -> overlook_core::BrowserDocument {
-        if self.resolved == ResolvedTheme::Light {
-            overlook_core::browser::prepare_document_with_colors(source, color_rgb(self.message_surface()), color_rgb(self.foreground))
-        } else {
-            overlook_core::prepare_document(source)
-        }
+        overlook_core::browser::prepare_document_with_colors(source, EMAIL_PAPER, EMAIL_INK)
     }
 
     pub fn is_dark(&self) -> bool {
@@ -402,6 +402,19 @@ mod tests {
     }
 
     #[test]
+    fn email_paper_is_independent_of_shell_appearance() {
+        for source in ["<p>Fictional message</p>", "<body bgcolor='#203040' text='#fafafa'><p>Authored colors</p></body>"] {
+            let expected = overlook_core::browser::prepare_document_with_colors(source, EMAIL_PAPER, EMAIL_INK);
+            for pref in AppearancePreference::ALL {
+                for system in [SystemAppearance::Light, SystemAppearance::Dark] {
+                    let palette = Palette::for_theme(pref.resolve(system));
+                    assert_eq!(palette.prepare_browser_document(source), expected, "{pref:?}, {system:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn message_center_is_white_except_in_dark_mode() {
         for pref in AppearancePreference::ALL {
             for system in [SystemAppearance::Light, SystemAppearance::Dark, SystemAppearance::Unknown] {
@@ -413,22 +426,28 @@ mod tests {
     }
 
     #[test]
-    fn alexander_has_navy_navigation_blue_selection_and_amber_edge() {
+    fn alexander_has_soft_blue_navigation_washed_out_selection_and_amber_edge() {
         let p = Palette::for_theme(ResolvedTheme::Alexander);
         assert_eq!(p.surface, c(0xFFFFFF));
         assert_eq!(p.action, c(0x1F57A5));
-        assert_eq!(p.chip, c(0xECEEF1));
-        assert_eq!(p.selection, c(0xCCE8FF));
+        assert_eq!(p.chip, p.hover);
+        assert_eq!(p.selection, c(0xE0EAF0));
         assert_eq!(p.avatar, c(0xDDE0E4));
         assert_eq!(p.brand_accent, c(0xFF9F0A));
         assert_eq!(p.message_accent(), c(0xFF9F0A));
         assert_eq!(p.label_amber, c(0xFF9F0A));
         assert_eq!(p.focus, p.action, "Keep keyboard focus legible on white surfaces");
         let nav = p.navigation_palette();
-        assert_eq!(nav.sidebar, c(0x142433));
-        for (fg, bg) in [(nav.foreground, nav.sidebar), (nav.muted, nav.sidebar), (nav.foreground, nav.hover), (nav.accent, nav.selection)] {
+        assert_eq!(nav.sidebar, c(0x1F343F));
+        for (fg, bg) in [
+            (nav.foreground, nav.sidebar), (nav.muted, nav.sidebar),
+            (nav.foreground, nav.hover), (nav.accent, nav.selection),
+            (nav.muted, nav.hover), (nav.success, nav.sidebar),
+            (nav.warning, nav.sidebar), (nav.error, nav.sidebar),
+        ] {
             let (a, b) = (luminance(fg), luminance(bg));
-            assert!((a.max(b) + 0.05) / (a.min(b) + 0.05) >= 4.5);
+            let ratio = (a.max(b) + 0.05) / (a.min(b) + 0.05);
+            assert!(ratio >= 4.5, "Alexander navigation: {} on {} has contrast {ratio}", color_hex(fg), color_hex(bg));
         }
         for (fg, bg) in [(p.foreground, p.chip), (p.foreground, p.brand_accent), (p.focus, p.surface)] {
             let (a, b) = (luminance(fg), luminance(bg));

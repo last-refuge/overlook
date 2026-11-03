@@ -134,10 +134,11 @@ impl MailWindow {
                 .size_full()
                 .items_center()
                 .gap(px(24.))
-                .px(px(20.))
+                .pl(px(12.))
+                .pr(px(20.))
                 .child(
                     div()
-                        .w(px(144.))
+                        .w(px(152.))
                         .flex_none()
                         .font_family("Source Serif 4 Display")
                         .text_size(px(23.))

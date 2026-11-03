@@ -79,7 +79,7 @@ impl MailWindow {
     /// presentation projection. Sanitized documents are cached only in memory.
     pub(super) fn browser_message_body(
         &self, key: String, source: &str, original: Option<&Message>,
-        allow_remote: bool, dark: bool, cx: &mut Context<Self>,
+        allow_remote: bool, cx: &mut Context<Self>,
     ) -> (AnyElement, usize) {
         if key.starts_with("message-") && !self.live_browser_messages.borrow().contains(&key) {
             return (self.message_text_fallback(original, &key, cx), 0);
@@ -88,9 +88,7 @@ impl MailWindow {
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         source.hash(&mut hash);
         allow_remote.hash(&mut hash);
-        dark.hash(&mut hash);
-        // Light-to-light switches must also refresh Chromium's default paper.
-        std::mem::discriminant(&cx.palette().resolved).hash(&mut hash);
+        // App-theme switches do not change the document or invalidate its light-paper tiles.
         if source.as_bytes().windows(4).any(|chunk| chunk.eq_ignore_ascii_case(b"cid:")) {
             if let Some(m) = original {
                 // Downloading a PDF or other non-inline attachment does not
@@ -108,9 +106,9 @@ impl MailWindow {
                 let (html, resources) = self.browser_document(source, original, cx.palette());
                 *count = resources;
                 *old = fingerprint;
-                view.update(cx, |body, cx| body.set_document(html, allow_remote, dark, cx));
+                view.update(cx, |body, cx| body.set_document(html, allow_remote, false, cx));
             }
-            return (view.clone().into_any_element(), *count);
+            return (email_paper(view.clone()).into_any_element(), *count);
         }
         if cache.len() >= 4 {
             return (self.message_text_fallback(original, &key, cx), 0);
@@ -122,15 +120,15 @@ impl MailWindow {
                 // Start at the reader's width, reuse a finished render when there is one,
                 // and show the text until Chromium's first tiles arrive.
                 let placeholder = SharedString::from(placeholder_text(source));
-                crate::browser_body::BrowserBody::new_sized(html, allow_remote, dark, crate::browser_body::reader_size(), Some(placeholder), cx)
+                crate::browser_body::BrowserBody::new_sized(html, allow_remote, false, crate::browser_body::reader_size(), Some(placeholder), cx)
             } else {
-                crate::browser_body::BrowserBody::new(html, allow_remote, dark, cx)
+                crate::browser_body::BrowserBody::new(html, allow_remote, false, cx)
             };
             if let Some(scroll) = native_scroll { body.attach_native_scroll(scroll); }
             body
         });
         cache.insert(key, (fingerprint, count, view.clone()));
-        (view.into_any_element(), count)
+        (email_paper(view).into_any_element(), count)
     }
 
     fn message_text_fallback(&self, message: Option<&Message>, key: &str, cx: &mut Context<Self>) -> AnyElement {
@@ -139,7 +137,7 @@ impl MailWindow {
             // a browser-process limit. Keep the full text and its files available.
             if message.body.text.is_some() { return self.native_text_body(message); }
             let id = message.id.clone();
-            return v_flex().gap(px(8.)).child(message.snippet.clone())
+            return email_paper(v_flex().gap(px(8.)).child(message.snippet.clone())
                 .child(Button::new(SharedString::from(format!("read-{key}"))).small().label("Read message")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.cancel_composer_reveal();
@@ -147,9 +145,9 @@ impl MailWindow {
                         this.expanded.insert(id.clone());
                         if let Some(index) = this.reader_message_index(&id) { this.reader_scroll.scroll_to_top_of_item(index); }
                         cx.notify();
-                    }))).into_any_element();
+                    })))).into_any_element();
         }
-        div().p_3().child("Close an open preview, then try again.").into_any_element()
+        email_paper(div().child("Close an open preview, then try again.")).into_any_element()
     }
 
     pub(super) fn reader_message_index(&self, id: &MessageId) -> Option<usize> {
@@ -179,21 +177,23 @@ impl MailWindow {
     /// A plain-text message, drawn natively: no browser process, nothing to wait for.
     fn native_text_body(&self, m: &Message) -> AnyElement {
         let text = m.body.text.as_deref().unwrap_or_default();
-        div()
-            .px(px(16.))
-            .py(px(12.))
-            .text_size(px(14.))
-            .line_height(px(21.))
-            .child(
-                gpui_kit::component::text::TextView::html(SharedString::from(format!("text-{}", m.id)), plain_text_html(text))
-                    .selectable(true)
-                    .on_link_click(|url, _, _, cx| {
-                        if crate::browser_body::allowed_url(url) {
-                            cx.open_url(url);
-                        }
-                    }),
-            )
-            .into_any_element()
+        email_paper(
+            div()
+                .px(px(8.))
+                .py(px(8.))
+                .text_size(px(14.))
+                .line_height(px(21.))
+                .child(
+                    gpui_kit::base::text::TextView::html(SharedString::from(format!("text-{}", m.id)), plain_text_html(text))
+                        .style(gpui_kit::base::text::TextViewStyle::default().with_foreground(rgb(crate::theme::EMAIL_INK).into()))
+                        .selectable(true)
+                        .on_link_click(|url, _, _, cx| {
+                            if crate::browser_body::allowed_url(url) {
+                                cx.open_url(url);
+                            }
+                        }),
+                ),
+        ).into_any_element()
     }
 
     pub(super) fn render_reader(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -437,7 +437,7 @@ impl MailWindow {
             (self.native_text_body(m), 0)
         } else {
             let html = self.thread_history.get(&m.id).cloned().unwrap_or_else(|| Self::message_source(m));
-            self.browser_message_body(format!("message-{}", m.id), &html, Some(m), allow_remote, p.is_dark(), cx)
+            self.browser_message_body(format!("message-{}", m.id), &html, Some(m), allow_remote, cx)
         };
         let sender_email = if m.is_outgoing { self.account.email.clone() } else { m.from.email.clone() };
         let mid = m.id.clone();
@@ -919,7 +919,7 @@ impl MailWindow {
                         let source = d.in_reply_to.as_ref().and_then(|id| self.store.message(id).ok().flatten());
                         let allow_remote = self.prefs.remote_images == RemoteImages::Allow || source.as_ref().is_some_and(|m| self.remote_allowed.contains(&m.id));
                         let html = super::signature::resolve_draft_images(&overlook_core::compose::outgoing_bodies(d, source.as_ref()).html, &d.attachments);
-                        self.browser_message_body(format!("outbox-{}", d.id), &html, source.as_ref(), allow_remote, p.is_dark(), cx).0
+                        self.browser_message_body(format!("outbox-{}", d.id), &html, source.as_ref(), allow_remote, cx).0
                     }),
             )
     }
@@ -1048,6 +1048,15 @@ fn plain_text_html(text: &str) -> String {
         out.push_str("</p>");
     }
     out
+}
+
+/// White gutters belong to the native surface, outside sender-authored HTML. This
+/// keeps full-width tables, authored body backgrounds, fallbacks and loading frames
+/// inside the same readable paper without rewriting the message's own layout.
+fn email_paper(body: impl IntoElement) -> Div {
+    div().w_full().min_w_0().px(px(20.)).py(px(16.)).rounded(px(6.))
+        .bg(rgb(crate::theme::EMAIL_PAPER)).text_color(rgb(crate::theme::EMAIL_INK))
+        .child(body)
 }
 
 #[cfg(test)]
