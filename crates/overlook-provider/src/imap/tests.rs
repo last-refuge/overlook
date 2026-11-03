@@ -158,6 +158,32 @@ fn draft_flags_do_not_leak_unsent_messages_into_regular_mail() {
 }
 
 #[test]
+fn unselectable_parents_become_containers_that_are_not_synchronized() {
+    // Dovecot lists "Projects" and "Projects/2026" as \Noselect when only the leaf exists.
+    let mut state = mailbox();
+    let mut taxes = FakeFolder::new("Projects/2026/Taxes", &["\\HasNoChildren"], 1760400006);
+    taxes.add(FakeMessage::new(&[], "09-Oct-2026 09:00:00 +0000", msg(&["From: irs@example.com", "To: jason@example.com", "Subject: Return", "Message-ID: <tax-1@example.com>", "Date: Fri, 09 Oct 2026 09:00:00 +0000"], "Due soon.\r\n")));
+    state.folders.push(FakeFolder::new("Projects", &["\\Noselect", "\\HasChildren"], 0));
+    state.folders.push(FakeFolder::new("Projects/2026", &["\\Noselect", "\\HasChildren"], 0));
+    state.folders.push(taxes);
+    let server = serve(state);
+    let p = provider(&server);
+    let snap = block(p.fetch_snapshot(&account())).unwrap();
+    let names: Vec<(&str, LabelKind)> = snap.labels.iter().map(|l| (l.name.as_str(), l.kind)).collect();
+    assert_eq!(
+        names,
+        vec![("Inbox", LabelKind::Inbox), ("Sent", LabelKind::Sent), ("Trash", LabelKind::Trash), ("Projects", LabelKind::Container), ("Projects / 2026", LabelKind::Container), ("Projects / 2026 / Taxes", LabelKind::User), ("Work", LabelKind::User), ("Work / Clients", LabelKind::User)],
+        "containers of user folders are labels; [Gmail] still is not"
+    );
+    let container = snap.labels.iter().find(|l| l.kind == LabelKind::Container).unwrap();
+    assert_eq!(container.provider_id.as_ref().unwrap().as_str(), "Projects", "the path serves as parent for new folders");
+    let cp = Checkpoint::parse(snap.checkpoint.as_deref().unwrap()).unwrap();
+    assert!(cp.folders.contains_key("Projects/2026/Taxes"));
+    assert!(!cp.folders.contains_key("Projects") && !cp.folders.contains_key("Projects/2026"), "nothing to synchronize in a container: {:?}", cp.folders.keys());
+    assert!(snap.message_ids.iter().any(|p| p.0.starts_with("Projects/2026/Taxes\u{1f}")), "the leaf's mail is queued");
+}
+
+#[test]
 fn snapshot_maps_folders_and_queues_newest_messages() {
     let server = serve(mailbox());
     let p = provider(&server);
@@ -1468,4 +1494,109 @@ fn a_verifying_cycle_reports_mail_beyond_the_window_as_untracked() {
     let old = pid("INBOX", 1760400000, 1);
     assert!(!checked.complete.unwrap().iter().any(|s| s.provider_id == old));
     assert!(checked.untracked.contains(&old), "{:?}", checked.untracked);
+}
+
+#[test]
+fn only_imap_deletes_single_messages_for_good() {
+    let server = serve(mailbox());
+    assert!(provider(&server).supports_delete_forever());
+    assert!(!crate::sample::SampleProvider::default().supports_delete_forever(), "the trait default stays off");
+}
+
+#[test]
+fn folder_names_sent_as_literals_are_read_back_as_is() {
+    // Cyrus and others write such names as `{13}\r\nQA/Back\slash`: nothing to unescape.
+    let mut state = mailbox();
+    state.literal_names = true;
+    let mut odd = FakeFolder::new("QA/Back\\slash", &["\\HasNoChildren"], 1760400010);
+    odd.add(FakeMessage::new(&[], "09-Oct-2026 09:00:00 +0000", msg(&["From: qa@example.com", "To: jason@example.com", "Subject: Slash", "Message-ID: <slash-1@example.com>", "Date: Fri, 09 Oct 2026 09:00:00 +0000"], "Literal.\r\n")));
+    state.folders.push(FakeFolder::new("QA", &["\\HasChildren"], 1760400009));
+    state.folders.push(odd);
+    state.subscribed.insert("QA/Back\\slash".into());
+    let server = serve(state);
+    let p = provider(&server);
+    let snap = block(p.fetch_snapshot(&account())).unwrap();
+    let names: Vec<&str> = snap.labels.iter().map(|l| l.name.as_str()).collect();
+    assert!(names.contains(&"QA / Back\\slash"), "{names:?}");
+    let cp = Checkpoint::parse(snap.checkpoint.as_deref().unwrap()).unwrap();
+    assert!(cp.folders.contains_key("QA/Back\\slash") && cp.folders["QA/Back\\slash"].subscribed, "{:?}", cp.folders.keys());
+    assert!(snap.message_ids.iter().any(|id| id.0.starts_with("QA/Back\\slash\u{1f}")), "the folder was opened and its mail queued");
+    let changes = block(p.fetch_changes(&account(), snap.checkpoint.as_deref().unwrap())).unwrap();
+    assert!(changes.deleted_provider_ids.is_empty(), "{:?}", changes.deleted_provider_ids);
+    let cp = Checkpoint::parse(changes.checkpoint.as_deref().unwrap()).unwrap();
+    assert!(cp.folders.contains_key("QA/Back\\slash"));
+}
+
+#[test]
+fn folder_names_with_quoted_string_escapes_are_read_back_unescaped() {
+    // The server writes such names as "QA/Back\\slash" and "QA/Quote\"Inside" in LIST.
+    let mut state = mailbox();
+    let mut odd = FakeFolder::new("QA/Back\\slash", &["\\HasNoChildren"], 1760400010);
+    odd.add(FakeMessage::new(&[], "09-Oct-2026 09:00:00 +0000", msg(&["From: qa@example.com", "To: jason@example.com", "Subject: Slash", "Message-ID: <slash-1@example.com>", "Date: Fri, 09 Oct 2026 09:00:00 +0000"], "Escaped.\r\n")));
+    state.folders.push(FakeFolder::new("QA", &["\\HasChildren"], 1760400009));
+    state.folders.push(odd);
+    state.folders.push(FakeFolder::new("QA/Quote\"Inside", &["\\HasNoChildren"], 1760400011));
+    state.subscribed.insert("QA/Back\\slash".into());
+    let server = serve(state);
+    let p = provider(&server);
+    let snap = block(p.fetch_snapshot(&account())).unwrap();
+    let names: Vec<&str> = snap.labels.iter().map(|l| l.name.as_str()).collect();
+    assert!(names.contains(&"QA / Back\\slash") && names.contains(&"QA / Quote\"Inside"), "{names:?}");
+    let cp = Checkpoint::parse(snap.checkpoint.as_deref().unwrap()).unwrap();
+    assert!(cp.folders.contains_key("QA/Back\\slash") && cp.folders.contains_key("QA/Quote\"Inside"), "{:?}", cp.folders.keys());
+    assert!(cp.folders["QA/Back\\slash"].subscribed, "LSUB names are unescaped too");
+    assert!(snap.message_ids.iter().any(|id| id.0.starts_with("QA/Back\\slash\u{1f}")), "the folder was opened and its mail queued");
+    // The next cycle opens them again by name: nothing vanishes.
+    let changes = block(p.fetch_changes(&account(), snap.checkpoint.as_deref().unwrap())).unwrap();
+    let cp = Checkpoint::parse(changes.checkpoint.as_deref().unwrap()).unwrap();
+    assert!(cp.folders.contains_key("QA/Back\\slash") && cp.folders.contains_key("QA/Quote\"Inside"));
+    assert!(changes.deleted_provider_ids.is_empty(), "{:?}", changes.deleted_provider_ids);
+}
+
+#[test]
+fn a_system_folder_the_server_refuses_to_open_keeps_its_kind() {
+    // One refused EXAMINE on Trash must not turn it into a container: deletes and sent
+    // copies would be rejected until a verifying cycle.
+    let mut state = mailbox();
+    state.fail_next = Some(("EXAMINE \"TRASH\"".into(), "NO Mailbox doesn't exist: Trash".into()));
+    let server = serve(state);
+    let p = provider(&server);
+    let snap = block(p.fetch_snapshot(&account())).unwrap();
+    let trash = snap.labels.iter().find(|l| l.name == "Trash").expect("still a label");
+    assert_eq!(trash.kind, LabelKind::Trash, "{:?}", snap.labels);
+    let cp = Checkpoint::parse(snap.checkpoint.as_deref().unwrap()).unwrap();
+    assert!(cp.folders.contains_key("Trash"), "still synchronized: {:?}", cp.folders.keys());
+    // The next cycle opens it again and reads its mail.
+    let changes = block(p.fetch_changes(&account(), snap.checkpoint.as_deref().unwrap())).unwrap();
+    assert!(changes.labels.as_ref().is_none_or(|labels| labels.iter().any(|l| l.name == "Trash" && l.kind == LabelKind::Trash)));
+    let opened = server.state.lock().unwrap().log.iter().filter(|l| l.to_ascii_uppercase().contains("EXAMINE \"TRASH\"")).count();
+    assert!(opened >= 2, "tried again: {:?}", server.state.lock().unwrap().log);
+}
+
+#[test]
+fn a_listed_folder_the_server_refuses_to_open_becomes_folder_only_until_verified() {
+    // Dovecot can list a deleted parent as selectable while children remain, yet answer
+    // EXAMINE with "Mailbox doesn't exist".
+    let mut state = mailbox();
+    state.folders.push(FakeFolder::new("Ghost", &["\\HasChildren"], 1760400012));
+    state.folders.push(FakeFolder::new("Ghost/Child", &["\\HasNoChildren"], 1760400013));
+    state.fail_next = Some(("EXAMINE \"GHOST\"".into(), "NO Mailbox doesn't exist: Ghost".into()));
+    let server = serve(state);
+    let p = provider(&server);
+    let snap = block(p.fetch_snapshot(&account())).unwrap();
+    let ghost = snap.labels.iter().find(|l| l.name == "Ghost").expect("still a label");
+    assert_eq!(ghost.kind, LabelKind::Container, "shown as folder-only, not dropped");
+    assert!(snap.labels.iter().any(|l| l.name == "Ghost / Child" && l.kind == LabelKind::User));
+    let cp = Checkpoint::parse(snap.checkpoint.as_deref().unwrap()).unwrap();
+    assert!(!cp.folders.contains_key("Ghost"), "not synchronized: {:?}", cp.folders.keys());
+    let log_before = server.state.lock().unwrap().log.len();
+    let changes = block(p.fetch_changes(&account(), snap.checkpoint.as_deref().unwrap())).unwrap();
+    let opened_again = server.state.lock().unwrap().log[log_before..].iter().any(|l| l.to_ascii_uppercase().contains("EXAMINE \"GHOST\""));
+    assert!(!opened_again, "an ordinary cycle leaves it alone");
+    assert!(changes.labels.as_ref().is_none_or(|labels| labels.iter().any(|l| l.name == "Ghost" && l.kind == LabelKind::Container)));
+    // Verifying (start-up, a manual sync) tries again; the server now opens it.
+    let verified = block(p.verify_changes(&account(), changes.checkpoint.as_deref().unwrap())).unwrap();
+    let labels = verified.labels.expect("a verifying cycle always reports labels");
+    assert!(labels.iter().any(|l| l.name == "Ghost" && l.kind == LabelKind::User), "{labels:?}");
+    assert!(Checkpoint::parse(verified.checkpoint.as_deref().unwrap()).unwrap().folders.contains_key("Ghost"));
 }

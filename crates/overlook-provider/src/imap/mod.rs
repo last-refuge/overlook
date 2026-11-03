@@ -279,6 +279,10 @@ struct Conn {
     sent_path: Option<String>,
     /// Every selectable folder from the last listing with its label kind, for search.
     folders: Vec<(String, LabelKind)>,
+    /// Folders the server lists as selectable but refuses to open (Dovecot keeps the name
+    /// of a deleted parent while children remain). They are shown as folder-only and left
+    /// alone instead of being dropped and re-added every cycle; a verifying cycle retries.
+    unopenable: HashSet<String>,
 }
 
 impl Conn {
@@ -420,14 +424,18 @@ impl Conn {
         Ok((present, seen, flagged))
     }
 
+    /// `LIST` and `LSUB`, read from the raw lines so a name the server sends as a literal
+    /// is kept as is while a quoted one is unescaped (see [`folders::decode_name`]).
     fn list_folders(&mut self) -> Result<Vec<FolderInfo>, ProviderError> {
-        let names = self.session().list(Some(""), Some("*")).map_err(|e| map_error(&e))?;
-        let mut folders: Vec<FolderInfo> = names.iter().map(FolderInfo::from_name).collect();
+        let (data, _) = self.session().run("LIST \"\" \"*\"").map_err(|e| map_error(&e))?;
+        let (mut folders, _) = parse_list_status(&data).ok_or_else(|| ProviderError::Temporary("could not read the LIST response".into()))?;
         // Subscriptions are informational; a server without LSUB support is not an error.
-        if let Ok(subscribed) = self.session().lsub(Some(""), Some("*")) {
-            let set: HashSet<String> = subscribed.iter().map(|n| n.name().to_owned()).collect();
-            for f in &mut folders {
-                f.subscribed = set.contains(&f.path);
+        if let Ok((data, _)) = self.session().run("LSUB \"\" \"*\"") {
+            if let Some((subscribed, _)) = parse_list_status(&data) {
+                let set: HashSet<String> = subscribed.into_iter().map(|f| f.path).collect();
+                for f in &mut folders {
+                    f.subscribed = set.contains(&f.path);
+                }
             }
         }
         Ok(folders)
@@ -471,17 +479,19 @@ impl Conn {
         if self.selected.as_ref().is_some_and(|s| s.path == path) {
             return Ok(None);
         }
-        let items = format!("({})", self.status_items());
-        match self.session().status(path, items) {
-            Ok(m) => Ok(Some(FolderStatus { uidvalidity: m.uid_validity.unwrap_or(0), uid_next: m.uid_next.unwrap_or(0), exists: m.exists, highest_modseq: m.highest_mod_seq })),
+        // Sent by hand: the library would match the reply by the name as the server
+        // escapes it, which differs from `path` for names with a quote or a backslash.
+        let command = format!("STATUS {} ({})", quote_mailbox(path), self.status_items());
+        match self.session().run(&command) {
+            Ok((data, _)) => Ok(parse_list_status(&data).and_then(|(_, mut statuses)| statuses.remove(path))),
             Err(imap::Error::No(_)) | Err(imap::Error::Bad(_)) => Ok(None),
             Err(e) => Err(map_error(&e)),
         }
     }
 }
 
-/// The folders and `STATUS` lines of a `LIST … RETURN (SUBSCRIBED STATUS …)` response.
-/// `None` when any line can't be parsed: the list would be incomplete.
+/// The folders and `STATUS` lines of a `LIST`, `LSUB` or `LIST … RETURN (SUBSCRIBED
+/// STATUS …)` response. `None` when any line can't be parsed: the list would be incomplete.
 fn parse_list_status(data: &[u8]) -> Option<ListedWithStatus> {
     let (mut folders, mut statuses) = (Vec::new(), HashMap::new());
     let mut rest = data;
@@ -491,11 +501,12 @@ fn parse_list_status(data: &[u8]) -> Option<ListedWithStatus> {
             debug!("imap: unparsed LIST-STATUS line: {}", String::from_utf8_lossy(line));
             return None;
         };
+        let line = &rest[..rest.len() - next.len()];
         match response {
             Response::MailboxData(MailboxDatum::List { name_attributes, delimiter, name }) => {
                 let attributes: Vec<String> = name_attributes.iter().map(folders::attribute_name).collect();
                 let subscribed = attributes.iter().any(|a| a.eq_ignore_ascii_case("\\Subscribed"));
-                folders.push(FolderInfo { path: name.into_owned(), delimiter: delimiter.map(|d| d.into_owned()), attributes, subscribed });
+                folders.push(FolderInfo { path: folders::decode_name(line, &name), delimiter: delimiter.map(|d| d.into_owned()), attributes, subscribed });
             }
             Response::MailboxData(MailboxDatum::Status { mailbox, status }) => {
                 let mut s = FolderStatus::default();
@@ -508,7 +519,7 @@ fn parse_list_status(data: &[u8]) -> Option<ListedWithStatus> {
                         _ => {}
                     }
                 }
-                statuses.insert(mailbox.into_owned(), s);
+                statuses.insert(folders::decode_name(line, &mailbox), s);
             }
             _ => {}
         }
@@ -565,7 +576,7 @@ impl ImapProvider {
             outgoing_password: None,
             inbox_limit: 100,
             timeout: DEFAULT_TIMEOUT,
-            conn: Mutex::new(Conn { session: None, selected: None, caps: Capabilities::default(), relist_pending: false, renamed: Vec::new(), sent_path: None, folders: Vec::new() }),
+            conn: Mutex::new(Conn { session: None, selected: None, caps: Capabilities::default(), relist_pending: false, renamed: Vec::new(), sent_path: None, folders: Vec::new(), unopenable: HashSet::new() }),
             send_phases: Mutex::new(HashMap::new()),
         }
     }
@@ -834,9 +845,17 @@ impl ImapProvider {
         Ok(self.relist_from(conn, account, cp, &listed))
     }
 
-    /// [`Self::relist`] from a listing already read.
+    /// [`Self::relist`] from a listing already read. A user folder the server refused to
+    /// open is shown as folder-only; a system folder (Inbox, Sent, Trash, …) keeps its
+    /// kind, since losing it would reject deletes and sent copies over one refused
+    /// `EXAMINE`, and is simply tried again.
     fn relist_from(&self, conn: &mut Conn, account: &Account, cp: &mut Checkpoint, listed: &[FolderInfo]) -> (Vec<Label>, Vec<ProviderId>) {
-        let classified = folders::classify(listed, self.servers.imap.as_ref());
+        let mut classified = folders::classify(listed, self.servers.imap.as_ref());
+        for (info, kind) in &mut classified {
+            if *kind == LabelKind::User && conn.unopenable.contains(&info.path) {
+                *kind = LabelKind::Container;
+            }
+        }
         let labels = folders::labels_for(&account.id, &classified);
         let mut deleted = Vec::new();
         for (old, new) in std::mem::take(&mut conn.renamed) {
@@ -846,6 +865,9 @@ impl ImapProvider {
         }
         let mut next: BTreeMap<String, FolderCursor> = BTreeMap::new();
         for (info, kind) in &classified {
+            if *kind == LabelKind::Container {
+                continue;
+            }
             let mut cursor = cp.folders.remove(&info.path).unwrap_or_else(|| FolderCursor { fresh: true, ..Default::default() });
             cursor.kind = kind.as_key().to_owned();
             cursor.delimiter = info.delimiter.clone();
@@ -895,7 +917,8 @@ impl ImapProvider {
     fn snapshot(&self, account: &Account) -> Result<MailboxSnapshot, ProviderError> {
         self.with_session(|conn| {
             let mut cp = Checkpoint { version: Checkpoint::VERSION, ..Default::default() };
-            let (labels, _) = self.relist(conn, account, &mut cp)?;
+            conn.unopenable.clear();
+            let (mut labels, _) = self.relist(conn, account, &mut cp)?;
             let mut ids: Vec<ProviderId> = Vec::new();
             // Inbox first so the first bodies downloaded are the ones shown first.
             let mut order: Vec<String> = cp.folders.keys().cloned().collect();
@@ -905,7 +928,8 @@ impl ImapProvider {
                 let mailbox = match conn.examine(&path) {
                     Ok(m) => m,
                     Err(ProviderError::Rejected(reason)) => {
-                        warn!("imap: skipping folder {path}: {reason}");
+                        warn!("imap: folder {path} cannot be opened ({reason}); shown as folder-only");
+                        conn.unopenable.insert(path.clone());
                         continue;
                     }
                     Err(e) => return Err(e),
@@ -915,6 +939,10 @@ impl ImapProvider {
                 ids.extend(self.reset_folder(conn, &path, cursor, uidvalidity, mailbox.highest_mod_seq.unwrap_or(0), &server)?);
                 cursor.uid_next = mailbox.uid_next.unwrap_or(0);
                 cursor.exists = mailbox.exists;
+            }
+            if !conn.unopenable.is_empty() {
+                // Listed again so the refused folders become containers without cursors.
+                labels = self.relist(conn, account, &mut cp)?.0;
             }
             info!("imap: {} folders, {} recent messages queued for download", cp.folders.len(), ids.len());
             Ok(MailboxSnapshot { labels, messages: Vec::new(), message_ids: ids, checkpoint: Some(cp.to_json()) })
@@ -931,6 +959,10 @@ impl ImapProvider {
             let mut cp = base.clone();
             cp.cycle += 1;
             let mut changes = RemoteChanges::default();
+            if verify {
+                // A folder that could not be opened before gets another try.
+                conn.unopenable.clear();
+            }
             // With LIST-STATUS the folder list comes every cycle: the same command says which
             // folders changed, and a folder made, renamed or removed elsewhere shows at the
             // next sync. Without it the list is read hourly (or when forced) and each folder
@@ -976,8 +1008,11 @@ impl ImapProvider {
                 let mailbox = match conn.examine(&path) {
                     Ok(m) => m,
                     Err(ProviderError::Rejected(reason)) => {
-                        info!("imap: folder {path} is gone ({reason}); removing its messages");
+                        info!("imap: folder {path} cannot be opened ({reason}); removing its messages");
                         changes.deleted_provider_ids.extend(cursor.known_set().into_iter().map(|uid| MessageRef::provider_id(&path, cursor.uidvalidity, uid)));
+                        // Still listed next time, it is treated as folder-only rather than
+                        // dropped and re-added for ever.
+                        conn.unopenable.insert(path.clone());
                         vanished.push(path.clone());
                         relist_needed = true;
                         continue;
@@ -1874,6 +1909,8 @@ impl MailProvider for ImapProvider {
     fn supports_drafts(&self) -> bool { true }
 
     fn manages_folders(&self) -> bool { true }
+
+    fn supports_delete_forever(&self) -> bool { true }
 
     fn create_folder(&self, account: &Account, name: &str, parent: Option<&Label>, labels: &[Label]) -> BoxFuture<'_, Result<Label, ProviderError>> {
         let (account, name, parent, labels) = (account.clone(), name.trim().to_owned(), parent.cloned(), labels.to_vec());

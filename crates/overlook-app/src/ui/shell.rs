@@ -194,59 +194,6 @@ impl MailWindow {
         )
     }
 
-    pub(super) fn mail_move_menu(
-        &self,
-        button: Button,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let labels: Vec<(LabelId, String)> = self
-            .labels
-            .iter()
-            .filter(|l| l.kind == LabelKind::User)
-            .map(|l| (l.id.clone(), l.name.clone()))
-            .collect();
-        let ids = self.selected_message_ids();
-        let this = cx.entity().downgrade();
-        button.dropdown_menu(move |mut menu, _, _| {
-            for (label, view) in [
-                ("Inbox", MailboxView::Kind(LabelKind::Inbox)),
-                ("Archive", MailboxView::Kind(LabelKind::Archive)),
-                ("Trash", MailboxView::Kind(LabelKind::Trash)),
-            ] {
-                let this = this.clone();
-                let ids = ids.clone();
-                menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                    let drag = ConversationDrag {
-                        mail: DraggedMail::Messages(ids.clone()),
-                        title: String::new(),
-                        count: 0,
-                    };
-                    this.update(cx, |this, cx| {
-                        this.drop_on_view(drag, view.clone(), window, cx)
-                    })
-                    .ok();
-                }));
-            }
-            if !labels.is_empty() {
-                menu = menu.separator().label("Labels");
-            }
-            for (id, name) in &labels {
-                let this = this.clone();
-                let ids = ids.clone();
-                let id = id.clone();
-                menu = menu.item(PopupMenuItem::new(name.clone()).on_click(
-                    move |_, window, cx| {
-                        this.update(cx, |this, cx| {
-                            this.move_to_label(ids.clone(), id.clone(), window, cx)
-                        })
-                        .ok();
-                    },
-                ));
-            }
-            menu
-        })
-    }
-
     pub(super) fn appearance_menu(
         &self,
         button: Button,

@@ -20,10 +20,6 @@ pub struct FolderInfo {
 }
 
 impl FolderInfo {
-    pub fn from_name(name: &imap::types::Name<'_>) -> Self {
-        Self { path: name.name().to_owned(), delimiter: name.delimiter().map(str::to_owned), attributes: name.attributes().iter().map(attribute_name).collect(), subscribed: true }
-    }
-
     fn has(&self, attribute: &str) -> bool {
         self.attributes.iter().any(|a| a.eq_ignore_ascii_case(attribute))
     }
@@ -182,8 +178,51 @@ pub fn attribute_name(a: &NameAttribute<'_>) -> String {
     }
 }
 
-/// What a folder is to Overlook. `None` means "not shown" (Drafts, virtual Gmail views,
-/// unselectable containers).
+/// The mailbox name of a `LIST`, `LSUB` or `STATUS` line as the folder is really called.
+/// `name` is what the response parser returned for `line`: a literal (`{N}` followed by
+/// the raw bytes, which some servers use for names with 8-bit or special characters) is
+/// already the real name, while a quoted string still carries its escapes.
+pub fn decode_name(line: &[u8], name: &str) -> String {
+    if sent_as_literal(line, name) {
+        name.to_owned()
+    } else {
+        unescape_name(name)
+    }
+}
+
+/// Whether `line` carries `name` as a literal: `{N}\r\n` directly followed by its bytes.
+/// A quoted name can't look like that, since CR and LF are not allowed inside quotes.
+fn sent_as_literal(line: &[u8], name: &str) -> bool {
+    let marker = format!("{{{}}}\r\n{name}", name.len());
+    line.windows(marker.len()).any(|w| w == marker.as_bytes())
+}
+
+/// A quoted mailbox name with the quoted-string escapes removed. The response parser
+/// keeps `\\` and `\"` as sent, so a folder called `Back\slash` would otherwise be
+/// remembered as `Back\\slash` and every command naming it (which escapes it again)
+/// would miss. An unquoted (atom) name has no escapes.
+pub fn unescape_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut chars = name.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(next) => out.push(next),
+                None => out.push(c),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// What a folder is to Overlook. Not every folder is shown: Drafts and virtual Gmail views
+/// are left out, and an unselectable container (`\Noselect`) is kept, as
+/// [`LabelKind::Container`], only when user folders sit inside it. Dovecot and Courier
+/// make such containers whenever a child is created without its parent, and keep them
+/// when a parent is deleted with children left; `[Gmail]`, whose children are all system
+/// folders, is dropped.
 pub fn classify(folders: &[FolderInfo], policy: Option<&ImapPolicy>) -> Vec<(FolderInfo, LabelKind)> {
     let mut out: Vec<(FolderInfo, LabelKind)> = Vec::new();
     let taken = |out: &Vec<(FolderInfo, LabelKind)>, kind: LabelKind| out.iter().any(|(_, k)| *k == kind);
@@ -245,6 +284,18 @@ pub fn classify(folders: &[FolderInfo], policy: Option<&ImapPolicy>) -> Vec<(Fol
             continue;
         }
         out.push((f.clone(), LabelKind::User));
+    }
+    for f in folders {
+        if f.selectable() || f.path.eq_ignore_ascii_case("INBOX") || out.iter().any(|(o, _)| o.path == f.path) {
+            continue;
+        }
+        let inside = |path: &str| match &f.delimiter {
+            Some(d) if !d.is_empty() => path.len() > f.path.len() + d.len() && path.starts_with(&f.path) && path[f.path.len()..].starts_with(d.as_str()),
+            _ => false,
+        };
+        if out.iter().any(|(o, k)| *k == LabelKind::User && inside(&o.path)) {
+            out.push((f.clone(), LabelKind::Container));
+        }
     }
     out
 }
@@ -369,6 +420,49 @@ mod tests {
         assert_eq!(find("INBOX.Sent"), Some(LabelKind::Sent));
         let labels = labels_for(&AccountId::from("a"), &classified);
         assert_eq!(labels.iter().find(|l| l.kind == LabelKind::User).unwrap().name, "Archive", "INBOX namespace is hidden in names");
+    }
+
+    #[test]
+    fn quoted_string_escapes_are_removed_from_names() {
+        assert_eq!(unescape_name("Work/Clients"), "Work/Clients");
+        assert_eq!(unescape_name("QA.Special.Back\\\\slash"), "QA.Special.Back\\slash");
+        assert_eq!(unescape_name("QA.Special.Quote\\\"Inside"), "QA.Special.Quote\"Inside");
+        assert_eq!(unescape_name("trailing\\"), "trailing\\", "a lone backslash at the end stays");
+    }
+
+    #[test]
+    fn literal_names_keep_their_backslashes() {
+        let quoted = b"* LIST (\\HasNoChildren) \"/\" \"QA/Back\\\\slash\"\r\n";
+        assert_eq!(decode_name(quoted, "QA/Back\\\\slash"), "QA/Back\\slash");
+        let literal = b"* LIST (\\HasNoChildren) \"/\" {13}\r\nQA/Back\\slash\r\n";
+        assert_eq!(decode_name(literal, "QA/Back\\slash"), "QA/Back\\slash", "a literal has no escapes to remove");
+        let status = b"* STATUS {13}\r\nQA/Back\\slash (MESSAGES 1)\r\n";
+        assert_eq!(decode_name(status, "QA/Back\\slash"), "QA/Back\\slash");
+        assert_eq!(decode_name(b"* LIST () \"/\" Plain\r\n", "Plain"), "Plain");
+    }
+
+    #[test]
+    fn unselectable_parents_of_user_folders_are_containers() {
+        let folders = vec![
+            f("INBOX", &[]),
+            f("Projects", &["\\Noselect", "\\HasChildren"]),
+            f("Projects/2026", &["\\Noselect", "\\HasChildren"]),
+            f("Projects/2026/Taxes", &["\\HasNoChildren"]),
+            f("Old", &["\\Noselect", "\\HasChildren"]),
+            f("Old/Sent", &["\\Sent"]),
+            f("Empty", &["\\Noselect", "\\HasNoChildren"]),
+            f("Projectsother", &["\\HasNoChildren"]),
+        ];
+        let classified = classify(&folders, None);
+        let kinds: Vec<(&str, LabelKind)> = classified.iter().map(|(f, k)| (f.path.as_str(), *k)).collect();
+        assert!(kinds.contains(&("Projects", LabelKind::Container)));
+        assert!(kinds.contains(&("Projects/2026", LabelKind::Container)));
+        assert!(kinds.contains(&("Projects/2026/Taxes", LabelKind::User)));
+        assert!(!kinds.iter().any(|(p, _)| *p == "Old"), "a container of system folders only is dropped: {kinds:?}");
+        assert!(!kinds.iter().any(|(p, _)| *p == "Empty"), "a container with nothing inside is dropped");
+        let labels = labels_for(&AccountId::from("imap:j"), &classified);
+        let names: Vec<(&str, LabelKind)> = labels.iter().map(|l| (l.name.as_str(), l.kind)).collect();
+        assert_eq!(names, [("Inbox", LabelKind::Inbox), ("Sent", LabelKind::Sent), ("Projects", LabelKind::Container), ("Projects / 2026", LabelKind::Container), ("Projects / 2026 / Taxes", LabelKind::User), ("Projectsother", LabelKind::User)]);
     }
 
     #[test]

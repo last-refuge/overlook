@@ -19,7 +19,7 @@ use overlook_store::MailboxView;
 const DEPTH_STEP: f32 = 18.;
 
 /// Name and icon of a mailbox that is not a user label; `None` for user labels.
-fn system_folder(kind: LabelKind) -> Option<(&'static str, &'static str)> {
+pub(super) fn system_folder(kind: LabelKind) -> Option<(&'static str, &'static str)> {
     Some(match kind {
         LabelKind::Inbox => ("Inbox", "inbox"),
         LabelKind::Starred => ("Starred", "star"),
@@ -29,7 +29,7 @@ fn system_folder(kind: LabelKind) -> Option<(&'static str, &'static str)> {
         LabelKind::Archive => ("Archive", "archive"),
         LabelKind::Spam => ("Junk", "shield-alert"),
         LabelKind::Trash => ("Trash", "trash"),
-        LabelKind::User => return None,
+        LabelKind::User | LabelKind::Container => return None,
     })
 }
 
@@ -181,8 +181,14 @@ impl MailWindow {
     }
 
     /// Pins a folder to Favorites. The first change turns the default (every Inbox) into a
-    /// saved list, so the defaults stay pinned.
+    /// saved list, so the defaults stay pinned. A folder-only container is not pinned:
+    /// Favorites shows only folders that hold mail.
     pub(crate) fn pin_favorite(&mut self, favorite: Favorite, cx: &mut Context<Self>) {
+        if let Some(id) = &favorite.label {
+            if self.labels_of(&favorite.account).iter().any(|l| &l.id == id && l.kind == LabelKind::Container) {
+                return;
+            }
+        }
         let mut favorites = self.favorites();
         if overlook_core::sidebar::pin(&mut favorites, favorite) {
             self.prefs.favorites = Some(favorites);
@@ -332,7 +338,7 @@ impl MailWindow {
             self.account_counts.get(account).and_then(|c| c.get(&MailboxView::Kind(LabelKind::Outbox))).is_some_and(|n| *n > 0)
         };
         use overlook_core::sidebar::{folder_tree, TreeRoot};
-        let users: Vec<&overlook_core::Label> = self.labels_of(account).iter().filter(|l| l.kind == LabelKind::User).collect();
+        let users: Vec<&overlook_core::Label> = self.labels_of(account).iter().filter(|l| matches!(l.kind, LabelKind::User | LabelKind::Container)).collect();
         let names: Vec<&str> = users.iter().map(|l| l.name.as_str()).collect();
         let trash_name = self.labels_of(account).iter().find(|l| l.kind == LabelKind::Trash).map(|l| l.name.clone());
         // One branch of the folder tree as rows, `base` levels in, without what is folded.
@@ -345,13 +351,15 @@ impl MailWindow {
                 }
                 folded_at = None;
                 let l = users[row.index];
+                let container = l.kind == LabelKind::Container;
                 let mut nav = Nav {
                     label: row.leaf.to_owned().into(),
-                    icon: "tag",
+                    icon: "folder",
                     view: MailboxView::Label(l.id.clone()),
-                    color: Some(p.label_color(l.color.as_deref())),
+                    color: if container { None } else { p.label_color(l.color.as_deref()) },
                     depth: base + row.depth,
                     expander: None,
+                    container,
                 };
                 if row.has_children {
                     let key = format!("folder:{}:{}", account.0, l.id.0);
@@ -401,8 +409,8 @@ impl MailWindow {
                 continue;
             }
             let nav = match (f.kind, &f.label) {
-                (LabelKind::User, Some(id)) => match self.labels_of(&f.account).iter().find(|l| &l.id == id) {
-                    Some(l) => Nav { label: l.name.clone().into(), icon: "tag", view: MailboxView::Label(id.clone()), color: Some(p.label_color(l.color.as_deref())), depth: 0, expander: None },
+                (LabelKind::User, Some(id)) => match self.labels_of(&f.account).iter().find(|l| &l.id == id && l.kind == LabelKind::User) {
+                    Some(l) => Nav { label: l.name.clone().into(), icon: "folder", view: MailboxView::Label(id.clone()), color: p.label_color(l.color.as_deref()), depth: 0, expander: None, container: false },
                     None => continue,
                 },
                 (kind, _) => match system_folder(kind) {
@@ -447,7 +455,9 @@ impl MailWindow {
             };
             let view = nav.view.clone();
             let drop_view = nav.view.clone();
-            let droppable = in_active && matches!(nav.view, MailboxView::Kind(LabelKind::Inbox) | MailboxView::Kind(LabelKind::Archive) | MailboxView::Kind(LabelKind::Trash) | MailboxView::Kind(LabelKind::Starred) | MailboxView::Label(_));
+            let container = nav.container;
+            // The same set `drop_on_view` accepts.
+            let droppable = in_active && !container && matches!(nav.view, MailboxView::Kind(LabelKind::Inbox | LabelKind::Archive | LabelKind::Trash | LabelKind::Starred | LabelKind::Spam) | MailboxView::Label(_));
             let color = nav.color;
             let target = account.clone();
             let favorite = favorite_for(account, &nav.view);
@@ -460,17 +470,18 @@ impl MailWindow {
             let fav_drag = super::FavoriteDrag { favorite: favorite.clone(), name: nav.label.to_string() };
             let drop_target = favorite.clone();
             let (menu_account, menu_view) = (account.clone(), nav.view.clone());
-            // Drafts and the Outbox hold drafts, not received mail.
-            let has_mail = !matches!(nav.view, MailboxView::Kind(LabelKind::Drafts | LabelKind::Outbox));
+            // Drafts and the Outbox hold drafts, not received mail; a container holds folders.
+            let has_mail = !container && !matches!(nav.view, MailboxView::Kind(LabelKind::Drafts | LabelKind::Outbox));
             // New, rename and delete apply to the account's own folders, where the server allows.
             let user_folder = match &nav.view {
                 MailboxView::Label(id) if this.manages_folders(account) => this.user_label(account, id),
                 _ => None,
             };
-            // Folders can go inside your own folders and inside the Inbox (a Gmail label
-            // named "Inbox/…", which Outlook shows there too).
+            // Folders can go inside your own folders, inside a container, and inside the
+            // Inbox (a Gmail label named "Inbox/…", which Outlook shows there too).
             let new_inside = match &nav.view {
                 MailboxView::Kind(LabelKind::Inbox) if this.manages_folders(account) => this.labels_of(account).iter().find(|l| l.kind == LabelKind::Inbox).cloned(),
+                MailboxView::Label(id) if container && this.manages_folders(account) => this.labels_of(account).iter().find(|l| &l.id == id).cloned(),
                 _ => user_folder.clone(),
             };
             let empty_kind = match &nav.view {
@@ -483,6 +494,8 @@ impl MailWindow {
             let me = cx.entity().downgrade();
             // Only in the account tree: Favorites rows stand alone.
             let expander = nav.expander.clone().filter(|_| !in_favorites);
+            // A container opens nothing: clicking it folds or unfolds the folders inside.
+            let fold_key = expander.as_ref().filter(|_| container).map(|(key, _)| key.clone());
             div()
                 .id(SharedString::from(format!("nav-{section}-{}-{:?}", account.0, nav.view)))
                 .relative()
@@ -545,7 +558,8 @@ impl MailWindow {
                 .rounded(px(7.))
                 .cursor_pointer()
                 .text_size(px(13.))
-                .text_color(if current { p.accent } else { p.foreground })
+                .text_color(if current { p.accent } else if container { p.muted } else { p.foreground })
+                .when(container, |d| d.tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Holds folders only. Mail cannot be stored here. Right-click to learn more.").build(window, cx)))
                 .font_weight(if current { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
                 .when(current, |d| d.bg(p.selection))
                 .when(!current, |d| d.hover(|d| d.bg(p.hover)))
@@ -565,8 +579,32 @@ impl MailWindow {
                             .child(count.to_string()),
                     )
                 })
-                .on_click(cx.listener(move |this, _, window, cx| this.open_folder(target.clone(), view.clone(), window, cx)))
+                .on_click(cx.listener(move |this, _, window, cx| match &fold_key {
+                    Some(key) => this.toggle_section(key, cx),
+                    None => this.open_folder(target.clone(), view.clone(), window, cx),
+                }))
                 .context_menu(move |menu, _window, _cx| {
+                    if container {
+                        // A container has no mail to open or pin, and the server drops it
+                        // once the last folder in it goes: only a new folder, and help. A pin
+                        // from before the folder lost its mail is hidden, so it can be removed.
+                        let mut menu = menu;
+                        if pinned {
+                            let (t, f) = (me.clone(), favorite.clone());
+                            menu = menu.item(PopupMenuItem::new("Remove from Favorites").on_click(move |_, _window, cx| {
+                                t.update(cx, |this, cx| this.unpin_favorite(&f, cx)).ok();
+                            }));
+                            menu = menu.separator();
+                        }
+                        if let Some(parent) = new_inside.clone() {
+                            let (t, account) = (me.clone(), menu_account.clone());
+                            menu = menu.item(PopupMenuItem::new("New Folder Inside…").on_click(move |_, window, cx| {
+                                t.update(cx, |this, cx| this.open_folder_prompt(account.clone(), super::folder_manage::FolderPromptMode::New { parent: Some(parent.clone()) }, window, cx)).ok();
+                            }));
+                            menu = menu.separator();
+                        }
+                        return menu.item(PopupMenuItem::new("About Folder-Only Mailboxes…").on_click(|_, _window, cx| cx.open_url(super::list::FOLDER_ONLY_HELP_URL)));
+                    }
                     let (t, account, view) = (me.clone(), menu_account.clone(), menu_view.clone());
                     let mut menu = menu.item(PopupMenuItem::new("Open in New Window").on_click(move |_, window, cx| {
                         t.update(cx, |this, cx| this.open_folder_window(account.clone(), view.clone(), window, cx)).ok();

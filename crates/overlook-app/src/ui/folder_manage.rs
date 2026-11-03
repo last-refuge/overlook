@@ -267,10 +267,11 @@ impl MailWindow {
         }
     }
 
-    /// The folder `label` sits in, by name: another folder or the Inbox; `None` at the top.
+    /// The folder `label` sits in, by name: another folder, a container or the Inbox;
+    /// `None` at the top.
     fn folder_parent_label(&self, account: &AccountId, label: &Label) -> Option<LabelId> {
         let parent = overlook_core::sidebar::folder_parent(&label.name)?;
-        self.labels_of(account).iter().find(|l| l.name == parent && matches!(l.kind, LabelKind::User | LabelKind::Inbox)).map(|l| l.id.clone())
+        self.labels_of(account).iter().find(|l| l.name == parent && matches!(l.kind, LabelKind::User | LabelKind::Container | LabelKind::Inbox)).map(|l| l.id.clone())
     }
 
     fn move_folder_to_trash(&mut self, account: Account, label: Label, trash: Label, window: &mut Window, cx: &mut Context<Self>) {

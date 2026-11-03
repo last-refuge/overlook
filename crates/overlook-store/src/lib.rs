@@ -110,7 +110,7 @@ fn ensure_same_account(record_account: &AccountId, account: &AccountId, noun: &'
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// Which mailbox the list is showing.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum MailboxView {
     Kind(LabelKind),
     Label(LabelId),
@@ -2436,6 +2436,15 @@ mod tests {
                     "{view:?} after {change:?}"
                 );
                 assert_eq!(index.view_count(owner, view, None), fresh.view_count(owner, view, None));
+                // The badge counts what the list would show, without building the list.
+                for focus in [None, Some(FocusTab::Focused), Some(FocusTab::Other)] {
+                    let convs = index.conversations(owner, view, ListFilter::All, focus);
+                    let expected = match view {
+                        MailboxView::Kind(LabelKind::Inbox) | MailboxView::Label(_) => convs.iter().filter(|c| c.is_unread()).count(),
+                        _ => convs.len(),
+                    };
+                    assert_eq!(index.view_count(owner, view, focus), expected, "{view:?} {focus:?} after {change:?}");
+                }
             }
         }
     }
@@ -2583,6 +2592,27 @@ mod tests {
         }
         assert_eq!(index.message_ids_in(&ConversationId::from("conv-m1")), vec![MessageId::from("m1")]);
         assert!(index.message_ids_in(&ConversationId::from("missing")).is_empty());
+    }
+
+    #[test]
+    fn visible_message_ids_follow_the_views_trash_split() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let mut reply = message("m3", "Re: Launch creative — final review", "Looks good.", &["label-inbox"]);
+        reply.conversation_id = ConversationId::from("conv-m1");
+        reply.date = 1_000_001;
+        store.upsert_messages(&[reply]).unwrap();
+        let mut index = store.mail_index(&AccountId::from("acct-1")).unwrap();
+        let conv = ConversationId::from("conv-m1");
+        let inbox = MailboxView::Kind(LabelKind::Inbox);
+        let trash = MailboxView::Kind(LabelKind::Trash);
+        assert_eq!(index.visible_message_ids_in(&conv, &inbox), vec![MessageId::from("m1"), MessageId::from("m3")]);
+        assert!(index.visible_message_ids_in(&conv, &trash).is_empty());
+        index.apply(&LocalChange::Trash { message_ids: vec![MessageId::from("m3")] });
+        // The reply sits in Trash now: each view sees only its own half of the conversation.
+        assert_eq!(index.visible_message_ids_in(&conv, &inbox), vec![MessageId::from("m1")]);
+        assert_eq!(index.visible_message_ids_in(&conv, &trash), vec![MessageId::from("m3")]);
+        assert!(index.visible_message_ids_in(&ConversationId::from("missing"), &inbox).is_empty());
     }
 
     #[test]

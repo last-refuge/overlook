@@ -271,6 +271,11 @@ pub trait MailProvider: Send + Sync {
     /// done online, not queued: the server picks the new folder's identity.
     fn manages_folders(&self) -> bool { false }
 
+    /// Whether single messages can be deleted for good, skipping Trash
+    /// (`OperationKind::DeleteForever` without a folder). False where the server would
+    /// reject it (Gmail without the full scope) or quietly keep the mail (POP3).
+    fn supports_delete_forever(&self) -> bool { false }
+
     /// Creates a user folder named `name` (one level, no delimiter), inside `parent` if given.
     /// `labels` is the account's current list. Returns the new label as the next sync will
     /// list it.

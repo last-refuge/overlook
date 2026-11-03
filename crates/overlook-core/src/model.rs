@@ -178,6 +178,9 @@ pub enum LabelKind {
     Spam,
     Outbox,
     User,
+    /// An IMAP folder that only holds other folders (`\Noselect`): shown in the tree so
+    /// its children nest under it, never opened or synchronized.
+    Container,
 }
 
 impl LabelKind {
@@ -192,6 +195,7 @@ impl LabelKind {
             LabelKind::Spam => "spam",
             LabelKind::Outbox => "outbox",
             LabelKind::User => "user",
+            LabelKind::Container => "container",
         }
     }
 
@@ -206,6 +210,7 @@ impl LabelKind {
             "spam" => LabelKind::Spam,
             "outbox" => LabelKind::Outbox,
             "user" => LabelKind::User,
+            "container" => LabelKind::Container,
             _ => return None,
         })
     }
@@ -689,6 +694,31 @@ impl Draft {
         draft
     }
 
+    /// A fresh message carrying a sent message's recipients, subject and body, so it can be
+    /// sent again, edited or not. Attachments are copied by the caller. The body is kept as the
+    /// original HTML until the text is edited, the way an imported server draft is; the
+    /// original's threading headers travel with it.
+    pub fn resend_of(account_id: AccountId, source: &Message, now: Timestamp) -> Self {
+        let mut draft = Self::new(account_id, DraftKind::New, now);
+        draft.to = source.to.clone();
+        draft.cc = source.cc.clone();
+        draft.bcc = source.bcc.clone();
+        draft.subject = source.subject.clone();
+        draft.body_text = match (&source.body.html, &source.body.text) {
+            (Some(html), _) => crate::sanitize::html_to_text(html),
+            (None, Some(text)) => text.clone(),
+            (None, None) => source.snippet.clone(),
+        };
+        draft.body_html = source.body.html.clone();
+        draft.imported = Some(DraftSource {
+            text: draft.body_text.clone(),
+            html: source.body.html.clone(),
+            in_reply_to: source.in_reply_to.clone(),
+            references: source.references.clone(),
+        });
+        draft
+    }
+
     pub fn is_empty(&self) -> bool {
         // A server draft is intentional even if blank or containing only inline HTML.
         // Opening and closing one must never discard it automatically.
@@ -889,6 +919,42 @@ mod tests {
         );
         assert_eq!(fwd.subject, "Fwd: Launch creative");
         assert_eq!(fwd.validate_for_send(), Err(SendValidationError::NoRecipients));
+    }
+
+    #[test]
+    fn resending_copies_recipients_subject_and_body_as_a_new_message() {
+        let mut source = msg(Address::named("Jason", "jason@example.com"), 1000);
+        source.is_outgoing = true;
+        source.cc = vec![Address::named("Maya", "maya@northstar.example")];
+        source.bcc = vec![Address::named("Me", "me@example.com")];
+        source.in_reply_to = Some("<orig@example>".into());
+        source.references = vec!["<root@example>".into()];
+        let draft = Draft::resend_of(AccountId::from("acct"), &source, 5000);
+        assert_eq!(draft.kind, DraftKind::New);
+        assert!(draft.in_reply_to.is_none() && draft.conversation_id.is_none() && !draft.include_quote);
+        assert_eq!(draft.to, source.to);
+        assert_eq!(draft.cc, source.cc);
+        assert_eq!(draft.bcc, source.bcc);
+        assert_eq!(draft.subject, "Re: Launch creative");
+        // A text-only original is the editable body itself.
+        assert_eq!(draft.body_text, "Hello\n\nThanks");
+        let imported = draft.imported.as_ref().expect("the original body is kept");
+        assert_eq!((imported.html.as_deref(), imported.text.as_str()), (None, "Hello\n\nThanks"));
+        assert_eq!(imported.in_reply_to.as_deref(), Some("<orig@example>"));
+        assert_eq!(imported.references, vec!["<root@example>".to_string()]);
+        assert!(draft.validate_for_send().is_ok());
+    }
+
+    #[test]
+    fn resending_an_html_message_keeps_its_html_and_edits_its_text() {
+        let mut source = msg(Address::named("Jason", "jason@example.com"), 1000);
+        source.body = Body { text: None, html: Some("<p>Hello <b>Maya</b></p>".into()) };
+        let draft = Draft::resend_of(AccountId::from("acct"), &source, 5000);
+        assert_eq!(draft.body_text.trim(), "Hello Maya");
+        assert_eq!(draft.body_html.as_deref(), Some("<p>Hello <b>Maya</b></p>"));
+        let imported = draft.imported.as_ref().unwrap();
+        assert_eq!(imported.html.as_deref(), Some("<p>Hello <b>Maya</b></p>"));
+        assert_eq!(imported.text, draft.body_text);
     }
 
     #[test]

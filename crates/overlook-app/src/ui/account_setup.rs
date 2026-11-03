@@ -137,18 +137,25 @@ fn connection_key(servers: &MailServers, password: &str, out_password: Option<&s
 }
 
 /// Signs in to both servers (blocking; run it off the UI thread). One line per server.
+/// The two probes run at the same time, so a server that times out does not hold up the
+/// other's answer.
 fn probe_servers(kind: ProviderKind, servers: &MailServers, password: String, out_password: Option<String>) -> Vec<(bool, String)> {
-    let (what, incoming) = if kind == ProviderKind::Pop3 {
-        let pop3 = Pop3Provider::new(servers.clone(), password.clone(), std::env::temp_dir()).with_timeout(PROBE_TIMEOUT);
-        ("Incoming (POP3)", pollster_block(pop3.probe()))
-    } else {
-        let imap = ImapProvider::new(servers.clone(), password.clone()).with_timeout(PROBE_TIMEOUT);
-        let result = pollster_block(imap.probe());
-        imap.disconnect();
-        ("Incoming (IMAP)", result)
-    };
-    let outgoing = smtp::Transport::new(servers.outgoing.clone(), out_password.unwrap_or(password)).with_timeout(PROBE_TIMEOUT).probe();
-    vec![probe_line(what, &servers.incoming, incoming), probe_line("Outgoing (SMTP)", &servers.outgoing, outgoing)]
+    let out_password = out_password.unwrap_or_else(|| password.clone());
+    let (incoming_line, outgoing) = std::thread::scope(|scope| {
+        let outgoing = scope.spawn(|| smtp::Transport::new(servers.outgoing.clone(), out_password).with_timeout(PROBE_TIMEOUT).probe());
+        let (what, incoming) = if kind == ProviderKind::Pop3 {
+            let pop3 = Pop3Provider::new(servers.clone(), password, std::env::temp_dir()).with_timeout(PROBE_TIMEOUT);
+            ("Incoming (POP3)", pollster_block(pop3.probe()))
+        } else {
+            let imap = ImapProvider::new(servers.clone(), password).with_timeout(PROBE_TIMEOUT);
+            let result = pollster_block(imap.probe());
+            imap.disconnect();
+            ("Incoming (IMAP)", result)
+        };
+        let outgoing = outgoing.join().unwrap_or_else(|_| Err(ProviderError::Offline));
+        (probe_line(what, &servers.incoming, incoming), outgoing)
+    });
+    vec![incoming_line, probe_line("Outgoing (SMTP)", &servers.outgoing, outgoing)]
 }
 
 /// One line of "Test connection" output.

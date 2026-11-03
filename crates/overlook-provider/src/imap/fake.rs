@@ -160,6 +160,9 @@ pub struct FakeState {
     pub connections: usize,
     /// Close the connection of the next `IDLE` in progress without a word (a dropped link).
     pub kill_idle: bool,
+    /// Write mailbox names in `LIST`, `LSUB` and `STATUS` lines as literals (`{N}` and the
+    /// raw bytes) instead of quoted strings, as some servers do.
+    pub literal_names: bool,
 }
 
 impl Default for FakeState {
@@ -178,6 +181,7 @@ impl Default for FakeState {
             log: Vec::new(),
             connections: 0,
             kill_idle: false,
+            literal_names: false,
         }
     }
 }
@@ -357,9 +361,10 @@ impl Connection {
                         if extended && upper.contains("SUBSCRIBED") && s.subscribed.contains(&f.path) {
                             attributes.push("\\Subscribed".into());
                         }
-                        lines.push(format!("* {cmd} ({}) \"{}\" {}", attributes.join(" "), f.delimiter, quote(&f.path)));
+                        let name = if s.literal_names { format!("{{{}}}\r\n{}", f.path.len(), f.path) } else { quote(&f.path) };
+                        lines.push(format!("* {cmd} ({}) \"{}\" {name}", attributes.join(" "), f.delimiter));
                         if extended && upper.contains("STATUS") && !f.attributes.iter().any(|a| a.eq_ignore_ascii_case("\\Noselect")) {
-                            lines.push(format!("* STATUS {} ({})", quote(&f.path), f.status_items(condstore)));
+                            lines.push(format!("* STATUS {name} ({})", f.status_items(condstore)));
                         }
                     }
                     drop(s);

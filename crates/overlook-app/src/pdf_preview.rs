@@ -5,7 +5,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 pub const MAX_PAGES: usize = 40;
 const PAGE_WIDTH_PX: u32 = 1400;
@@ -49,6 +49,8 @@ pub fn render_pages(pdf: &Path) -> std::io::Result<Vec<PathBuf>> {
             .arg("-scale-to-y").arg("-1")
             .arg(pdf)
             .arg(&prefix)
+            // Poppler reports a damaged file on stderr; the exit status says enough.
+            .stderr(Stdio::null())
             .status()?;
         if !status.success() {
             return Err(std::io::Error::other(format!("pdftoppm exited with {status}")));
@@ -74,6 +76,7 @@ pub fn render_thumbnail(pdf: &Path) -> std::io::Result<PathBuf> {
         .arg("-scale-to").arg(THUMB_WIDTH_PX.to_string())
         .arg(pdf)
         .arg(dir.join("thumb"))
+        .stderr(Stdio::null())
         .status()?;
     if !status.success() || !out.exists() {
         return Err(std::io::Error::other("pdftoppm produced no thumbnail"));

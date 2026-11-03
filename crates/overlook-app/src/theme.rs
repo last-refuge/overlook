@@ -193,13 +193,14 @@ impl Palette {
         self.resolved.is_dark()
     }
 
-    /// Color for a user label dot by its token name.
-    pub fn label_color(&self, token: Option<&str>) -> Hsla {
-        match token {
-            Some("plum") => self.label_plum,
-            Some("amber") => self.label_amber,
+    /// Color for a user label dot by its token name. A label without a colour (every IMAP
+    /// folder, and Gmail labels left at Gmail's default) gets no dot, only its folder icon.
+    pub fn label_color(&self, token: Option<&str>) -> Option<Hsla> {
+        Some(match token? {
+            "plum" => self.label_plum,
+            "amber" => self.label_amber,
             _ => self.label_slate,
-        }
+        })
     }
 }
 

@@ -428,10 +428,12 @@ mod tests {
         let store = store();
         let a = AccountId::from("a");
         let changes = Reversal::Changes { changes: vec![LocalChange::Untrash { message_ids: ids(&["m"]) }] };
-        // Written out of order: the action time decides, not the write.
-        let third = store.record_history(&a, now() + 2, "Sent", "Hello", &Reversal::CancelSend { draft_id: DraftId::from("d") }).unwrap();
-        let first = store.record_history(&a, now(), "Moved to Trash", "Subject m", &changes).unwrap();
-        let second = store.record_history(&a, now() + 1, "Deleted forever", "Subject n", &Reversal::None).unwrap();
+        // Written out of order: the action time decides, not the write. One clock read,
+        // or a tick between reads would reorder them.
+        let t = now();
+        let third = store.record_history(&a, t + 2, "Sent", "Hello", &Reversal::CancelSend { draft_id: DraftId::from("d") }).unwrap();
+        let first = store.record_history(&a, t, "Moved to Trash", "Subject m", &changes).unwrap();
+        let second = store.record_history(&a, t + 1, "Deleted forever", "Subject n", &Reversal::None).unwrap();
 
         let list = store.history(&a, 10).unwrap();
         assert_eq!(list.iter().map(|e| e.id).collect::<Vec<_>>(), vec![third, second, first]);

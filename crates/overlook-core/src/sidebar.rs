@@ -3,6 +3,7 @@
 
 use crate::{AccountId, LabelId, LabelKind};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Whether the sidebar lists every account's folders or only the active account's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -60,34 +61,48 @@ pub struct TreeRow<'a> {
 /// `trash` (the Trash folder's name) under Trash. Names nest by " / " (IMAP) or "/" (Gmail).
 /// Siblings keep the order given.
 pub fn folder_tree<'a>(names: &[&'a str], root: TreeRoot, trash: Option<&str>) -> Vec<TreeRow<'a>> {
-    // Each folder's parent: another folder, or the root it hangs under, and its leaf name.
-    let placed: Vec<(Option<usize>, TreeRoot, &str)> = names
-        .iter()
-        .map(|name| {
-            let mut at = *name;
-            while let Some(parent) = folder_parent(at) {
-                let leaf = name[parent.len()..].trim_start_matches(" / ").trim_start_matches('/');
-                if let Some(i) = names.iter().position(|n| *n == parent) {
-                    return (Some(i), TreeRoot::Top, leaf);
-                }
-                if parent == "Inbox" {
-                    return (None, TreeRoot::Inbox, leaf);
-                }
-                if Some(parent) == trash {
-                    return (None, TreeRoot::Trash, leaf);
-                }
-                at = parent;
+    // The first folder of each name; a repeated name nests under the first.
+    let mut index_of: HashMap<&str, usize> = HashMap::with_capacity(names.len());
+    for (i, name) in names.iter().enumerate() {
+        index_of.entry(name).or_insert(i);
+    }
+    // Each folder's leaf name, and the children of each folder in the order given.
+    // `children[0]` holds the folders directly under `root`; folder `i`'s are at `i + 1`.
+    let mut leaves: Vec<&str> = Vec::with_capacity(names.len());
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); names.len() + 1];
+    for (i, name) in names.iter().enumerate() {
+        let mut at = *name;
+        let mut placed: Option<(Option<usize>, TreeRoot, &str)> = None;
+        while let Some(parent) = folder_parent(at) {
+            let leaf = name[parent.len()..].trim_start_matches(" / ").trim_start_matches('/');
+            if let Some(&p) = index_of.get(parent) {
+                placed = Some((Some(p), TreeRoot::Top, leaf));
+                break;
             }
-            (None, TreeRoot::Top, *name)
-        })
-        .collect();
-    let children = |of: Option<usize>| -> Vec<usize> { (0..names.len()).filter(|&i| placed[i].0 == of && (of.is_some() || placed[i].1 == root)).collect() };
-    let mut rows = Vec::new();
-    let mut stack: Vec<(usize, usize)> = children(None).into_iter().rev().map(|i| (i, 0)).collect();
+            if parent == "Inbox" {
+                placed = Some((None, TreeRoot::Inbox, leaf));
+                break;
+            }
+            if Some(parent) == trash {
+                placed = Some((None, TreeRoot::Trash, leaf));
+                break;
+            }
+            at = parent;
+        }
+        let (parent, under, leaf) = placed.unwrap_or((None, TreeRoot::Top, *name));
+        match parent {
+            Some(p) => children[p + 1].push(i),
+            None if under == root => children[0].push(i),
+            None => {}
+        }
+        leaves.push(leaf);
+    }
+    let mut rows = Vec::with_capacity(names.len());
+    let mut stack: Vec<(usize, usize)> = children[0].iter().rev().map(|&i| (i, 0)).collect();
     while let Some((i, depth)) = stack.pop() {
-        let kids = children(Some(i));
-        rows.push(TreeRow { index: i, depth, leaf: placed[i].2, has_children: !kids.is_empty() });
-        stack.extend(kids.into_iter().rev().map(|k| (k, depth + 1)));
+        let kids = &children[i + 1];
+        rows.push(TreeRow { index: i, depth, leaf: leaves[i], has_children: !kids.is_empty() });
+        stack.extend(kids.iter().rev().map(|&k| (k, depth + 1)));
     }
     rows
 }

@@ -152,7 +152,6 @@ impl MailWindow {
             for editor in editors {
                 editor
                     .update(cx, |this, cx| {
-                        this.reload_account_labels();
                         this.mark_counts_stale(changed.iter().cloned());
                         this.reload(cx);
                         cx.notify();
