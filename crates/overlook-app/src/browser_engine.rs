@@ -2455,11 +2455,11 @@ mod tests {
 
     #[test]
     #[ignore = "runs real sandboxed Chromium"]
-    fn chromium_light_paper_defaults_preserve_authored_colors() {
+    fn chromium_email_paper_defaults_preserve_authored_colors() {
         let palette = crate::theme::Palette::light();
         let mut actor = Actor::start(Arc::new(AtomicBool::new(false)), false).unwrap();
         for (source, paper, ink) in [
-            ("<p>Synthetic unstyled message</p>", [255, 255, 255], "rgb(41, 51, 46)"),
+            ("<p>Synthetic unstyled message</p>", [255, 255, 255], "rgb(32, 36, 43)"),
             ("<style>body{background:#203040;color:#fafafa}</style><p>Authored stylesheet</p>", [32, 48, 64], "rgb(250, 250, 250)"),
             ("<body style='background:#203040;color:#fafafa'><p>Authored inline style</p></body>", [32, 48, 64], "rgb(250, 250, 250)"),
             ("<body bgcolor='#203040' text='#fafafa'><p>Authored legacy attributes</p></body>", [32, 48, 64], "rgb(250, 250, 250)"),
@@ -2475,26 +2475,21 @@ mod tests {
 
     #[test]
     #[ignore = "runs real sandboxed Chromium"]
-    fn chromium_dark_paper_is_actually_painted_dark() {
-        let document = overlook_core::browser::prepare_document(
-            "<div style='height:100px;background:white;color:black'>Synthetic dark paper</div>",
-        );
+    fn chromium_email_paper_stays_light_in_dark_shell() {
         let mut actor = Actor::start(Arc::new(AtomicBool::new(false)), false).unwrap();
-        actor.load(&document.html, true).unwrap();
-        let (png, _, _) = actor.frame().unwrap();
-        let pixels = image::load_from_memory(&png).unwrap().into_rgb8();
-        let paper = pixels.get_pixel(400, 50).0;
-        assert!(
-            paper.iter().all(|c| *c < 100),
-            "Dark mode must paint dark paper, got {paper:?}"
-        );
-        assert_eq!(
-            actor
-                .cdp
-                .eval("matchMedia('(prefers-color-scheme: dark)').matches".into())
-                .unwrap(),
-            true
-        );
+        for theme in [overlook_core::ResolvedTheme::Light, overlook_core::ResolvedTheme::Dark, overlook_core::ResolvedTheme::Pink] {
+            let palette = crate::theme::Palette::for_theme(theme);
+            let document = palette.prepare_browser_document(
+                "<style>@media(prefers-color-scheme:dark){body{background:black;color:white}}</style><div style='height:100px;background:white;color:black'>Fictional light paper</div>",
+            );
+            actor.load(&document.html, false).unwrap();
+            let (png, _, _) = actor.frame().unwrap();
+            let pixels = image::load_from_memory(&png).unwrap().into_rgb8();
+            assert_eq!(pixels.get_pixel(400, 50).0, [255, 255, 255], "{theme:?}");
+            assert_eq!(actor.cdp.eval("getComputedStyle(document.body).backgroundColor".into()).unwrap(), "rgb(255, 255, 255)");
+            assert_eq!(actor.cdp.eval("getComputedStyle(document.body).color".into()).unwrap(), "rgb(32, 36, 43)");
+            assert_eq!(actor.cdp.eval("matchMedia('(prefers-color-scheme: dark)').matches".into()).unwrap(), false);
+        }
     }
 
     #[test]

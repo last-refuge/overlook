@@ -970,7 +970,7 @@ impl MailWindow {
                         let html = super::signature::resolve_draft_images(&overlook_core::compose::outgoing_bodies(&c.draft, None).html, &c.draft.attachments);
                         self.browser_message_body(
                             format!("preview-{}", c.draft.id), &html, None,
-                            self.prefs.remote_images == RemoteImages::Allow, p.is_dark(), cx,
+                            self.prefs.remote_images == RemoteImages::Allow, cx,
                         ).0
                     })
                     .into_any_element()
@@ -1068,7 +1068,7 @@ impl MailWindow {
         let html = shown.then(|| {
             let allow_remote = self.remote_allowed.contains(&source.id) || self.prefs.remote_images == RemoteImages::Allow;
             let safe = overlook_core::compose::history_preview(&c.draft, source, overlook_core::sanitize::RemoteContent::Allowed);
-            self.browser_message_body(format!("quote-{}", c.draft.id), &safe, Some(source), allow_remote, p.is_dark(), cx).0
+            self.browser_message_body(format!("quote-{}", c.draft.id), &safe, Some(source), allow_remote, cx).0
         });
         Some(
             v_flex()

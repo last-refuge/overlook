@@ -89,6 +89,20 @@ pub struct RoundedFrameCover {
 }
 
 impl RoundedFrameCover {
+    /// A frame with independent top radii; its bottom corners stay square.
+    pub fn top(left: Pixels, right: Pixels) -> Self {
+        Self {
+            corner_radii: Corners {
+                top_left: Some(left.into()),
+                top_right: Some(right.into()),
+                bottom_left: None,
+                bottom_right: None,
+            },
+            backdrop: None,
+            frame_border: px(0.),
+        }
+    }
+
     /// A frame with the same radius on all four corners.
     pub fn uniform(radius: Pixels) -> Self {
         let radius = Some(radius.into());

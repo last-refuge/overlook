@@ -22,6 +22,9 @@ accepting means to the listener; any edit, caret movement, click, Enter, Escape 
 painter skips the covering fill when the caret ends a single-line field, because that field is not
 necessarily drawn on the editor background. Overlook's composer uses it for recipient completion.
 
+`RoundedFrameCover::top` keeps the mail panes' top corners rounded over their
+child backgrounds while leaving the bottom corners square (`src/scrollable_mask.rs`).
+
 To upgrade: review and reapply these changes, run both `cargo test --workspace` and
 `cargo test --manifest-path vendor/gpui-base/Cargo.toml --lib --features test-support`,
 and visually review the synthetic email corpus. Do not remove the patch until upstream

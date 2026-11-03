@@ -2124,12 +2124,11 @@ impl MailWindow {
                         if this.remote_allowed.contains(&m.id) || this.prefs.remote_images == RemoteImages::Allow {
                             return None;
                         }
-                        let dark = cx.palette().is_dark();
                         let (html, _) = this.browser_document(&Self::message_source(&m), Some(&m), cx.palette());
-                        if crate::browser_body::is_rendered(&html, false, dark, size) {
+                        if crate::browser_body::is_rendered(&html, false, false, size) {
                             return None;
                         }
-                        Some(crate::browser_body::prerender(html, false, dark, size, cx))
+                        Some(crate::browser_body::prerender(html, false, false, size, cx))
                     })
                     .ok()
                     .flatten();
@@ -3232,14 +3231,18 @@ impl MailWindow {
                 .into_any_element();
         }
         let sidebar = self.render_sidebar(cx).into_any_element();
-        let list = self.render_list(cx).into_any_element();
-        let reader = self.render_reader(cx).into_any_element();
+        let gutter = cx.palette().navigation_palette().sidebar;
+        // Keep the resize hit areas and cursors, with no painted pane dividers.
+        let handles: gpui_kit::base::ResizeHandleRenderer = std::rc::Rc::new(|_, _, _| Some(Empty.into_any_element()));
+        let list = mail_pane(self.render_list(cx), gutter, px(8.)).into_any_element();
+        let reader = mail_pane(self.render_reader(cx), gutter, px(0.)).into_any_element();
 
         let content = match self.reading_pane {
             ReadingPane::Right => h_resizable("content-h")
                 .with_state(&self.content_panes_h)
+                .with_handle_appearance(handles.clone())
                 .child(resizable_panel().size(px(self.list_width)).size_range(px(260.)..px(640.)).child(list))
-                .child(resizable_panel().child(reader))
+                .child(resizable_panel().bg(gutter).pl(px(5.)).child(reader))
                 .on_resize(cx.listener(|this, state: &Entity<ResizableState>, _window, cx| {
                     if let Some(w) = state.read(cx).sizes().first() {
                         this.list_width = f32::from(*w);
@@ -3248,8 +3251,9 @@ impl MailWindow {
                 })),
             ReadingPane::Bottom => v_resizable("content-v")
                 .with_state(&self.content_panes_v)
+                .with_handle_appearance(handles.clone())
                 .child(resizable_panel().size(px(self.list_height)).size_range(px(160.)..px(900.)).child(list))
-                .child(resizable_panel().child(reader))
+                .child(resizable_panel().bg(gutter).pt(px(8.)).child(reader))
                 .on_resize(cx.listener(|this, state: &Entity<ResizableState>, _window, cx| {
                     if let Some(h) = state.read(cx).sizes().first() {
                         this.list_height = f32::from(*h);
@@ -3260,8 +3264,9 @@ impl MailWindow {
 
         h_resizable("main")
             .with_state(&self.panes)
+            .with_handle_appearance(handles)
             .child(resizable_panel().size(px(self.sidebar_width)).size_range(px(180.)..px(360.)).child(sidebar))
-            .child(resizable_panel().child(content))
+            .child(resizable_panel().bg(gutter).pt(px(8.)).child(content))
             .on_resize(cx.listener(|this, state: &Entity<ResizableState>, _window, cx| {
                 if let Some(w) = state.read(cx).sizes().first() {
                     this.sidebar_width = f32::from(*w);
