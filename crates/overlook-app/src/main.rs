@@ -334,7 +334,7 @@ fn main() {
         let accounts = accounts.clone();
         let provider = provider.clone();
         gpui_kit::open_window(options, cx, move |window, cx| {
-            cx.new(|cx| ui::MailWindow::new(store, provider, accounts, active, preference, window, cx))
+            cx.new(|cx| ui::MailWindow::new(store, provider, accounts, active, ui::WindowSetup::Mail(preference), window, cx))
         })
         .expect("failed to open the Overlook window");
         cx.activate(true);

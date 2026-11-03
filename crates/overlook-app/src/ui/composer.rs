@@ -1,6 +1,5 @@
 //! Composer: new message, reply, and forward, with durable autosave to the local store.
 
-use super::widgets::*;
 use super::MailWindow;
 use crate::assets::icon;
 use crate::theme::ActivePalette;
@@ -61,8 +60,11 @@ pub struct Composer {
     pub error: Option<String>,
     /// Attachments of a forwarded message are still being copied into the draft.
     pub attaching: bool,
+    pub pending_saves: usize,
     pub _subscriptions: Vec<Subscription>,
     reveal: Option<ComposerReveal>,
+    scroll: ScrollHandle,
+    focused_header: Option<usize>,
 }
 
 impl Composer {
@@ -75,7 +77,61 @@ impl Composer {
     }
 }
 
+/// A handoff recreates window-bound input subscriptions while retaining raw
+/// unfinished address fields, draft identity, selection and presentation choices.
+pub(super) struct ComposerTransfer {
+    pub draft: Draft,
+    headers: [(String, std::ops::Range<usize>); 4],
+    focused_header: Option<usize>,
+    selection: std::ops::Range<usize>,
+    source: Option<Message>,
+    preview: bool,
+    history: bool,
+    show_cc: bool,
+    show_bcc: bool,
+    show_headers: bool,
+}
+
 impl MailWindow {
+    pub(super) fn composer_transfer(&self, cx: &App) -> ComposerTransfer {
+        let c = self.composer.as_ref().expect("a handoff requires an open composer");
+        ComposerTransfer {
+            draft: c.draft.clone(),
+            headers: [&c.to, &c.cc, &c.bcc, &c.subject].map(|s| (s.read(cx).value().to_string(), s.read(cx).selected_range())),
+            focused_header: c.focused_header,
+            selection: c.body.read(cx).selected_range(),
+            source: c.source.clone(), preview: c.preview, history: c.quote_shown,
+            show_cc: c.show_cc, show_bcc: c.show_bcc, show_headers: c.show_headers,
+        }
+    }
+
+    pub(super) fn restore_composer_transfer(&mut self, transfer: ComposerTransfer, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_composer(transfer.draft, window, cx);
+        if let Some(c) = &mut self.composer {
+            for (input, (value, selection)) in [&c.to, &c.cc, &c.bcc, &c.subject].into_iter().zip(transfer.headers) {
+                input.update(cx, |input, cx| { input.set_value(value, window, cx); input.set_selected_range(selection, cx); });
+            }
+            c.body.update(cx, |body, cx| body.set_selected_range(transfer.selection, cx));
+            c.source = transfer.source; c.preview = transfer.preview; c.quote_shown = transfer.history;
+            c.show_cc = transfer.show_cc; c.show_bcc = transfer.show_bcc; c.show_headers = transfer.show_headers;
+        }
+        self.reveal_current_composer(window, cx);
+        if let Some(index) = transfer.focused_header {
+            if let Some(c) = &self.composer {
+                if let Some(input) = [&c.to, &c.cc, &c.bcc, &c.subject].get(index) {
+                    input.update(cx, |input, cx| input.focus(window, cx));
+                }
+            }
+        }
+    }
+
+    pub(super) fn toggle_message_history(&mut self, cx: &mut Context<Self>) {
+        if let Some(c) = self.composer.as_mut().filter(|c| c.source.is_some()) {
+            c.quote_shown = !c.quote_shown;
+            self.cancel_composer_reveal();
+            cx.notify();
+        }
+    }
     /// Opens the composer for `draft`, creating the input entities and autosave wiring.
     pub(super) fn open_composer(&mut self, mut draft: Draft, window: &mut Window, cx: &mut Context<Self>) {
         crate::watchdog::mark("open composer");
@@ -110,12 +166,17 @@ impl MailWindow {
 
         let mut subs = Vec::new();
         for state in [&to, &cc, &bcc, &subject] {
-            subs.push(cx.subscribe_in(state, window, |this, _state, event: &InputEvent, window, cx| match event {
+            subs.push(cx.subscribe_in(state, window, |this, state, event: &InputEvent, window, cx| match event {
                 InputEvent::Change => this.composer_changed(window, cx),
                 // Ctrl+Enter sends from any field; plain Enter in a header field moves on.
                 InputEvent::PressEnter { secondary: true, .. } => this.send_composer(window, cx),
                 InputEvent::PressEnter { .. } => this.focus_next_composer_field(window, cx),
-                InputEvent::Focus => this.refresh_recipient_suggestions(window, cx),
+                InputEvent::Focus => {
+                    if let Some(c) = &mut this.composer {
+                        c.focused_header = [&c.to, &c.cc, &c.bcc, &c.subject].iter().position(|input| input.entity_id() == state.entity_id());
+                    }
+                    this.refresh_recipient_suggestions(window, cx);
+                },
                 // Tab on the suggestion shown inside the field.
                 InputEvent::AcceptSuggestion => this.accept_inline_suggestion(window, cx),
                 _ => {}
@@ -134,7 +195,10 @@ impl MailWindow {
             InputEvent::Change => this.composer_changed(window, cx),
             InputEvent::PressEnter { secondary: true, .. } => this.send_composer(window, cx),
             InputEvent::PressEnter { .. } => this.continue_list(window, cx),
-            InputEvent::Focus => this.refresh_recipient_suggestions(window, cx),
+            InputEvent::Focus => {
+                if let Some(c) = &mut this.composer { c.focused_header = None; }
+                this.refresh_recipient_suggestions(window, cx);
+            },
             _ => {}
         }));
 
@@ -163,8 +227,11 @@ impl MailWindow {
             ghost: None,
             error: None,
             attaching: false,
+            pending_saves: 0,
             _subscriptions: subs,
             reveal: None,
+            scroll: ScrollHandle::new(),
+            focused_header: None,
         });
         self.reveal_current_composer(window, cx);
     }
@@ -174,11 +241,12 @@ impl MailWindow {
     }
 
     pub(super) fn composer_is_inline(&self) -> bool {
-        self.composer.as_ref().is_some_and(|c| c.draft.kind != DraftKind::New
+        self.composer_owner.is_none() && self.composer.as_ref().is_some_and(|c| c.draft.kind != DraftKind::New
             && self.selected.is_some() && c.draft.conversation_id.as_ref() == self.selected.as_ref())
     }
 
     pub(super) fn reuse_reply(&mut self, kind: DraftKind, source: &Message, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.activate_detached_reply(kind, source, cx) { return true; }
         let replies = |kind| matches!(kind, DraftKind::Reply | DraftKind::ReplyAll);
         let Some(current) = self.composer.as_ref().filter(|c| c.draft.in_reply_to.as_ref() == Some(&source.id)
             && (c.draft.kind == kind || (replies(c.draft.kind) && replies(kind)))) else { return false };
@@ -390,11 +458,13 @@ impl MailWindow {
         }
         let draft = c.draft.clone();
         let draft_id = draft.id.clone();
+        self.composer.as_mut().expect("the autosaved composer is open").pending_saves += 1;
         let store = self.store.clone();
         cx.spawn_in(window, async move |this, cx| {
             let result = cx.background_spawn(async move { store.save_editing_draft(&draft).map(|_| ()) }).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 let Some(c) = this.composer.as_mut().filter(|c| c.draft.id == draft_id) else { return };
+                c.pending_saves = c.pending_saves.saturating_sub(1);
                 match result {
                     Ok(()) if c.save_generation == generation => {
                         c.dirty = false;
@@ -405,6 +475,7 @@ impl MailWindow {
                 }
                 this.reload_drafts();
                 this.schedule_draft_sync(window, cx);
+                this.notify_composer_owner(cx);
                 cx.notify();
             });
         })
@@ -424,6 +495,7 @@ impl MailWindow {
                 c.last_saved = Some(now());
                 self.reload_drafts();
                 self.schedule_draft_sync(window, cx);
+                self.notify_composer_owner(cx);
                 cx.notify();
                 true
             }
@@ -442,6 +514,10 @@ impl MailWindow {
     }
 
     pub(super) fn close_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composer_owner.is_some() && self.composer.is_some() {
+            if self.prepare_composer_window_close(window, cx) { window.remove_window(); }
+            return;
+        }
         if self.composer.is_some() {
             self.save_composer(window, cx);
             if let Some(c) = self.composer.take() {
@@ -463,26 +539,33 @@ impl MailWindow {
     }
 
     pub(super) fn discard_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(c) = self.composer.as_ref() else { return };
+        if c.attaching || c.pending_saves > 0 { return; }
+        if let Err(e) = self.store.delete_draft(&c.draft.account_id, &c.draft.id) {
+            if let Some(c) = &mut self.composer { c.error = Some(format!("Couldn’t delete this draft: {e}")); }
+            cx.notify();
+            return;
+        }
         if let Some(c) = self.composer.take() {
-            if c.last_saved.is_none() {
-                // Its first save may still be running; it removes the draft when it lands.
-                self.unwanted_drafts.insert(c.draft.id.clone());
-            }
-            let _ = self.store.delete_draft(&c.draft.account_id, &c.draft.id);
             self.forget_staged_files(&c.draft.id);
             self.reload_drafts();
-            crate::ui::toast(window, cx, crate::notify::Level::Info, "Draft discarded.");
-            self.list_focus.focus(window, cx);
             self.schedule_draft_sync(window, cx);
+            self.notify_composer_owner(cx);
+            if self.composer_owner.is_some() { window.remove_window(); }
+            else {
+                crate::ui::toast(window, cx, crate::notify::Level::Info, "Draft discarded.");
+                self.list_focus.focus(window, cx);
+            }
             cx.notify();
         }
     }
 
     /// Wait for a pause in typing before syncing saved drafts. The account's normal
     /// rate-limit/offline backoff and single-flight sync still apply.
-    fn schedule_draft_sync(&self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn schedule_draft_sync(&self, window: &mut Window, cx: &mut Context<Self>) {
         if !matches!(self.account.provider, ProviderKind::Gmail | ProviderKind::Imap) { return; }
         let account = self.account.id.clone();
+        if self.sync_through_composer_owner(&account, Duration::from_millis(1500), window, cx) { return; }
         let editor = self.composer.as_ref().map(|c| (c.draft.id.clone(), c.save_generation));
         cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(1500)).await;
@@ -521,36 +604,41 @@ impl MailWindow {
         match self.store.queue_send(&draft) {
             Ok(_) => {
                 self.composer = None;
-                self.reload(cx);
-                let online = self.connected(&self.account.id);
-                let delay = self.prefs.undo_send_secs;
-                let text = match (online, delay) {
-                    (false, _) => "Waiting for connection. We’ll send this when you’re back online.".to_owned(),
-                    (true, 0) => "Sending…".to_owned(),
-                    (true, s) => format!("Sending in {s} seconds."),
-                };
-                // The message is already safe in the Outbox; Undo takes it back to the composer
-                // until the sync that sends it starts.
-                let id = draft.id.clone();
-                let account = draft.account_id.clone();
-                self.toast_with_undo(text, move |this, window, cx| this.undo_send(account.clone(), id.clone(), window, cx), window, cx);
-                self.list_focus.focus(window, cx);
-                if online {
-                    if delay == 0 {
-                        self.sync_now(window, cx);
-                    } else {
-                        cx.spawn_in(window, async move |this, cx| {
-                            cx.background_executor().timer(std::time::Duration::from_millis(u64::from(delay) * 1000 + 300)).await;
-                            let _ = this.update_in(cx, |this, window, cx| this.sync_now(window, cx));
-                        })
-                        .detach();
-                    }
-                }
+                self.finish_queued_send(&draft, window, cx);
             }
             Err(e) => {
                 if let Some(c) = self.composer.as_mut() {
                     c.error = Some(e.to_string());
                 }
+            }
+        }
+        cx.notify();
+    }
+
+    pub(super) fn announce_queued_send(&mut self, draft: &Draft, window: &mut Window, cx: &mut Context<Self>) {
+        self.reload(cx);
+        let online = self.connected(&draft.account_id);
+        let delay = self.prefs.undo_send_secs;
+        let text = match (online, delay) {
+            (false, _) => "Waiting for connection. We’ll send this when you’re back online.".to_owned(),
+            (true, 0) => "Sending…".to_owned(),
+            (true, s) => format!("Sending in {s} seconds."),
+        };
+        let id = draft.id.clone();
+        let account = draft.account_id.clone();
+        self.toast_with_undo(text, move |this, window, cx| this.undo_send(account.clone(), id.clone(), window, cx), window, cx);
+        if self.composer_owner.is_none() { self.list_focus.focus(window, cx); }
+        if online {
+            let account = draft.account_id.clone();
+            let wait = if delay == 0 { Duration::ZERO } else { Duration::from_millis(u64::from(delay) * 1000 + 300) };
+            if self.sync_through_composer_owner(&account, wait, window, cx) { return; }
+            if delay == 0 {
+                self.sync_account(account, window, cx);
+            } else {
+                cx.spawn_in(window, async move |this, cx| {
+                    cx.background_executor().timer(Duration::from_millis(u64::from(delay) * 1000 + 300)).await;
+                    this.update_in(cx, |this, window, cx| this.sync_account(account, window, cx)).ok();
+                }).detach();
             }
         }
         cx.notify();
@@ -568,12 +656,21 @@ impl MailWindow {
     }
 
     pub(super) fn attach_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(c) = self.composer.as_ref() else { return };
+        let Some(c) = self.composer.as_mut() else { return };
+        if c.attaching { return; }
+        c.attaching = true;
         let draft_id = c.draft.id.clone();
+        cx.notify();
         let receiver = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: Some("Attach".into()) });
         let outgoing_dir = self.outgoing_dir.join(draft_id.as_str());
         cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(paths))) = receiver.await else { return };
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                this.update(cx, |this, cx| {
+                    if let Some(c) = this.composer.as_mut().filter(|c| c.draft.id == draft_id) { c.attaching = false; }
+                    cx.notify();
+                }).ok();
+                return;
+            };
             let Ok(existing) = this.update(cx, |this, _| this.composer.as_ref().map(|c| c.draft.attachments.iter().map(|a| a.size_bytes).sum::<u64>()).unwrap_or(0)) else { return };
             // Reading, scanning and copying stay off the UI thread.
             let (added, refused) = cx.background_spawn(async move { prepare_attachments(paths, &outgoing_dir, existing) }).await;
@@ -584,6 +681,7 @@ impl MailWindow {
                 }
                 if let Some(c) = this.composer.as_mut() {
                     if c.draft.id == draft_id {
+                        c.attaching = false;
                         c.draft.attachments.extend(added);
                         c.dirty = true;
                         this.save_composer(window, cx);
@@ -667,16 +765,12 @@ impl MailWindow {
     pub(super) fn render_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *cx.palette();
         let Some(c) = self.composer.as_ref() else { return div().into_any_element() };
-        let title = match c.draft.kind {
-            DraftKind::New => "New message",
-            DraftKind::Reply => "Reply",
-            DraftKind::ReplyAll => "Reply all",
-            DraftKind::Forward => "Forward",
-        };
         let inline = self.composer_is_inline();
         let extra_headers = (if c.show_headers { 80. } else { 0. }) + (if c.show_cc { 40. } else { 0. }) + (if c.show_bcc { 40. } else { 0. });
-        let editor_height = (self.reader_scroll.bounds().size.height - px(230. + extra_headers + if c.signature_view.is_some() { 100. } else { 0. })).min(px(220.)).max(px(96.));
-        let saved_text = match (c.dirty, c.last_saved) {
+        let editor_height = if inline {
+            (self.reader_scroll.bounds().size.height - px(200. + extra_headers + if c.signature_view.is_some() { 100. } else { 0. })).min(px(220.)).max(px(96.))
+        } else { (c.scroll.bounds().size.height - px(220. + extra_headers)).min(px(420.)).max(px(160.)) };
+        let saved_text = match (c.dirty || c.pending_saves > 0, c.last_saved) {
             (true, _) => "Saving…".to_owned(),
             (false, Some(ts)) => {
                 let (_, time, _) = overlook_core::time::civil_in_zone(ts, &self.time_zone);
@@ -751,7 +845,7 @@ impl MailWindow {
                                 .on_click(cx.listener(move |this, _, window, cx| this.remove_attachment(id.clone(), window, cx))),
                         )
                 }))
-                .when(attaching, |d| d.child(div().text_size(px(12.)).text_color(p.muted).child("Attaching files from the original message…")))
+                .when(attaching, |d| d.child(div().text_size(px(12.)).text_color(p.muted).child("Preparing attachments…")))
         });
 
         let error = c.error.clone().map(|e| {
@@ -766,11 +860,11 @@ impl MailWindow {
                 .child(e)
         });
 
-        let heading: AnyElement = if inline && matches!(c.draft.kind, DraftKind::Reply | DraftKind::ReplyAll) {
+        let reply_options: Option<AnyElement> = if matches!(c.draft.kind, DraftKind::Reply | DraftKind::ReplyAll) {
             let draft_id = c.draft.id.clone();
             let this = cx.entity().downgrade();
-            Button::new("reply-mode").ghost().small().label(title).icon(icon("chevron-down").size(px(12.)))
-                .accessibility_label("Reply type").tooltip("Switch between Reply and Reply all")
+            Some(Button::new("reply-mode").ghost().small().icon(icon("ellipsis").size(px(16.)))
+                .accessibility_label("Reply options").tooltip("Reply options")
                 .dropdown_menu(move |mut menu, _, _| {
                     for (label, kind) in [("Reply", DraftKind::Reply), ("Reply all", DraftKind::ReplyAll)] {
                         let this = this.clone(); let draft_id = draft_id.clone();
@@ -783,42 +877,44 @@ impl MailWindow {
                         }));
                     }
                     menu
-                }).into_any_element()
-        } else { div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child(title).into_any_element() };
+                }).into_any_element())
+        } else { None };
 
         v_flex()
             .when(inline, |d| d.mx(px(28.)).mt(px(18.)).mb(px(28.)).rounded(px(10.)).border_1().border_color(p.divider))
-            .when(!inline, |d| d.size_full())
-            .bg(p.message_surface())
-            .overflow_hidden()
-            .child(
-                h_flex()
-                    .items_center()
-                    .px(px(16.))
-                    .h(px(46.))
-                    .border_b_1()
-                    .border_color(p.divider)
-                    .child(heading)
-                    .child(div().flex_1())
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap(px(5.))
-                            .text_size(px(11.))
-                            .text_color(if c.dirty { p.muted } else { p.success })
-                            .child(icon(if c.dirty { "loader-circle" } else { "check" }).size(px(13.)))
-                            .child(saved_text),
-                    )
-                    .child(div().w(px(8.)))
-                    .child(
-                        Button::new("close-composer")
-                            .ghost()
-                            .small()
-                            .icon(icon("x").size(px(16.)))
-                            .tooltip("Save and close (Esc)")
-                            .on_click(cx.listener(|this, _, window, cx| this.close_composer(window, cx))),
-                    ),
-            )
+            .when(!inline, |d| d.size_full().min_h_0())
+            .bg(p.message_surface()).overflow_hidden()
+            .child(h_flex().flex_none().flex_wrap().items_center().gap(px(6.)).px(px(12.)).py(px(8.))
+                .border_b_1().border_color(p.divider)
+                .child(Button::new("send").primary().label("Send").icon(icon("send").size(px(15.)))
+                    .tooltip("Send (Ctrl Enter)").on_click(cx.listener(|this, _, window, cx| this.send_composer(window, cx))))
+                .child(Button::new("attach").ghost().small().icon(icon("paperclip").size(px(16.)))
+                    .tooltip("Attach files").accessibility_label("Attach files")
+                    .on_click(cx.listener(|this, _, window, cx| this.attach_files(window, cx))))
+                .child(div().flex_1())
+                .child(h_flex().items_center().gap(px(4.))
+                    .when(c.source.is_some(), |d| d.child(Button::new("message-history").ghost().small()
+                        .icon(icon("text-quote").size(px(15.))).label(if c.quote_shown { "Hide history" } else { "Show history" })
+                        .tooltip("Show or hide message history (Ctrl Shift H)")
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_message_history(cx)))))
+                    .when(self.composer_owner.is_none(), |d| d.child(Button::new("pop-out-composer").ghost().small()
+                        .icon(icon("external-link").size(px(16.))).disabled(c.attaching || c.pending_saves > 0)
+                        .tooltip(if c.attaching || c.pending_saves > 0 { "Wait for the draft and attachments to finish saving" } else { "Open draft in its own window (Ctrl Shift O)" })
+                        .accessibility_label("Pop out draft")
+                        .on_click(cx.listener(|this, _, window, cx| this.pop_out_composer(window, cx)))))
+                    .children(reply_options)
+                    .child(Button::new("discard").ghost().small().disabled(c.attaching || c.pending_saves > 0).icon(icon("trash").size(px(16.))).tooltip("Delete draft")
+                        .accessibility_label("Delete draft").on_click(cx.listener(|this, _, window, cx| this.discard_composer(window, cx))))
+                    .child(Button::new("close-composer").ghost().small().disabled(c.attaching || c.pending_saves > 0).icon(icon("x").size(px(16.)))
+                        .tooltip("Save and close (Esc)").accessibility_label("Save and close draft")
+                        .on_click(cx.listener(|this, _, window, cx| this.close_composer(window, cx))))))
+            .child(h_flex().flex_none().items_center().gap(px(5.)).px(px(16.)).py(px(5.)).text_size(px(11.))
+                .text_color(if c.dirty { p.muted } else { p.success })
+                .child(icon(if c.dirty { "loader-circle" } else { "check" }).size(px(13.))).child(saved_text))
+            .children(error)
+            .child(v_flex().id("composer-content").min_h_0()
+                .when(!inline, |d| d.flex_1().overflow_y_scroll().track_scroll(&c.scroll))
+                .child(v_flex().flex_none().h_auto().min_h_full()
             .when(!inline || c.show_headers, |d| d.child(field_row(
                 "From",
                 div().text_size(px(13.)).child(format!("{} <{}>", owner.display_name(), owner.email)).into_any_element(),
@@ -864,7 +960,7 @@ impl MailWindow {
                 div()
                     .id("composer-preview")
                     .when(inline, |d| d.flex_none().h(editor_height))
-                    .when(!inline, |d| d.flex_1().min_h(px(240.)))
+                    .when(!inline, |d| d.flex_none().h(editor_height))
                     .overflow_y_scroll()
                     .px(px(16.))
                     .py(px(12.))
@@ -882,7 +978,7 @@ impl MailWindow {
                 div()
                     .relative()
                     .when(inline, |d| d.flex_none().h(editor_height))
-                    .when(!inline, |d| d.flex_1().min_h(px(240.)))
+                    .when(!inline, |d| d.flex_none().h(editor_height))
                     .px(px(10.))
                     .py(px(6.))
                     .child(Editor::new(&c.body).appearance(false).bordered(false).h_full().font_family("Inter").text_size(px(14.)).line_height(px(22.)))
@@ -891,42 +987,7 @@ impl MailWindow {
             .children(self.render_signature_block(c, &p, cx))
             .children(self.render_quote_block(c, &p, cx))
             .children(attachments)
-            .children(error)
-            .child(
-                h_flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .px(px(12.))
-                    .py(px(10.))
-                    .border_t_1()
-                    .border_color(p.divider)
-                    .child(
-                        Button::new("send")
-                            .primary()
-                            .label("Send")
-                            .icon(icon("send").size(px(15.)))
-                            .tooltip("Send (Ctrl Enter)")
-                            .on_click(cx.listener(|this, _, window, cx| this.send_composer(window, cx))),
-                    )
-                    .child(
-                        Button::new("attach")
-                            .ghost()
-                            .small()
-                            .icon(icon("paperclip").size(px(16.)))
-                            .tooltip("Attach files")
-                            .on_click(cx.listener(|this, _, window, cx| this.attach_files(window, cx))),
-                    )
-                    .child(div().flex_1())
-                    .child(kbd("Ctrl Enter", &p))
-                    .child(
-                        Button::new("discard")
-                            .ghost()
-                            .small()
-                            .icon(icon("trash").size(px(16.)).text_color(p.error))
-                            .tooltip("Discard draft")
-                            .on_click(cx.listener(|this, _, window, cx| this.discard_composer(window, cx))),
-                    ),
-            )
+                ))
             .into_any_element()
     }
 
@@ -995,9 +1056,7 @@ impl MailWindow {
 
     /// The collapsed original under the editor of a reply or forward.
     fn render_quote_block(&self, c: &Composer, p: &crate::theme::Palette, cx: &mut Context<Self>) -> Option<Div> {
-        if !c.draft.include_quote {
-            return None;
-        }
+        if !c.draft.include_quote && !c.quote_shown { return None; }
         let source = c.source.as_ref()?;
         let who = source.from.display_name();
         let when = overlook_core::time::format_full(source.date, &self.time_zone);
@@ -1008,7 +1067,7 @@ impl MailWindow {
         let shown = c.quote_shown;
         let html = shown.then(|| {
             let allow_remote = self.remote_allowed.contains(&source.id) || self.prefs.remote_images == RemoteImages::Allow;
-            let safe = overlook_core::compose::quote_preview(&c.draft, source, overlook_core::sanitize::RemoteContent::Allowed);
+            let safe = overlook_core::compose::history_preview(&c.draft, source, overlook_core::sanitize::RemoteContent::Allowed);
             self.browser_message_body(format!("quote-{}", c.draft.id), &safe, Some(source), allow_remote, p.is_dark(), cx).0
         });
         Some(
@@ -1026,19 +1085,14 @@ impl MailWindow {
                         .text_color(p.muted)
                         .child(icon("text-quote").size(px(14.)))
                         .child(div().flex_1().truncate().child(label))
-                        .child(Button::new("quote-toggle").ghost().xsmall().label(if shown { "Hide" } else { "Show" }).on_click(cx.listener(|this, _, _w, cx| {
-                            if let Some(c) = this.composer.as_mut() {
-                                c.quote_shown = !c.quote_shown;
-                            }
-                            cx.notify();
-                        })))
-                        .child(Button::new("quote-remove").ghost().xsmall().icon(icon("x").size(px(13.))).tooltip("Send without the quoted message").on_click(cx.listener(|this, _, window, cx| {
+                        .when(c.draft.include_quote, |d| d.child(Button::new("quote-remove").ghost().xsmall().icon(icon("x").size(px(13.))).tooltip("Send without the quoted message").on_click(cx.listener(|this, _, window, cx| {
                             if let Some(c) = this.composer.as_mut() {
                                 c.draft.include_quote = false;
                                 c.dirty = true;
                             }
                             this.save_composer(window, cx);
-                        }))),
+                        }))))
+                        .when(!c.draft.include_quote, |d| d.child("Not included when sending")),
                 )
                 .when_some(html, |d, html| {
                     d.child(

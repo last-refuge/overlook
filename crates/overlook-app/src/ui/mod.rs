@@ -5,6 +5,7 @@ mod calendar;
 mod calendar_setup;
 mod calendar_changes;
 mod composer;
+mod composer_window;
 mod contact_card;
 mod contacts;
 mod mail_highlight;
@@ -28,6 +29,7 @@ use crate::SETTING_APPEARANCE;
 pub use account_setup::{AccountSetup, SetupMode};
 pub use calendar::{CalView, Module, NewEvent};
 pub use composer::Composer;
+pub(crate) use composer_window::WindowSetup;
 pub use settings::{SettingsPage, SettingsState};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -96,6 +98,8 @@ actions!(
         FormatNumbers,
         FormatQuote,
         TogglePreview,
+        ToggleMessageHistory,
+        PopOutComposer,
     ]
 );
 
@@ -157,6 +161,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-shift-p", OpenCommandPalette, Some(WINDOW_CONTEXT)),
         KeyBinding::new("escape", Escape, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-enter", SendMessage, Some(WINDOW_CONTEXT)),
+        KeyBinding::new("ctrl-shift-o", PopOutComposer, Some(WINDOW_CONTEXT)),
+        KeyBinding::new("ctrl-shift-h", ToggleMessageHistory, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-r", Reply, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-shift-r", ReplyAll, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-f", Forward, Some(WINDOW_CONTEXT)),
@@ -517,6 +523,8 @@ pub struct MailWindow {
     pub(crate) browser_bodies: std::cell::RefCell<HashMap<String, (u64, usize, Entity<crate::browser_body::BrowserBody>)>>,
 
     composer: Option<Composer>,
+    composer_owner: Option<composer_window::ComposerOwner>,
+    detached_composers: HashMap<DraftId, composer_window::DetachedComposer>,
     appearance: AppearancePreference,
     density: Density,
     reading_pane: ReadingPane,
@@ -593,15 +601,20 @@ impl MailWindow {
         sample: SampleProvider,
         accounts: Vec<Account>,
         active: AccountId,
-        appearance: AppearancePreference,
+        setup: WindowSetup,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         tracing::debug!("startup: window opening after {} ms", crate::since_start_ms());
         let account = accounts.iter().find(|a| a.id == active).cloned().unwrap_or_else(|| accounts[0].clone());
-        let mut providers: HashMap<AccountId, providers::AccountProviders> = HashMap::new();
+        let (appearance, composer_owner, shared_providers) = match setup {
+            WindowSetup::Mail(appearance) => (appearance, None, None),
+            WindowSetup::Composer { appearance, owner, providers } => (appearance, Some(owner), Some(providers)),
+        };
+        let detached = composer_owner.is_some();
+        let mut providers: HashMap<AccountId, providers::AccountProviders> = shared_providers.unwrap_or_default();
         let mut provider_issues = HashMap::new();
-        for a in &accounts {
+        for a in accounts.iter().filter(|_| !detached) {
             match providers::providers_for(a, &sample, &store) {
                 Ok(p) => {
                     providers.insert(a.id.clone(), p);
@@ -611,7 +624,7 @@ impl MailWindow {
                 }
             }
         }
-        cx.set_global(AppearanceGlobal(appearance));
+        if !detached { cx.set_global(AppearanceGlobal(appearance)); }
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search mail"));
         let contact_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search contacts"));
         let mut subs = Vec::new();
@@ -642,10 +655,12 @@ impl MailWindow {
         let collapsed_sections: HashSet<String> = store.setting::<Vec<String>>("sidebar.collapsed").ok().flatten().unwrap_or_default().into_iter().collect();
         let focused_enabled = store.setting::<bool>("focused_inbox").ok().flatten().unwrap_or(true);
         let prefs: Prefs = store.setting::<Prefs>("prefs").ok().flatten().unwrap_or_default();
-        crate::notify::set_mirror(prefs.omarchy_notifications);
+        if !detached { crate::notify::set_mirror(prefs.omarchy_notifications); }
         let reminders_enabled = prefs.event_reminders;
-        overlook_core::tz::set_clock_24h(prefs.clock_24h);
-        overlook_core::tz::set_override(prefs.time_zone.as_ref()).ok();
+        if !detached {
+            overlook_core::tz::set_clock_24h(prefs.clock_24h);
+            overlook_core::tz::set_override(prefs.time_zone.as_ref()).ok();
+        }
         let update_last_check = store.setting::<i64>("update.last_check").ok().flatten().unwrap_or(0);
         let update_dismissed = store.setting::<String>("update.dismissed").ok().flatten();
         let account_prefs: HashMap<AccountId, AccountPrefs> = accounts
@@ -740,6 +755,8 @@ impl MailWindow {
             inline_images: std::cell::RefCell::new(HashMap::new()),
             browser_bodies: std::cell::RefCell::new(HashMap::new()),
             composer: None,
+            composer_owner,
+            detached_composers: HashMap::new(),
             appearance,
             density,
             reading_pane,
@@ -802,6 +819,12 @@ impl MailWindow {
             retry_attempts: HashMap::new(),
             _subscriptions: subs,
         };
+        // A composer shares providers and the store, but never starts a second
+        // synchronization loop, IDLE watcher, reminder service or update checker.
+        if detached {
+            this.reload_contacts();
+            return this;
+        }
         // The watchdog reports any stall of this thread (see `watchdog.rs`).
         crate::watchdog::start();
         cx.spawn(async move |_, cx| loop {
@@ -2434,6 +2457,7 @@ impl MailWindow {
         let store = self.store.clone();
         let to_save = draft.clone();
         self.open_composer(draft, window, cx);
+        if let Some(c) = &mut self.composer { c.pending_saves += 1; }
         let draft_id = to_save.id.clone();
         if kind == DraftKind::Forward {
             // A forward carries the original's attachments along with its text.
@@ -2443,6 +2467,7 @@ impl MailWindow {
         cx.spawn_in(window, async move |this, cx| {
             let result = cx.background_spawn(async move { store.save_editing_draft(&to_save) }).await;
             let _ = this.update_in(cx, |this, window, cx| {
+                if let Some(c) = this.composer.as_mut().filter(|c| c.draft.id == draft_id) { c.pending_saves = c.pending_saves.saturating_sub(1); }
                 match result {
                     Ok(_) if this.unwanted_drafts.remove(&draft_id) => {
                         let _ = this.store.delete_draft(&draft_account, &draft_id);
@@ -2464,6 +2489,7 @@ impl MailWindow {
     }
 
     pub(crate) fn open_draft(&mut self, id: DraftId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.activate_detached_draft(&id, cx) { return; }
         if let Ok(Some(draft)) = self.store.draft(&id) {
             if let Some(conv) = draft.conversation_id.clone() {
                 // Show the conversation being replied to, if it is in this view.
@@ -3435,6 +3461,7 @@ impl Focusable for MailWindow {
 
 impl Render for MailWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.composer_owner.is_some() { return self.render_composer_window(cx).into_any_element(); }
         crate::watchdog::mark("render");
         if !self.first_frame_logged {
             self.first_frame_logged = true;
@@ -3458,6 +3485,8 @@ impl Render for MailWindow {
             .on_action(cx.listener(Self::on_toggle_preview))
             .on_action(cx.listener(Self::on_escape))
             .on_action(cx.listener(Self::on_send))
+            .on_action(cx.listener(Self::on_toggle_message_history))
+            .on_action(cx.listener(Self::on_pop_out_composer))
             .on_action(cx.listener(Self::on_reply))
             .on_action(cx.listener(Self::on_reply_all))
             .on_action(cx.listener(Self::on_forward))
@@ -3502,6 +3531,7 @@ impl Render for MailWindow {
             .when(self.account_setup.is_some(), |d| d.child(self.render_account_setup(cx)))
             .when(self.quick_look.is_some(), |d| d.child(self.render_quick_look(cx)))
             .when(self.palette.is_some(), |d| d.child(self.render_palette(cx)))
+            .into_any_element()
     }
 }
 
