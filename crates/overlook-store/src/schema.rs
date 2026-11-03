@@ -2,7 +2,24 @@
 
 use rusqlite::Connection;
 
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17, V18, V19];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17, V18, V19, V20];
+
+/// The change history behind Undo, Ctrl+Z and the History view.
+const V20: &str = "
+BEGIN;
+CREATE TABLE change_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    at INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    reversal_json TEXT NOT NULL,
+    undone_at INTEGER
+);
+CREATE INDEX change_history_account ON change_history(account_id, at);
+PRAGMA user_version = 20;
+COMMIT;
+";
 
 const V19: &str = "
 BEGIN;

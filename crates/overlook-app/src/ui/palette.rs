@@ -73,6 +73,8 @@ impl MailWindow {
             entry("Delete", Some("Del"), action(Box::new(TrashSelected))),
             entry("Mark read or unread", Some("U"), action(Box::new(ToggleRead))),
             entry("Star or unstar", Some("S"), action(Box::new(ToggleStar))),
+            entry("Undo", Some("Ctrl+Z"), action(Box::new(UndoLast))),
+            entry("Show change history", Some("Ctrl+H"), action(Box::new(ShowHistory))),
             entry("Search mail", Some("Ctrl+E"), action(Box::new(FocusSearch))),
             entry("Sync now", Some("F5"), action(Box::new(SyncNow))),
             entry("New event", Some("Ctrl+Shift+A"), action(Box::new(NewEventAction))),

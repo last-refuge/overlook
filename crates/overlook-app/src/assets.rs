@@ -87,6 +87,7 @@ color_icons! {
     Appearance => "appearance",
     Layout => "layout",
     Settings => "settings",
+    History => "history",
 }
 
 const ICON_THEMES: &[(&str, ResolvedTheme)] = &[

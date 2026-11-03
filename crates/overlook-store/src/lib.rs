@@ -19,6 +19,8 @@ mod caldav_outbox;
 mod schema;
 mod draft_sync;
 mod time_zone;
+mod history;
+pub use history::{reversal_for, HistoryEntry, Reversal, HISTORY_MAX_ENTRIES};
 pub use draft_sync::{DraftEditGuard, DraftSyncEntry, DraftUpload, same_draft_content};
 
 pub use index::{apply_to_message, MailIndex};
@@ -124,7 +126,8 @@ pub enum ListFilter {
 }
 
 /// A local mailbox change. Each variant maps to one [`OperationKind`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LocalChange {
     SetRead { message_ids: Vec<MessageId>, read: bool },
     SetStarred { message_ids: Vec<MessageId>, starred: bool },
@@ -173,6 +176,8 @@ pub struct Store {
     /// holds `conn` for a write, so the UI never waits for a download. `None` in memory.
     reader: Option<Mutex<Connection>>,
     editing_drafts: Mutex<HashMap<DraftId, usize>>,
+    /// Serializes finding and claiming history entries, so two quick undos take two entries.
+    history_claim: Mutex<()>,
 }
 
 impl Store {
@@ -198,7 +203,7 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         schema::migrate(&conn)?;
-        Ok(Self { conn: Mutex::new(conn), reader: None, editing_drafts: Mutex::new(HashMap::new()) })
+        Ok(Self { conn: Mutex::new(conn), reader: None, editing_drafts: Mutex::new(HashMap::new()), history_claim: Mutex::new(()) })
     }
 
     fn with_tx<T>(&self, f: impl FnOnce(&Transaction) -> Result<T>) -> Result<T> {
@@ -321,6 +326,8 @@ impl Store {
             if id_prefixes.is_empty() && id_changes.is_empty() {
                 return Ok(());
             }
+            // Undo history names folders by id as well.
+            history::rename_labels_tx(tx, account, &id_changes)?;
             for (old, new) in id_prefixes {
                 tx.execute(
                     "UPDATE messages SET provider_id = ?3 || substr(provider_id, length(?2) + 1) WHERE account_id=?1 AND substr(provider_id, 1, length(?2)) = ?2",

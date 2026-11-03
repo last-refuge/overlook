@@ -101,6 +101,10 @@ fn open_store() -> anyhow::Result<(Arc<Store>, Vec<Account>)> {
         }
     }
     store.project_calendar_time_zone(&previous_zone, &overlook_core::tz::current_definition())?;
+    // Old undo history goes; a failure here only keeps it longer.
+    if let Err(e) = store.prune_history() {
+        tracing::warn!("could not prune the change history: {e}");
+    }
     let accounts = store.accounts()?;
     Ok((Arc::new(store), accounts))
 }

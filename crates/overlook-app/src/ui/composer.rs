@@ -624,9 +624,12 @@ impl MailWindow {
             (true, 0) => "Sending…".to_owned(),
             (true, s) => format!("Sending in {s} seconds."),
         };
-        let id = draft.id.clone();
-        let account = draft.account_id.clone();
-        self.toast_with_undo(text, move |this, window, cx| this.undo_send(account.clone(), id.clone(), window, cx), window, cx);
+        let subject = match draft.subject.trim() {
+            "" => "(no subject)".to_owned(),
+            s => format!("“{s}”"),
+        };
+        let reversal = overlook_store::Reversal::CancelSend { draft_id: draft.id.clone() };
+        self.record(draft.account_id.clone(), "Sent".into(), subject, reversal, Some(text), window, cx);
         if self.composer_owner.is_none() { self.list_focus.focus(window, cx); }
         if online {
             let account = draft.account_id.clone();
@@ -642,17 +645,6 @@ impl MailWindow {
             }
         }
         cx.notify();
-    }
-
-    /// Takes a just-sent message back out of the Outbox into the composer.
-    pub(super) fn undo_send(&mut self, account: AccountId, id: DraftId, window: &mut Window, cx: &mut Context<Self>) {
-        match self.store.cancel_send(&account, &id) {
-            Ok(_) => {
-                self.reload(cx);
-                self.open_draft(id, window, cx);
-            }
-            Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Warning, format!("Too late to undo: {e}")),
-        }
     }
 
     pub(super) fn attach_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {

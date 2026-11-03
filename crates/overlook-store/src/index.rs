@@ -61,7 +61,7 @@ impl MailIndex {
         msgs.into_iter().map(|m| m.id.clone()).collect()
     }
 
-    fn label_of_kind(&self, kind: LabelKind) -> Option<LabelId> {
+    pub(crate) fn label_of_kind(&self, kind: LabelKind) -> Option<LabelId> {
         self.labels.iter().find(|l| l.kind == kind).map(|l| l.id.clone())
     }
 

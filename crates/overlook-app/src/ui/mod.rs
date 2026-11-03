@@ -8,6 +8,7 @@ mod composer;
 mod composer_window;
 mod folder_manage;
 mod folder_window;
+mod history;
 mod contact_card;
 mod contacts;
 mod mail_highlight;
@@ -106,6 +107,8 @@ actions!(
         PopOutComposer,
         FocusSettingsSearch,
         RenameFolder,
+        UndoLast,
+        ShowHistory,
     ]
 );
 
@@ -175,6 +178,9 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-shift-r", ReplyAll, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-f", Forward, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-u", ToggleRead, Some(WINDOW_CONTEXT)),
+        // Text fields bind ctrl-z in their own, deeper context, so typing is undone there.
+        KeyBinding::new("ctrl-z", UndoLast, Some(WINDOW_CONTEXT)),
+        KeyBinding::new("ctrl-h", ShowHistory, Some(WINDOW_CONTEXT)),
         KeyBinding::new("f5", SyncNow, Some(WINDOW_CONTEXT)),
         KeyBinding::new("f2", RenameFolder, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-1", SwitchToMail, Some(WINDOW_CONTEXT)),
@@ -600,6 +606,7 @@ pub struct MailWindow {
     folder_windows: Vec<folder_window::FolderWindow>,
     /// The New/Rename folder dialog, when open.
     folder_prompt: Option<folder_manage::FolderPrompt>,
+    history: Option<history::HistoryState>,
     appearance: AppearancePreference,
     density: Density,
     reading_pane: ReadingPane,
@@ -860,6 +867,7 @@ impl MailWindow {
             folder_owner,
             folder_windows: Vec::new(),
             folder_prompt: None,
+            history: None,
             appearance,
             density,
             reading_pane,
@@ -2474,26 +2482,6 @@ impl MailWindow {
         self.thread.iter().map(|m| m.id.clone()).collect()
     }
 
-    /// Shows a toast with an Undo button that runs `undo` on this window.
-    fn toast_with_undo(&self, text: impl Into<SharedString>, undo: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static, window: &mut Window, cx: &mut Context<Self>) {
-        let this = cx.entity().downgrade();
-        let undo = std::rc::Rc::new(undo);
-        window.push_notification(
-            Notification::info(text)
-                .action(move |_note, _window, cx| {
-                    let this = this.clone();
-                    let undo = undo.clone();
-                    let note = cx.entity();
-                    Button::new("undo").xsmall().label("Undo").on_click(move |_, window, cx| {
-                        let _ = this.update(cx, |t, cx| undo(t, window, cx));
-                        note.update(cx, |n, cx| n.dismiss(window, cx));
-                    })
-                })
-                .autohide(true),
-            cx,
-        );
-    }
-
     /// Whether every message is in Trash / has the Inbox label, for toolbar wording.
     pub(crate) fn thread_state(&self) -> (bool, bool) {
         let trash = self.labels.iter().find(|l| l.kind == LabelKind::Trash).map(|l| l.id.clone());
@@ -2508,9 +2496,8 @@ impl MailWindow {
             return;
         }
         let next = self.neighbour_after_removal();
-        self.apply_local(overlook_store::LocalChange::Archive { message_ids: ids.clone() }, window, cx);
+        self.perform("Archived", vec![LocalChange::Archive { message_ids: ids }], true, window, cx);
         self.select_after_removal(next, window, cx);
-        self.toast_with_undo("Archived", move |this, window, cx| this.move_to_inbox(ids.clone(), window, cx), window, cx);
     }
 
     pub(crate) fn trash(&mut self, ids: Vec<MessageId>, window: &mut Window, cx: &mut Context<Self>) {
@@ -2518,9 +2505,8 @@ impl MailWindow {
             return;
         }
         let next = self.neighbour_after_removal();
-        self.apply_local(overlook_store::LocalChange::Trash { message_ids: ids.clone() }, window, cx);
+        self.perform("Moved to Trash", vec![LocalChange::Trash { message_ids: ids }], true, window, cx);
         self.select_after_removal(next, window, cx);
-        self.toast_with_undo("Moved to Trash", move |this, window, cx| this.restore(ids.clone(), window, cx), window, cx);
     }
 
     /// Puts archived (or trashed) messages back in the Inbox.
@@ -2532,25 +2518,12 @@ impl MailWindow {
         let trashed: Vec<MessageId> = ids.iter().filter(|id| self.mail_index.message(id).is_some_and(|m| trash.as_ref().is_some_and(|t| m.has_label(t)))).cloned().collect();
         let others: Vec<MessageId> = ids.iter().filter(|id| !trashed.contains(id)).cloned().collect();
         let next = self.neighbour_after_removal();
-        if !trashed.is_empty() {
-            self.apply_local(overlook_store::LocalChange::Untrash { message_ids: trashed }, window, cx);
+        let mut changes = vec![LocalChange::Untrash { message_ids: trashed }];
+        if let Some(inbox) = self.labels.iter().find(|l| l.kind == LabelKind::Inbox).map(|l| l.id.clone()) {
+            changes.push(LocalChange::AddLabel { message_ids: others, label_id: inbox });
         }
-        if let (Some(inbox), false) = (self.labels.iter().find(|l| l.kind == LabelKind::Inbox).map(|l| l.id.clone()), others.is_empty()) {
-            self.apply_local(overlook_store::LocalChange::AddLabel { message_ids: others, label_id: inbox }, window, cx);
-        }
+        self.perform("Moved to Inbox", changes, true, window, cx);
         self.select_after_removal(next, window, cx);
-        self.toast_with_undo("Moved to Inbox", move |this, window, cx| this.archive(ids.clone(), window, cx), window, cx);
-    }
-
-    /// Restores trashed messages to the Inbox.
-    pub(crate) fn restore(&mut self, ids: Vec<MessageId>, window: &mut Window, cx: &mut Context<Self>) {
-        if ids.is_empty() {
-            return;
-        }
-        let next = self.neighbour_after_removal();
-        self.apply_local(overlook_store::LocalChange::Untrash { message_ids: ids.clone() }, window, cx);
-        self.select_after_removal(next, window, cx);
-        self.toast_with_undo("Restored to Inbox", move |this, window, cx| this.trash(ids.clone(), window, cx), window, cx);
     }
 
     /// Applies a user label and, like moving to a folder, takes the messages out of the Inbox.
@@ -2562,18 +2535,9 @@ impl MailWindow {
         let inbox = self.labels.iter().find(|l| l.kind == LabelKind::Inbox).map(|l| l.id.clone());
         let was_in_inbox: Vec<MessageId> = ids.iter().filter(|id| self.mail_index.message(id).is_some_and(|m| inbox.as_ref().is_some_and(|i| m.has_label(i)))).cloned().collect();
         let next = self.neighbour_after_removal();
-        self.apply_local(overlook_store::LocalChange::AddLabel { message_ids: ids.clone(), label_id: label_id.clone() }, window, cx);
-        if !was_in_inbox.is_empty() {
-            self.apply_local(overlook_store::LocalChange::Archive { message_ids: was_in_inbox.clone() }, window, cx);
-        }
+        let changes = vec![LocalChange::AddLabel { message_ids: ids, label_id }, LocalChange::Archive { message_ids: was_in_inbox }];
+        self.perform(format!("Moved to {name}"), changes, true, window, cx);
         self.select_after_removal(next, window, cx);
-        let label_for_undo = label_id.clone();
-        self.toast_with_undo(format!("Moved to {name}"), move |this, window, cx| {
-            this.apply_local(overlook_store::LocalChange::RemoveLabel { message_ids: ids.clone(), label_id: label_for_undo.clone() }, window, cx);
-            if !was_in_inbox.is_empty() {
-                this.move_to_inbox(was_in_inbox.clone(), window, cx);
-            }
-        }, window, cx);
     }
 
     /// Handles a conversation dropped onto a sidebar destination.
@@ -2616,9 +2580,8 @@ impl MailWindow {
     }
 
     pub(crate) fn set_starred(&mut self, ids: Vec<MessageId>, starred: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if !ids.is_empty() {
-            self.apply_local(overlook_store::LocalChange::SetStarred { message_ids: ids, starred }, window, cx);
-        }
+        let title = if starred { "Starred" } else { "Unstarred" };
+        self.perform(title, vec![LocalChange::SetStarred { message_ids: ids, starred }], false, window, cx);
     }
 
     // --------------------------------------------------------------- compose
@@ -2996,6 +2959,8 @@ impl MailWindow {
             self.close_palette(window, cx);
         } else if self.folder_prompt.is_some() {
             self.close_folder_prompt(window, cx);
+        } else if self.history.is_some() {
+            self.close_history(window, cx);
         } else if self.account_setup.is_some() {
             self.close_account_setup(window, cx);
         } else if self.quick_look.is_some() {
@@ -3660,6 +3625,8 @@ impl Render for MailWindow {
             .on_action(cx.listener(Self::on_cal_select_previous))
             .on_action(cx.listener(Self::on_save_calendar_event))
             .on_action(cx.listener(Self::on_open_settings))
+            .on_action(cx.listener(|this, _: &UndoLast, window, cx| this.undo_last(window, cx)))
+            .on_action(cx.listener(|this, _: &ShowHistory, window, cx| this.open_history(window, cx)))
             .size_full()
             .bg(p.background)
             .text_color(p.foreground)
@@ -3679,6 +3646,7 @@ impl Render for MailWindow {
             .when(self.settings.is_some(), |d| d.child(self.render_settings(cx)))
             .when(self.account_setup.is_some(), |d| d.child(self.render_account_setup(cx)))
             .when(self.folder_prompt.is_some(), |d| d.child(self.render_folder_prompt(cx)))
+            .when(self.history.is_some(), |d| d.child(self.render_history(cx)))
             .when(self.quick_look.is_some(), |d| d.child(self.render_quick_look(cx)))
             .when(self.palette.is_some(), |d| d.child(self.render_palette(cx)))
             .into_any_element()

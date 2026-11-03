@@ -257,14 +257,24 @@ impl MailWindow {
         }
         let ids = self.mail_index.messages_labelled(kind);
         let name = system_folder(kind).map(|(name, _)| name).unwrap_or("this folder");
-        if ids.is_empty() {
+        // Folders deleted into Trash go with it.
+        let has_folders = kind == LabelKind::Trash
+            && self.labels_of(&account).iter().find(|l| l.kind == LabelKind::Trash).is_some_and(|t| {
+                self.labels_of(&account).iter().any(|l| l.kind == LabelKind::User && overlook_core::sidebar::folder_within(&l.name, &t.name))
+            });
+        if ids.is_empty() && !has_folders {
             crate::ui::toast(window, cx, crate::notify::Level::Info, format!("{name} is already empty."));
             return;
         }
+        let detail = if has_folders {
+            "Every message and folder in it is removed from the server, including any not downloaded yet. This can’t be undone."
+        } else {
+            "Every message in it is removed from the server, including any not downloaded yet. This can’t be undone."
+        };
         let answer = window.prompt(
             PromptLevel::Warning,
             &format!("Permanently delete everything in {name}?"),
-            Some("Every message in it is removed from the server, including any not downloaded yet. This can’t be undone."),
+            Some(detail),
             &["Delete", "Cancel"],
             cx,
         );
@@ -279,7 +289,12 @@ impl MailWindow {
                 }
                 let still: std::collections::HashSet<MessageId> = this.mail_index.messages_labelled(kind).into_iter().collect();
                 let ids: Vec<MessageId> = ids.into_iter().filter(|id| still.contains(id)).collect();
+                // Always queued: the server empties the whole folder, downloaded or not.
                 this.apply_local(overlook_store::LocalChange::DeleteForever { message_ids: ids, folder: Some(kind) }, window, cx);
+                this.record(account.clone(), format!("Emptied {name}"), "Every message in it, for good".into(), overlook_store::Reversal::None, None, window, cx);
+                if kind == LabelKind::Trash {
+                    this.delete_folders_in_trash(&account, window, cx);
+                }
                 if this.selected.as_ref().is_some_and(|s| !this.conversations.iter().any(|c| &c.id == s)) {
                     this.selected = this.conversations.first().map(|c| c.id.clone());
                     this.expanded.clear();
@@ -319,11 +334,12 @@ impl MailWindow {
         use overlook_core::sidebar::{folder_tree, TreeRoot};
         let users: Vec<&overlook_core::Label> = self.labels_of(account).iter().filter(|l| l.kind == LabelKind::User).collect();
         let names: Vec<&str> = users.iter().map(|l| l.name.as_str()).collect();
+        let trash_name = self.labels_of(account).iter().find(|l| l.kind == LabelKind::Trash).map(|l| l.name.clone());
         // One branch of the folder tree as rows, `base` levels in, without what is folded.
         let branch = |root: TreeRoot, base: usize| -> Vec<Nav> {
             let mut rows = Vec::new();
             let mut folded_at: Option<usize> = None;
-            for row in folder_tree(&names, root) {
+            for row in folder_tree(&names, root, trash_name.as_deref()) {
                 if folded_at.is_some_and(|d| row.depth > d) {
                     continue;
                 }
@@ -356,9 +372,13 @@ impl MailWindow {
             }
             let Some((name, icon)) = system_folder(k) else { continue };
             let mut nav = Nav::view(name, icon, MailboxView::Kind(k));
-            // Folders inside the Inbox sit under it and fold away with it, as in Outlook.
-            let inside = if k == LabelKind::Inbox { branch(TreeRoot::Inbox, 1) } else { Vec::new() };
-            let key = format!("inbox:{}", account.0);
+            // Folders inside the Inbox sit under it and fold away with it, as in Outlook, and
+            // deleted folders likewise under Trash.
+            let (inside, key) = match k {
+                LabelKind::Inbox => (branch(TreeRoot::Inbox, 1), format!("inbox:{}", account.0)),
+                LabelKind::Trash => (branch(TreeRoot::Trash, 1), format!("trash:{}", account.0)),
+                _ => (Vec::new(), String::new()),
+            };
             let collapsed = self.collapsed_sections.contains(&key);
             if !inside.is_empty() {
                 nav.expander = Some((key, collapsed));

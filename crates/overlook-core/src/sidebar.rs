@@ -33,11 +33,13 @@ impl Favorite {
     }
 }
 
-/// Where a branch of the folder tree hangs: the account's top level, or under the Inbox.
+/// Where a branch of the folder tree hangs: the account's top level, under the Inbox, or
+/// under Trash (deleted folders).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TreeRoot {
     Top,
     Inbox,
+    Trash,
 }
 
 /// One row of the folder tree, in display order.
@@ -54,9 +56,10 @@ pub struct TreeRow<'a> {
 
 /// The rows under `root`, parents before their children, as Outlook nests them. A folder
 /// sits under the nearest ancestor that exists ("Work / A / B" under "Work" when there is no
-/// "Work / A"); "Inbox / …" names with no such ancestor sit under the Inbox. Names nest by
-/// " / " (IMAP) or "/" (Gmail). Siblings keep the order given.
-pub fn folder_tree<'a>(names: &[&'a str], root: TreeRoot) -> Vec<TreeRow<'a>> {
+/// "Work / A"); "Inbox / …" names with no such ancestor sit under the Inbox, and names inside
+/// `trash` (the Trash folder's name) under Trash. Names nest by " / " (IMAP) or "/" (Gmail).
+/// Siblings keep the order given.
+pub fn folder_tree<'a>(names: &[&'a str], root: TreeRoot, trash: Option<&str>) -> Vec<TreeRow<'a>> {
     // Each folder's parent: another folder, or the root it hangs under, and its leaf name.
     let placed: Vec<(Option<usize>, TreeRoot, &str)> = names
         .iter()
@@ -69,6 +72,9 @@ pub fn folder_tree<'a>(names: &[&'a str], root: TreeRoot) -> Vec<TreeRow<'a>> {
                 }
                 if parent == "Inbox" {
                     return (None, TreeRoot::Inbox, leaf);
+                }
+                if Some(parent) == trash {
+                    return (None, TreeRoot::Trash, leaf);
                 }
                 at = parent;
             }
@@ -199,7 +205,7 @@ mod tests {
     #[test]
     fn folders_nest_under_their_parents_and_the_inbox() {
         fn rows<'a>(names: &[&'a str], root: TreeRoot) -> Vec<(&'a str, usize, &'a str, bool)> {
-            folder_tree(names, root).into_iter().map(|r| (names[r.index], r.depth, r.leaf, r.has_children)).collect()
+            folder_tree(names, root, None).into_iter().map(|r| (names[r.index], r.depth, r.leaf, r.has_children)).collect()
         }
         let names = ["inbox2", "inbox2 / sub3", "Other", "Inbox / inbox-sub2", "inbox2 / sub3 / deep", "Work/A/B"];
         assert_eq!(
@@ -211,6 +217,16 @@ mod tests {
         let gmail = ["Work", "Work/A/B", "Inbox/Receipts", "Inbox/Receipts/2026"];
         assert_eq!(rows(&gmail, TreeRoot::Top), [("Work", 0, "Work", true), ("Work/A/B", 1, "A/B", false)]);
         assert_eq!(rows(&gmail, TreeRoot::Inbox), [("Inbox/Receipts", 0, "Receipts", true), ("Inbox/Receipts/2026", 1, "2026", false)]);
+    }
+
+    #[test]
+    fn deleted_folders_nest_under_trash() {
+        let names = ["Work", "Trash / Old", "Trash / Old / Clients", "Deleted Items / Other"];
+        let rows = |root| folder_tree(&names, root, Some("Trash")).into_iter().map(|r| (names[r.index], r.depth, r.leaf)).collect::<Vec<_>>();
+        assert_eq!(rows(TreeRoot::Trash), [("Trash / Old", 0, "Old"), ("Trash / Old / Clients", 1, "Clients")]);
+        assert_eq!(rows(TreeRoot::Top), [("Work", 0, "Work"), ("Deleted Items / Other", 0, "Deleted Items / Other")]);
+        // Without a Trash folder, nothing is taken out of the top level.
+        assert_eq!(folder_tree(&names, TreeRoot::Top, None).len(), 4);
     }
 
     #[test]

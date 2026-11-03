@@ -250,17 +250,70 @@ impl MailWindow {
         .detach();
     }
 
-    /// Deletes a user folder after asking. IMAP deletes the mail in it too; Gmail keeps the
-    /// messages and only removes the label.
+    /// Deletes a user folder. An IMAP folder moves into Trash with its mail and the folders
+    /// inside it, as Outlook's Deleted Items, and can be restored; a folder already in Trash
+    /// (or on a server that won't take folders in Trash) is deleted for good after asking.
+    /// Gmail keeps the messages and only removes the label, which Undo puts back.
     pub(crate) fn delete_folder(&mut self, account_id: AccountId, label: Label, window: &mut Window, cx: &mut Context<Self>) {
         let Some(account) = self.accounts.iter().find(|a| a.id == account_id).cloned() else { return };
-        let imap = account.provider == ProviderKind::Imap;
-        let detail = if imap {
-            "The folder and every message in it are deleted from the server. This can’t be undone."
+        if account.provider == ProviderKind::Imap {
+            let trash = self.labels_of(&account_id).iter().find(|l| l.kind == LabelKind::Trash).cloned();
+            match trash {
+                Some(trash) if !overlook_core::sidebar::folder_within(&label.name, &trash.name) => self.move_folder_to_trash(account, label, trash, window, cx),
+                _ => self.delete_folder_for_good(account, label, None, window, cx),
+            }
         } else {
-            "The label is removed. Its messages stay in your mailbox."
+            self.delete_label(account, label, window, cx);
+        }
+    }
+
+    /// The folder `label` sits in, by name: another folder or the Inbox; `None` at the top.
+    fn folder_parent_label(&self, account: &AccountId, label: &Label) -> Option<LabelId> {
+        let parent = overlook_core::sidebar::folder_parent(&label.name)?;
+        self.labels_of(account).iter().find(|l| l.name == parent && matches!(l.kind, LabelKind::User | LabelKind::Inbox)).map(|l| l.id.clone())
+    }
+
+    fn move_folder_to_trash(&mut self, account: Account, label: Label, trash: Label, window: &mut Window, cx: &mut Context<Self>) {
+        let account_id = account.id.clone();
+        let parent = self.folder_parent_label(&account_id, &label);
+        let Some(mail) = self.providers.get(&account_id).map(|p| p.mail.clone()) else {
+            crate::ui::toast(window, cx, crate::notify::Level::Error, "Sign in to this account again to change its folders.");
+            return;
         };
-        let answer = window.prompt(PromptLevel::Warning, &format!("Delete the folder “{}”?", label.name), Some(detail), &["Delete", "Cancel"], cx);
+        let labels = self.store.labels(&account_id).unwrap_or_default();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn({
+                    let (account, label) = (account.clone(), label.clone());
+                    async move { mail.move_folder(&account, &label, Some(&trash), &labels).await }
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| match result {
+                Ok(changed) => {
+                    this.record_renamed_folders(&account_id, &changed, cx);
+                    this.after_folder_change(&account_id, window, cx);
+                    let moved = changed.first().map(|c| c.new.id.clone()).unwrap_or_else(|| label.id.clone());
+                    let reversal = overlook_store::Reversal::RestoreFolder { label_id: moved, parent };
+                    let title = format!("Deleted folder “{}”", leaf_name(&label.name));
+                    this.record(account_id.clone(), title, "Moved to Trash with its messages".into(), reversal, Some(format!("Moved “{}” to Trash.", leaf_name(&label.name))), window, cx);
+                }
+                // The server won't keep folders in Trash: offer to delete it for good instead.
+                Err(ProviderError::Rejected(reason)) => this.delete_folder_for_good(account, label, Some(reason), window, cx),
+                Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t delete “{}”: {}", label.name, folder_error(&e))),
+            });
+        })
+        .detach();
+    }
+
+    /// Deletes an IMAP folder and its mail from the server after asking. `why` says why it
+    /// can't go to Trash instead.
+    fn delete_folder_for_good(&mut self, account: Account, label: Label, why: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let account_id = account.id.clone();
+        let detail = match why {
+            Some(why) => format!("It can’t be moved to Trash: {why} Deleting it removes the folder and every message in it from the server. This can’t be undone."),
+            None => "The folder and every message in it are deleted from the server. This can’t be undone.".into(),
+        };
+        let answer = window.prompt(PromptLevel::Warning, &format!("Permanently delete the folder “{}”?", leaf_name(&label.name)), Some(&detail), &["Delete", "Cancel"], cx);
         cx.spawn_in(window, async move |this, cx| {
             if answer.await != Ok(0) {
                 return;
@@ -277,20 +330,183 @@ impl MailWindow {
                 .await;
             let _ = this.update_in(cx, |this, window, cx| match result {
                 Ok(()) => {
-                    if let Err(e) = this.store.delete_label(&account_id, &label.id, imap) {
-                        tracing::warn!("could not record the deleted folder: {e}");
-                    }
-                    this.unpin_favorite(&Favorite::label(account_id.clone(), label.id.clone()), cx);
-                    if this.account.id == account_id && this.view == MailboxView::Label(label.id.clone()) {
-                        this.select_view(MailboxView::Kind(LabelKind::Inbox), window, cx);
-                    }
-                    this.after_folder_change(&account_id, window, cx);
+                    this.forget_deleted_folder(&account_id, &label, true, window, cx);
+                    let title = format!("Permanently deleted folder “{}”", leaf_name(&label.name));
+                    this.record(account_id.clone(), title, "With every message in it".into(), overlook_store::Reversal::None, None, window, cx);
                     crate::ui::toast(window, cx, crate::notify::Level::Success, format!("Deleted “{}”.", label.name));
                 }
                 Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t delete “{}”: {}", label.name, folder_error(&e))),
             });
         })
         .detach();
+    }
+
+    /// After Trash is emptied: deletes the folders deleted into it (IMAP), innermost first.
+    pub(crate) fn delete_folders_in_trash(&mut self, account_id: &AccountId, window: &mut Window, cx: &mut Context<Self>) {
+        let labels = self.labels_of(account_id).to_vec();
+        let Some(trash) = labels.iter().find(|l| l.kind == LabelKind::Trash) else { return };
+        let mut inside: Vec<Label> = labels.iter().filter(|l| l.kind == LabelKind::User && overlook_core::sidebar::folder_within(&l.name, &trash.name)).cloned().collect();
+        if inside.is_empty() {
+            return;
+        }
+        inside.sort_by_key(|l| std::cmp::Reverse(l.name.len()));
+        let (Some(account), Some(mail)) = (self.accounts.iter().find(|a| &a.id == account_id).cloned(), self.providers.get(account_id).map(|p| p.mail.clone())) else { return };
+        let account_id = account_id.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let results = cx
+                .background_spawn(async move {
+                    let mut out = Vec::new();
+                    for label in inside {
+                        let r = mail.delete_folder(&account, &label).await;
+                        out.push((label, r));
+                    }
+                    out
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                for (label, r) in results {
+                    match r {
+                        Ok(()) => this.forget_deleted_folder(&account_id, &label, true, window, cx),
+                        Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t delete “{}”: {}", label.name, folder_error(&e))),
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Removes a Gmail label after asking; its messages stay, and Undo puts it back on them.
+    fn delete_label(&mut self, account: Account, label: Label, window: &mut Window, cx: &mut Context<Self>) {
+        let account_id = account.id.clone();
+        let answer = window.prompt(PromptLevel::Warning, &format!("Delete the label “{}”?", label.name), Some("The label is removed. Its messages stay in your mailbox."), &["Delete", "Cancel"], cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            let Ok(Some((mail, store))) = this.update(cx, |this, _| this.providers.get(&account_id).map(|p| (p.mail.clone(), this.store.clone()))) else {
+                let _ = this.update_in(cx, |_, window, cx| crate::ui::toast(window, cx, crate::notify::Level::Error, "Sign in to this account again to change its folders."));
+                return;
+            };
+            let result = cx
+                .background_spawn({
+                    let (account_id, label) = (account_id.clone(), label.clone());
+                    async move {
+                        // Read before the label goes, so Undo knows where to put it back.
+                        let messages = store.message_ids_with_label(&account_id, &label.id).unwrap_or_default();
+                        mail.delete_folder(&account, &label).await.map(|()| messages)
+                    }
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| match result {
+                Ok(message_ids) => {
+                    this.forget_deleted_folder(&account_id, &label, false, window, cx);
+                    let count = message_ids.len();
+                    let reversal = overlook_store::Reversal::RecreateLabel { name: label.name.clone(), message_ids };
+                    let detail = match count {
+                        1 => "1 message kept".to_owned(),
+                        n => format!("{n} messages kept"),
+                    };
+                    this.record(account_id.clone(), format!("Deleted label “{}”", label.name), detail, reversal, Some(format!("Deleted “{}”.", label.name)), window, cx);
+                }
+                Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t delete “{}”: {}", label.name, folder_error(&e))),
+            });
+        })
+        .detach();
+    }
+
+    /// Drops a folder the server no longer has from this device, its pin and the open view.
+    fn forget_deleted_folder(&mut self, account_id: &AccountId, label: &Label, with_messages: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(e) = self.store.delete_label(account_id, &label.id, with_messages) {
+            tracing::warn!("could not record the deleted folder: {e}");
+        }
+        self.unpin_favorite(&Favorite::label(account_id.clone(), label.id.clone()), cx);
+        if &self.account.id == account_id && self.view == MailboxView::Label(label.id.clone()) {
+            self.select_view(MailboxView::Kind(LabelKind::Inbox), window, cx);
+        }
+        self.after_folder_change(account_id, window, cx);
+    }
+
+    /// Takes back a folder deletion (a history entry already claimed): an IMAP folder moves
+    /// out of Trash to where it was, a Gmail label is made again and put back on its
+    /// messages. On failure the entry can be undone again later. The task answers whether
+    /// it was undone.
+    pub(super) fn undo_folder_change(&mut self, entry: overlook_store::HistoryEntry, window: &mut Window, cx: &mut Context<Self>) -> Task<bool> {
+        let account_id = entry.account_id.clone();
+        let Some(account) = self.accounts.iter().find(|a| a.id == account_id).cloned() else { return Task::ready(false) };
+        let Some(mail) = self.providers.get(&account_id).map(|p| p.mail.clone()) else {
+            let _ = self.store.clear_undone(entry.id);
+            crate::ui::toast(window, cx, crate::notify::Level::Error, "Sign in to this account again to change its folders.");
+            return Task::ready(false);
+        };
+        let labels = self.store.labels(&account_id).unwrap_or_default();
+        let find = |id: &LabelId| labels.iter().find(|l| &l.id == id).cloned();
+        enum Undo {
+            Restore { label: Label, parent: Option<Label> },
+            Recreate { leaf: String, parent: Option<Label>, message_ids: Vec<MessageId> },
+        }
+        let undo = match &entry.reversal {
+            overlook_store::Reversal::RestoreFolder { label_id, parent } => match find(label_id) {
+                Some(label) => Undo::Restore { label, parent: parent.as_ref().and_then(find) },
+                None => {
+                    // Emptied from Trash since: nothing is left to restore.
+                    let _ = self.store.forget_reversal(entry.id);
+                    crate::ui::toast(window, cx, crate::notify::Level::Warning, "That folder is no longer in Trash.");
+                    return Task::ready(false);
+                }
+            },
+            overlook_store::Reversal::RecreateLabel { name, message_ids } => {
+                let parent_name = overlook_core::sidebar::folder_parent(name);
+                let parent = parent_name.and_then(|p| labels.iter().find(|l| l.name == p).cloned());
+                let leaf = match (&parent, parent_name) {
+                    (Some(_), Some(p)) => name[p.len()..].trim_start_matches(" / ").trim_start_matches('/').to_owned(),
+                    _ => name.clone(),
+                };
+                Undo::Recreate { leaf, parent, message_ids: message_ids.clone() }
+            }
+            _ => return Task::ready(false),
+        };
+        let store = self.store.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn({
+                    let (labels, store) = (labels.clone(), store.clone());
+                    async move {
+                        match undo {
+                            Undo::Restore { label, parent } => mail.move_folder(&account, &label, parent.as_ref(), &labels).await.map(|changed| (changed, None)),
+                            Undo::Recreate { leaf, parent, message_ids } => {
+                                let label = mail.create_folder(&account, &leaf, parent.as_ref(), &labels).await?;
+                                // Only the messages still on this device can get it back.
+                                let message_ids: Vec<MessageId> = message_ids.into_iter().filter(|id| store.message(id).ok().flatten().is_some()).collect();
+                                Ok((Vec::new(), Some((label, message_ids))))
+                            }
+                        }
+                    }
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok((changed, recreated)) => {
+                        this.record_renamed_folders(&account_id, &changed, cx);
+                        if let Some((label, message_ids)) = recreated {
+                            if let Err(e) = store.upsert_label(&label) {
+                                tracing::warn!("could not record the recreated label: {e}");
+                            }
+                            if !message_ids.is_empty() {
+                                this.apply_local_for(&account_id, LocalChange::AddLabel { message_ids, label_id: label.id.clone() }, window, cx);
+                            }
+                        }
+                        this.after_folder_change(&account_id, window, cx);
+                        true
+                    }
+                    Err(e) => {
+                        let _ = store.clear_undone(entry.id);
+                        crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t undo “{}”: {}", entry.title, folder_error(&e)));
+                        false
+                    }
+                }
+            })
+            .unwrap_or(false)
+        })
     }
 
     pub(crate) fn render_folder_prompt(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -343,5 +559,13 @@ impl MailWindow {
                     ),
             )
             .into_any_element()
+    }
+}
+
+/// The last part of a folder name: "Clients" for "Work / Clients".
+fn leaf_name(name: &str) -> &str {
+    match overlook_core::sidebar::folder_parent(name) {
+        Some(parent) => name[parent.len()..].trim_start_matches(" / ").trim_start_matches('/'),
+        None => name,
     }
 }

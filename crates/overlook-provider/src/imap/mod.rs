@@ -1469,8 +1469,9 @@ impl ImapProvider {
             return Err(ProviderError::Rejected("only your own folders can be moved".into()));
         };
         let parent_path = match parent {
-            Some(p) if matches!(p.kind, LabelKind::User | LabelKind::Inbox) => Some(p.provider_id.as_ref().map(|id| id.0.clone()).ok_or_else(|| ProviderError::Rejected("that folder isn’t on the server yet".into()))?),
-            Some(_) => return Err(ProviderError::Rejected("folders can go only inside your own folders or the Inbox".into())),
+            // Trash takes deleted folders, so they can be restored.
+            Some(p) if matches!(p.kind, LabelKind::User | LabelKind::Inbox | LabelKind::Trash) => Some(p.provider_id.as_ref().map(|id| id.0.clone()).ok_or_else(|| ProviderError::Rejected("that folder isn’t on the server yet".into()))?),
+            Some(_) => return Err(ProviderError::Rejected("folders can go only inside your own folders, the Inbox or Trash".into())),
             None => None,
         };
         self.with_session(|conn| {

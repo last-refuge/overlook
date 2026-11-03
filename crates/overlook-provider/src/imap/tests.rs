@@ -1361,6 +1361,45 @@ fn folders_move_with_their_children_and_never_into_themselves() {
 }
 
 #[test]
+fn a_deleted_folder_moves_into_trash_with_its_children_and_back() {
+    let server = serve(mailbox());
+    let p = provider(&server);
+    let acct = account();
+    let (labels, _, _) = synced(&server, &p);
+    let work = labels.iter().find(|l| l.provider_id.as_ref().is_some_and(|p| p.0 == "Work")).unwrap().clone();
+    let trash = labels.iter().find(|l| l.kind == LabelKind::Trash).unwrap().clone();
+
+    let changed = block(p.move_folder(&acct, &work, Some(&trash), &labels)).unwrap();
+    let moved = changed[0].new.clone();
+    assert_eq!(moved.provider_id, Some(ProviderId("Trash/Work".into())));
+    assert_eq!(moved.kind, LabelKind::User, "a folder in Trash is still a folder of its own");
+    assert_eq!(changed[1].new.provider_id, Some(ProviderId("Trash/Work/Clients".into())));
+    {
+        let s = server.lock();
+        assert!(s.has_folder("Trash/Work") && s.has_folder("Trash/Work/Clients") && !s.has_folder("Work"), "{:?}", s.log);
+    }
+
+    // Restoring puts it back where it was.
+    let back = block(p.move_folder(&acct, &moved, None, &labels)).unwrap();
+    assert_eq!(back[0].new.provider_id, Some(ProviderId("Work".into())));
+    assert!(server.lock().has_folder("Work/Clients"));
+}
+
+#[test]
+fn a_trash_without_subfolders_refuses_a_deleted_folder() {
+    let mut state = mailbox();
+    state.folders.iter_mut().find(|f| f.path == "Trash").unwrap().attributes.push("\\Noinferiors".into());
+    let server = serve(state);
+    let p = provider(&server);
+    let acct = account();
+    let (labels, _, _) = synced(&server, &p);
+    let work = labels.iter().find(|l| l.provider_id.as_ref().is_some_and(|p| p.0 == "Work")).unwrap().clone();
+    let trash = labels.iter().find(|l| l.kind == LabelKind::Trash).unwrap().clone();
+    assert!(matches!(block(p.move_folder(&acct, &work, Some(&trash), &labels)), Err(ProviderError::Rejected(m)) if m.contains("doesn’t allow folders")));
+    assert!(server.lock().has_folder("Work"));
+}
+
+#[test]
 fn a_verifying_cycle_opens_every_folder_and_lists_every_message() {
     let mut state = condstore_mailbox(true);
     state.capabilities.push_str(" LIST-STATUS");

@@ -99,6 +99,26 @@ impl MailWindow {
             )
             .child(div().flex_1())
             .child(
+                Button::new("rail-history")
+                    .ghost()
+                    .w(px(38.))
+                    .h(px(40.))
+                    .p(px(4.))
+                    .mb(px(4.))
+                    .toggled(self.history.is_some())
+                    .when(self.history.is_some(), |b| b.bg(p.selection))
+                    .accessibility_label("Change history")
+                    .tooltip("Change history (Ctrl H)")
+                    .child(color_icon(C::History, 20., &p))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if this.history.is_some() {
+                            this.close_history(window, cx)
+                        } else {
+                            this.open_history(window, cx)
+                        }
+                    })),
+            )
+            .child(
                 Button::new("rail-settings")
                     .ghost()
                     .w(px(38.))
