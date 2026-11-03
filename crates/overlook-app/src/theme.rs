@@ -115,6 +115,10 @@ impl Palette {
         let colors = match theme {
             ResolvedTheme::Light => return Self::light(),
             ResolvedTheme::Dark => return Self::dark(),
+            ResolvedTheme::SystemLight | ResolvedTheme::SystemDark => {
+                let desktop = DESKTOP.read().ok().and_then(|d| d.as_ref().map(|(_, p)| *p)).filter(|p| p.resolved == theme);
+                return desktop.unwrap_or_else(|| Self { resolved: theme, ..if theme.is_dark() { Self::dark() } else { Self::light() } });
+            }
             // Background, surface, sidebar, text, muted, divider, control border,
             // hover, action, selection, selected text, and focus ring.
             ResolvedTheme::Gray => [0xE5E7EB, 0xF3F4F6, 0xD1D5DB, 0x1F2937, 0x4B5563, 0xB8BEC7, 0x6B7280, 0xDDE1E7, 0x374151, 0xCDD5DF, 0x1F2937, 0x805015],
@@ -213,13 +217,67 @@ impl ActivePalette for App {
 fn component_colors(theme: ResolvedTheme) -> serde_json::Value {
     let base = if theme.is_dark() { DARK_JSON } else { LIGHT_JSON };
     let mut colors: serde_json::Value = serde_json::from_str(base).expect("valid color tokens");
-    if theme == ResolvedTheme::Dark {
-        return colors;
-    }
     let p = Palette::for_theme(theme);
-    let shade = |color: Hsla, alpha| -> Hsla {
-        Rgba::from(color).blend(gpui_kit::rgb(0).alpha(alpha)).into()
-    };
+    if theme == ResolvedTheme::Dark {
+        // The dark tokens are written in this palette already.
+    } else if theme.is_dark() {
+        dark_component_colors(&mut colors, &p);
+    } else {
+        light_component_colors(&mut colors, &p);
+    }
+    if theme == ResolvedTheme::Light {
+        colors["input.border"] = serde_json::Value::String(color_hex(p.control_border));
+    }
+    // Selected text: a translucent action tint shows on every field background, where the
+    // list highlight (`p.selection`) nearly matches the Light theme's inputs.
+    colors["selection.background"] = serde_json::Value::String(format!("{}55", color_hex(p.action)));
+    // A switch that is off is grey; only an on switch takes the action color.
+    colors["switch.background"] = serde_json::Value::String(color_hex(p.muted));
+    colors
+}
+
+fn shade(color: Hsla, alpha: f32) -> Hsla {
+    Rgba::from(color).blend(gpui_kit::rgb(0).alpha(alpha)).into()
+}
+
+fn lift(color: Hsla, alpha: f32) -> Hsla {
+    Rgba::from(color).blend(gpui_kit::rgb(0xFFFFFF).alpha(alpha)).into()
+}
+
+/// Rewrites the dark tokens (written in [`Palette::dark`]) into a dark desktop palette.
+fn dark_component_colors(colors: &mut serde_json::Value, p: &Palette) {
+    for value in colors.as_object_mut().expect("color object").values_mut() {
+        let replacement = match value.as_str().unwrap_or_default() {
+            "#101A21" => p.background,
+            "#17242C" => p.surface,
+            "#121F27" => p.sidebar,
+            "#F0EBDD" => p.foreground,
+            "#A8B7BA" => p.muted,
+            "#30424B" | "#3E535D" => p.divider,
+            "#3B4F59" | "#55707C" => p.control_border,
+            "#FFBA6B" => p.focus,
+            "#A9CDD9" => p.action,
+            "#B8D7E1" => lift(p.action, 0.12),
+            "#98BFCC" => shade(p.action, 0.12),
+            "#10232D" => p.on_action,
+            "#23353F" => p.hover,
+            "#2A3F4A" => lift(p.hover, 0.04),
+            "#1E2E37" => shade(p.hover, 0.1),
+            "#28404C" => p.selection,
+            "#DCECEF" => p.selection_text,
+            "#FFB0A6" => p.error,
+            "#FFC0B8" => lift(p.error, 0.12),
+            "#F09E94" => shade(p.error, 0.08),
+            "#A8CEB1" => p.success,
+            "#F1BE78" => p.warning,
+            _ => continue, // Overlays and transparent scrollbar tracks.
+        };
+        *value = serde_json::Value::String(color_hex(replacement));
+    }
+}
+
+/// Rewrites the light tokens into any light palette.
+fn light_component_colors(colors: &mut serde_json::Value, p: &Palette) {
     for value in colors.as_object_mut().expect("color object").values_mut() {
         let replacement = match value.as_str().unwrap_or_default() {
             "#F4F3EE" => p.background,
@@ -250,10 +308,6 @@ fn component_colors(theme: ResolvedTheme) -> serde_json::Value {
     ] {
         colors[key] = serde_json::Value::String(color_hex(value));
     }
-    if theme == ResolvedTheme::Light {
-        colors["input.border"] = serde_json::Value::String(color_hex(p.control_border));
-    }
-    colors
 }
 
 fn color_rgb(color: Hsla) -> u32 {
@@ -331,7 +385,7 @@ const DARK_JSON: &str = r##"{
 /// Installs the selected colorway and applies its light/dark rendering mode.
 pub fn apply(theme: ResolvedTheme, cx: &mut App) {
     let light = Rc::new(component_theme(if theme.is_dark() { ResolvedTheme::Light } else { theme }));
-    let dark = Rc::new(component_theme(ResolvedTheme::Dark));
+    let dark = Rc::new(component_theme(if theme.is_dark() { theme } else { ResolvedTheme::Dark }));
     Theme::update(cx, |t| {
         t.light_theme = light;
         t.dark_theme = dark;
@@ -350,13 +404,186 @@ pub fn system_appearance(appearance: WindowAppearance) -> SystemAppearance {
 }
 
 /// Resolves and applies the stored preference against the current system appearance.
+/// Follow system uses the desktop theme's colors when they can be read, and the desktop's
+/// light/dark appearance otherwise. The colors are re-read on every call (at launch, on an
+/// appearance change, and when Omarchy's theme-set hook runs `overlook --reload-theme`); a
+/// changed desktop theme is applied, an unchanged one is not.
 pub fn apply_preference(pref: AppearancePreference, system: SystemAppearance, cx: &mut App) -> ResolvedTheme {
-    let resolved = pref.resolve(system);
+    let desktop_changed = refresh_desktop_colors();
+    let resolved = match (pref, desktop_theme()) {
+        (AppearancePreference::FollowSystem, Some(desktop)) => desktop,
+        _ => pref.resolve(system),
+    };
     let current = cx.try_global::<Palette>().map(|p| p.resolved);
-    if current != Some(resolved) {
+    let desktop_in_use = matches!(resolved, ResolvedTheme::SystemLight | ResolvedTheme::SystemDark);
+    if current != Some(resolved) || (desktop_in_use && desktop_changed) {
         apply(resolved, cx);
     }
     resolved
+}
+
+// ------------------------------------------------------------- desktop theme
+
+/// The desktop theme's palette and the file text it came from.
+static DESKTOP: std::sync::RwLock<Option<(String, Palette)>> = std::sync::RwLock::new(None);
+
+/// Omarchy's current theme: `~/.local/state/omarchy/current/theme` (older releases kept it
+/// under `~/.config/omarchy/current/theme`).
+fn omarchy_theme_dirs() -> Vec<std::path::PathBuf> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let state = std::env::var_os("XDG_STATE_HOME").map(std::path::PathBuf::from).or_else(|| home.as_ref().map(|h| h.join(".local/state")));
+    let config = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from).or_else(|| home.as_ref().map(|h| h.join(".config")));
+    [state, config].into_iter().flatten().map(|base| base.join("omarchy/current/theme")).collect()
+}
+
+/// Marks the hook as Overlook's, so it is only ever rewritten by Overlook.
+const HOOK_MARKER: &str = "# Installed by Overlook";
+
+/// Installs `~/.config/omarchy/hooks/theme-set.d/overlook`, which Omarchy runs after every
+/// theme switch, so a running Overlook following the system picks the new colors up at once.
+/// Only on Omarchy (the hooks folder exists). The hook prefers `overlook` on PATH and falls
+/// back to this executable; an existing hook is rewritten only when it is Overlook's and its
+/// fallback no longer exists, so a development build and the installed one never take turns.
+pub fn install_omarchy_hook() {
+    let Some(config) = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))) else { return };
+    let Ok(exe) = std::env::current_exe() else { return };
+    install_hook_in(&config, &exe);
+}
+
+fn install_hook_in(config: &std::path::Path, exe: &std::path::Path) {
+    let hooks = config.join("omarchy/hooks");
+    if !hooks.is_dir() {
+        return;
+    }
+    let path = hooks.join("theme-set.d/overlook");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let fallback_alive = existing.lines().find_map(|l| l.strip_prefix("fallback=")).is_some_and(|f| std::path::Path::new(f.trim_matches('\'')).is_file());
+        if !existing.starts_with(&format!("#!/bin/bash\n{HOOK_MARKER}")) || fallback_alive {
+            return;
+        }
+    }
+    let script = format!(
+        "#!/bin/bash\n{HOOK_MARKER}: a running Overlook re-reads the Omarchy theme colors.\n\
+fallback='{}'\n\
+if command -v overlook >/dev/null; then\n  overlook --reload-theme\nelif [[ -x $fallback ]]; then\n  \"$fallback\" --reload-theme\nfi\nexit 0\n",
+        exe.display()
+    );
+    let written = std::fs::create_dir_all(path.parent().expect("hook folder")).and_then(|_| std::fs::write(&path, script));
+    match written {
+        Ok(()) => tracing::info!("installed the Omarchy theme hook at {}", path.display()),
+        Err(e) => tracing::warn!("could not install the Omarchy theme hook: {e}"),
+    }
+}
+
+/// Re-reads the desktop colors; true when they changed since the last read.
+fn refresh_desktop_colors() -> bool {
+    let source = omarchy_theme_dirs().into_iter().find_map(|dir| std::fs::read_to_string(dir.join("colors.toml")).ok());
+    let Ok(mut slot) = DESKTOP.write() else { return false };
+    if slot.as_ref().map(|(text, _)| text) == source.as_ref() {
+        return false;
+    }
+    *slot = source.and_then(|text| desktop_palette(&text).map(|p| (text, p)));
+    true
+}
+
+/// The desktop theme to use for Follow system, when its colors were readable.
+pub fn desktop_theme() -> Option<ResolvedTheme> {
+    DESKTOP.read().ok().and_then(|d| d.as_ref().map(|(_, p)| p.resolved))
+}
+
+/// The desktop theme's name for menus ("Tokyo Night"), when Omarchy names it.
+pub fn desktop_theme_name() -> Option<String> {
+    desktop_theme()?;
+    let name = omarchy_theme_dirs().into_iter().find_map(|dir| std::fs::read_to_string(dir.with_file_name("theme.name")).ok())?;
+    let words: Vec<String> = name.trim().split(['-', '_', ' ']).filter(|w| !w.is_empty()).map(|w| {
+        let mut chars = w.chars();
+        chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_default()
+    }).collect();
+    (!words.is_empty()).then(|| words.join(" "))
+}
+
+fn parse_hex(value: &str) -> Option<Hsla> {
+    let hex = value.trim().trim_start_matches('#');
+    (hex.len() == 6).then(|| u32::from_str_radix(hex, 16).ok()).flatten().map(c)
+}
+
+fn relative_luminance(color: Hsla) -> f32 {
+    let rgba = Rgba::from(color);
+    let channel = |v: f32| if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+    0.2126 * channel(rgba.r) + 0.7152 * channel(rgba.g) + 0.0722 * channel(rgba.b)
+}
+
+fn contrast(a: Hsla, b: Hsla) -> f32 {
+    let (a, b) = (relative_luminance(a), relative_luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+fn mix(a: Hsla, b: Hsla, t: f32) -> Hsla {
+    let (a, b) = (Rgba::from(a), Rgba::from(b));
+    Rgba { r: a.r + (b.r - a.r) * t, g: a.g + (b.g - a.g) * t, b: a.b + (b.b - a.b) * t, a: 1. }.into()
+}
+
+/// `color`, moved toward `toward` just far enough to reach `ratio` against `background`.
+fn readable(color: Hsla, background: Hsla, toward: Hsla, ratio: f32) -> Hsla {
+    (0..=20).map(|step| mix(color, toward, step as f32 / 20.)).find(|c| contrast(*c, background) >= ratio).unwrap_or(toward)
+}
+
+/// A palette from Omarchy's `colors.toml` (`key = "#rrggbb"` lines). Needs at least the
+/// background, foreground and accent; other keys fall back to blends of those.
+fn desktop_palette(source: &str) -> Option<Palette> {
+    let mut values = std::collections::HashMap::new();
+    for line in source.lines() {
+        let Some((key, value)) = line.split_once('=') else { continue };
+        values.insert(key.trim().to_owned(), value.trim().trim_matches('"').to_owned());
+    }
+    let get = |key: &str| values.get(key).and_then(|v| parse_hex(v));
+    let surface = get("background")?;
+    let foreground = get("foreground")?;
+    let accent = get("accent").or_else(|| get("blue"))?;
+    let dark = match values.get("mode").map(String::as_str) {
+        Some("dark") => true,
+        Some("light") => false,
+        _ => relative_luminance(surface) < relative_luminance(foreground),
+    };
+    let base = if dark { Palette::dark() } else { Palette::light() };
+    let (white, black) = (c(0xFFFFFF), c(0x000000));
+    let ink = if dark { white } else { black };
+    let frame = get("dark_background").unwrap_or_else(|| shade(surface, 0.12));
+    let raised = get("lighter_background").unwrap_or_else(|| mix(surface, foreground, 0.06));
+    let selection = get("selection").filter(|s| contrast(*s, surface) > 1.1).unwrap_or_else(|| mix(surface, accent, 0.25));
+    let selection_text = readable(get("bright_foreground").unwrap_or(foreground), selection, ink, 4.5);
+    let on_action = if contrast(accent, surface) >= contrast(accent, white) { surface } else { white };
+    let tone = |key: &str, fallback: Hsla| readable(get(key).unwrap_or(fallback), surface, ink, 4.5);
+    let foreground = readable(foreground, surface, ink, 4.5);
+    let muted = readable(get("dark_foreground").unwrap_or_else(|| mix(foreground, surface, 0.4)), surface, foreground, 4.5);
+    let accent_text = readable(accent, surface, ink, 4.5);
+    Some(Palette {
+        resolved: if dark { ResolvedTheme::SystemDark } else { ResolvedTheme::SystemLight },
+        background: frame,
+        surface,
+        sidebar: frame,
+        foreground,
+        muted,
+        divider: get("muted").unwrap_or_else(|| mix(surface, foreground, 0.18)),
+        control_border: readable(get("dark_foreground").unwrap_or_else(|| mix(surface, foreground, 0.4)), surface, foreground, 3.0),
+        hover: raised,
+        accent: accent_text,
+        action: accent,
+        on_action,
+        selection,
+        selection_text,
+        focus: accent,
+        success: tone("green", base.success),
+        warning: tone("yellow", base.warning),
+        error: tone("red", base.error),
+        brand_accent: get("orange").or_else(|| get("yellow")).unwrap_or(base.brand_accent),
+        avatar: selection,
+        avatar_ink: selection_text,
+        chip: raised,
+        label_slate: accent_text,
+        label_plum: tone("magenta", base.label_plum),
+        label_amber: tone("yellow", base.label_amber),
+    })
 }
 
 #[cfg(test)]
@@ -399,6 +626,88 @@ mod tests {
             }
             let _ = component_theme(theme);
         }
+    }
+
+    const TOKYO_NIGHT: &str = r##"mode = "dark"
+accent = "#7aa2f7"
+selection = "#292e42"
+muted = "#414868"
+background = "#1a1b26"
+dark_background = "#13141c"
+lighter_background = "#24283b"
+foreground = "#a9b1d6"
+dark_foreground = "#565f89"
+bright_foreground = "#c0caf5"
+red = "#f7768e"
+yellow = "#e0af68"
+green = "#9ece6a"
+magenta = "#ad8ee6"
+"##;
+
+    #[test]
+    fn desktop_colors_become_a_readable_palette() {
+        let p = desktop_palette(TOKYO_NIGHT).expect("palette");
+        assert_eq!(p.resolved, ResolvedTheme::SystemDark);
+        assert_eq!(color_hex(p.surface), "#1A1B26");
+        assert_eq!(color_hex(p.action), "#7AA2F7");
+        for (fg, bg) in [
+            (p.foreground, p.surface), (p.muted, p.surface), (p.accent, p.surface),
+            (p.selection_text, p.selection), (p.error, p.surface), (p.success, p.surface),
+        ] {
+            assert!(contrast(fg, bg) >= 4.5, "contrast {}", contrast(fg, bg));
+        }
+        // A light theme with only the required keys still works, by luminance.
+        let light = desktop_palette("background = \"#fafafa\"\nforeground = \"#333333\"\naccent = \"#0055aa\"").expect("light palette");
+        assert_eq!(light.resolved, ResolvedTheme::SystemLight);
+        assert!(desktop_palette("background = \"#000000\"").is_none(), "foreground and accent are required");
+    }
+
+    #[test]
+    fn desktop_dark_theme_rewrites_every_built_in_dark_color() {
+        let p = desktop_palette(TOKYO_NIGHT).unwrap();
+        *DESKTOP.write().unwrap() = Some((TOKYO_NIGHT.to_owned(), p));
+        let colors = component_colors(ResolvedTheme::SystemDark);
+        assert_eq!(colors["background"].as_str(), Some("#13141C"));
+        assert_eq!(colors["popover.background"].as_str(), Some("#1A1B26"));
+        assert_eq!(colors["switch.background"].as_str(), Some(color_hex(p.muted).as_str()), "an off switch is grey");
+        let dark: serde_json::Value = serde_json::from_str(DARK_JSON).unwrap();
+        let built_in: std::collections::HashSet<&str> = dark.as_object().unwrap().values().filter_map(|v| v.as_str()).filter(|v| v.len() == 7).collect();
+        for (key, value) in colors.as_object().unwrap() {
+            let value = value.as_str().unwrap();
+            assert!(!built_in.contains(value) || dark[key].as_str() != Some(value), "{key} kept the built-in {value}");
+        }
+        let _ = component_theme(ResolvedTheme::SystemDark);
+    }
+
+    #[test]
+    fn built_in_dark_turns_switches_grey_when_off() {
+        assert_eq!(component_colors(ResolvedTheme::Dark)["switch.background"].as_str(), Some(color_hex(Palette::dark().muted).as_str()));
+    }
+
+    #[test]
+    fn omarchy_hook_is_installed_once_and_runs_the_fallback() {
+        let dir = std::env::temp_dir().join(format!("overlook-hook-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        install_hook_in(&dir, std::path::Path::new("/bin/true"));
+        assert!(!dir.join("omarchy").exists(), "nothing is written without Omarchy");
+        std::fs::create_dir_all(dir.join("omarchy/hooks")).unwrap();
+        // A fallback that echoes its argument stands in for the binary.
+        let fake = dir.join("fake-overlook");
+        std::fs::write(&fake, "#!/bin/bash\necho \"called $1\"\n").unwrap();
+        std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        install_hook_in(&dir, &fake);
+        let hook = dir.join("omarchy/hooks/theme-set.d/overlook");
+        let out = std::process::Command::new("bash").arg(&hook).env("PATH", "/usr/bin:/bin").output().unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "called --reload-theme");
+        // A second build does not take the hook over while the first one's binary exists.
+        install_hook_in(&dir, std::path::Path::new("/somewhere/else/overlook"));
+        assert!(std::fs::read_to_string(&hook).unwrap().contains(&fake.display().to_string()));
+        // A user's own hook of that name is never replaced.
+        std::fs::write(&hook, "#!/bin/bash\necho mine\n").unwrap();
+        install_hook_in(&dir, &fake);
+        assert_eq!(std::fs::read_to_string(&hook).unwrap(), "#!/bin/bash\necho mine\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

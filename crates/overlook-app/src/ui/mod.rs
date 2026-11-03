@@ -898,12 +898,15 @@ impl MailWindow {
         })
         .detach();
 
-        // mailto: links handed over by later launches (or this one) open the composer.
+        // mailto: links handed over by later launches (or this one) open the composer;
+        // Omarchy's theme-set hook asks for the desktop theme to be read again.
         cx.spawn_in(window, async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_millis(700)).await;
             let alive = this.update_in(cx, |this, window, cx| {
                 for link in crate::single_instance::take() {
-                    if let Some(m) = overlook_core::mailto::parse(&link) {
+                    if link == crate::single_instance::RELOAD_THEME {
+                        theme::apply_preference(this.appearance, theme::system_appearance(window.appearance()), cx);
+                    } else if let Some(m) = overlook_core::mailto::parse(&link) {
                         this.compose_mailto(m, window, cx);
                         window.activate_window();
                     }
@@ -1170,8 +1173,20 @@ impl MailWindow {
         self.accounts = self.store.accounts().unwrap_or_default();
         crate::ui::toast(window, cx, crate::notify::Level::Info, format!("Removed {} from this device.", account.email));
         match self.accounts.first().map(|a| a.id.clone()) {
-            Some(next) => self.switch_account(next, window, cx),
-            None => self.show_no_account(cx),
+            Some(next) => {
+                self.switch_account(next, window, cx);
+                // Settings stays open, now on the account that took over.
+                if self.settings.is_some() {
+                    self.open_settings(SettingsPage::Accounts, window, cx);
+                }
+            }
+            None => {
+                // The empty screen replaces everything, Settings included.
+                if self.settings.is_some() {
+                    self.close_settings(window, cx);
+                }
+                self.show_no_account(cx);
+            }
         }
     }
 

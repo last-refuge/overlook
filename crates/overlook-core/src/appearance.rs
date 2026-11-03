@@ -1,7 +1,9 @@
 //! Appearance preference and theme resolution.
 //!
 //! Explicit themes are independent of the desktop appearance. "Follow system"
-//! selects Light or Dark, with Light as the fallback.
+//! selects Light or Dark, with Light as the fallback; the app upgrades that to
+//! [`ResolvedTheme::SystemLight`] / [`ResolvedTheme::SystemDark`] when it can read the
+//! desktop theme's own colors (Omarchy's current theme).
 
 use serde::{Deserialize, Serialize};
 
@@ -113,11 +115,14 @@ pub enum ResolvedTheme {
     White,
     Alexander,
     Pink,
+    /// The desktop theme's colors, light or dark by that theme's own mode.
+    SystemLight,
+    SystemDark,
 }
 
 impl ResolvedTheme {
     pub fn is_dark(self) -> bool {
-        matches!(self, ResolvedTheme::Dark)
+        matches!(self, ResolvedTheme::Dark | ResolvedTheme::SystemDark)
     }
 }
 

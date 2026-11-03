@@ -260,12 +260,17 @@ fn main() {
             return;
         }
     }
+    if args.iter().any(|a| a == "--reload-theme") {
+        // Omarchy's theme-set hook: running instances re-read the theme; nothing starts.
+        single_instance::broadcast(single_instance::RELOAD_THEME);
+        return;
+    }
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("overlook {}", env!("CARGO_PKG_VERSION"));
         return;
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("Overlook {} — a clear view of what matters.\n\nUsage: overlook [mailto:…] [--version] [--help]\n\nEnvironment:\n  OVERLOOK_DATA_DIR      profile directory (default ~/.local/share/overlook)\n  OVERLOOK_CONFIG_DIR    directory holding google-oauth-client.json (default ~/.config/overlook)\n  OVERLOOK_SIGN_IN=gmail start the Google sign-in at launch (imap / pop3: open that account setup)\n  OVERLOOK_BROWSER_BIN  compatible Chromium executable (default PATH discovery){}", env!("CARGO_PKG_VERSION"), if cfg!(debug_assertions) { "\n  RUST_LOG=overlook=debug tracing output (development builds only)" } else { "" });
+        println!("Overlook {} — a clear view of what matters.\n\nUsage: overlook [mailto:…] [--reload-theme] [--version] [--help]\n\nEnvironment:\n  OVERLOOK_DATA_DIR      profile directory (default ~/.local/share/overlook)\n  OVERLOOK_CONFIG_DIR    directory holding google-oauth-client.json (default ~/.config/overlook)\n  OVERLOOK_SIGN_IN=gmail start the Google sign-in at launch (imap / pop3: open that account setup)\n  OVERLOOK_BROWSER_BIN  compatible Chromium executable (default PATH discovery){}", env!("CARGO_PKG_VERSION"), if cfg!(debug_assertions) { "\n  RUST_LOG=overlook=debug tracing output (development builds only)" } else { "" });
         return;
     }
     init_logging();
@@ -280,6 +285,7 @@ fn main() {
     };
     tracing::debug!("startup: store open after {} ms", since_start_ms());
     single_instance::listen();
+    theme::install_omarchy_hook();
     if let Some(link) = mailto {
         single_instance::push(link);
     }

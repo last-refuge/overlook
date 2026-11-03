@@ -1,6 +1,7 @@
 //! One running Overlook per profile. A second launch with a `mailto:` link hands the link to
 //! the running instance over a Unix socket and exits; the running instance drains the queue
-//! from its UI loop.
+//! from its UI loop. `overlook --reload-theme` (Omarchy's theme-set hook) tells every running
+//! profile to re-read the desktop theme.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -11,12 +12,32 @@ use std::sync::Mutex;
 
 static PENDING: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
+/// The line that asks a running instance to re-read the desktop theme.
+pub const RELOAD_THEME: &str = "overlook:reload-theme";
+
+fn socket_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
+}
+
 fn socket_path() -> PathBuf {
     let profile = std::env::var("OVERLOOK_DATA_DIR").unwrap_or_default();
     let mut h = DefaultHasher::new();
     profile.hash(&mut h);
-    let dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    dir.join(format!("overlook-{:08x}.sock", h.finish() as u32))
+    socket_dir().join(format!("overlook-{:08x}.sock", h.finish() as u32))
+}
+
+/// Hands `line` to every running instance, whatever its profile. Stale sockets are skipped.
+pub fn broadcast(line: &str) {
+    let Ok(entries) = std::fs::read_dir(socket_dir()) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("overlook-") && name.ends_with(".sock") {
+            if let Ok(mut stream) = UnixStream::connect(entry.path()) {
+                let _ = stream.write_all(format!("{line}\n").as_bytes());
+            }
+        }
+    }
 }
 
 /// Hands `line` to a running instance. `false` when none is listening.

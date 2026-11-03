@@ -682,7 +682,6 @@ impl MailWindow {
                 "Remove this account from this device",
                 if is_gmail { "Removes local mail and sign-in, and revokes this Google account’s access for this app’s Google project on all devices. Requires internet; mail at Google is kept." } else { "Deletes downloaded mail, events, drafts, and stored sign-in for this account. Nothing is deleted at the provider." },
                 Button::new("settings-remove").danger().small().label("Remove account").on_click(cx.listener(move |this, _, window, cx| {
-                    this.close_settings(window, cx);
                     this.remove_account(remove_id.clone(), window, cx);
                 })).into_any_element(),
             ))

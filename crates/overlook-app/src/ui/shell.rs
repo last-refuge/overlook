@@ -229,10 +229,11 @@ impl MailWindow {
             for pref in AppearancePreference::ALL {
                 let this = this.clone();
                 let label = if pref == AppearancePreference::FollowSystem {
-                    match system {
-                        SystemAppearance::Dark => "Follow system (currently Dark)".to_owned(),
-                        SystemAppearance::Light => "Follow system (currently Light)".to_owned(),
-                        SystemAppearance::Unknown => "Follow system".to_owned(),
+                    match (theme::desktop_theme_name(), system) {
+                        (Some(name), _) => format!("Follow system (currently {name})"),
+                        (None, SystemAppearance::Dark) => "Follow system (currently Dark)".to_owned(),
+                        (None, SystemAppearance::Light) => "Follow system (currently Light)".to_owned(),
+                        (None, SystemAppearance::Unknown) => "Follow system".to_owned(),
                     }
                 } else {
                     pref.label().to_owned()

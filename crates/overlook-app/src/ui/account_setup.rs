@@ -83,6 +83,10 @@ pub struct AccountSetup {
     pub error: Option<String>,
     /// Outcome of "Test connection": one line per server.
     pub test_result: Vec<(bool, String)>,
+    /// The last probe: the [`connection_key`] it ran with and whether both servers
+    /// answered. Saving settings that match a failed probe is the explicit "anyway"; any
+    /// edit to a connection field clears it.
+    pub checked: Option<(u64, bool)>,
     /// Bumped per background task so a stale result is dropped.
     pub generation: u64,
     /// Explicit consent to reuse this new Fastmail account's incoming credential.
@@ -119,6 +123,32 @@ fn capitalised_local_part(email: &str) -> String {
     let local = email.split('@').next().unwrap_or(email);
     let mut chars = local.chars();
     chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_else(|| local.to_owned())
+}
+
+/// Identifies what a probe tested: both endpoints and the passwords, hashed so the setup
+/// keeps no extra copy of them.
+fn connection_key(servers: &MailServers, password: &str, out_password: Option<&str>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    format!("{:?}{:?}", servers.incoming, servers.outgoing).hash(&mut h);
+    password.hash(&mut h);
+    out_password.hash(&mut h);
+    h.finish()
+}
+
+/// Signs in to both servers (blocking; run it off the UI thread). One line per server.
+fn probe_servers(kind: ProviderKind, servers: &MailServers, password: String, out_password: Option<String>) -> Vec<(bool, String)> {
+    let (what, incoming) = if kind == ProviderKind::Pop3 {
+        let pop3 = Pop3Provider::new(servers.clone(), password.clone(), std::env::temp_dir()).with_timeout(PROBE_TIMEOUT);
+        ("Incoming (POP3)", pollster_block(pop3.probe()))
+    } else {
+        let imap = ImapProvider::new(servers.clone(), password.clone()).with_timeout(PROBE_TIMEOUT);
+        let result = pollster_block(imap.probe());
+        imap.disconnect();
+        ("Incoming (IMAP)", result)
+    };
+    let outgoing = smtp::Transport::new(servers.outgoing.clone(), out_password.unwrap_or(password)).with_timeout(PROBE_TIMEOUT).probe();
+    vec![probe_line(what, &servers.incoming, incoming), probe_line("Outgoing (SMTP)", &servers.outgoing, outgoing)]
 }
 
 /// One line of "Test connection" output.
@@ -173,7 +203,7 @@ impl MailWindow {
             SetupStep::Servers if matches!(existing, SetupMode::UpdatePassword(_)) => password.clone(),
             SetupStep::Servers => in_host.clone(),
         };
-        let subscriptions = [&in_host, &in_user].into_iter().map(|input| {
+        let mut subscriptions: Vec<Subscription> = [&in_host, &in_user].into_iter().map(|input| {
             cx.subscribe(input, |this, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
                     if let Some(setup) = this.account_setup.as_mut() {
@@ -184,6 +214,17 @@ impl MailWindow {
                 }
             })
         }).collect();
+        // Any change to what the probe tests asks for a fresh probe before saving.
+        subscriptions.extend([&email, &password, &in_host, &in_port, &in_user, &out_host, &out_port, &out_user, &out_password].into_iter().map(|input| {
+            cx.subscribe(input, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    if let Some(setup) = this.account_setup.as_mut().filter(|s| s.checked.is_some()) {
+                        setup.checked = None;
+                        cx.notify();
+                    }
+                }
+            })
+        }));
         self.account_setup = Some(AccountSetup {
             kind,
             mode: existing,
@@ -212,6 +253,7 @@ impl MailWindow {
             note: None,
             error: None,
             test_result: Vec::new(),
+            checked: None,
             generation: 0,
             connect_calendars: false,
             _subscriptions: subscriptions,
@@ -288,6 +330,7 @@ impl MailWindow {
         setup.step = SetupStep::Servers;
         setup.error = None;
         setup.test_result.clear();
+        setup.checked = None;
         let fields = [
             (setup.in_host.clone(), s.incoming.host.clone()),
             (setup.in_port.clone(), s.incoming.port.to_string()),
@@ -304,8 +347,22 @@ impl MailWindow {
         cx.notify();
     }
 
+    /// Step 2 → step 1 for a new account. Continuing again looks the servers up afresh.
+    fn setup_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(setup) = self.account_setup.as_mut() else { return };
+        setup.step = SetupStep::Basics;
+        setup.error = None;
+        setup.test_result.clear();
+        setup.checked = None;
+        setup.generation += 1;
+        let focus = setup.email.clone();
+        focus.update(cx, |i, cx| i.focus(window, cx));
+        cx.notify();
+    }
+
     fn setup_set_security(&mut self, incoming: bool, security: Security, window: &mut Window, cx: &mut Context<Self>) {
         let Some(setup) = self.account_setup.as_mut() else { return };
+        setup.checked = None;
         let incoming_protocol = setup.incoming_protocol();
         let (protocol, port_input, current) = if incoming { (incoming_protocol, setup.in_port.clone(), &mut setup.in_security) } else { (ServerProtocol::Smtp, setup.out_port.clone(), &mut setup.out_security) };
         let previous_default = protocol.default_port(*current).to_string();
@@ -322,6 +379,7 @@ impl MailWindow {
     fn setup_toggle_same_password(&mut self, same: bool, cx: &mut Context<Self>) {
         if let Some(setup) = self.account_setup.as_mut() {
             setup.same_password = same;
+            setup.checked = None;
         }
         cx.notify();
     }
@@ -431,10 +489,40 @@ impl MailWindow {
         Ok((incoming, outgoing))
     }
 
+    /// The typed settings with the passwords to use, and the key a probe of them records.
+    fn setup_prepared(&self, cx: &App) -> Result<(MailServers, String, Option<String>, u64), String> {
+        let (servers, pw, out_pw) = self.setup_servers(cx)?;
+        let (password, out_password) = self.setup_passwords(pw, out_pw)?;
+        let key = connection_key(&servers, &password, out_password.as_deref());
+        Ok((servers, password, out_password, key))
+    }
+
     fn setup_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let prepared = self.setup_servers(cx).and_then(|(servers, pw, out_pw)| self.setup_passwords(pw, out_pw).map(|p| (servers, p)));
+        self.setup_probe(false, window, cx);
+    }
+
+    /// "Add account" / "Save": settings that already passed a probe, or that failed one the
+    /// user has seen (the button then reads "anyway"), are saved at once; anything else is
+    /// probed first and saved only when both servers answer.
+    fn setup_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let prepared = self.setup_prepared(cx);
         let Some(setup) = self.account_setup.as_mut() else { return };
-        let (servers, (password, out_password)) = match prepared {
+        match prepared {
+            Ok((.., key)) if setup.checked.is_some_and(|(k, _)| k == key) => self.setup_commit(window, cx),
+            Ok(_) => self.setup_probe(true, window, cx),
+            Err(e) => {
+                setup.error = Some(e);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Signs in to both servers off the UI thread and shows the outcome; with `then_save`,
+    /// a clean result saves the account and a failure asks the user to fix it or save anyway.
+    fn setup_probe(&mut self, then_save: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let prepared = self.setup_prepared(cx);
+        let Some(setup) = self.account_setup.as_mut() else { return };
+        let (servers, password, out_password, key) = match prepared {
             Ok(v) => v,
             Err(e) => {
                 setup.error = Some(e);
@@ -444,31 +532,27 @@ impl MailWindow {
         };
         setup.error = None;
         setup.test_result.clear();
-        setup.busy = Some("Testing the connection…");
+        setup.checked = None;
+        setup.busy = Some(if then_save { "Checking the connection before saving…" } else { "Testing the connection…" });
         setup.generation += 1;
         let generation = setup.generation;
         let kind = setup.kind;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let lines = cx
-                .background_spawn(async move {
-                    let (what, incoming) = if kind == ProviderKind::Pop3 {
-                        let pop3 = Pop3Provider::new(servers.clone(), password.clone(), std::env::temp_dir()).with_timeout(PROBE_TIMEOUT);
-                        ("Incoming (POP3)", pollster_block(pop3.probe()))
-                    } else {
-                        let imap = ImapProvider::new(servers.clone(), password.clone()).with_timeout(PROBE_TIMEOUT);
-                        let result = pollster_block(imap.probe());
-                        imap.disconnect();
-                        ("Incoming (IMAP)", result)
-                    };
-                    let outgoing = smtp::Transport::new(servers.outgoing.clone(), out_password.unwrap_or(password)).with_timeout(PROBE_TIMEOUT).probe();
-                    vec![probe_line(what, &servers.incoming, incoming), probe_line("Outgoing (SMTP)", &servers.outgoing, outgoing)]
-                })
-                .await;
-            let _ = this.update_in(cx, |this, _window, cx| {
-                if let Some(setup) = this.account_setup.as_mut().filter(|s| s.generation == generation) {
-                    setup.busy = None;
-                    setup.test_result = lines;
+            let lines = cx.background_spawn(async move { probe_servers(kind, &servers, password, out_password) }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let Some(setup) = this.account_setup.as_mut().filter(|s| s.generation == generation) else { return };
+                let ok = lines.iter().all(|(ok, _)| *ok);
+                setup.busy = None;
+                setup.test_result = lines;
+                setup.checked = Some((key, ok));
+                if then_save && ok {
+                    this.setup_commit(window, cx);
+                    return;
+                }
+                if then_save {
+                    let anyway = if matches!(setup.mode, SetupMode::New) { "Add anyway" } else { "Save anyway" };
+                    setup.error = Some(format!("These settings didn’t work (details above), so the account won’t sync. Fix them, or choose {anyway}."));
                 }
                 cx.notify();
             });
@@ -477,7 +561,7 @@ impl MailWindow {
     }
 
     /// Saves the account: the same tail as finishing a Google sign-in.
-    fn setup_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn setup_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let prepared = self.setup_servers(cx).and_then(|(servers, pw, out_pw)| self.setup_passwords(pw, out_pw).map(|p| (servers, p)));
         let name = self.setup_value(cx, |s| &s.name);
         let Some(setup) = self.account_setup.as_ref() else { return };
@@ -626,8 +710,8 @@ impl MailWindow {
                 .into_any_element(),
             SetupStep::Servers => v_flex()
                 .gap(px(12.))
-                // Always shown: a new account has no way back to the first step, and the
-                // address or password may need correcting after a failed test.
+                // Always shown: the address or password may need correcting after a failed
+                // test, without going Back (which looks the servers up again).
                 .child(h_flex().gap(px(10.)).child(div().flex_1().child(field("Your name", Input::new(&setup.name).into_any_element()))).child(div().flex_1().child(field("Email address", Input::new(&setup.email).into_any_element()))))
                 .child(field("Password", Input::new(&setup.password).into_any_element()))
                 .child(divider(&p))
@@ -683,27 +767,43 @@ impl MailWindow {
                         .gap(px(8.))
                         .text_size(px(12.))
                         .child(icon(if *ok { "circle-check" } else { "circle-x" }).size(px(14.)).text_color(if *ok { p.success } else { p.error }))
-                        .child(div().flex_1().child(line.clone()))
+                        .child(div().flex_1().min_w_0().child(line.clone()))
                 }))
                 .into_any_element(),
         };
 
-        let footer = h_flex()
+        // The message gets its own wrapping line so it never pushes the buttons out of
+        // the dialog.
+        let message = setup.error.clone().map(|e| (e, p.error)).or_else(|| busy.map(|b| (b.to_owned(), p.muted)));
+        let buttons = h_flex()
             .items_center()
+            .justify_end()
+            .flex_wrap()
             .gap(px(8.))
-            .pt(px(6.))
-            .children(setup.error.clone().map(|e| div().flex_1().text_size(px(12.)).text_color(p.error).child(e)))
-            .children(busy.map(|b| div().flex_1().text_size(px(12.)).text_color(p.muted).child(b)))
-            .when(setup.error.is_none() && busy.is_none(), |d| d.child(div().flex_1()))
             .child(Button::new("setup-cancel").ghost().small().label("Cancel").on_click(cx.listener(|this, _, window, cx| this.close_account_setup(window, cx))))
             .map(|d| match setup.step {
                 SetupStep::Basics => d
                     .child(Button::new("setup-manual").small().label("Set up servers manually").disabled(busy.is_some()).on_click(cx.listener(|this, _, window, cx| this.setup_manual(window, cx))))
                     .child(Button::new("setup-continue").primary().small().label("Continue").loading(busy.is_some()).on_click(cx.listener(|this, _, window, cx| this.setup_continue(window, cx)))),
-                SetupStep::Servers => d
-                    .child(Button::new("setup-test").small().label("Test connection").disabled(busy.is_some()).on_click(cx.listener(|this, _, window, cx| this.setup_test(window, cx))))
-                    .child(Button::new("setup-save").primary().small().label(if matches!(setup.mode, SetupMode::New) { "Add account" } else { "Save" }).disabled(busy.is_some()).on_click(cx.listener(|this, _, window, cx| this.setup_save(window, cx)))),
+                SetupStep::Servers => {
+                    let is_new = matches!(setup.mode, SetupMode::New);
+                    let failed = matches!(setup.checked, Some((_, false)));
+                    let save_label = match (is_new, failed) {
+                        (true, false) => "Add account",
+                        (true, true) => "Add anyway",
+                        (false, false) => "Save",
+                        (false, true) => "Save anyway",
+                    };
+                    d.when(is_new, |d| d.child(Button::new("setup-back").ghost().small().label("Back").disabled(busy.is_some()).on_click(cx.listener(|this, _, window, cx| this.setup_back(window, cx)))))
+                        .child(Button::new("setup-test").small().label("Test connection").disabled(busy.is_some()).on_click(cx.listener(|this, _, window, cx| this.setup_test(window, cx))))
+                        .child(Button::new("setup-save").small().map(|b| if failed { b.danger() } else { b.primary() }).label(save_label).loading(busy.is_some()).disabled(busy.is_some()).on_click(cx.listener(|this, _, window, cx| this.setup_save(window, cx))))
+                }
             });
+        let footer = v_flex()
+            .gap(px(8.))
+            .pt(px(6.))
+            .children(message.map(|(text, color)| div().w_full().text_size(px(12.)).text_color(color).child(text)))
+            .child(buttons);
 
         div()
             .id("account-setup-overlay")
