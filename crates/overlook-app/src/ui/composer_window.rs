@@ -2,18 +2,28 @@
 
 use super::*;
 
+/// The main window a detached window (a composer or a folder window) belongs to. Sync,
+/// IDLE and the update checker run only there; detached windows hand that work back.
 #[derive(Clone)]
-pub(crate) struct ComposerOwner {
-    parent: Entity<MailWindow>,
-    window: AnyWindowHandle,
+pub(crate) struct WindowOwner {
+    pub(super) parent: Entity<MailWindow>,
+    pub(super) window: AnyWindowHandle,
 }
 
 pub(crate) enum WindowSetup {
     Mail(AppearancePreference),
     Composer {
         appearance: AppearancePreference,
-        owner: ComposerOwner,
+        owner: WindowOwner,
         providers: HashMap<AccountId, providers::AccountProviders>,
+    },
+    /// "Open in New Window": one folder of one account, beside the main window.
+    Folder {
+        appearance: AppearancePreference,
+        owner: WindowOwner,
+        providers: HashMap<AccountId, providers::AccountProviders>,
+        account: AccountId,
+        view: MailboxView,
     },
 }
 
@@ -110,7 +120,7 @@ impl MailWindow {
         let remote_allowed = self.remote_allowed.clone();
         let setup = WindowSetup::Composer {
             appearance: self.appearance,
-            owner: ComposerOwner {
+            owner: WindowOwner {
                 parent: cx.entity(),
                 window: window.window_handle(),
             },
@@ -249,14 +259,14 @@ impl MailWindow {
         }
     }
 
-    pub(super) fn sync_through_composer_owner(
+    pub(super) fn sync_through_owner(
         &self,
         account: &AccountId,
         delay: Duration,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(owner) = self.composer_owner.clone() else {
+        let Some(owner) = self.window_owner() else {
             return false;
         };
         let schedule = |parent: &Entity<MailWindow>, window: &mut Window, cx: &mut App| {
@@ -286,11 +296,16 @@ impl MailWindow {
         true
     }
 
-    pub(super) fn notify_composer_owner(&self, cx: &mut Context<Self>) {
-        if let Some(owner) = &self.composer_owner {
+    /// Tells the main window (and through it, the other folder windows) that this
+    /// detached window changed the store.
+    pub(super) fn notify_owner(&self, cx: &mut Context<Self>) {
+        if let Some(owner) = self.window_owner() {
             let parent = owner.parent.clone();
             cx.defer(move |cx| {
-                parent.update(cx, |this, cx| this.reload(cx));
+                parent.update(cx, |this, cx| {
+                    this.reload(cx);
+                    this.reload_folder_windows(cx);
+                });
             });
         }
     }

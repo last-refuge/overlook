@@ -45,11 +45,15 @@ pub fn label_from_json(account: &AccountId, v: &Value, sort_order: i32) -> Optio
         LabelKind::User
     };
     let display = match kind {
-        LabelKind::Inbox => "Inbox",
-        LabelKind::Sent => "Sent",
-        LabelKind::Trash => "Trash",
-        LabelKind::Spam => "Spam",
-        _ => name,
+        LabelKind::Inbox => "Inbox".to_owned(),
+        LabelKind::Sent => "Sent".to_owned(),
+        LabelKind::Trash => "Trash".to_owned(),
+        LabelKind::Spam => "Spam".to_owned(),
+        // IMAP clients (Outlook) create folders inside the Inbox as "INBOX/Name".
+        _ => match name.get(..6).filter(|p| p.eq_ignore_ascii_case("inbox/")) {
+            Some(_) => format!("Inbox/{}", &name[6..]),
+            None => name.to_owned(),
+        },
     };
     let color = v
         .get("color")
@@ -60,7 +64,7 @@ pub fn label_from_json(account: &AccountId, v: &Value, sort_order: i32) -> Optio
         id: local_label_id(account, id),
         account_id: account.clone(),
         kind,
-        name: display.to_owned(),
+        name: display,
         provider_id: Some(ProviderId(id.to_owned())),
         color,
         sort_order: if system { sort_order } else { 100 + sort_order },
@@ -256,6 +260,8 @@ mod tests {
         assert_eq!(inbox.name, "Inbox");
         assert_eq!(inbox.provider_id.as_ref().unwrap().as_str(), "INBOX");
         assert!(label_from_json(&acct, &serde_json::json!({"id":"UNREAD","name":"UNREAD","type":"system"}), 0).is_none());
+        let inside = label_from_json(&acct, &serde_json::json!({"id":"Label_9","name":"INBOX/Receipts","type":"user"}), 4).unwrap();
+        assert_eq!((inside.kind, inside.name.as_str()), (LabelKind::User, "Inbox/Receipts"));
         let user = label_from_json(&acct, &serde_json::json!({"id":"Label_7","name":"Projects","type":"user","color":{"backgroundColor":"#fb4c2f"}}), 3).unwrap();
         assert_eq!(user.kind, LabelKind::User);
         assert_eq!(user.color.as_deref(), Some("amber"));

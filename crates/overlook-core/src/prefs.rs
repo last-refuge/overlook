@@ -75,6 +75,12 @@ pub struct Prefs {
     pub show_declined_events: bool,
     // Updates
     pub check_for_updates: bool,
+    // Sidebar
+    pub sidebar_mode: crate::SidebarMode,
+    /// Account ids in the order the sidebar lists them; see `sidebar::ordered_accounts`.
+    pub account_order: Vec<crate::AccountId>,
+    /// Pinned folders; `None` until the user changes them, meaning every account's Inbox.
+    pub favorites: Option<Vec<crate::Favorite>>,
 }
 
 impl Default for Prefs {
@@ -104,6 +110,9 @@ impl Default for Prefs {
             default_reminder_minutes: 10,
             show_declined_events: false,
             check_for_updates: true,
+            sidebar_mode: crate::SidebarMode::AllAccounts,
+            account_order: Vec::new(),
+            favorites: None,
         }
     }
 }
@@ -138,6 +147,8 @@ pub struct SignatureImage {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AccountPrefs {
+    /// What the account is called in the sidebar ("Work"); empty shows the address.
+    pub name: String,
     /// The single signature of older versions; migrated into `signatures` by `normalized`.
     pub signature: String,
     pub signatures: Vec<Signature>,

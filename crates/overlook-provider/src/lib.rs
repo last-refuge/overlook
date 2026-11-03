@@ -85,6 +85,31 @@ pub struct RemoteChanges {
     /// The sync engine adds them to the persisted backlog.
     pub message_ids: Vec<ProviderId>,
     pub checkpoint: Option<String>,
+    /// Set only by [`MailProvider::verify_changes`]: every message the provider tracks for
+    /// the account (the window it downloads), with its read and starred state. The sync
+    /// engine treats anything stored that is in neither this nor `untracked` as stale,
+    /// corrects flags that differ, and downloads what it lacks.
+    pub complete: Option<Vec<RemoteState>>,
+    /// With `complete`: messages the provider holds outside the window it tracks (older mail,
+    /// or mail an online search downloaded). Stored copies of them are not stale, and the
+    /// ones not stored are not downloaded.
+    pub untracked: Vec<ProviderId>,
+}
+
+/// A folder a rename or move changed, before and after. For IMAP the id changes with the
+/// path; for Gmail only the name does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenamedFolder {
+    pub old: Label,
+    pub new: Label,
+}
+
+/// One message as a verifying check found it at the provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteState {
+    pub provider_id: ProviderId,
+    pub read: bool,
+    pub starred: bool,
 }
 
 /// What changed at the provider as a side effect of applying an operation. `Default` means
@@ -166,6 +191,13 @@ pub trait MailProvider: Send + Sync {
     /// Downloads changes since `checkpoint`.
     fn fetch_changes(&self, account: &Account, checkpoint: &str) -> BoxFuture<'_, Result<RemoteChanges, ProviderError>>;
 
+    /// Like `fetch_changes`, but checks everything instead of trusting shortcuts, and fills
+    /// `RemoteChanges::complete` so the engine can repair what drifted. Run at start-up and
+    /// when the user asks for a sync. The default is an ordinary change fetch.
+    fn verify_changes(&self, account: &Account, checkpoint: &str) -> BoxFuture<'_, Result<RemoteChanges, ProviderError>> {
+        self.fetch_changes(account, checkpoint)
+    }
+
     /// Downloads full messages for provider ids listed by a snapshot. Ids that no longer
     /// exist are skipped.
     fn fetch_messages(&self, _account: &Account, _ids: &[ProviderId], _labels: &[Label]) -> BoxFuture<'_, Result<Vec<Message>, ProviderError>> {
@@ -235,11 +267,60 @@ pub trait MailProvider: Send + Sync {
         Box::pin(async { Err(ProviderError::Rejected("this account cannot download attachments".into())) })
     }
 
+    /// Whether folders (labels) can be created, renamed and deleted from Overlook. These are
+    /// done online, not queued: the server picks the new folder's identity.
+    fn manages_folders(&self) -> bool { false }
+
+    /// Creates a user folder named `name` (one level, no delimiter), inside `parent` if given.
+    /// `labels` is the account's current list. Returns the new label as the next sync will
+    /// list it.
+    fn create_folder(&self, _account: &Account, _name: &str, _parent: Option<&Label>, _labels: &[Label]) -> BoxFuture<'_, Result<Label, ProviderError>> {
+        Box::pin(async { Err(ProviderError::Rejected("this account cannot create folders".into())) })
+    }
+
+    /// Renames the last part of a user folder's name, keeping where it is. Returns every
+    /// folder that changed: this one first, then the folders inside it, which are renamed
+    /// with it. Empty when nothing changed.
+    fn rename_folder(&self, _account: &Account, _label: &Label, _name: &str, _labels: &[Label]) -> BoxFuture<'_, Result<Vec<RenamedFolder>, ProviderError>> {
+        Box::pin(async { Err(ProviderError::Rejected("this account cannot rename folders".into())) })
+    }
+
+    /// Moves a user folder, with the folders inside it, into `parent` (a user folder or the
+    /// Inbox) or to the top level. Returns every folder that changed, like
+    /// [`MailProvider::rename_folder`].
+    fn move_folder(&self, _account: &Account, _label: &Label, _parent: Option<&Label>, _labels: &[Label]) -> BoxFuture<'_, Result<Vec<RenamedFolder>, ProviderError>> {
+        Box::pin(async { Err(ProviderError::Rejected("this account cannot move folders".into())) })
+    }
+
+    /// Deletes a user folder. IMAP deletes the messages in it; Gmail only removes the label.
+    fn delete_folder(&self, _account: &Account, _label: &Label) -> BoxFuture<'_, Result<(), ProviderError>> {
+        Box::pin(async { Err(ProviderError::Rejected("this account cannot delete folders".into())) })
+    }
+
     /// Submits a message. Only a returned receipt means "Sent".
     fn send(&self, account: &Account, draft: &Draft, context: SendContext) -> BoxFuture<'_, Result<SentReceipt, ProviderError>>;
 
     /// Determines whether an uncertain send was delivered, by Message-ID.
     fn reconcile_send(&self, account: &Account, draft: &Draft) -> BoxFuture<'_, Result<SendOutcome, ProviderError>>;
+}
+
+/// Why `name` can't be one level of a folder name, if it can't: empty, too long, or it
+/// contains the hierarchy `delimiter` (which would make nested folders instead).
+pub fn folder_name_problem(name: &str, delimiter: &str) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Some("Enter a folder name.".into());
+    }
+    if name.chars().count() > 200 {
+        return Some("That name is too long.".into());
+    }
+    if !delimiter.is_empty() && name.contains(delimiter) {
+        return Some(format!("Folder names can’t contain “{delimiter}”."));
+    }
+    if name.chars().any(char::is_control) {
+        return Some("Folder names can’t contain control characters.".into());
+    }
+    None
 }
 
 /// Deterministic Message-ID for a draft, so an interrupted send can be reconciled.

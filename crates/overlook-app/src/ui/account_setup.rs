@@ -51,6 +51,8 @@ pub struct AccountSetup {
     pub mode: SetupMode,
     pub step: SetupStep,
     pub name: Entity<InputState>,
+    /// What the sidebar calls the account ("Work"); empty shows the address.
+    pub account_name: Entity<InputState>,
     pub email: Entity<InputState>,
     pub password: Entity<InputState>,
     pub in_host: Entity<InputState>,
@@ -164,6 +166,10 @@ fn probe_line(what: &str, endpoint: &ServerEndpoint, result: Result<(), Provider
 
 impl MailWindow {
     pub(crate) fn open_account_setup(&mut self, kind: ProviderKind, mode: SetupMode, window: &mut Window, cx: &mut Context<Self>) {
+        let forwarded = mode.clone();
+        if self.in_main_window(cx, move |this, window, cx| this.open_account_setup(kind, forwarded, window, cx)) {
+            return;
+        }
         let existing = mode.clone();
         let protocol = if kind == ProviderKind::Pop3 { ServerProtocol::Pop3 } else { ServerProtocol::Imap };
         let (account, servers) = match &existing {
@@ -172,6 +178,8 @@ impl MailWindow {
         };
         let email_value = account.as_ref().map(|a| a.email.clone()).unwrap_or_default();
         let name = cx.new(|cx| InputState::new(window, cx).placeholder("Your name").default_value(account.as_ref().map(|a| a.display_name.clone()).unwrap_or_default()));
+        let saved_account_name = account.as_ref().map(|a| self.account_prefs_for(&a.id).name).unwrap_or_default();
+        let account_name = cx.new(|cx| InputState::new(window, cx).placeholder("Work, Personal… (optional)").default_value(saved_account_name));
         let email = cx.new(|cx| InputState::new(window, cx).placeholder("you@example.com").default_value(email_value.clone()));
         let password = cx.new(|cx| InputState::new(window, cx).placeholder(if matches!(existing, SetupMode::Edit(_)) { "Leave empty to keep the saved password" } else { "Password or app password" }).masked(true));
         let mut field = |cx: &mut Context<Self>, placeholder: &str, value: String| cx.new(|cx| InputState::new(window, cx).placeholder(placeholder.to_owned()).default_value(value));
@@ -230,6 +238,7 @@ impl MailWindow {
             mode: existing,
             step,
             name,
+            account_name,
             email,
             password,
             in_host,
@@ -564,6 +573,7 @@ impl MailWindow {
     fn setup_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let prepared = self.setup_servers(cx).and_then(|(servers, pw, out_pw)| self.setup_passwords(pw, out_pw).map(|p| (servers, p)));
         let name = self.setup_value(cx, |s| &s.name);
+        let account_name = self.setup_value(cx, |s| &s.account_name);
         let Some(setup) = self.account_setup.as_ref() else { return };
         let (servers, (password, out_password)) = match prepared {
             Ok(v) => v,
@@ -608,6 +618,11 @@ impl MailWindow {
         if let Err(e) = self.store.upsert_account(&account).and_then(|_| self.store.set_servers(&account.id, &servers)) {
             crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t save the account: {e}"));
             return;
+        }
+        let mut prefs = self.account_prefs_for(&account.id);
+        if prefs.name != account_name {
+            prefs.name = account_name;
+            self.save_account_prefs(&account.id, prefs, cx);
         }
         if let Err(e) = credentials::save_password(&account.id, credentials::KIND_PASSWORD_INCOMING, &password) {
             crate::ui::toast(window, cx, crate::notify::Level::Error, format!("{e} Overlook cannot sync this account without it."));
@@ -704,6 +719,7 @@ impl MailWindow {
                 } else {
                     "Overlook reads mail over IMAP and sends it over SMTP. Your password is kept in the system keyring and never written to disk by Overlook."
                 }))
+                .child(field("Account name", Input::new(&setup.account_name).into_any_element()))
                 .child(field("Your name", Input::new(&setup.name).into_any_element()))
                 .child(field("Email address", Input::new(&setup.email).into_any_element()))
                 .child(field("Password", Input::new(&setup.password).into_any_element()))
@@ -712,7 +728,8 @@ impl MailWindow {
                 .gap(px(12.))
                 // Always shown: the address or password may need correcting after a failed
                 // test, without going Back (which looks the servers up again).
-                .child(h_flex().gap(px(10.)).child(div().flex_1().child(field("Your name", Input::new(&setup.name).into_any_element()))).child(div().flex_1().child(field("Email address", Input::new(&setup.email).into_any_element()))))
+                .child(h_flex().gap(px(10.)).child(div().flex_1().child(field("Account name", Input::new(&setup.account_name).into_any_element()))).child(div().flex_1().child(field("Your name", Input::new(&setup.name).into_any_element()))))
+                .child(field("Email address", Input::new(&setup.email).into_any_element()))
                 .child(field("Password", Input::new(&setup.password).into_any_element()))
                 .child(divider(&p))
                 .children(setup.note.clone().map(|n| div().text_size(px(12.)).text_color(p.muted).child(n)))

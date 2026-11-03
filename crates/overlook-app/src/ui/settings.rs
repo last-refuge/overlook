@@ -60,6 +60,8 @@ pub struct SettingsState {
     /// Account shown on the Accounts page.
     pub account: AccountId,
     pub name_input: Entity<InputState>,
+    /// The account's sidebar name (`AccountPrefs::name`).
+    pub account_name_input: Entity<InputState>,
     /// HTML source of the signature being edited.
     pub signature: Entity<TextareaState>,
     pub signature_name: Entity<InputState>,
@@ -156,6 +158,7 @@ impl MailWindow {
         crate::notify::set_mirror(self.prefs.omarchy_notifications);
         self.reminders_enabled = self.prefs.event_reminders;
         self.reload(cx);
+        self.share_prefs(cx);
     }
 
     pub(crate) fn account_prefs_for(&self, id: &AccountId) -> AccountPrefs {
@@ -168,7 +171,7 @@ impl MailWindow {
         if let Some(s) = p.signatures.iter_mut().find(|s| s.id == id) {
             change(s);
         }
-        self.save_account_prefs(account, p);
+        self.store_account_prefs(account, p);
     }
 
     pub(super) fn select_signature(&mut self, account: &AccountId, id: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
@@ -195,7 +198,7 @@ impl MailWindow {
         if p.default_reply.is_none() {
             p.default_reply = Some(id.clone());
         }
-        self.save_account_prefs(account, p);
+        self.save_account_prefs(account, p, cx);
         self.select_signature(account, Some(id), window, cx);
         if let Some(state) = self.settings.as_ref() {
             let name = state.signature_name.clone();
@@ -212,7 +215,7 @@ impl MailWindow {
         p.signatures.retain(|s| s.id != id);
         let p = p.normalized();
         let next = p.signatures.first().map(|s| s.id.clone());
-        self.save_account_prefs(account, p);
+        self.save_account_prefs(account, p, cx);
         self.select_signature(account, next, window, cx);
     }
 
@@ -223,7 +226,7 @@ impl MailWindow {
         } else {
             p.default_new = id;
         }
-        self.save_account_prefs(account, p);
+        self.save_account_prefs(account, p, cx);
         cx.notify();
     }
 
@@ -311,12 +314,22 @@ impl MailWindow {
         .detach();
     }
 
-    pub(crate) fn save_account_prefs(&mut self, id: &AccountId, prefs: AccountPrefs) {
+    pub(crate) fn save_account_prefs(&mut self, id: &AccountId, prefs: AccountPrefs, cx: &mut Context<Self>) {
+        self.store_account_prefs(id, prefs);
+        self.share_prefs(cx);
+    }
+
+    /// Saves without telling the other windows; the next `share_prefs` carries it along.
+    pub(crate) fn store_account_prefs(&mut self, id: &AccountId, prefs: AccountPrefs) {
         self.save_setting(&format!("account_prefs:{}", id.0), &prefs);
         self.account_prefs.insert(id.clone(), prefs);
     }
 
     pub(crate) fn open_settings(&mut self, page: SettingsPage, window: &mut Window, cx: &mut Context<Self>) {
+        // Settings and accounts are managed in the main window only.
+        if self.in_main_window(cx, move |this, window, cx| this.open_settings(page, window, cx)) {
+            return;
+        }
         let account = self.account.id.clone();
         self.build_settings(page, account, window, cx);
     }
@@ -326,6 +339,7 @@ impl MailWindow {
         let acct = self.accounts.iter().find(|a| a.id == account).cloned().unwrap_or_else(|| self.account.clone());
         let ap = self.account_prefs_for(&acct.id);
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("Your name").default_value(acct.display_name.clone()));
+        let account_name_input = cx.new(|cx| InputState::new(window, cx).placeholder(acct.email.clone()).default_value(ap.name.clone()));
         let selected_signature = ap.default_new.clone().or_else(|| ap.signatures.first().map(|s| s.id.clone()));
         let selected = selected_signature.as_deref().and_then(|id| ap.signature_by_id(id)).cloned().unwrap_or_default();
         let signature = cx.new(|cx| TextareaState::new(window, cx).placeholder("<p><b>Jason Alexander</b><br>Last Refuge</p>").default_value(selected.html.clone()));
@@ -377,6 +391,18 @@ impl MailWindow {
                 cx.notify();
             }
         }));
+        let for_account = acct.id.clone();
+        subs.push(cx.subscribe_in(&account_name_input, window, move |this, state, event: &InputEvent, _window, cx| {
+            if matches!(event, InputEvent::Change) {
+                let name = state.read(cx).value().trim().to_owned();
+                let mut prefs = this.account_prefs_for(&for_account);
+                if prefs.name != name {
+                    prefs.name = name;
+                    this.save_account_prefs(&for_account, prefs, cx);
+                    cx.notify();
+                }
+            }
+        }));
         subs.push(cx.subscribe_in(&signature, window, move |this, state, event: &InputEvent, window, cx| {
             if matches!(event, InputEvent::Change) {
                 let html = state.read(cx).value().to_string();
@@ -424,6 +450,7 @@ impl MailWindow {
             scroll: ScrollHandle::new(),
             account: acct.id.clone(),
             name_input,
+            account_name_input,
             signature,
             signature_name,
             selected_signature,
@@ -752,7 +779,7 @@ impl MailWindow {
                 .when(active, |d| d.bg(p.selection))
                 .when(!active, |d| d.hover(|d| d.bg(p.hover)))
                 .child(owner_avatar(&Address::named(&a.display_name, &a.email), 28., &p))
-                .child(v_flex().flex_1().min_w_0().child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).truncate().child(a.display_name.clone())).child(div().text_size(px(11.)).text_color(p.muted).truncate().child(format!("{} · {}", a.email, a.provider.label()))))
+                .child(v_flex().flex_1().min_w_0().child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).truncate().child(self.account_name(&a.id))).child(div().text_size(px(11.)).text_color(p.muted).truncate().child(format!("{} · {}", a.email, a.provider.label()))))
                 .on_click(cx.listener(move |this, _, window, cx| this.set_settings_account(id.clone(), window, cx)))
         }));
 
@@ -763,6 +790,7 @@ impl MailWindow {
             .child(account_list)
             .child(self.add_account_menu(cx))
             .child(section(&format!("{}", account.email), Some(&connection_line)))
+            .child(setting_row("Account name", "What the sidebar calls this account. Leave empty to show the address.", Input::new(&state.account_name_input).w(px(280.)).into_any_element()))
             .child(setting_row("Your name", "Shown as the sender on messages you write.", Input::new(&state.name_input).w(px(280.)).into_any_element()))
             .child(setting_row(
                 "Status",
@@ -976,6 +1004,14 @@ impl MailWindow {
         v_flex()
             .gap(px(22.))
             .child(section("Layout", None))
+            .child(setting_row(
+                "Sidebar accounts",
+                "Show every account’s folders, or only the account you are in.",
+                choice(&[("Show all accounts", SidebarMode::AllAccounts), ("One at a time", SidebarMode::OneAccount)], prefs.sidebar_mode, cx, |this, v, _w, cx| {
+                    this.prefs.sidebar_mode = v;
+                    this.save_prefs(cx);
+                }),
+            ))
             .child(setting_row(
                 "Focused Inbox",
                 "Sort the Inbox into Focused and Other.",
@@ -1393,6 +1429,7 @@ use SettingsPage::{About as AB, Accounts as AC, Calendar as CA, General as GE, M
 
 pub(crate) static SETTINGS_INDEX: &[SettingEntry] = &[
     entry(AC, "Your accounts", "Add account", "Mail and calendar accounts on this device.", "gmail imap pop3 new"),
+    entry(AC, "Account", "Account name", "What the sidebar calls this account.", "label nickname title sidebar"),
     entry(AC, "Account", "Your name", "Shown as the sender on messages you write.", "display name from sender"),
     entry(AC, "Account", "Status", "Sync state, sign-in and server settings.", "sync now sign in server settings connection password"),
     entry(AC, "Account", "Calendar server", "CalDAV calendars for this account.", "caldav calendar"),
@@ -1415,6 +1452,7 @@ pub(crate) static SETTINGS_INDEX: &[SettingEntry] = &[
     entry(GE, "Notifications", "New mail", "Desktop notification when new mail arrives.", "notifications alert focused"),
     entry(GE, "Notifications", "Event reminders", "Desktop notification before events start.", "notifications alert reminder"),
     entry(GE, "Synchronization", "Check for changes every", "How often Overlook looks for new mail and events.", "sync interval refresh poll frequency"),
+    entry(MA, "Layout", "Sidebar accounts", "Show every account’s folders, or only the account you are in.", "sidebar all accounts one at a time folders tree"),
     entry(MA, "Layout", "Focused Inbox", "Sort the Inbox into Focused and Other.", "other inbox sort"),
     entry(MA, "Layout", "Sender pictures", "Show initials next to each conversation.", "avatars initials photos"),
     entry(MA, "Layout", "Message preview text", "Show the first line of each conversation in the list.", "snippet preview"),

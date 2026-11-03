@@ -3,7 +3,7 @@
 use super::api::{ApiError, GmailClient};
 use super::mapping::{self, base64url_encode, gmail_id, label_from_json, message_from_json};
 use crate::outgoing::build_gmail_raw as build_raw;
-use crate::{draft_message_id, AppliedChanges, BoxFuture, MailProvider, MailboxSnapshot, ProviderError, RemoteChanges, SendContext, SendOutcome, SentReceipt};
+use crate::{draft_message_id, folder_name_problem, AppliedChanges, BoxFuture, MailProvider, MailboxSnapshot, ProviderError, RemoteChanges, RenamedFolder, SendContext, SendOutcome, SentReceipt};
 use overlook_core::time::Timestamp;
 use overlook_core::*;
 use serde_json::{json, Value};
@@ -162,6 +162,36 @@ impl GmailProvider {
             .iter()
             .filter_map(|m| m.provider_id.as_ref().map(|p| p.0.clone()).or_else(|| gmail_id(&account.id, m.id.as_str())))
             .collect()
+    }
+}
+
+/// The user labels nested inside `label` (Gmail nests by "/" in the name).
+fn labels_inside(label: &Label, labels: &[Label]) -> Vec<Label> {
+    let prefix = format!("{}/", label.name);
+    labels.iter().filter(|l| l.kind == LabelKind::User && l.id != label.id && l.name.starts_with(&prefix)).cloned().collect()
+}
+
+impl GmailProvider {
+    /// Renames `label` to `target` and the labels `inside` it to match: Gmail nests by name
+    /// and does not rename children itself. Returns every label renamed, `label` first. A
+    /// child that fails is logged and left under its old name, as the server has it.
+    fn rename_with_children(&self, account: &Account, label: &Label, target: &str, inside: Vec<Label>) -> Result<Vec<RenamedFolder>, ProviderError> {
+        let id = label.provider_id.as_ref().ok_or_else(|| ProviderError::Rejected("only your own labels can be renamed".into()))?;
+        let v = with_inbox_spelling(target, |name| self.client.patch(&format!("labels/{}", id.0), &json!({ "name": name })))?;
+        let renamed = label_from_json(&account.id, &v, label.sort_order).ok_or_else(|| ProviderError::Temporary("Gmail did not return the renamed label".into()))?;
+        let mut changed = vec![RenamedFolder { old: label.clone(), new: renamed.clone() }];
+        for child in inside {
+            let Some(child_id) = child.provider_id.as_ref() else { continue };
+            let name = format!("{}{}", renamed.name, &child.name[label.name.len()..]);
+            match with_inbox_spelling(&name, |name| self.client.patch(&format!("labels/{}", child_id.0), &json!({ "name": name }))) {
+                Ok(v) => match label_from_json(&account.id, &v, child.sort_order) {
+                    Some(new) => changed.push(RenamedFolder { old: child, new }),
+                    None => warn!("gmail: no label returned for {} after renaming it", child.name),
+                },
+                Err(e) => warn!("gmail: could not rename label {} with its parent: {e:?}", child.name),
+            }
+        }
+        Ok(changed)
     }
 }
 
@@ -493,6 +523,8 @@ impl MailProvider for GmailProvider {
                 message_ids: Vec::new(),
                 deleted_provider_ids: Vec::new(),
                 checkpoint: Some(new_checkpoint),
+                complete: None,
+                untracked: Vec::new(),
             })
         })
     }
@@ -541,6 +573,8 @@ impl MailProvider for GmailProvider {
                     }
                 }
                 OperationKind::SendDraft { .. } => return Err(ProviderError::Rejected("sends go through send()".into())),
+                // Needs the full mail.google.com scope, which Overlook does not request.
+                OperationKind::DeleteForever { .. } => return Err(ProviderError::Rejected("Gmail messages can only be moved to Trash".into())),
                 kind if kind.is_calendar() => return Err(ProviderError::Rejected("calendar operations go through the calendar provider".into())),
                 _ => {}
             }
@@ -611,6 +645,98 @@ impl MailProvider for GmailProvider {
             message.is_read = true;
             message.is_outgoing = true;
             Ok(SentReceipt { provider_id: ProviderId(id), rfc_message_id: Some(rfc_id), message })
+        })
+    }
+
+    fn manages_folders(&self) -> bool {
+        true
+    }
+
+    fn create_folder(&self, account: &Account, name: &str, parent: Option<&Label>, labels: &[Label]) -> BoxFuture<'_, Result<Label, ProviderError>> {
+        let account = account.clone();
+        let full = match parent {
+            Some(p) => format!("{}/{}", p.name, name.trim()),
+            None => name.trim().to_owned(),
+        };
+        let leaf_ok = folder_name_problem(name, "/");
+        let order = labels.len() as i32;
+        Box::pin(async move {
+            if let Some(problem) = leaf_ok {
+                return Err(ProviderError::Rejected(problem));
+            }
+            let v = with_inbox_spelling(&full, |name| self.client.post("labels", &json!({ "name": name, "labelListVisibility": "labelShow", "messageListVisibility": "show" })))?;
+            label_from_json(&account.id, &v, order).ok_or_else(|| ProviderError::Temporary("Gmail did not return the new label".into()))
+        })
+    }
+
+    fn rename_folder(&self, account: &Account, label: &Label, name: &str, labels: &[Label]) -> BoxFuture<'_, Result<Vec<RenamedFolder>, ProviderError>> {
+        let account = account.clone();
+        let label = label.clone();
+        let problem = folder_name_problem(name, "/");
+        // Gmail nests by "/" in the name: keep the parent part, replace the last.
+        let full = match label.name.rsplit_once('/') {
+            Some((parent, _)) => format!("{parent}/{}", name.trim()),
+            None => name.trim().to_owned(),
+        };
+        let inside = labels_inside(&label, labels);
+        let clash = labels.iter().any(|l| l.id != label.id && l.name.eq_ignore_ascii_case(&full));
+        Box::pin(async move {
+            if let Some(problem) = problem {
+                return Err(ProviderError::Rejected(problem));
+            }
+            if label.provider_id.is_none() || label.kind != LabelKind::User {
+                return Err(ProviderError::Rejected("only your own labels can be renamed".into()));
+            }
+            if full == label.name {
+                return Ok(Vec::new());
+            }
+            if clash {
+                return Err(ProviderError::Rejected(format!("There is already a label called “{full}”.")));
+            }
+            self.rename_with_children(&account, &label, &full, inside)
+        })
+    }
+
+    fn move_folder(&self, account: &Account, label: &Label, parent: Option<&Label>, labels: &[Label]) -> BoxFuture<'_, Result<Vec<RenamedFolder>, ProviderError>> {
+        let account = account.clone();
+        let label = label.clone();
+        let leaf = label.name.rsplit('/').next().unwrap_or(&label.name).to_owned();
+        let target = match parent {
+            Some(p) if matches!(p.kind, LabelKind::User | LabelKind::Inbox) => Ok(format!("{}/{leaf}", p.name)),
+            Some(_) => Err(ProviderError::Rejected("labels can go only inside your own labels or the Inbox".into())),
+            None => Ok(leaf.clone()),
+        };
+        let inside = labels_inside(&label, labels);
+        let taken = |name: &str| labels.iter().any(|l| l.id != label.id && l.name.eq_ignore_ascii_case(name));
+        let clash = target.as_ref().ok().filter(|t| taken(t)).cloned();
+        Box::pin(async move {
+            let target = target?;
+            if label.provider_id.is_none() || label.kind != LabelKind::User {
+                return Err(ProviderError::Rejected("only your own labels can be moved".into()));
+            }
+            if target.eq_ignore_ascii_case(&label.name) {
+                return Ok(Vec::new());
+            }
+            if target.to_ascii_lowercase().starts_with(&format!("{}/", label.name.to_ascii_lowercase())) {
+                return Err(ProviderError::Rejected(format!("“{}” can’t go inside itself.", label.name)));
+            }
+            if let Some(name) = clash {
+                return Err(ProviderError::Rejected(format!("There is already a label called “{name}”.")));
+            }
+            self.rename_with_children(&account, &label, &target, inside)
+        })
+    }
+
+    fn delete_folder(&self, _account: &Account, label: &Label) -> BoxFuture<'_, Result<(), ProviderError>> {
+        let label = label.clone();
+        Box::pin(async move {
+            let Some(id) = label.provider_id.as_ref().filter(|_| label.kind == LabelKind::User) else {
+                return Err(ProviderError::Rejected("only your own labels can be deleted".into()));
+            };
+            match self.client.delete(&format!("labels/{}", id.0)) {
+                Ok(_) | Err(ApiError::NotFound) => Ok(()),
+                Err(e) => Err(e.into()),
+            }
         })
     }
 
@@ -722,4 +848,17 @@ pub fn person_json(c: &Contact, etag: Option<&str>) -> Value {
         None => json!([]),
     };
     body
+}
+
+/// Gmail has no folders inside the Inbox, but a label named "Inbox/Name" is what IMAP
+/// clients such as Outlook create there and show under the Inbox. "INBOX" is a reserved
+/// label name, so try "Inbox/…" first and the IMAP spelling "INBOX/…" if Google refuses it.
+fn with_inbox_spelling(full: &str, mut call: impl FnMut(&str) -> Result<serde_json::Value, ApiError>) -> Result<serde_json::Value, ApiError> {
+    let Some(rest) = full.get(..6).filter(|p| p.eq_ignore_ascii_case("inbox/")).map(|_| &full[6..]) else {
+        return call(full);
+    };
+    match call(&format!("Inbox/{rest}")) {
+        Err(ApiError::Client(400, _)) => call(&format!("INBOX/{rest}")),
+        other => other,
+    }
 }

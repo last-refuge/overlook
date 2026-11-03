@@ -80,6 +80,9 @@ impl MailWindow {
             entry("Go to Calendar", Some("Ctrl+2"), PaletteCommand::Module(Module::Calendar)),
             entry("Go to Contacts", Some("Ctrl+3"), PaletteCommand::Module(Module::Contacts)),
         ];
+        if self.renamable_open_folder().is_some() {
+            out.push(entry("Rename folder", Some("F2"), action(Box::new(RenameFolder))));
+        }
         for (name, kind) in [
             ("Inbox", LabelKind::Inbox),
             ("Starred", LabelKind::Starred),

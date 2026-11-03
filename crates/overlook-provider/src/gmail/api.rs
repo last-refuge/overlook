@@ -205,6 +205,10 @@ impl GmailClient {
         self.put_url(&format!("{}/{path}", self.api_base), body)
     }
 
+    pub fn patch(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
+        self.patch_url(&format!("{}/{path}", self.api_base), body)
+    }
+
     pub fn delete(&self, path: &str) -> Result<serde_json::Value, ApiError> {
         self.delete_url(&format!("{}/{path}", self.api_base))
     }

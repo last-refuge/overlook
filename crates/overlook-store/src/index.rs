@@ -128,6 +128,28 @@ impl MailIndex {
         out
     }
 
+    /// Every message filed in the mailbox of `kind` (Trash, Junk…), for "Empty Folder". Only
+    /// messages carrying that label count, not the rest of their conversations.
+    pub fn messages_labelled(&self, kind: LabelKind) -> Vec<MessageId> {
+        let Some(label) = self.label_of_kind(kind) else { return Vec::new() };
+        self.by_conv.values().flatten().filter(|m| m.has_label(&label)).map(|m| m.id.clone()).collect()
+    }
+
+    /// The unread messages shown in a view, for "Mark All as Read". Like the list, a
+    /// conversation's trashed messages count only in Trash.
+    pub fn unread_in(&self, owner_email: &str, view: &MailboxView) -> Vec<MessageId> {
+        let trash = self.label_of_kind(LabelKind::Trash);
+        let in_trash = |m: &Message| trash.as_ref().is_some_and(|t| m.has_label(t));
+        let trash_view = matches!(view, MailboxView::Kind(LabelKind::Trash));
+        self.conversations(owner_email, view, ListFilter::Unread, None)
+            .iter()
+            .filter_map(|c| self.by_conv.get(&c.id))
+            .flatten()
+            .filter(|m| !m.is_read && in_trash(m) == trash_view)
+            .map(|m| m.id.clone())
+            .collect()
+    }
+
     /// Unread conversation count for Inbox and labels, conversation count otherwise, for
     /// sidebar badges.
     pub fn view_count(&self, owner_email: &str, view: &MailboxView, focus: Option<FocusTab>) -> usize {
@@ -189,6 +211,18 @@ impl MailIndex {
         let inbox = self.label_of_kind(LabelKind::Inbox);
         let trash = self.label_of_kind(LabelKind::Trash);
         let ids = change.message_ids().to_vec();
+        if let LocalChange::DeleteForever { .. } = change {
+            for id in &ids {
+                let Some(conv) = self.conv_of.remove(id) else { continue };
+                if let Some(msgs) = self.by_conv.get_mut(&conv) {
+                    msgs.retain(|m| &m.id != id);
+                    if msgs.is_empty() {
+                        self.by_conv.remove(&conv);
+                    }
+                }
+            }
+            return;
+        }
         for id in &ids {
             let Some(conv) = self.conv_of.get(id) else { continue };
             let Some(m) = self.by_conv.get_mut(conv).and_then(|msgs| msgs.iter_mut().find(|m| &m.id == id)) else { continue };
@@ -226,5 +260,7 @@ pub fn apply_to_message(m: &mut Message, change: &LocalChange, inbox: Option<&La
                 m.label_ids.insert(i.clone());
             }
         }
+        // Removed from the index by `MailIndex::apply`; nothing to change on the message.
+        LocalChange::DeleteForever { .. } => {}
     }
 }

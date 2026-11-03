@@ -6,10 +6,13 @@ mod calendar_setup;
 mod calendar_changes;
 mod composer;
 mod composer_window;
+mod folder_manage;
+mod folder_window;
 mod contact_card;
 mod contacts;
 mod mail_highlight;
 mod palette;
+mod prompt;
 mod list;
 mod settings;
 mod signature;
@@ -102,6 +105,7 @@ actions!(
         ToggleMessageHistory,
         PopOutComposer,
         FocusSettingsSearch,
+        RenameFolder,
     ]
 );
 
@@ -157,6 +161,7 @@ pub struct AppearanceGlobal(pub AppearancePreference);
 impl Global for AppearanceGlobal {}
 
 pub fn init(cx: &mut App) {
+    prompt::init(cx);
     cx.bind_keys([
         KeyBinding::new("ctrl-n", Compose, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-e", FocusSearch, Some(WINDOW_CONTEXT)),
@@ -171,6 +176,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-f", Forward, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-u", ToggleRead, Some(WINDOW_CONTEXT)),
         KeyBinding::new("f5", SyncNow, Some(WINDOW_CONTEXT)),
+        KeyBinding::new("f2", RenameFolder, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-1", SwitchToMail, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-2", SwitchToCalendar, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-3", SwitchToContacts, Some(WINDOW_CONTEXT)),
@@ -217,11 +223,16 @@ pub struct Nav {
     pub icon: &'static str,
     pub view: MailboxView,
     pub color: Option<Hsla>,
+    /// How many levels in the folder tree this row sits (0: top level).
+    pub depth: usize,
+    /// A disclosure arrow for the folders under this row: the `collapsed_sections` key that
+    /// remembers it, and whether they are hidden.
+    pub expander: Option<(String, bool)>,
 }
 
 impl Nav {
     pub fn view(label: &str, icon: &'static str, view: MailboxView) -> Self {
-        Self { label: label.to_owned().into(), icon, view, color: None }
+        Self { label: label.to_owned().into(), icon, view, color: None, depth: 0, expander: None }
     }
 }
 
@@ -268,6 +279,50 @@ pub enum OnlineSearch {
 pub enum DraggedMail {
     Conversation(ConversationId),
     Messages(Vec<MessageId>),
+}
+
+/// The sidebar badges of one account, from its index. Every window and every account uses
+/// this, so the same mailbox shows the same numbers wherever it appears.
+pub(crate) fn sidebar_counts(index: &MailIndex, owner: &str, focused_enabled: bool) -> HashMap<MailboxView, usize> {
+    let mut counts = HashMap::new();
+    for view in [MailboxView::Kind(LabelKind::Inbox), MailboxView::Kind(LabelKind::Starred)]
+        .into_iter()
+        .chain(index.labels().iter().filter(|l| l.kind == LabelKind::User).map(|l| MailboxView::Label(l.id.clone())))
+    {
+        let focus = if view == MailboxView::Kind(LabelKind::Inbox) && focused_enabled { Some(FocusTab::Focused) } else { None };
+        let n = index.view_count(owner, &view, focus);
+        counts.insert(view, n);
+    }
+    counts
+}
+
+/// An account header being dragged to a new place in the sidebar.
+#[derive(Clone, Debug)]
+pub struct AccountDrag {
+    pub account: AccountId,
+    pub name: String,
+}
+
+/// A Favorites row being dragged to a new place in Favorites.
+#[derive(Clone, Debug)]
+pub struct FavoriteDrag {
+    pub favorite: Favorite,
+    pub name: String,
+}
+
+/// One of the account's own folders being dragged onto another folder, the Inbox or the
+/// account (top level).
+#[derive(Clone, Debug)]
+pub struct FolderDrag {
+    pub account: AccountId,
+    pub label: Label,
+}
+
+impl FolderDrag {
+    /// Whether dropping on `target` (`None`: the account's top level) of `account` is a move.
+    pub fn fits(&self, account: &AccountId, target: Option<&Label>) -> bool {
+        &self.account == account && target.is_none_or(|t| t.id != self.label.id) && overlook_core::sidebar::can_move_folder(&self.label.name, target.map(|t| t.name.as_str()))
+    }
 }
 
 /// A conversation being dragged from the list onto the sidebar.
@@ -536,16 +591,32 @@ pub struct MailWindow {
     pub(crate) browser_bodies: std::cell::RefCell<HashMap<String, (u64, usize, Entity<crate::browser_body::BrowserBody>)>>,
 
     composer: Option<Composer>,
-    composer_owner: Option<composer_window::ComposerOwner>,
+    /// Set in a pop-out composer window: the main window it belongs to.
+    composer_owner: Option<composer_window::WindowOwner>,
     detached_composers: HashMap<DraftId, composer_window::DetachedComposer>,
+    /// Set in a folder window ("Open in New Window"): the main window it belongs to.
+    folder_owner: Option<composer_window::WindowOwner>,
+    /// In the main window: the folder windows opened from it.
+    folder_windows: Vec<folder_window::FolderWindow>,
+    /// The New/Rename folder dialog, when open.
+    folder_prompt: Option<folder_manage::FolderPrompt>,
     appearance: AppearancePreference,
     density: Density,
     reading_pane: ReadingPane,
     toolbar_layouts: overlook_core::toolbar::ToolbarLayouts,
     toolbar_more_open: bool,
     toolbar_editing: bool,
-    /// Sidebar sections the user collapsed ("favorites", "labels"); persisted.
+    /// Sidebar sections the user collapsed ("favorites", "account:<id>"); persisted.
     collapsed_sections: HashSet<String>,
+    /// Folders of the accounts other than the active one, for the sidebar's account tree.
+    /// The active account's are `labels`.
+    account_labels: HashMap<AccountId, Vec<Label>>,
+    /// Sidebar badges of the accounts other than the active one (the active one's are
+    /// `counts`), including Drafts and Outbox; recounted in the background on every reload.
+    account_counts: HashMap<AccountId, HashMap<MailboxView, usize>>,
+    /// A recount is running; `account_counts_again` asks for one more when it ends.
+    account_counts_running: bool,
+    account_counts_again: bool,
     /// Focused Inbox: enabled per profile, with the selected tab.
     focused_enabled: bool,
     inbox_tab: FocusTab,
@@ -604,6 +675,11 @@ pub struct MailWindow {
 
     syncing: HashSet<AccountId>,
     sync_requested: HashSet<AccountId>,
+    /// Accounts whose next sync checks everything against the server and repairs drift:
+    /// all of them at start-up, and every one when the Sync button is pressed.
+    verify_pending: HashSet<AccountId>,
+    /// Checks the user asked for (the Sync button), whose result is shown.
+    verify_announce: HashSet<AccountId>,
     /// Earliest time (unix ms) a background sync may start again, per account, after a
     /// temporary failure or rate limit. Manual Sync now ignores it.
     next_retry: HashMap<AccountId, i64>,
@@ -623,11 +699,17 @@ impl MailWindow {
     ) -> Self {
         tracing::debug!("startup: window opening after {} ms", crate::since_start_ms());
         let account = accounts.iter().find(|a| Some(&a.id) == active.as_ref()).or_else(|| accounts.first()).cloned().unwrap_or_else(no_account);
-        let (appearance, composer_owner, shared_providers) = match setup {
-            WindowSetup::Mail(appearance) => (appearance, None, None),
-            WindowSetup::Composer { appearance, owner, providers } => (appearance, Some(owner), Some(providers)),
+        let (appearance, composer_owner, folder_owner, shared_providers, folder) = match setup {
+            WindowSetup::Mail(appearance) => (appearance, None, None, None, None),
+            WindowSetup::Composer { appearance, owner, providers } => (appearance, Some(owner), None, Some(providers), None),
+            WindowSetup::Folder { appearance, owner, providers, account, view } => (appearance, None, Some(owner), Some(providers), Some((account, view))),
         };
-        let detached = composer_owner.is_some();
+        let detached = composer_owner.is_some() || folder_owner.is_some();
+        // A folder window opens on its own account, whatever the main window shows.
+        let account = match &folder {
+            Some((id, _)) => accounts.iter().find(|a| &a.id == id).cloned().unwrap_or(account),
+            None => account,
+        };
         let mut providers: HashMap<AccountId, providers::AccountProviders> = shared_providers.unwrap_or_default();
         let mut provider_issues = HashMap::new();
         for a in accounts.iter().filter(|_| !detached) {
@@ -774,6 +856,9 @@ impl MailWindow {
             composer: None,
             composer_owner,
             detached_composers: HashMap::new(),
+            folder_owner,
+            folder_windows: Vec::new(),
+            folder_prompt: None,
             appearance,
             density,
             reading_pane,
@@ -781,6 +866,10 @@ impl MailWindow {
             toolbar_more_open: false,
             toolbar_editing: false,
             collapsed_sections,
+            account_labels: HashMap::new(),
+            account_counts: HashMap::new(),
+            account_counts_running: false,
+            account_counts_again: false,
             focused_enabled,
             inbox_tab: FocusTab::Focused,
             downloading: HashSet::new(),
@@ -835,16 +924,32 @@ impl MailWindow {
             content_panes_v: cx.new(|_| ResizableState::default()),
             syncing: HashSet::new(),
             sync_requested: HashSet::new(),
+            verify_pending: HashSet::new(),
+            verify_announce: HashSet::new(),
             next_retry: HashMap::new(),
             retry_attempts: HashMap::new(),
             _subscriptions: subs,
         };
         // A composer shares providers and the store, but never starts a second
         // synchronization loop, IDLE watcher, reminder service or update checker.
+        if let Some((_, view)) = folder {
+            this.module = Module::Mail;
+            this.select_view(view, window, cx);
+            this.focus_current_module(window, cx);
+            return this;
+        }
         if detached {
             this.reload_contacts();
             return this;
         }
+        // Folder windows go when the main window goes.
+        let main_window = window.window_handle().window_id();
+        let me = cx.weak_entity();
+        this._subscriptions.push(cx.on_window_closed(move |cx, closed| {
+            if closed == main_window {
+                me.update(cx, |this, cx| this.close_folder_windows(cx)).ok();
+            }
+        }));
         // The watchdog reports any stall of this thread (see `watchdog.rs`).
         crate::watchdog::start();
         cx.spawn(async move |_, cx| loop {
@@ -872,6 +977,8 @@ impl MailWindow {
         this.focus_current_module(window, cx);
         // Synchronize on startup for every reachable account; queued work from a previous
         // session is replayed before anything else happens.
+        // A fresh start checks every account's folders and messages against the server once.
+        this.verify_pending = this.accounts.iter().map(|a| a.id.clone()).collect();
         this.sync_all(window, cx);
         // IMAP IDLE: one thread per account asks for a sync the moment the Inbox changes.
         this.watch_idle_events(idle_rx, window, cx);
@@ -1047,7 +1154,10 @@ impl MailWindow {
             self.close_composer(window, cx);
         }
         self.account = account;
-        self.save_setting("active_account", &id);
+        // The account a folder window shows is not the one the app opens with next time.
+        if self.folder_owner.is_none() {
+            self.save_setting("active_account", &id);
+        }
         self.view = MailboxView::Kind(LabelKind::Inbox);
         self.filter = ListFilter::All;
         self.selected = None;
@@ -1348,6 +1458,10 @@ impl MailWindow {
     // ------------------------------------------------------------ Google sign-in
 
     pub(crate) fn start_google_sign_in(&mut self, hint: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let forwarded = hint.clone();
+        if self.in_main_window(cx, move |this, window, cx| this.start_google_sign_in(forwarded, window, cx)) {
+            return;
+        }
         if self.signin.is_some() {
             crate::ui::toast(window, cx, crate::notify::Level::Info, "Finish the sign-in that is already open in your browser, or cancel it first.");
             return;
@@ -1478,6 +1592,12 @@ impl MailWindow {
             // refresh it in the background; read it here only the first time.
             let previous = std::mem::take(&mut self.mail_index);
             if let Some(old) = self.mail_index_account.take() {
+                // Until the background recount lands, the account just left keeps the badges
+                // it had a moment ago rather than older ones.
+                let mut counts = self.counts.clone();
+                counts.insert(MailboxView::Kind(LabelKind::Drafts), self.drafts.len());
+                counts.insert(MailboxView::Kind(LabelKind::Outbox), self.outbox.len());
+                self.account_counts.insert(old.clone(), counts);
                 self.other_indexes.insert(old, previous);
             }
             match self.other_indexes.remove(&acct) {
@@ -1498,6 +1618,8 @@ impl MailWindow {
         self.refresh_mail();
         self.reload_drafts();
         self.status = self.store.account_status(&acct).unwrap_or_default();
+        self.reload_account_labels();
+        self.refresh_account_counts(cx);
         self.load_thread(cx);
         self.reload_calendar();
         self.reload_contacts();
@@ -1518,16 +1640,7 @@ impl MailWindow {
         self.list_data_generation += 1;
         // Search coverage counts cached bodies, a full scan: only worth it while searching.
         self.search_coverage = if self.search_query.trim().is_empty() { String::new() } else { self.search_coverage_line(&acct) };
-        let mut counts = HashMap::new();
-        for view in [MailboxView::Kind(LabelKind::Inbox), MailboxView::Kind(LabelKind::Starred)]
-            .into_iter()
-            .chain(self.labels.iter().filter(|l| l.kind == LabelKind::User).map(|l| MailboxView::Label(l.id.clone())))
-        {
-            let focus = if view == MailboxView::Kind(LabelKind::Inbox) && self.focused_enabled { Some(FocusTab::Focused) } else { None };
-            let n = self.mail_index.view_count(&owner, &view, focus);
-            counts.insert(view, n);
-        }
-        self.counts = counts;
+        self.counts = sidebar_counts(&self.mail_index, &owner, self.focused_enabled);
         if let Some(sel) = &self.selected {
             if !self.conversations.iter().any(|c| &c.id == sel) && self.search_query.is_empty() {
                 // The selected conversation left this view (archived, trashed, filtered).
@@ -1667,6 +1780,7 @@ impl MailWindow {
         self.save_setting("focused_inbox", &self.focused_enabled);
         self.inbox_tab = FocusTab::Focused;
         self.reload(cx);
+        self.share_focused_inbox(cx);
     }
 
     /// Moves the selected conversation to Focused or Other. With `always`, future mail from
@@ -2338,6 +2452,12 @@ impl MailWindow {
                         this.sync_account(acct, window, cx);
                     }
                 }
+                // Show the change in the other windows now rather than after the sync.
+                if this.folder_owner.is_some() {
+                    this.notify_owner(cx);
+                } else {
+                    this.reload_folder_windows(cx);
+                }
                 cx.notify();
             });
         })
@@ -2681,16 +2801,36 @@ impl MailWindow {
 
     /// Syncs the active account (manual: ignores the retry pause).
 
+    /// The Sync button: every account syncs now (ignoring retry pauses) and checks all its
+    /// folders and messages against the server, repairing whatever drifted.
     pub(crate) fn sync_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let id = self.account.id.clone();
-        self.sync_caldav_account(id.clone(), true, cx);
-        self.next_retry.remove(&id);
-        self.sync_account(id, window, cx);
+        if let Some(owner) = self.window_owner() {
+            let parent = owner.parent.clone();
+            owner.window.update(cx, |_, window, cx| parent.update(cx, |this, cx| this.sync_now(window, cx))).ok();
+            return;
+        }
+        let active = self.account.id.clone();
+        self.sync_caldav_account(active.clone(), true, cx);
+        let ids: Vec<AccountId> = self.accounts.iter().map(|a| a.id.clone()).collect();
+        for id in ids {
+            self.verify_pending.insert(id.clone());
+            self.next_retry.remove(&id);
+            if id == active || self.connected(&id) {
+                self.verify_announce.insert(id.clone());
+                self.sync_account(id, window, cx);
+            }
+        }
     }
 
     /// Syncs every reachable account that is not in a retry pause. One account never
     /// blocks another.
     pub(crate) fn sync_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Only the main window syncs; composer and folder windows hand the request over.
+        if let Some(owner) = self.window_owner() {
+            let parent = owner.parent.clone();
+            owner.window.update(cx, |_, window, cx| parent.update(cx, |this, cx| this.sync_all(window, cx))).ok();
+            return;
+        }
         self.expire_idle_sessions(window, cx);
         for id in self.accounts.iter().map(|a| a.id.clone()).collect::<Vec<_>>() {
             self.sync_caldav_account(id, false, cx);
@@ -2708,6 +2848,11 @@ impl MailWindow {
     }
 
     pub(crate) fn sync_account(&mut self, id: AccountId, window: &mut Window, cx: &mut Context<Self>) {
+        // Detached windows share the providers but not the single-flight sync state, so a
+        // sync started here could run twice at once.
+        if self.sync_through_owner(&id, Duration::ZERO, window, cx) {
+            return;
+        }
         let Some(account) = self.accounts.iter().find(|a| a.id == id).cloned() else { return };
         let Some(bundle) = self.providers.get(&id).cloned() else {
             let _ = self.store.set_sync_state(&id, &SyncState::SignInRequired, None);
@@ -2720,11 +2865,12 @@ impl MailWindow {
         }
         self.syncing.insert(id.clone());
         self.sync_requested.remove(&id);
+        let verify = self.verify_pending.remove(&id);
         let store = self.store.clone();
         let first_download = store.message_count(&id).unwrap_or(0) == 0;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let outcome: SyncOutcome = cx.background_spawn(run_sync(store, bundle.mail, bundle.calendar, account.clone())).await;
+            let outcome: SyncOutcome = cx.background_spawn(run_sync(store, bundle.mail, bundle.calendar, account.clone(), verify)).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 crate::watchdog::mark("sync finished");
                 this.syncing.remove(&account.id);
@@ -2756,6 +2902,20 @@ impl MailWindow {
                     }
                 }
                 this.reload(cx);
+                this.reload_folder_windows(cx);
+                if verify && !outcome.verified {
+                    // Offline or failed before the check ran: check on the next sync instead.
+                    this.verify_pending.insert(account.id.clone());
+                } else if verify && this.verify_announce.remove(&account.id) {
+                    if outcome.repaired > 0 {
+                        let n = outcome.repaired;
+                        crate::ui::toast(window, cx, crate::notify::Level::Info, format!("Sync check fixed {n} {} in {}.", if n == 1 { "item" } else { "items" }, this.account_name(&account.id)));
+                    } else if account.id == this.account.id {
+                        // Only a compared list proves the store matches; other providers just synced.
+                        let message = if outcome.compared { format!("{} is in sync with the server.", this.account_name(&account.id)) } else { format!("Synced {}.", this.account_name(&account.id)) };
+                        crate::ui::toast(window, cx, crate::notify::Level::Success, message);
+                    }
+                }
                 if outcome.draft_conflicts > 0 {
                     crate::ui::toast(window, cx, crate::notify::Level::Warning, "A draft changed on another device. Your work was preserved; review Drafts and the Outbox before sending.");
                 }
@@ -2827,6 +2987,8 @@ impl MailWindow {
     fn on_escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
         if self.palette.is_some() {
             self.close_palette(window, cx);
+        } else if self.folder_prompt.is_some() {
+            self.close_folder_prompt(window, cx);
         } else if self.account_setup.is_some() {
             self.close_account_setup(window, cx);
         } else if self.quick_look.is_some() {
@@ -2999,6 +3161,20 @@ impl MailWindow {
     }
     fn on_sync_now(&mut self, _: &SyncNow, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_now(window, cx);
+    }
+    /// F2 renames the open folder, when it is one of the account's own folders.
+    fn on_rename_folder(&mut self, _: &RenameFolder, window: &mut Window, cx: &mut Context<Self>) {
+        if self.folder_prompt.is_some() {
+            return;
+        }
+        if let Some(label) = self.renamable_open_folder() {
+            self.open_folder_prompt(self.account.id.clone(), folder_manage::FolderPromptMode::Rename { label }, window, cx);
+        }
+    }
+    /// The open folder, when it is one of the account's own folders that can be renamed.
+    pub(crate) fn renamable_open_folder(&self) -> Option<Label> {
+        let MailboxView::Label(id) = &self.view else { return None };
+        (self.module == Module::Mail && self.manages_folders(&self.account.id)).then(|| self.user_label(&self.account.id, id)).flatten()
     }
     fn on_switch_mail(&mut self, _: &SwitchToMail, window: &mut Window, cx: &mut Context<Self>) {
         self.set_module(Module::Mail, window, cx);
@@ -3459,6 +3635,7 @@ impl Render for MailWindow {
             .on_action(cx.listener(Self::on_toggle_read))
             .on_action(cx.listener(Self::on_open_selected))
             .on_action(cx.listener(Self::on_sync_now))
+            .on_action(cx.listener(Self::on_rename_folder))
             .on_action(cx.listener(Self::on_switch_mail))
             .on_action(cx.listener(Self::on_switch_calendar))
             .on_action(cx.listener(Self::on_switch_contacts))
@@ -3494,6 +3671,7 @@ impl Render for MailWindow {
                     .child(self.render_status_bar(cx))))
             .when(self.settings.is_some(), |d| d.child(self.render_settings(cx)))
             .when(self.account_setup.is_some(), |d| d.child(self.render_account_setup(cx)))
+            .when(self.folder_prompt.is_some(), |d| d.child(self.render_folder_prompt(cx)))
             .when(self.quick_look.is_some(), |d| d.child(self.render_quick_look(cx)))
             .when(self.palette.is_some(), |d| d.child(self.render_palette(cx)))
             .into_any_element()

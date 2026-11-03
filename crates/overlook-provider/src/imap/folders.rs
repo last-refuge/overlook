@@ -33,6 +33,11 @@ impl FolderInfo {
         !self.has("\\Noselect") && !self.has("\\NonExistent")
     }
 
+    /// Whether the server allows folders inside this one (RFC 3501 `\Noinferiors`).
+    pub fn allows_children(&self) -> bool {
+        !self.has("\\Noinferiors")
+    }
+
     /// The SPECIAL-USE attribute, if any (`\Sent`, `\Trash`, `\Junk`, `\Archive`, `\All`,
     /// `\Drafts`, `\Flagged`, `\Important`).
     pub fn special_use(&self) -> Option<String> {
@@ -67,20 +72,96 @@ impl FolderInfo {
     /// Display name: path with the delimiter shown as " / ", without a leading `INBOX`
     /// namespace (Courier/Dovecot "INBOX.Work" shows as "Work").
     pub fn display_name(&self) -> String {
+        self.display_name_in(true)
+    }
+
+    /// Display name when the server does (`inbox_namespace`) or does not keep every folder
+    /// under INBOX. Without that namespace a folder inside the Inbox shows as "Inbox / Work".
+    pub fn display_name_in(&self, inbox_namespace: bool) -> String {
         let path = match &self.delimiter {
             Some(d) if !d.is_empty() => {
                 let prefix = format!("INBOX{d}");
-                let trimmed = if self.path.len() > prefix.len() && self.path[..prefix.len()].eq_ignore_ascii_case(&prefix) { &self.path[prefix.len()..] } else { self.path.as_str() };
-                trimmed.split(d.as_str()).collect::<Vec<_>>().join(" / ")
+                let under_inbox = self.path.len() > prefix.len() && self.path[..prefix.len()].eq_ignore_ascii_case(&prefix);
+                if under_inbox {
+                    let rest = self.path[prefix.len()..].split(d.as_str()).collect::<Vec<_>>().join(" / ");
+                    if inbox_namespace { rest } else { format!("Inbox / {rest}") }
+                } else {
+                    self.path.split(d.as_str()).collect::<Vec<_>>().join(" / ")
+                }
             }
             _ => self.path.clone(),
         };
         if path.is_empty() {
             self.path.clone()
         } else {
-            path
+            decode_mutf7(&path)
         }
     }
+}
+
+/// The modified-UTF-7 alphabet (RFC 3501 §5.1.3): base64 with ',' for '/', no padding.
+const MUTF7: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
+    &match base64::alphabet::Alphabet::new("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+,") {
+        Ok(a) => a,
+        Err(_) => panic!("valid alphabet"),
+    },
+    base64::engine::GeneralPurposeConfig::new().with_encode_padding(false).with_decode_padding_mode(base64::engine::DecodePaddingMode::RequireNone),
+);
+
+/// A mailbox name as IMAP4rev1 sends it: printable ASCII as is, "&" as "&-", anything
+/// else as UTF-16 in modified base64 between "&" and "-".
+pub fn encode_mutf7(name: &str) -> String {
+    use base64::Engine;
+    let mut out = String::new();
+    let mut run: Vec<u16> = Vec::new();
+    let flush = |run: &mut Vec<u16>, out: &mut String| {
+        if !run.is_empty() {
+            let bytes: Vec<u8> = run.iter().flat_map(|u| u.to_be_bytes()).collect();
+            out.push('&');
+            out.push_str(&MUTF7.encode(bytes));
+            out.push('-');
+            run.clear();
+        }
+    };
+    for c in name.chars() {
+        if (' '..='~').contains(&c) {
+            flush(&mut run, &mut out);
+            if c == '&' { out.push_str("&-") } else { out.push(c) }
+        } else {
+            let mut buf = [0u16; 2];
+            run.extend_from_slice(c.encode_utf16(&mut buf));
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
+/// The reverse of [`encode_mutf7`]. A name that is not valid modified UTF-7 comes back
+/// unchanged, so a server that sends raw UTF-8 still shows readable names.
+pub fn decode_mutf7(name: &str) -> String {
+    use base64::Engine;
+    let mut out = String::new();
+    let mut rest = name;
+    while let Some(start) = rest.find('&') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('-') else { return name.to_owned() };
+        let chunk = &after[..end];
+        if chunk.is_empty() {
+            out.push('&');
+        } else {
+            let Ok(bytes) = MUTF7.decode(chunk) else { return name.to_owned() };
+            if bytes.len() % 2 != 0 {
+                return name.to_owned();
+            }
+            let units: Vec<u16> = bytes.chunks(2).map(|b| u16::from_be_bytes([b[0], b[1]])).collect();
+            let Ok(text) = String::from_utf16(&units) else { return name.to_owned() };
+            out.push_str(&text);
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 pub fn attribute_name(a: &NameAttribute<'_>) -> String {
@@ -175,6 +256,18 @@ pub fn drafts_folder(folders: &[FolderInfo]) -> Option<&FolderInfo> {
         .or_else(|| folders.iter().find(|f| f.selectable() && f.near_top() && matches!(f.leaf().as_str(), "draft" | "drafts" | "draft messages")))
 }
 
+/// The `INBOX.` or `INBOX/` prefix every folder but the Inbox lives under (Courier, some
+/// Dovecot setups), or `None` when the server keeps folders at the top level.
+pub fn inbox_namespace_prefix<'a>(paths: impl IntoIterator<Item = &'a str>) -> Option<&'static str> {
+    let paths: Vec<&str> = paths.into_iter().collect();
+    ["INBOX.", "INBOX/"].into_iter().find(|prefix| !paths.is_empty() && paths.iter().all(|p| p.len() > prefix.len() && p[..prefix.len()].eq_ignore_ascii_case(prefix)))
+}
+
+/// Whether the server keeps every folder under INBOX; see [`inbox_namespace_prefix`].
+pub fn inbox_namespace<'a>(paths: impl IntoIterator<Item = &'a str>) -> bool {
+    inbox_namespace_prefix(paths).is_some()
+}
+
 pub fn label_id(account: &AccountId, path: &str) -> LabelId {
     LabelId(format!("{}:{path}", account.0))
 }
@@ -189,6 +282,7 @@ pub fn labels_for(account: &AccountId, classified: &[(FolderInfo, LabelKind)]) -
         LabelKind::Spam => 4,
         _ => 100,
     };
+    let namespace = inbox_namespace(classified.iter().filter(|(_, k)| *k != LabelKind::Inbox).map(|(f, _)| f.path.as_str()));
     let mut labels: Vec<Label> = classified
         .iter()
         .map(|(f, kind)| Label {
@@ -201,7 +295,7 @@ pub fn labels_for(account: &AccountId, classified: &[(FolderInfo, LabelKind)]) -
                 LabelKind::Archive => "Archive".into(),
                 LabelKind::Trash => "Trash".into(),
                 LabelKind::Spam => "Spam".into(),
-                _ => f.display_name(),
+                _ => f.display_name_in(namespace),
             },
             provider_id: Some(ProviderId(f.path.clone())),
             color: None,
@@ -296,5 +390,34 @@ mod tests {
             kinds,
             vec![("INBOX", LabelKind::Inbox), ("[Gmail]/All Mail", LabelKind::Archive), ("[Gmail]/Sent Mail", LabelKind::Sent), ("[Gmail]/Spam", LabelKind::Spam), ("[Gmail]/Trash", LabelKind::Trash)]
         );
+    }
+
+    #[test]
+    fn folders_inside_the_inbox_keep_the_inbox_in_their_name_without_a_namespace() {
+        let names = |folders: Vec<FolderInfo>| -> Vec<String> {
+            labels_for(&AccountId::from("imap:j"), &classify(&folders, None)).into_iter().filter(|l| l.kind == LabelKind::User).map(|l| l.name).collect()
+        };
+        // Top-level server: a child of INBOX is shown under the Inbox.
+        assert_eq!(names(vec![f("INBOX", &[]), f("Work", &[]), f("INBOX/Receipts", &[])]), ["Inbox / Receipts", "Work"]);
+        // Everything under INBOX: the prefix is a namespace and is hidden.
+        assert_eq!(names(vec![f("INBOX", &[]), f("INBOX/Work", &[]), f("INBOX/Receipts", &[])]), ["Receipts", "Work"]);
+        assert!(!f("INBOX", &["\\Noinferiors"]).allows_children());
+        assert!(f("INBOX", &["\\HasChildren"]).allows_children());
+    }
+
+    #[test]
+    fn modified_utf7_round_trips_the_rfc_examples() {
+        // RFC 3501 §5.1.3, plus "&" and a character outside the BMP.
+        for (plain, wire) in [("Entwürfe", "Entw&APw-rfe"), ("~peter/mail/台北/日本語", "~peter/mail/&U,BTFw-/&ZeVnLIqe-"), ("R&D", "R&-D"), ("Plain", "Plain"), ("📁 Box", "&2D3cwQ- Box")] {
+            assert_eq!(encode_mutf7(plain), wire, "{plain}");
+            assert_eq!(decode_mutf7(wire), plain, "{wire}");
+        }
+    }
+
+    #[test]
+    fn names_that_are_not_modified_utf7_show_as_sent() {
+        assert_eq!(decode_mutf7("Broken &abc"), "Broken &abc");
+        assert_eq!(decode_mutf7("Odd &AP-"), "Odd &AP-");
+        assert_eq!(f("INBOX/Entw&APw-rfe", &[]).display_name(), "Entwürfe");
     }
 }

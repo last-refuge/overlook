@@ -133,6 +133,9 @@ pub enum LocalChange {
     Archive { message_ids: Vec<MessageId> },
     Trash { message_ids: Vec<MessageId> },
     Untrash { message_ids: Vec<MessageId> },
+    /// Delete for good: the rows are removed now and the server follows. With `folder`
+    /// ("Empty Folder") the server empties the whole folder, not only the cached messages.
+    DeleteForever { message_ids: Vec<MessageId>, folder: Option<LabelKind> },
 }
 
 impl LocalChange {
@@ -144,7 +147,8 @@ impl LocalChange {
             | LocalChange::RemoveLabel { message_ids, .. }
             | LocalChange::Archive { message_ids }
             | LocalChange::Trash { message_ids }
-            | LocalChange::Untrash { message_ids } => message_ids,
+            | LocalChange::Untrash { message_ids }
+            | LocalChange::DeleteForever { message_ids, .. } => message_ids,
         }
     }
 
@@ -157,6 +161,7 @@ impl LocalChange {
             LocalChange::Archive { message_ids } => OperationKind::Archive { message_ids },
             LocalChange::Trash { message_ids } => OperationKind::Trash { message_ids },
             LocalChange::Untrash { message_ids } => OperationKind::Untrash { message_ids },
+            LocalChange::DeleteForever { message_ids, folder } => OperationKind::DeleteForever { message_ids, provider_ids: Vec::new(), folder },
         }
     }
 }
@@ -280,6 +285,93 @@ impl Store {
             for id in existing.into_iter().filter(|id| !keep.contains(id)) {
                 tx.execute("DELETE FROM labels WHERE id=?1", [&id])?;
             }
+            Ok(())
+        })
+    }
+
+    /// Records a folder renamed at the provider. When the id changed (an IMAP path) the new
+    /// row takes over the old one's messages, so the folder keeps its mail until the next
+    /// sync lists it again.
+    pub fn rename_label(&self, account: &AccountId, old: &LabelId, renamed: &Label) -> Result<()> {
+        self.rename_folders(account, &[(old.clone(), renamed.clone())], &[])
+    }
+
+    /// Records several folders renamed together (a folder and the ones inside it), each like
+    /// [`Store::rename_label`], in one transaction. `id_prefixes` lists `(old, new)` starts
+    /// of provider ids that name a message by its folder (IMAP); stored messages and queued
+    /// permanent deletions are rewritten to the new start, so the next sync still knows them.
+    pub fn rename_folders(&self, account: &AccountId, renames: &[(LabelId, Label)], id_prefixes: &[(String, String)]) -> Result<()> {
+        if renames.iter().any(|(_, renamed)| &renamed.account_id != account) {
+            return Err(StoreError::Invalid("the label belongs to another account".into()));
+        }
+        self.with_tx(|tx| {
+            ensure_owned(tx, Owned::Label, account, renames.iter().map(|(old, _)| old.0.as_str()))?;
+            for (old, renamed) in renames {
+                tx.execute(
+                    "INSERT INTO labels(id, account_id, kind, name, provider_id, color, sort_order) VALUES(?1,?2,?3,?4,?5,?6,?7)
+                     ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, name=excluded.name, provider_id=excluded.provider_id, color=excluded.color, sort_order=excluded.sort_order",
+                    params![renamed.id.0, renamed.account_id.0, renamed.kind.as_key(), renamed.name, renamed.provider_id.as_ref().map(|p| &p.0), renamed.color, renamed.sort_order],
+                )?;
+                if &renamed.id != old {
+                    tx.execute("UPDATE OR IGNORE message_labels SET label_id=?2 WHERE label_id=?1", params![old.0, renamed.id.0])?;
+                    tx.execute("DELETE FROM labels WHERE id=?1", [&old.0])?;
+                }
+            }
+            let id_changes: Vec<(&LabelId, &LabelId)> = renames.iter().filter(|(old, renamed)| old != &renamed.id).map(|(old, renamed)| (old, &renamed.id)).collect();
+            if id_prefixes.is_empty() && id_changes.is_empty() {
+                return Ok(());
+            }
+            for (old, new) in id_prefixes {
+                tx.execute(
+                    "UPDATE messages SET provider_id = ?3 || substr(provider_id, length(?2) + 1) WHERE account_id=?1 AND substr(provider_id, 1, length(?2)) = ?2",
+                    params![account.0, old, new],
+                )?;
+            }
+            // Queued operations name the folder too: a permanent deletion by its messages'
+            // provider ids, a label change by the label id. Both must follow the rename or
+            // the replay cannot find the folder.
+            let ops: Vec<(String, String)> = {
+                let mut stmt = tx.prepare("SELECT id, kind_json FROM pending_operations WHERE account_id=?1 AND state != 'applied'")?;
+                let rows = stmt.query_map([&account.0], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect::<std::result::Result<_, _>>()?
+            };
+            for (id, json) in ops {
+                let Ok(mut kind) = serde_json::from_str::<OperationKind>(&json) else { continue };
+                let mut changed = false;
+                match &mut kind {
+                    OperationKind::DeleteForever { provider_ids, .. } => {
+                        for pid in provider_ids.iter_mut() {
+                            if let Some((old, new)) = id_prefixes.iter().find(|(old, _)| pid.0.starts_with(old.as_str())) {
+                                pid.0 = format!("{new}{}", &pid.0[old.len()..]);
+                                changed = true;
+                            }
+                        }
+                    }
+                    OperationKind::AddLabel { label_id, .. } | OperationKind::RemoveLabel { label_id, .. } => {
+                        if let Some((_, new)) = id_changes.iter().find(|(old, _)| *old == label_id) {
+                            *label_id = (*new).clone();
+                            changed = true;
+                        }
+                    }
+                    _ => {}
+                }
+                if changed {
+                    tx.execute("UPDATE pending_operations SET kind_json=?2 WHERE id=?1", params![id, serde_json::to_string(&kind)?])?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Records a folder deleted at the provider. `with_messages` also removes the messages
+    /// filed in it (IMAP deletes them with the folder); otherwise they only lose the label.
+    pub fn delete_label(&self, account: &AccountId, id: &LabelId, with_messages: bool) -> Result<()> {
+        self.with_tx(|tx| {
+            ensure_owned(tx, Owned::Label, account, [id.0.as_str()])?;
+            if with_messages {
+                tx.execute("DELETE FROM messages WHERE account_id=?1 AND id IN (SELECT message_id FROM message_labels WHERE label_id=?2)", params![account.0, id.0])?;
+            }
+            tx.execute("DELETE FROM labels WHERE id=?1", [&id.0])?;
             Ok(())
         })
     }
@@ -776,8 +868,25 @@ impl Store {
     pub fn apply_change(&self, account: &AccountId, change: LocalChange) -> Result<PendingOperation> {
         let ts = now();
         self.with_tx(|tx| {
+            // A permanent delete removes the rows, so read their provider ids first.
+            let provider_ids = match &change {
+                LocalChange::DeleteForever { message_ids, .. } => {
+                    ensure_owned(tx, Owned::Message, account, message_ids.iter().map(|i| i.0.as_str()))?;
+                    let mut out = Vec::new();
+                    for id in message_ids {
+                        let pid: Option<String> = tx.query_row("SELECT provider_id FROM messages WHERE id=?1", [&id.0], |r| r.get(0)).optional()?.flatten();
+                        out.extend(pid.map(ProviderId));
+                    }
+                    Some(out)
+                }
+                _ => None,
+            };
             apply_change_tx(tx, account, &change)?;
-            let op = insert_operation_tx(tx, account, change.into_operation(), ts)?;
+            let mut kind = change.into_operation();
+            if let (OperationKind::DeleteForever { provider_ids: slot, .. }, Some(ids)) = (&mut kind, provider_ids) {
+                *slot = ids;
+            }
+            let op = insert_operation_tx(tx, account, kind, ts)?;
             Ok(op)
         })
     }
@@ -1085,6 +1194,28 @@ impl Store {
     /// The newest message of the account with this Message-ID.
     pub fn message_by_rfc_id(&self, account: &AccountId, rfc_id: &str) -> Result<Option<Message>> {
         Ok(self.messages_by_rfc_id(account, rfc_id)?.into_iter().next())
+    }
+
+    /// Every stored message of the account that has a provider id, with its read and
+    /// starred state, for a sync check against the provider's full list.
+    pub fn message_states(&self, account: &AccountId) -> Result<Vec<(MessageId, ProviderId, bool, bool)>> {
+        self.with_read(|c| {
+            let mut stmt = c.prepare("SELECT id, provider_id, is_read, is_starred FROM messages WHERE account_id=?1 AND provider_id IS NOT NULL")?;
+            let rows = stmt.query_map([&account.0], |r| Ok((MessageId(r.get(0)?), ProviderId(r.get(1)?), r.get::<_, bool>(2)?, r.get::<_, bool>(3)?)))?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    /// Sets read and starred as the provider has them (a sync check's repair). Only this
+    /// account's messages are touched.
+    pub fn set_remote_flags(&self, account: &AccountId, flags: &[(MessageId, bool, bool)]) -> Result<usize> {
+        self.with_tx(|tx| {
+            let mut n = 0;
+            for (id, read, starred) in flags {
+                n += tx.execute("UPDATE messages SET is_read=?3, is_starred=?4 WHERE id=?1 AND account_id=?2", params![id.0, account.0, read, starred])?;
+            }
+            Ok(n)
+        })
     }
 
     /// The local id of the message the provider knows by `provider_id`, if any.
@@ -1896,6 +2027,11 @@ fn apply_change_tx(tx: &Connection, account: &AccountId, change: &LocalChange) -
             remove_label(message_ids, &trash)?;
             add_label(message_ids, &inbox)?;
         }
+        LocalChange::DeleteForever { message_ids, .. } => {
+            for id in message_ids {
+                tx.execute("DELETE FROM messages WHERE id=?1", [&id.0])?;
+            }
+        }
     }
     Ok(())
 }
@@ -2295,6 +2431,138 @@ mod tests {
                 assert_eq!(index.view_count(owner, view, None), fresh.view_count(owner, view, None));
             }
         }
+    }
+
+    #[test]
+    fn delete_forever_removes_the_rows_and_keeps_the_provider_ids_for_the_server() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+        let mut gone = message("m3", "Old receipt", "Thanks for your order.", &["label-trash"]);
+        gone.provider_id = Some(ProviderId("Trash;7;42".into()));
+        store.upsert_messages(&[gone]).unwrap();
+        let mut index = store.mail_index(&acct).unwrap();
+        assert_eq!(index.messages_labelled(LabelKind::Trash), vec![MessageId::from("m3")]);
+        let change = LocalChange::DeleteForever { message_ids: vec![MessageId::from("m3")], folder: None };
+        index.apply(&change);
+        let op = store.apply_change(&acct, change).unwrap();
+
+        assert!(store.message(&MessageId::from("m3")).unwrap().is_none());
+        assert_eq!(op.kind, OperationKind::DeleteForever { message_ids: vec![MessageId::from("m3")], provider_ids: vec![ProviderId("Trash;7;42".into())], folder: None });
+        assert!(store.pending_message_ids(&acct).unwrap().contains(&MessageId::from("m3")), "a download must not bring it back before the server deletes it");
+        let fresh = store.mail_index(&acct).unwrap();
+        let trash = MailboxView::Kind(LabelKind::Trash);
+        assert!(index.conversations("jason@example.com", &trash, ListFilter::All, None).is_empty());
+        assert!(index.messages_labelled(LabelKind::Trash).is_empty());
+        assert_eq!(index.conversations("jason@example.com", &trash, ListFilter::All, None), fresh.conversations("jason@example.com", &trash, ListFilter::All, None));
+    }
+
+    #[test]
+    fn delete_forever_refuses_another_accounts_messages() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let other = AccountId::from("acct-2");
+        store.upsert_account(&Account { id: other.clone(), provider: ProviderKind::Sample, display_name: "Other".into(), email: "other@example.com".into(), created_at: 2 }).unwrap();
+        assert!(store.apply_change(&other, LocalChange::DeleteForever { message_ids: vec![MessageId::from("m1")], folder: None }).is_err());
+        assert!(store.message(&MessageId::from("m1")).unwrap().is_some());
+    }
+
+    #[test]
+    fn renamed_imap_folders_rewrite_message_and_queued_deletion_ids() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+        let with_pid = |id: &str, pid: &str| {
+            let mut m = message(id, id, "", &["label-user"]);
+            m.provider_id = Some(ProviderId(pid.into()));
+            m
+        };
+        store.upsert_messages(&[with_pid("m3", "Work\u{1f}7\u{1f}1"), with_pid("m4", "Workshop\u{1f}7\u{1f}3"), with_pid("m5", "Work\u{1f}7\u{1f}2")]).unwrap();
+        store.apply_change(&acct, LocalChange::DeleteForever { message_ids: vec![MessageId::from("m5")], folder: None }).unwrap();
+
+        let renamed = Label { id: LabelId::from("label-jobs"), name: "Jobs".into(), provider_id: Some(ProviderId("Jobs".into())), ..label(LabelKind::User, "Jobs") };
+        store.rename_folders(&acct, &[(LabelId::from("label-user"), renamed)], &[("Work\u{1f}".into(), "Jobs\u{1f}".into())]).unwrap();
+        let pid_of = |id: &str| store.message(&MessageId::from(id)).unwrap().unwrap().provider_id.unwrap().0;
+        assert_eq!(pid_of("m3"), "Jobs\u{1f}7\u{1f}1");
+        assert_eq!(pid_of("m4"), "Workshop\u{1f}7\u{1f}3", "another folder that only starts the same way");
+        let ops = store.pending_operations(&acct).unwrap();
+        assert_eq!(ops[0].kind, OperationKind::DeleteForever { message_ids: vec![MessageId::from("m5")], provider_ids: vec![ProviderId("Jobs\u{1f}7\u{1f}2".into())], folder: None });
+    }
+
+    #[test]
+    fn a_renamed_folder_rewrites_queued_label_operations_to_its_new_id() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+        let old = LabelId::from("label-user");
+        store.apply_change(&acct, LocalChange::AddLabel { message_ids: vec![MessageId::from("m2")], label_id: old.clone() }).unwrap();
+        store.apply_change(&acct, LocalChange::RemoveLabel { message_ids: vec![MessageId::from("m1")], label_id: old.clone() }).unwrap();
+        store.apply_change(&acct, LocalChange::AddLabel { message_ids: vec![MessageId::from("m2")], label_id: LabelId::from("label-inbox") }).unwrap();
+
+        let renamed = Label { id: LabelId::from("label-jobs"), name: "Jobs".into(), provider_id: Some(ProviderId("Jobs".into())), ..label(LabelKind::User, "Jobs") };
+        store.rename_label(&acct, &old, &renamed).unwrap();
+        let kinds: Vec<OperationKind> = store.pending_operations(&acct).unwrap().into_iter().map(|o| o.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                OperationKind::AddLabel { message_ids: vec![MessageId::from("m2")], label_id: renamed.id.clone() },
+                OperationKind::RemoveLabel { message_ids: vec![MessageId::from("m1")], label_id: renamed.id.clone() },
+                OperationKind::AddLabel { message_ids: vec![MessageId::from("m2")], label_id: LabelId::from("label-inbox") },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_renamed_folder_keeps_its_messages_under_the_new_id() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+        let old = LabelId::from("label-user");
+        let renamed = Label { id: LabelId::from("label-renamed"), name: "Clients".into(), provider_id: Some(ProviderId("Clients".into())), ..label(LabelKind::User, "Clients") };
+        store.rename_label(&acct, &old, &renamed).unwrap();
+        let labels = store.labels(&acct).unwrap();
+        assert!(labels.iter().any(|l| l.id == renamed.id && l.name == "Clients") && !labels.iter().any(|l| l.id == old));
+        let index = store.mail_index(&acct).unwrap();
+        let in_new = index.conversations("jason@example.com", &MailboxView::Label(renamed.id.clone()), ListFilter::All, None);
+        assert_eq!(in_new.len(), 1, "m1 follows the folder");
+    }
+
+    #[test]
+    fn deleting_a_folder_removes_its_mail_only_when_asked() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+        let other = AccountId::from("acct-2");
+        store.upsert_account(&Account { id: other.clone(), provider: ProviderKind::Sample, display_name: "Other".into(), email: "other@example.com".into(), created_at: 2 }).unwrap();
+        assert!(store.delete_label(&other, &LabelId::from("label-user"), true).is_err(), "another account's label");
+        assert!(store.rename_label(&other, &LabelId::from("label-user"), &label(LabelKind::User, "X")).is_err());
+
+        store.delete_label(&acct, &LabelId::from("label-user"), false).unwrap();
+        assert!(store.message(&MessageId::from("m1")).unwrap().is_some(), "Gmail: the message only loses the label");
+
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        store.delete_label(&acct, &LabelId::from("label-user"), true).unwrap();
+        assert!(store.message(&MessageId::from("m1")).unwrap().is_none(), "IMAP: the server deleted it with the folder");
+        assert!(store.message(&MessageId::from("m2")).unwrap().is_some());
+    }
+
+    #[test]
+    fn unread_in_lists_only_the_views_unread_messages() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+        let owner = "jason@example.com";
+        let mut index = store.mail_index(&acct).unwrap();
+        let ids = |v: &[&str]| v.iter().map(|i| MessageId::from(*i)).collect::<BTreeSet<_>>();
+        let unread = |index: &MailIndex, view: MailboxView| index.unread_in(owner, &view).into_iter().collect::<BTreeSet<_>>();
+        assert_eq!(unread(&index, MailboxView::Kind(LabelKind::Inbox)), ids(&["m1", "m2"]));
+        assert_eq!(unread(&index, MailboxView::Label(LabelId::from("label-user"))), ids(&["m1"]));
+        index.apply(&LocalChange::SetRead { message_ids: vec![MessageId::from("m1")], read: true });
+        assert_eq!(unread(&index, MailboxView::Kind(LabelKind::Inbox)), ids(&["m2"]));
+        index.apply(&LocalChange::Trash { message_ids: vec![MessageId::from("m2")] });
+        assert!(unread(&index, MailboxView::Kind(LabelKind::Inbox)).is_empty());
+        assert_eq!(unread(&index, MailboxView::Kind(LabelKind::Trash)), ids(&["m2"]));
     }
 
     #[test]

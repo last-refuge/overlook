@@ -229,7 +229,7 @@ impl MailWindow {
         let already_had_data_images = signature.html.to_ascii_lowercase().contains("data:image/");
         let extracted = sig::extract_data_images(&html, &mut signature.images);
         signature.html = extracted.html.clone();
-        self.save_account_prefs(&account, prefs);
+        self.save_account_prefs(&account, prefs, cx);
         if extracted.html != html {
             // The pasted pictures are now references; show the source as it is stored.
             area.update(cx, |s, cx| s.set_value(extracted.html.clone(), window, cx));
@@ -249,7 +249,7 @@ impl MailWindow {
             sig::prune_images(&html, &mut s.images);
         }
         if prefs.signatures.iter().map(|s| s.images.len()).sum::<usize>() != before {
-            self.save_account_prefs(account, prefs);
+            self.store_account_prefs(account, prefs);
         }
     }
 
@@ -327,7 +327,7 @@ impl MailWindow {
         let width = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok().and_then(|r| r.into_dimensions().ok()).map(|(w, _)| w.min(DEFAULT_IMAGE_WIDTH));
         let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
         let snippet = format!("<img src=\"cid:{content_id}\" alt=\"{}\"{}>", escape_html(stem), width.map(|w| format!(" width=\"{w}\"")).unwrap_or_default());
-        self.save_account_prefs(&account, prefs);
+        self.save_account_prefs(&account, prefs, cx);
         let (text, selection) = {
             let area = area.read(cx);
             (area.value().to_string(), area.selected_range())
