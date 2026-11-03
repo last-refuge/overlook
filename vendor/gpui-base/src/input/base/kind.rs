@@ -331,14 +331,53 @@ pub trait InputModeKind: sealed::Sealed + Sized + 'static {
     }
 }
 
+/// What a single-line field adds on top of the shared engine: a suggestion painted after
+/// the text. Masking, validation and number stepping live in the engine, because their
+/// access sites sit inside the shared edit path and separating them would cost more in
+/// dispatch than it saves.
+#[derive(Default)]
+pub struct LineExtras {
+    pub(crate) ghost: Option<lsp_types::InlineCompletionItem>,
+}
+
+impl InputExtras for LineExtras {
+    fn inline_completion_item(&self) -> Option<&lsp_types::InlineCompletionItem> {
+        self.ghost.as_ref()
+    }
+}
+
 impl InputModeKind for InputMode {
     const MULTI_LINE: bool = false;
 
-    /// A single-line field needs nothing beyond the shared engine. Masking,
-    /// validation and number stepping live there: together they are ~120 bytes
-    /// and their access sites sit inside the shared edit path, so separating
-    /// them would cost more in dispatch than it saves.
-    type Extras = ();
+    type Extras = LineExtras;
+
+    /// Tab on a suggestion hands it back to the listener rather than inserting it: a
+    /// field's suggestion usually stands for something longer than what it shows.
+    fn accept_inline_completion(
+        state: &mut InputBaseState<Self>,
+        _window: &mut Window,
+        cx: &mut gpui::Context<InputBaseState<Self>>,
+    ) -> bool {
+        if state.extras.ghost.take().is_none() {
+            return false;
+        }
+        cx.emit(crate::input::InputEvent::AcceptSuggestion);
+        cx.notify();
+        true
+    }
+
+    fn has_inline_completion(state: &InputBaseState<Self>) -> bool {
+        state.extras.ghost.is_some()
+    }
+
+    fn clear_inline_completion(
+        state: &mut InputBaseState<Self>,
+        cx: &mut gpui::Context<InputBaseState<Self>>,
+    ) {
+        if state.extras.ghost.take().is_some() {
+            cx.notify();
+        }
+    }
 }
 impl InputModeKind for TextareaMode {
     const MULTI_LINE: bool = true;

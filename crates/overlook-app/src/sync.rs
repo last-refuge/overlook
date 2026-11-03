@@ -18,6 +18,7 @@ use tracing::{info, warn};
 pub struct SyncOutcome {
     pub state: Option<SyncState>,
     pub calendar_changes: usize,
+    pub draft_conflicts: usize,
     /// The provider asked us to slow down; the caller should wait longer before retrying.
     pub rate_limited: bool,
     pub applied: usize,
@@ -82,6 +83,8 @@ async fn sync_contacts(store: &Store, provider: &dyn MailProvider, account: &Acc
 /// never block mail.
 fn sync_calendar(store: &Store, provider: &dyn CalendarProvider, account: &Account, outcome: &mut SyncOutcome) {
     let acct = &account.id;
+    let projection = overlook_core::tz::current_definition();
+    let zone_revision = overlook_core::tz::revision();
     if !provider.has_calendar_access() {
         set_calendar_status(store, acct, &SyncState::SignInRequired);
         return;
@@ -100,7 +103,7 @@ fn sync_calendar(store: &Store, provider: &dyn CalendarProvider, account: &Accou
     }
     // Bumped when the event mapping gains fields: existing sync tokens are dropped once so
     // the window is downloaded again with the new fields.
-    const CALENDAR_COVERAGE: u32 = 3;
+    const CALENDAR_COVERAGE: u32 = 4;
     let coverage_key = format!("cal_coverage:{}", acct.0);
     let refresh = store.setting::<u32>(&coverage_key).ok().flatten().unwrap_or(1) < CALENDAR_COVERAGE;
     let calendars = store.calendars(acct).unwrap_or_default();
@@ -123,17 +126,13 @@ fn sync_calendar(store: &Store, provider: &dyn CalendarProvider, account: &Accou
         };
         // Local intent wins until it has been replayed: a locally deleted or edited event
         // that the server still reports must not come back in this download.
-        let protected = store.pending_event_ids(acct).unwrap_or_default();
-        let upserts: Vec<_> = changes.upserts.iter().filter(|e| !protected.contains(&e.id)).cloned().collect();
-        let _ = store.delete_events(&changes.deleted);
-        if let Err(e) = store.upsert_events(&upserts) {
-            set_calendar_status(store, acct, &SyncState::SyncFailed(e.to_string()));
-            return;
+        if overlook_core::tz::revision() != zone_revision || overlook_core::tz::current_definition() != projection { return; }
+        match store.apply_calendar_download(acct, &projection, &changes.upserts, &changes.deleted, changes.next_sync_token.as_deref().map(|token| (key.as_str(), token))) {
+            Ok(true) => {},
+            Ok(false) => return,
+            Err(e) => { set_calendar_status(store, acct, &SyncState::SyncFailed(e.to_string())); return; }
         }
         outcome.calendar_changes += changes.upserts.len() + changes.deleted.len();
-        if let Some(t) = changes.next_sync_token {
-            let _ = store.set_setting(&key, &t);
-        }
     }
     let _ = store.set_setting(&coverage_key, &CALENDAR_COVERAGE);
     set_calendar_status(store, acct, &SyncState::UpToDate);
@@ -560,7 +559,14 @@ async fn replay_operations(
                     set_calendar_status(&store, &acct, &SyncState::SignInRequired);
                     continue;
                 };
-                let event = kind.event_id().and_then(|id| store.event(id).ok().flatten());
+                let (event, projection) = match store.calendar_event_for_replay(kind.event_id().expect("calendar operation has an event id"), &overlook_core::tz::current_definition()) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => { let _ = store.set_operation_state(&op.id, OperationState::Pending, Some(&error.to_string())); continue; }
+                };
+                let zone = match projection.resolve() {
+                    Ok(zone) => zone,
+                    Err(_) => { let _ = store.set_operation_state(&op.id, OperationState::Pending, Some("Invalid calendar time zone.")); continue; }
+                };
                 let find_calendar = |id: &CalendarId| calendars.iter().find(|c| &c.id == id).cloned();
                 let result: Result<(), ProviderError> = match kind {
                     OperationKind::RespondToEvent { response, .. } => match event.as_ref().and_then(|e| find_calendar(&e.calendar_id).map(|c| (e, c))) {
@@ -568,11 +574,11 @@ async fn replay_operations(
                         None => Ok(()),
                     },
                     OperationKind::CreateEvent { .. } => match event.as_ref().and_then(|e| find_calendar(&e.calendar_id).map(|c| (e, c))) {
-                        Some((e, c)) => cal.create_event(&account, &c, e).await.and_then(|created| store.upsert_events(&[created]).map_err(|e| ProviderError::Temporary(e.to_string()))),
+                        Some((e, c)) => cal.create_event_in_zone(account, &c, e, &zone).await.and_then(|created| store.finish_calendar_write(&created, &projection).map_err(|e| ProviderError::Temporary(e.to_string()))),
                         None => Ok(()),
                     },
                     OperationKind::UpdateEvent { scope, .. } => match event.as_ref().and_then(|e| find_calendar(&e.calendar_id).map(|c| (e, c))) {
-                        Some((e, c)) => cal.update_event_scoped(&account, &c, e, *scope).await.and_then(|updated| store.upsert_events(&[updated]).map_err(|e| ProviderError::Temporary(e.to_string()))),
+                        Some((e, c)) => cal.update_event_scoped_in_zone(account, &c, e, *scope, &zone).await.and_then(|updated| store.finish_calendar_write(&updated, &projection).map_err(|e| ProviderError::Temporary(e.to_string()))),
                         None => Ok(()),
                     },
                     OperationKind::DeleteEvent { calendar_id, provider_id, scope, recurring_event_id, original_start, .. } => match (find_calendar(calendar_id), provider_id) {
@@ -685,6 +691,24 @@ pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calend
     }
     let _ = store.set_sync_state(&acct, &SyncState::Syncing, None);
 
+    // Reconcile drafts before replaying sends so any persisted, uncertain draft upload
+    // has a known remote identity before the Outbox can remove its local row.
+    let draft_error = match crate::draft_sync::synchronize(&store, provider.as_ref(), &account, &crate::data_dir().join("outgoing")).await {
+        Ok(conflicts) => { outcome.draft_conflicts += conflicts; None }
+        Err(err @ ProviderError::Rejected(_)) => {
+            outcome.failed.push(format!("Drafts: {err}"));
+            Some(state_for(&err))
+        }
+        Err(err) => {
+            let state = state_for(&err);
+            store.set_sync_state(&acct, &state, None).ok();
+            outcome.rate_limited = matches!(err, ProviderError::RateLimited(_));
+            outcome.stopped_offline = matches!(err, ProviderError::Offline);
+            outcome.state = Some(state);
+            return outcome;
+        }
+    };
+
     // What the user already did goes to the server first, so an archive or a send does not
     // wait behind a download. Anything queued meanwhile goes in the pass after it.
     let pre_state = if store.pending_count(&acct).unwrap_or(0) > 0 {
@@ -714,7 +738,7 @@ pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calend
     }
     sync_contacts(&store, provider.as_ref(), &account).await;
 
-    let final_state = if pre_state == SyncState::UpToDate {
+    let mut final_state = if pre_state == SyncState::UpToDate {
         replay_operations(&store, &provider, &calendar, &account, &mut outcome).await
     } else {
         pre_state
@@ -728,6 +752,14 @@ pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calend
         let _ = store.delete_messages(&gone);
     }
 
+    if let Err(err) = crate::draft_sync::flush_deletions(&store, provider.as_ref(), &account).await {
+        outcome.rate_limited |= matches!(err, ProviderError::RateLimited(_));
+        outcome.stopped_offline |= matches!(err, ProviderError::Offline);
+        final_state = state_for(&err);
+    }
+    if final_state == SyncState::UpToDate {
+        if let Some(state) = draft_error { final_state = state; }
+    }
     let success_at = if final_state == SyncState::UpToDate { Some(now()) } else { None };
     let _ = store.set_sync_state(&acct, &final_state, success_at);
     let _ = store.prune_applied(now() - 7 * 86_400_000);

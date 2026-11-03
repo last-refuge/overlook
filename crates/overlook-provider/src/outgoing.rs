@@ -13,19 +13,39 @@ fn mailbox(address: &Address) -> Result<Mailbox, String> {
 
 /// Returns the raw message bytes. `rfc_id` is the Message-ID (with angle brackets).
 pub fn build_raw(account: &Account, draft: &Draft, in_reply_to: Option<&Message>, rfc_id: &str) -> Result<Vec<u8>, String> {
+    build_message(account, draft, in_reply_to, rfc_id, false, false)
+}
+
+/// Gmail derives its envelope from MIME headers, including Bcc.
+pub fn build_gmail_raw(account: &Account, draft: &Draft, in_reply_to: Option<&Message>, rfc_id: &str) -> Result<Vec<u8>, String> {
+    build_message(account, draft, in_reply_to, rfc_id, false, true)
+}
+
+/// Drafts may have no recipient yet, or an unfinished recipient. The artificial SMTP
+/// envelope satisfies lettre's send-time checks but is never serialized or submitted.
+pub fn build_draft_raw(account: &Account, draft: &Draft, in_reply_to: Option<&Message>, rfc_id: &str) -> Result<Vec<u8>, String> {
+    build_message(account, draft, in_reply_to, rfc_id, true, true)
+}
+
+fn build_message(account: &Account, draft: &Draft, in_reply_to: Option<&Message>, rfc_id: &str, editing: bool, keep_bcc: bool) -> Result<Vec<u8>, String> {
     let mut builder = MimeMessage::builder()
         .from(mailbox(&Address::named(&account.display_name, &account.email))?)
         .subject(draft.subject.clone())
         .message_id(Some(rfc_id.to_owned()))
         .user_agent("Overlook".to_owned());
-    for a in &draft.to {
-        builder = builder.to(mailbox(a)?);
-    }
-    for a in &draft.cc {
-        builder = builder.cc(mailbox(a)?);
-    }
-    for a in &draft.bcc {
-        builder = builder.bcc(mailbox(a)?);
+    if keep_bcc { builder = builder.keep_bcc(); }
+    if editing {
+        use lettre::message::header::{HeaderName, HeaderValue};
+        builder = builder.envelope(lettre::address::Envelope::new(None, vec!["draft@invalid.example".parse().map_err(|e| format!("{e}"))?]).map_err(|e| e.to_string())?).keep_bcc();
+        for (name, addresses) in [("To", &draft.to), ("Cc", &draft.cc), ("Bcc", &draft.bcc)] {
+            if !addresses.is_empty() {
+                builder = builder.raw_header(HeaderValue::new(HeaderName::new_from_ascii_str(name), addresses.iter().map(Address::to_header).collect::<Vec<_>>().join(", ")));
+            }
+        }
+    } else {
+        for a in &draft.to { builder = builder.to(mailbox(a)?); }
+        for a in &draft.cc { builder = builder.cc(mailbox(a)?); }
+        for a in &draft.bcc { builder = builder.bcc(mailbox(a)?); }
     }
     if let Some(source) = in_reply_to {
         if let Some(id) = &source.rfc_message_id {
@@ -36,6 +56,9 @@ pub fn build_raw(account: &Account, draft: &Draft, in_reply_to: Option<&Message>
             };
             builder = builder.references(references);
         }
+    } else if let Some(original) = &draft.imported {
+        if let Some(id) = &original.in_reply_to { builder = builder.in_reply_to(id.clone()); }
+        if !original.references.is_empty() { builder = builder.references(original.references.join(" ")); }
     }
     let bodies = overlook_core::compose::outgoing_bodies(draft, in_reply_to);
     let text = if bodies.text.is_empty() { "\n".to_owned() } else { bodies.text };
@@ -116,10 +139,36 @@ pub fn message_to_raw(message: &Message) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn drafts_allow_unfinished_recipients_and_keep_bcc_and_original_html() {
+        let account = Account { id: AccountId::from("draft-test"), provider: ProviderKind::Gmail, display_name: "Test".into(), email: "me@example.com".into(), created_at: 0 };
+        let mut draft = Draft::new(account.id.clone(), DraftKind::New, 0);
+        draft.body_text = "literal **text**".into();
+        draft.imported = Some(DraftSource { text: draft.body_text.clone(), html: Some("<p>literal <b>**text**</b></p>".into()), in_reply_to: Some("<parent@example.com>".into()), references: vec!["<parent@example.com>".into()] });
+        let raw = build_draft_raw(&account, &draft, None, "<draft@example.com>").unwrap();
+        let parsed = mail_parser::MessageParser::default().parse(&raw).unwrap();
+        assert!(parsed.to().is_none());
+        assert_eq!(parsed.body_text(0).unwrap(), "literal **text**");
+        assert!(parsed.body_html(0).unwrap().contains("<b>**text**</b>"));
+        draft.to = vec![Address::new(None, "unfinished")];
+        draft.bcc = vec![Address::new(None, "hidden@example.com")];
+        let raw = build_draft_raw(&account, &draft, None, "<draft@example.com>").unwrap();
+        let text = String::from_utf8(raw).unwrap();
+        assert!(text.contains("To: unfinished\r\n"));
+        assert!(text.contains("Bcc: hidden@example.com\r\n"));
+        assert!(text.contains("In-Reply-To: <parent@example.com>"));
+        draft.to = vec![Address::new(None, "friend@example.com")];
+        assert!(String::from_utf8(build_gmail_raw(&account, &draft, None, "<sent@example.com>").unwrap()).unwrap().contains("Bcc: hidden@example.com"));
+        assert!(!String::from_utf8(build_raw(&account, &draft, None, "<sent@example.com>").unwrap()).unwrap().contains("Bcc:"));
+    }
+
     fn decoded_part(raw: &str, mime: &str) -> String {
         let start = raw.find(&format!("Content-Type: {mime}")).expect("MIME alternative");
         let (headers, body) = raw[start..].split_once("\r\n\r\n").expect("part headers");
-        let body = body.split("\r\n--").next().unwrap();
+        // The next MIME boundary ends the part. A "-- " signature line is not one: a boundary
+        // is followed by its token, never by a space.
+        let end = body.match_indices("\r\n--").find(|(i, _)| body[i + 4..].chars().next().is_some_and(|c| c != ' ')).map_or(body.len(), |(i, _)| i);
+        let body = &body[..end];
         let bytes = if headers.contains("base64") {
             use base64::Engine;
             base64::engine::general_purpose::STANDARD.decode(body.replace(['\r', '\n'], "")).unwrap()
@@ -223,6 +272,31 @@ mod tests {
         // ... and the real file is an ordinary attachment, outside it.
         assert_eq!(raw.matches("Content-Disposition: attachment").count(), 1, "{raw}");
         assert!(raw.find("plan.pdf").unwrap() > raw.rfind("Content-ID: <logo@brand.example>").unwrap(), "{raw}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_signature_with_an_image_is_sent_as_html_with_the_image_inline() {
+        let (account, mut draft, dir) = forwarded_with_logo();
+        // Only the logo, as a signature's image; no quote, and not a forward.
+        draft.attachments.retain(|a| a.content_id.is_some());
+        draft.kind = DraftKind::New;
+        draft.include_quote = false;
+        draft.in_reply_to = None;
+        draft.body_text = "See you Thursday.".into();
+        draft.signature_id = Some("work".into());
+        draft.signature_html = Some("<p><b>Jason Alexander</b><br>Last Refuge</p><img src=\"cid:logo@brand.example\" width=\"120\">".into());
+        let raw = String::from_utf8(build_raw(&account, &draft, None, "<sig@overlook.example>").unwrap()).unwrap();
+
+        let html = decoded_part(&raw, "text/html");
+        let (body, signature) = (html.find("See you Thursday.").unwrap(), html.find("Jason Alexander").unwrap());
+        assert!(body < signature && html.contains("cid:logo@brand.example"), "{html}");
+        let text = decoded_part(&raw, "text/plain").replace("\r\n", "\n");
+        assert!(text.starts_with("See you Thursday.\n\n-- \nJason Alexander\nLast Refuge"), "{text:?}");
+        // The image rides in multipart/related, found by the Content-ID the HTML names.
+        assert!(raw.contains("Content-Type: multipart/related"), "{raw}");
+        assert_eq!(raw.matches("Content-ID: <logo@brand.example>").count(), 1, "{raw}");
+        assert!(!raw.contains("Content-Disposition: attachment"), "it is not an attachment: {raw}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

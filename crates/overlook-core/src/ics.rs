@@ -12,6 +12,9 @@ pub struct Invitation {
     pub method: String,
     pub summary: Option<String>,
     pub start: Option<Timestamp>,
+    /// Date-only invitations keep their civil date across display-zone changes.
+    #[serde(default)]
+    pub start_date: Option<String>,
     pub all_day: bool,
     pub organizer_email: Option<String>,
 }
@@ -19,6 +22,15 @@ pub struct Invitation {
 impl Invitation {
     pub fn is_cancellation(&self) -> bool {
         self.method.eq_ignore_ascii_case("CANCEL")
+    }
+
+    pub fn start_in_zone(&self, zone: &crate::tz::TimeZone) -> Option<Timestamp> {
+        if self.all_day {
+            if let Some(date) = self.start_date.as_deref().and_then(crate::tz::parse_date) {
+                return date.to_zoned(zone.clone()).ok().map(|date| crate::tz::to_millis(&date));
+            }
+        }
+        self.start
     }
 }
 
@@ -43,7 +55,7 @@ fn unescape(v: &str) -> String {
     v.replace("\\n", "\n").replace("\\,", ",").replace("\\;", ";").replace("\\\\", "\\")
 }
 
-fn parse_dt(key: &str, value: &str) -> Option<(Timestamp, bool)> {
+fn parse_dt(key: &str, value: &str) -> Option<(Timestamp, Option<String>)> {
     use jiff::civil::{Date, DateTime};
     use jiff::tz::TimeZone;
     let params: Vec<&str> = key.split(';').skip(1).collect();
@@ -51,7 +63,7 @@ fn parse_dt(key: &str, value: &str) -> Option<(Timestamp, bool)> {
     let is_date = params.iter().any(|p| *p == "VALUE=DATE") || value.len() == 8;
     if is_date {
         let date: Date = format!("{}-{}-{}", &value[0..4], &value[4..6], &value[6..8]).parse().ok()?;
-        return Some((crate::tz::date_start(date), true));
+        return Some((crate::tz::date_start(date), Some(date.to_string())));
     }
     let utc = value.ends_with('Z');
     let v = value.trim_end_matches('Z');
@@ -62,10 +74,10 @@ fn parse_dt(key: &str, value: &str) -> Option<(Timestamp, bool)> {
     let zone = if utc {
         TimeZone::UTC
     } else {
-        tzid.and_then(|t| TimeZone::get(t).ok()).unwrap_or_else(crate::tz::system_zone)
+        tzid.and_then(|t| TimeZone::get(t).ok()).unwrap_or_else(crate::tz::current_zone)
     };
     let zoned = dt.to_zoned(zone).ok()?;
-    Some((crate::tz::to_millis(&zoned), false))
+    Some((crate::tz::to_millis(&zoned), None))
 }
 
 /// Parses the first VEVENT of an iCalendar text.
@@ -74,6 +86,7 @@ pub fn parse_invitation(text: &str) -> Option<Invitation> {
     let mut uid = None;
     let mut summary = None;
     let mut start = None;
+    let mut start_date = None;
     let mut all_day = false;
     let mut organizer = None;
     let mut in_event = false;
@@ -86,9 +99,10 @@ pub fn parse_invitation(text: &str) -> Option<Invitation> {
             "UID" if in_event => uid = Some(value.trim().to_owned()),
             "SUMMARY" if in_event => summary = Some(unescape(value.trim())),
             "DTSTART" if in_event => {
-                if let Some((ts, date_only)) = parse_dt(&key, value.trim()) {
+                if let Some((ts, date)) = parse_dt(&key, value.trim()) {
                     start = Some(ts);
-                    all_day = date_only;
+                    all_day = date.is_some();
+                    start_date = date;
                 }
             }
             "ORGANIZER" if in_event => {
@@ -97,7 +111,7 @@ pub fn parse_invitation(text: &str) -> Option<Invitation> {
             _ => {}
         }
     }
-    Some(Invitation { uid: uid?, method, summary, start, all_day, organizer_email: organizer })
+    Some(Invitation { uid: uid?, method, summary, start, start_date, all_day, organizer_email: organizer })
 }
 
 #[cfg(test)]
@@ -126,5 +140,19 @@ mod tests {
         let all_day = parse_invitation("BEGIN:VEVENT\nUID:y\nDTSTART;VALUE=DATE:20261020\nEND:VEVENT").unwrap();
         assert!(all_day.all_day);
         assert!(parse_invitation("BEGIN:VEVENT\nSUMMARY:no uid\nEND:VEVENT").is_none());
+    }
+
+    #[test]
+    fn all_day_invitation_dates_survive_travel_and_json_roundtrips() {
+        let inv = parse_invitation("BEGIN:VEVENT\nUID:day\nDTSTART;VALUE=DATE:20261102\nEND:VEVENT").unwrap();
+        let inv: Invitation = serde_json::from_str(&serde_json::to_string(&inv).unwrap()).unwrap();
+        for name in ["Asia/Tokyo", "America/Phoenix"] {
+            let zone = crate::tz::TimeZone::get(name).unwrap();
+            let start = inv.start_in_zone(&zone).unwrap();
+            assert_eq!(crate::tz::in_zone(start, &zone).date().to_string(), "2026-11-02");
+        }
+        let legacy: Invitation = serde_json::from_value(serde_json::json!({"uid":"old", "method":"REQUEST", "summary":null, "start":0, "all_day":true, "organizer_email":null})).unwrap();
+        assert_eq!(legacy.start_date, None);
+        assert_eq!(legacy.start_in_zone(&crate::tz::TimeZone::UTC), Some(0));
     }
 }

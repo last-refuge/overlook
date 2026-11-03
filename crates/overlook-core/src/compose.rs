@@ -195,8 +195,16 @@ pub struct OutgoingBodies {
 /// asks for it. Replies get an attribution line and a blockquote; forwards get a header block
 /// and the original in full.
 pub fn outgoing_bodies(draft: &Draft, source: Option<&Message>) -> OutgoingBodies {
-    let mut text = markdown_to_plain(&draft.body_text);
-    let mut html = render_markdown(&draft.body_text);
+    let original = draft.imported.as_ref().filter(|s| s.text == draft.body_text);
+    let mut text = original.map_or_else(|| markdown_to_plain(&draft.body_text), |s| s.text.clone());
+    let mut html = original.map_or_else(|| render_markdown(&draft.body_text), |s| s.html.as_deref().map(|h| clean_only(h, RemoteContent::Allowed)).unwrap_or_else(|| text_to_html(&s.text)));
+    // The signature goes under what was written and above the quoted message. Its plain-text
+    // form follows the "-- " line that mail readers know to fold away.
+    if let Some(signature) = draft.signature_html.as_deref().filter(|s| !s.trim().is_empty()) {
+        let signature = clean_only(signature, RemoteContent::Allowed);
+        text = format!("{}\n\n-- \n{}", text.trim_end(), html_to_text(&signature));
+        html = format!("{html}<br><div class=\"overlook_signature\">{signature}</div>");
+    }
     let Some(source) = source.filter(|_| draft.include_quote) else {
         return OutgoingBodies { text, html };
     };
@@ -237,7 +245,13 @@ pub fn outgoing_bodies(draft: &Draft, source: Option<&Message>) -> OutgoingBodie
 /// Local quote previews enforce resource consent independently of the outgoing
 /// serialization. Keep the full visible history, rather than folding it for display.
 pub fn quote_preview(draft: &Draft, source: &Message, policy: RemoteContent) -> String {
-    outgoing_preview(&Draft { body_text: String::new(), ..draft.clone() }, Some(source), policy)
+    outgoing_preview(&Draft { body_text: String::new(), signature_html: None, ..draft.clone() }, Some(source), policy)
+}
+
+/// Read the original history even after it was excluded from the outgoing message.
+/// Visibility is a display choice; it never changes the draft's quote setting.
+pub fn history_preview(draft: &Draft, source: &Message, policy: RemoteContent) -> String {
+    quote_preview(&Draft { include_quote: true, ..draft.clone() }, source, policy)
 }
 
 /// Preview a draft (including Outbox items) without bypassing local image consent.
@@ -292,6 +306,12 @@ mod tests {
         assert_eq!(plain, "Title\n\nHi Maya, see the brief (https://ex.com/b) and cargo test.\n- one\n> quoted_word_here");
     }
 
+    fn message_with_body(html: &str) -> Message {
+        let mut m = source();
+        m.body.html = Some(html.into());
+        m
+    }
+
     fn source() -> Message {
         Message {
             id: MessageId::from("a:1"),
@@ -337,6 +357,23 @@ mod tests {
     }
 
     #[test]
+    fn reading_history_does_not_restore_an_excluded_outgoing_quote() {
+        let source = message_with_body("<p>Original discussion</p><img src='https://images.example/history.png'>");
+        for kind in [DraftKind::Reply, DraftKind::ReplyAll, DraftKind::Forward] {
+            let mut draft = Draft::new(AccountId::from("a"), kind, 0);
+            draft.body_text = "Authored answer".into();
+            draft.include_quote = false;
+            let before = draft.clone();
+            let history = history_preview(&draft, &source, RemoteContent::Blocked);
+            assert!(history.contains("Original discussion"));
+            assert!(!history.contains("Authored answer") && !history.contains("https://images.example/history.png"));
+            assert!(history_preview(&draft, &source, RemoteContent::Allowed).contains("https://images.example/history.png"));
+            assert_eq!(draft, before);
+            assert!(!outgoing_bodies(&draft, Some(&source)).html.contains("Original discussion"));
+        }
+    }
+
+    #[test]
     fn quotes_share_visible_content_but_preview_requires_remote_consent() {
         let mut source = source();
         source.body.html = Some("<div style=\"display:none\">Private preheader</div><p style=\"margin:0;font-size:10pt\">Café 東京</p><img src=\"https://images.example/logo.png\" alt=\"Logo\"><blockquote>Earlier history</blockquote>".into());
@@ -357,6 +394,49 @@ mod tests {
         assert!(outbox.contains("My <strong>reply</strong>"));
         assert!(!outbox.contains("https://images.example/logo.png"));
         assert!(quote_preview(&draft, &source, RemoteContent::Allowed).contains("https://images.example/logo.png"));
+    }
+
+    #[test]
+    fn the_signature_sits_between_what_was_written_and_the_quote() {
+        let mut draft = Draft::new(AccountId::from("a"), DraftKind::Forward, 0);
+        draft.body_text = "FYI".into();
+        draft.include_quote = true;
+        draft.signature_html = Some("<p><b>Jason</b><br>Last Refuge</p><img src=\"cid:sig-1@overlook\">".into());
+        let out = outgoing_bodies(&draft, Some(&message_with_body("<p>Original</p>")));
+        let (body, signature, quote) = (out.html.find("FYI").unwrap(), out.html.find("Jason").unwrap(), out.html.find("Original").unwrap());
+        assert!(body < signature && signature < quote, "{}", out.html);
+        assert!(out.html.contains("<div class=\"overlook_signature\"><p><b>Jason</b>"), "{}", out.html);
+        assert!(out.html.contains("cid:sig-1@overlook"), "images stay cid references");
+        // Plain text: the "-- " line, then the signature as text, then the quote.
+        assert!(out.text.starts_with("FYI\n\n-- \nJason"), "{:?}", out.text);
+        assert!(out.text.find("Last Refuge").unwrap() < out.text.find("Original").unwrap(), "{:?}", out.text);
+    }
+
+    #[test]
+    fn a_signature_is_cleaned_like_everything_else_that_is_sent() {
+        let mut draft = Draft::new(AccountId::from("a"), DraftKind::New, 0);
+        draft.signature_html = Some("<p onclick=\"x()\">Jason</p><script>alert(1)</script><img src=\"data:image/png;base64,AAAA\">".into());
+        let out = outgoing_bodies(&draft, None);
+        assert!(out.html.contains("Jason") && !out.html.contains("onclick") && !out.html.contains("script") && !out.html.contains("data:"), "{}", out.html);
+    }
+
+    #[test]
+    fn no_signature_or_a_blank_one_changes_nothing() {
+        let mut draft = Draft::new(AccountId::from("a"), DraftKind::New, 0);
+        draft.body_text = "Hi".into();
+        let plain = outgoing_bodies(&draft, None);
+        draft.signature_html = Some("  \n".into());
+        assert_eq!(outgoing_bodies(&draft, None), plain);
+        assert!(!plain.html.contains("overlook_signature") && !plain.text.contains("-- "));
+    }
+
+    #[test]
+    fn the_quote_preview_leaves_the_signature_out() {
+        let mut draft = Draft::new(AccountId::from("a"), DraftKind::Reply, 0);
+        draft.include_quote = true;
+        draft.signature_html = Some("<p>Jason</p>".into());
+        let preview = quote_preview(&draft, &message_with_body("<p>Original</p>"), RemoteContent::Allowed);
+        assert!(preview.contains("Original") && !preview.contains("Jason"), "{preview}");
     }
 
     #[test]

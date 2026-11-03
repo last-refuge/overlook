@@ -2,7 +2,39 @@
 
 use rusqlite::Connection;
 
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17, V18, V19];
+
+const V19: &str = "
+BEGIN;
+CREATE TABLE draft_imports (
+    draft_id TEXT PRIMARY KEY REFERENCES drafts(id) ON DELETE CASCADE,
+    source_json TEXT NOT NULL
+);
+-- Deliberately independent of drafts: discarding/sending during an upload must
+-- retain the remote identity and the exact bytes needed to reconcile a lost reply.
+CREATE TABLE draft_sync (
+    draft_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    remote_json TEXT,
+    base_json TEXT,
+    pending_json TEXT,
+    pending_raw BLOB
+);
+CREATE INDEX draft_sync_account ON draft_sync(account_id);
+INSERT INTO draft_sync(draft_id, account_id) SELECT d.id, d.account_id FROM drafts d JOIN accounts a ON a.id=d.account_id WHERE a.provider IN ('gmail','imap');
+PRAGMA user_version = 19;
+COMMIT;
+";
+
+/// The signature chosen for a draft, as it was when chosen. A table of its own, so nothing
+/// that exists is altered.
+const V18: &str = "
+CREATE TABLE draft_signatures (
+    draft_id TEXT PRIMARY KEY REFERENCES drafts(id) ON DELETE CASCADE,
+    signature_id TEXT,
+    html TEXT NOT NULL
+);
+";
 
 const V17: &str = "
 ALTER TABLE draft_attachments ADD COLUMN content_id TEXT;
@@ -465,6 +497,8 @@ mod calendar_migration_tests {
         assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0)).unwrap(), MIGRATIONS.len() as u32);
         let (name, content_id) = conn.query_row("SELECT filename, content_id FROM draft_attachments WHERE id='att'", [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))).unwrap();
         assert_eq!((name.as_str(), content_id), ("plan.pdf", None));
+        let (account, base, pending) = conn.query_row("SELECT account_id,base_json,pending_json FROM draft_sync WHERE draft_id='draft'", [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?))).unwrap();
+        assert_eq!((account.as_str(), base, pending), ("test", None, None), "existing offline drafts are enrolled without claiming they are uploaded");
     }
 
     #[test]

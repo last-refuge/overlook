@@ -129,6 +129,10 @@ pub enum InputEvent {
     PressEnter { secondary: bool, shift: bool },
     Focus,
     Blur,
+    /// Tab was pressed while ghost text set with `InputState::set_ghost_text` was showing.
+    /// The ghost text is already gone and the value is untouched: what accepting means is
+    /// for the listener to do.
+    AcceptSuggestion,
 }
 
 pub(super) const CONTEXT: &str = "Input";
@@ -4145,6 +4149,11 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         if !self.is_editable() {
             return;
         }
+        // Typing, deleting and pasting all change what a single-line suggestion was for. An
+        // editor's completions are driven by its own requests, so they are left alone here.
+        if !M::MULTI_LINE {
+            M::clear_inline_completion(self, cx);
+        }
         let selection_before = *self.active_selection();
         // Committing a composition ends the transaction it opened, whether or
         // not the platform follows up with `unmark_text`.
@@ -4638,6 +4647,11 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
                     .on_action(window.listener_for(&entity, InputBaseState::cut))
                     .on_action(window.listener_for(&entity, InputBaseState::undo))
                     .on_action(window.listener_for(&entity, InputBaseState::redo))
+                    // A single-line field has no use for Tab as an indent, so it handles the
+                    // action only to accept ghost text; without any, Tab moves focus on.
+                    .when(!self.is_multi_line() && M::has_inline_completion(self), |this| {
+                        this.on_action(window.listener_for(&entity, InputBaseState::indent_inline))
+                    })
                     .when(self.is_multi_line(), |this| {
                         this.on_action(window.listener_for(&entity, InputBaseState::indent_inline))
                             .on_action(window.listener_for(&entity, InputBaseState::outdent_inline))
@@ -5635,6 +5649,99 @@ mod tests {
                 f(crate::input::InputState::new(window, cx))
             })
         }
+    }
+
+    /// Ghost text on a single-line field is a suggestion the application offers for what
+    /// is being typed. It is painted, not valued, and Tab hands it back.
+    #[gpui::test]
+    fn single_line_ghost_text_is_not_the_value_and_tab_hands_it_back(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let view = InputView::<InputMode>::build(cx, |state| state);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let accepted = Rc::new(Cell::new(0));
+        cx.update(|window, cx| {
+            let accepted = accepted.clone();
+            cx.subscribe(&view.input, move |_, event: &InputEvent, _| {
+                if matches!(event, InputEvent::AcceptSuggestion) {
+                    accepted.set(accepted.get() + 1);
+                }
+            })
+            .detach();
+            view.input.update(cx, |state, cx| {
+                state.focus(window, cx);
+                state.set_value("ma", window, cx);
+                state.set_selected_range(2..2, cx);
+                state.set_ghost_text(Some("ya Chen".into()), cx);
+            });
+        });
+        cx.run_until_parked();
+        view.input.read_with(&cx, |state, _| {
+            assert_eq!(state.value(), "ma", "the suggestion is not part of the text");
+            assert_eq!(state.ghost_text(), Some("ya Chen"));
+        });
+
+        cx.simulate_keystrokes("tab");
+        assert_eq!(accepted.get(), 1);
+        view.input.read_with(&cx, |state, _| {
+            assert_eq!(state.value(), "ma", "accepting is the listener's to do");
+            assert_eq!(state.ghost_text(), None);
+        });
+
+        // With nothing offered, Tab is not this field's to take.
+        cx.simulate_keystrokes("tab");
+        assert_eq!(accepted.get(), 1);
+    }
+
+    #[gpui::test]
+    fn single_line_ghost_text_goes_when_the_user_carries_on_or_dismisses_it(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let view = InputView::<InputMode>::build(cx, |state| state);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let offer = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                view.input.update(cx, |state, cx| {
+                    state.focus(window, cx);
+                    state.set_value("ma", window, cx);
+                    state.set_selected_range(2..2, cx);
+                    state.set_ghost_text(Some("ya Chen".into()), cx);
+                });
+            });
+            cx.run_until_parked();
+        };
+
+        offer(&mut cx);
+        cx.simulate_keystrokes("y");
+        view.input.read_with(&cx, |state, _| {
+            assert_eq!(state.value(), "may");
+            assert_eq!(state.ghost_text(), None, "typing drops it");
+        });
+
+        offer(&mut cx);
+        cx.simulate_keystrokes("left");
+        view.input.read_with(&cx, |state, _| assert_eq!(state.ghost_text(), None, "moving the caret drops it"));
+
+        offer(&mut cx);
+        cx.simulate_keystrokes("escape");
+        view.input.read_with(&cx, |state, _| {
+            assert_eq!(state.ghost_text(), None, "Escape dismisses it");
+            assert_eq!(state.value(), "ma");
+        });
+    }
+
+    #[gpui::test]
+    fn an_empty_suggestion_is_no_suggestion(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let view = InputView::<InputMode>::build(cx, |state| state);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|_, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_ghost_text(Some(String::new()), cx);
+                assert_eq!(state.ghost_text(), None);
+                state.set_ghost_text(Some("x".into()), cx);
+                state.set_ghost_text(None, cx);
+                assert_eq!(state.ghost_text(), None);
+            });
+        });
     }
 
     /// The frame is laid out by the application, which should not have to
@@ -10952,6 +11059,33 @@ impl InputBaseState<crate::input::InputMode> {
     pub fn set_masked(&mut self, masked: bool, _: &mut Window, cx: &mut Context<Self>) {
         self.masked = masked;
         cx.notify();
+    }
+
+    /// Shows `text` faintly after the caret as a suggestion for what is being typed, or
+    /// removes it with `None`. It is painted, never part of the value.
+    ///
+    /// Tab accepts it by emitting [`InputEvent::AcceptSuggestion`] (the field changes
+    /// nothing itself). Typing, moving the caret, clicking, Enter, Escape and losing focus
+    /// drop it, so set it again after the text changes. It is painted over whatever follows
+    /// the caret, so offer it only with the caret at the end of the text.
+    pub fn set_ghost_text(&mut self, text: Option<String>, cx: &mut Context<Self>) {
+        let item = text.filter(|t| !t.is_empty()).map(|insert_text| lsp_types::InlineCompletionItem {
+            insert_text,
+            filter_text: None,
+            range: None,
+            command: None,
+            insert_text_format: None,
+        });
+        if self.extras.ghost == item {
+            return;
+        }
+        self.extras.ghost = item;
+        cx.notify();
+    }
+
+    /// The ghost text being offered, if any.
+    pub fn ghost_text(&self) -> Option<&str> {
+        self.extras.ghost.as_ref().map(|item| item.insert_text.as_str())
     }
 
     /// Set the regular expression pattern of the input field.

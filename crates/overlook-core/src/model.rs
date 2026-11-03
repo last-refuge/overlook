@@ -551,6 +551,24 @@ impl DraftAttachment {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftSource {
+    /// Original body of an imported draft. Preserve its HTML until the text is edited.
+    pub text: String,
+    pub html: Option<String>,
+    pub in_reply_to: Option<String>,
+    pub references: Vec<String>,
+}
+
+/// A server draft and its content version. IMAP identifies versions by mailbox,
+/// UIDVALIDITY and UID; Gmail keeps the draft id while changing the message id.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteDraft {
+    pub id: ProviderId,
+    pub revision: String,
+    pub thread_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Draft {
     pub id: DraftId,
     pub account_id: AccountId,
@@ -565,15 +583,25 @@ pub struct Draft {
     /// The HTML rendering of `body_text`, which is Markdown-flavoured. Theme changes must
     /// never rewrite this.
     pub body_html: Option<String>,
+    #[serde(default)]
+    pub imported: Option<DraftSource>,
     /// Whether the message this replies to or forwards is appended below the body when sent
     /// (and shown, collapsed, in the composer). The quoted text is not part of `body_text`.
     #[serde(default)]
     pub include_quote: bool,
+    /// The signature chosen for this message, by id in the account's signatures.
+    #[serde(default)]
+    pub signature_id: Option<String>,
+    /// That signature's HTML as it was when it was chosen, so editing signatures later never
+    /// changes a message already written or waiting in the Outbox. It goes below the body and
+    /// above the quote. Its images are inline attachments of the draft.
+    #[serde(default)]
+    pub signature_html: Option<String>,
     pub attachments: Vec<DraftAttachment>,
     pub state: DraftState,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
-    /// Set when the provider has a copy of this draft (Gmail draft id).
+    /// The Gmail draft id or IMAP mailbox/UIDVALIDITY/UID of its server copy.
     pub provider_id: Option<ProviderId>,
 }
 
@@ -591,7 +619,10 @@ impl Draft {
             subject: String::new(),
             body_text: String::new(),
             body_html: None,
+            imported: None,
             include_quote: false,
+            signature_id: None,
+            signature_html: None,
             attachments: Vec::new(),
             state: DraftState::Editing,
             created_at: now,
@@ -659,7 +690,10 @@ impl Draft {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.to.is_empty()
+        // A server draft is intentional even if blank or containing only inline HTML.
+        // Opening and closing one must never discard it automatically.
+        self.imported.is_none()
+            && self.to.is_empty()
             && self.cc.is_empty()
             && self.bcc.is_empty()
             && self.subject.trim().is_empty()
@@ -721,7 +755,7 @@ fn strip_prefixes(subject: &str) -> String {
 pub fn quote_header(source: &Message) -> String {
     format!(
         "On {}, {} wrote:",
-        crate::time::format_full(source.date, crate::time::local_utc_offset_minutes()),
+        crate::time::format_full(source.date, &crate::tz::current_zone()),
         source.from.to_header()
     )
 }
@@ -731,7 +765,7 @@ pub fn forward_header(source: &Message) -> String {
     format!(
         "---------- Forwarded message ----------\nFrom: {}\nDate: {}\nSubject: {}\nTo: {}",
         source.from.to_header(),
-        crate::time::format_full(source.date, crate::time::local_utc_offset_minutes()),
+        crate::time::format_full(source.date, &crate::tz::current_zone()),
         source.subject,
         source.to.iter().map(Address::to_header).collect::<Vec<_>>().join(", ")
     )
@@ -858,6 +892,19 @@ mod tests {
     }
 
     #[test]
+    fn a_contact_is_known_by_its_name_or_its_given_and_family_names() {
+        let mut c = Contact { email: "maya@northstar.example".into(), ..Default::default() };
+        assert_eq!((c.known_name(), c.display_name().as_str()), (None, "maya@northstar.example"));
+        c.given_name = Some("Maya".into());
+        c.family_name = Some("Chen".into());
+        assert_eq!(c.known_name().as_deref(), Some("Maya Chen"));
+        c.name = Some("  ".into());
+        assert_eq!(c.known_name().as_deref(), Some("Maya Chen"), "a blank name does not count");
+        c.name = Some("Maya C.".into());
+        assert_eq!(c.display_name(), "Maya C.");
+    }
+
+    #[test]
     fn images_embedded_in_the_quote_do_not_make_a_draft_non_empty() {
         let attachment = |content_id: Option<&str>| DraftAttachment {
             id: AttachmentId::generate(),
@@ -919,16 +966,18 @@ impl Contact {
         Address { name: self.name.clone(), email: self.email.clone() }
     }
 
+    /// The name, or the given and family names together, when either is known.
+    pub fn known_name(&self) -> Option<String> {
+        self.name.clone().filter(|n| !n.trim().is_empty()).or_else(|| {
+            let full = format!("{} {}", self.given_name.clone().unwrap_or_default(), self.family_name.clone().unwrap_or_default());
+            let full = full.trim().to_owned();
+            (!full.is_empty()).then_some(full)
+        })
+    }
+
     /// Name, or the address, or a placeholder.
     pub fn display_name(&self) -> String {
-        self.name
-            .clone()
-            .filter(|n| !n.trim().is_empty())
-            .or_else(|| {
-                let full = format!("{} {}", self.given_name.clone().unwrap_or_default(), self.family_name.clone().unwrap_or_default());
-                let full = full.trim().to_owned();
-                (!full.is_empty()).then_some(full)
-            })
+        self.known_name()
             .or_else(|| (!self.email.is_empty()).then(|| self.email.clone()))
             .unwrap_or_else(|| "(No name)".into())
     }

@@ -464,6 +464,10 @@ impl Connection {
                     narrow(&mut uids, self.selected_folder(|f| f.messages.keys().copied().collect()).unwrap_or_default());
                     i += 1;
                 }
+                "UNDELETED" => {
+                    narrow(&mut uids, self.selected_folder(|f| f.messages.iter().filter(|(_, m)| !m.has_flag("\\Deleted")).map(|(uid, _)| *uid).collect()).unwrap_or_default());
+                    i += 1;
+                }
                 "CHARSET" => i += 2,
                 "HEADER" => {
                     let (name, value) = (tokens.get(i + 1).cloned().unwrap_or_default(), tokens.get(i + 2).cloned().unwrap_or_default());

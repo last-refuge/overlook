@@ -24,8 +24,15 @@ from the native sanitizer's lossy presentation projection. It preserves safe
 inline/head CSS and actual HTML/body root attributes, while removing active
 markup, event handlers, forms, embedded frames, metadata, base URLs, external
 stylesheet links and unsafe resource schemes. Original HTML in SQLite is never
-rewritten. Authored layout containers and full visible history remain intact;
-the old native quote splitting/folding is not applied to received browser bodies.
+rewritten. Authored layout containers remain intact. Before browser sanitization,
+`thread_history::prepare` can add a reversible Message history disclosure around
+a quoted tail whose whitespace-normalized text, images and link targets exactly
+match an earlier message in the conversation. Gmail/cite/Thunderbird/Yahoo quote
+containers and Outlook reply headers are recognized. Unmatched history, changed
+inline notes/resources, short ambiguous quotes and forwarded content stay visible.
+All original content remains inside the disclosure; outgoing quotes, printing,
+raw mail and stored bodies are unchanged. Preparation runs off the UI thread with
+generation cancellation, parsing limits and a 64-message / 8 MiB thread budget.
 CID image sources are normalized, then resolved from downloaded local attachment
 parts into data URLs. Unresolved CIDs cannot fetch through the browser.
 
@@ -63,7 +70,10 @@ printing projection; it is not yet guaranteed to match the new inline surface.
   also its child-only `TMPDIR`. It does not inherit a quota-exhausted `/tmp` or a
   deep project temp path; the latter can exceed Chromium's Unix socket limit.
   The launcher does not force shared-memory/font buffers onto `/tmp`.
-- Four live browser views maximum; process RSS is polled with a 2 GiB watchdog per
+- Four live browser views maximum, reserving slots for composer previews and
+  prioritizing the latest message and reply source. Other expanded messages use
+  their full native text part when present; HTML-only messages offer Read message
+  to open the complete browser body. Process RSS is polled with a 2 GiB watchdog per
   view (not a hard cgroup memory limit). HTML, response bodies, queues and frames
   are bounded. Document display height is capped at 100,000 CSS pixels; the stored
   original is unchanged. Closing/collapsing a view cancels its worker, reaps subprocesses and
@@ -76,10 +86,14 @@ printing projection; it is not yet guaranteed to match the new inline surface.
 - Remote consent remains an explicit per-message choice or the global **Remote
   content** preference. The legacy persisted preference key remains compatible.
 
-White is the fallback browser paper in every non-dark shell theme. Dark uses
-Chromium dark-mode emulation; sender-authored colors need not match the shell
-palette exactly. Fonts depend on installed system fonts and consent for authored
-remote fonts. Animation/transition playback is suppressed. Full DOM accessibility
+Email paper stays white with dark default text in every shell theme. Mail rendering
+uses Chromium's light color scheme, including previews, quoted history and Outbox;
+a Dark app theme does not invert sender content. Sender-authored colors still take
+precedence. A native white surface adds 20px horizontal and 16px vertical gutters
+outside the document, with matching light paper for plain text, loading and fallback
+content. The surrounding app and message controls retain the selected theme. Fonts
+depend on installed system fonts and consent for authored remote fonts.
+Animation/transition playback is suppressed. Full DOM accessibility
 bridging is not implemented yet.
 
 ## Runtime and packaging

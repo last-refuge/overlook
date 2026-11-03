@@ -320,7 +320,7 @@ fn export_caldav_native_fixture() {
         .unwrap();
     let at = tz::day_start(now()) + 15 * 3_600_000;
     let mut s = snapshot(&c, tz::add_days(at, -60), tz::add_days(at, 366), Some(at));
-    s.timezone = format!("{:?}", tz::system_zone());
+    s.timezone = tz::cache_key();
     s.calendars[0].calendar.name = "Demo · Personal".into();
     s.calendars[0].calendar.color = Some("#568b75".into());
     let e = &mut s.calendars[0].resources[0].events[0];

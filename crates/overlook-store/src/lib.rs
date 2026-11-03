@@ -17,6 +17,9 @@ mod calendar_connections;
 mod caldav;
 mod caldav_outbox;
 mod schema;
+mod draft_sync;
+mod time_zone;
+pub use draft_sync::{DraftEditGuard, DraftSyncEntry, DraftUpload, same_draft_content};
 
 pub use index::{apply_to_message, MailIndex};
 
@@ -164,6 +167,7 @@ pub struct Store {
     /// the open conversation). With WAL it reads the last committed state while a sync
     /// holds `conn` for a write, so the UI never waits for a download. `None` in memory.
     reader: Option<Mutex<Connection>>,
+    editing_drafts: Mutex<HashMap<DraftId, usize>>,
 }
 
 impl Store {
@@ -189,7 +193,7 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         schema::migrate(&conn)?;
-        Ok(Self { conn: Mutex::new(conn), reader: None })
+        Ok(Self { conn: Mutex::new(conn), reader: None, editing_drafts: Mutex::new(HashMap::new()) })
     }
 
     fn with_tx<T>(&self, f: impl FnOnce(&Transaction) -> Result<T>) -> Result<T> {
@@ -1925,6 +1929,11 @@ fn save_draft_tx(tx: &Connection, d: &Draft) -> Result<()> {
     // A draft is saved under its own account; an id already used by another account's
     // draft is refused rather than overwritten.
     ensure_owned(tx, Owned::Draft, &d.account_id, [d.id.0.as_str()])?;
+    let owner: Option<String> = tx.query_row("SELECT account_id FROM draft_sync WHERE draft_id=?1", [&d.id.0], |r| r.get(0)).optional()?;
+    if owner.is_some_and(|owner| owner != d.account_id.0) { return Err(StoreError::NotOwned("draft")); }
+    tx.execute("INSERT OR IGNORE INTO draft_sync(draft_id, account_id) SELECT ?1,?2 FROM accounts WHERE id=?2 AND provider IN ('gmail','imap')", params![d.id.0, d.account_id.0])?;
+    let remote: Option<String> = tx.query_row("SELECT remote_json FROM draft_sync WHERE draft_id=?1", [&d.id.0], |r| r.get(0)).optional()?.flatten();
+    let remote: Option<RemoteDraft> = remote.as_deref().map(serde_json::from_str).transpose()?;
     // Its conversation and the message it replies to must be the same account's.
     ensure_owned(tx, Owned::Message, &d.account_id, d.in_reply_to.iter().map(|m| m.0.as_str()))?;
     tx.execute(
@@ -1950,10 +1959,18 @@ fn save_draft_tx(tx: &Connection, d: &Draft) -> Result<()> {
             serde_json::to_string(&d.state)?,
             d.created_at,
             d.updated_at,
-            d.provider_id.as_ref().map(|p| &p.0),
+            remote.as_ref().map(|r| &r.id.0).or_else(|| d.provider_id.as_ref().map(|p| &p.0)),
             d.include_quote as i64,
         ],
     )?;
+    tx.execute("DELETE FROM draft_imports WHERE draft_id=?1", [&d.id.0])?;
+    if let Some(imported) = &d.imported {
+        tx.execute("INSERT INTO draft_imports(draft_id,source_json) VALUES(?1,?2)", params![d.id.0, serde_json::to_string(imported)?])?;
+    }
+    tx.execute("DELETE FROM draft_signatures WHERE draft_id=?1", [&d.id.0])?;
+    if let Some(html) = &d.signature_html {
+        tx.execute("INSERT INTO draft_signatures(draft_id, signature_id, html) VALUES(?1,?2,?3)", params![d.id.0, d.signature_id, html])?;
+    }
     tx.execute("DELETE FROM draft_attachments WHERE draft_id=?1", [&d.id.0])?;
     for a in &d.attachments {
         tx.execute(
@@ -1967,7 +1984,7 @@ fn save_draft_tx(tx: &Connection, d: &Draft) -> Result<()> {
 fn load_drafts(c: &Connection, where_clause: &str, args: impl rusqlite::Params) -> Result<Vec<Draft>> {
     let sql = format!(
         "SELECT d.id, d.account_id, d.kind, d.conversation_id, d.in_reply_to, d.to_json, d.cc_json, d.bcc_json, d.subject, d.body_text,
-                d.body_html, d.state_json, d.created_at, d.updated_at, d.provider_id, d.include_quote FROM drafts d {where_clause}"
+                d.body_html, d.state_json, d.created_at, d.updated_at, d.provider_id, d.include_quote, i.source_json FROM drafts d LEFT JOIN draft_imports i ON i.draft_id=d.id {where_clause}"
     );
     let mut stmt = c.prepare(&sql)?;
     let rows = stmt.query_map(args, |r| {
@@ -1988,11 +2005,12 @@ fn load_drafts(c: &Connection, where_clause: &str, args: impl rusqlite::Params) 
             r.get::<_, i64>(13)?,
             r.get::<_, Option<String>>(14)?,
             r.get::<_, i64>(15)? != 0,
+            r.get::<_, Option<String>>(16)?,
         ))
     })?;
     let mut drafts = Vec::new();
     for row in rows {
-        let (id, account_id, kind, conv, reply, to, cc, bcc, subject, body_text, body_html, state, created, updated, provider, include_quote) = row?;
+        let (id, account_id, kind, conv, reply, to, cc, bcc, subject, body_text, body_html, state, created, updated, provider, include_quote, imported) = row?;
         drafts.push(Draft {
             id: DraftId(id),
             account_id: AccountId(account_id),
@@ -2005,13 +2023,24 @@ fn load_drafts(c: &Connection, where_clause: &str, args: impl rusqlite::Params) 
             subject,
             body_text,
             body_html,
+            imported: imported.as_deref().map(serde_json::from_str).transpose()?,
             include_quote,
+            signature_id: None,
+            signature_html: None,
             attachments: Vec::new(),
             state: serde_json::from_str(&state)?,
             created_at: created,
             updated_at: updated,
             provider_id: provider.map(ProviderId),
         });
+    }
+    let mut stmt = c.prepare("SELECT draft_id, signature_id, html FROM draft_signatures")?;
+    for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, String>(2)?)))? {
+        let (draft_id, signature_id, html) = row?;
+        if let Some(d) = drafts.iter_mut().find(|d| d.id.0 == draft_id) {
+            d.signature_id = signature_id;
+            d.signature_html = Some(html);
+        }
     }
     let mut stmt = c.prepare("SELECT id, draft_id, filename, mime_type, size_bytes, local_path, content_id FROM draft_attachments ORDER BY rowid")?;
     for row in stmt.query_map([], |r| {
@@ -2390,6 +2419,32 @@ mod tests {
         let loaded = store.draft(&draft.id).unwrap().unwrap();
         assert_eq!(loaded.attachments, draft.attachments);
         assert_eq!(loaded.attachments.iter().filter(|a| a.is_listed()).count(), 1);
+    }
+
+    #[test]
+    fn a_draft_keeps_the_signature_it_was_given() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+        let mut draft = Draft::new(acct.clone(), DraftKind::New, 10);
+        draft.signature_id = Some("sig-work".into());
+        draft.signature_html = Some("<p>Jason<br><img src=\"cid:sig-1@overlook\"></p>".into());
+        store.save_draft(&draft).unwrap();
+        let loaded = store.draft(&draft.id).unwrap().unwrap();
+        assert_eq!((loaded.signature_id.as_deref(), loaded.signature_html.as_deref()), (Some("sig-work"), draft.signature_html.as_deref()));
+
+        // Choosing no signature removes it; saving again does not duplicate it.
+        draft.signature_id = None;
+        draft.signature_html = None;
+        store.save_draft(&draft).unwrap();
+        let loaded = store.draft(&draft.id).unwrap().unwrap();
+        assert_eq!((loaded.signature_id, loaded.signature_html), (None, None));
+
+        // It goes with the draft.
+        draft.signature_html = Some("<p>x</p>".into());
+        store.save_draft(&draft).unwrap();
+        store.delete_draft(&acct, &draft.id).unwrap();
+        assert_eq!(store.with_read(|c| Ok(c.query_row("SELECT COUNT(*) FROM draft_signatures", [], |r| r.get::<_, i64>(0))?)).unwrap(), 0);
     }
 
     #[test]

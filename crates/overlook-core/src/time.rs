@@ -1,6 +1,7 @@
 //! Minimal time helpers. Timestamps are Unix milliseconds in UTC.
 
 use std::time::{SystemTime, UNIX_EPOCH};
+use crate::tz::TimeZone;
 
 /// Unix timestamp in milliseconds.
 pub type Timestamp = i64;
@@ -42,6 +43,14 @@ pub fn civil(ts: Timestamp, utc_offset_minutes: i32) -> (CivilDate, CivilTime, u
         },
         weekday,
     )
+}
+
+/// Splits a timestamp using the zone's offset at that instant, including DST.
+pub fn civil_in_zone(ts: Timestamp, zone: &TimeZone) -> (CivilDate, CivilTime, u32) {
+    let z = crate::tz::in_zone(ts, zone);
+    (CivilDate { year: i32::from(z.year()), month: z.month() as u32, day: z.day() as u32 },
+        CivilTime { hour: z.hour() as u32, minute: z.minute() as u32 },
+        z.weekday().to_sunday_zero_offset() as u32)
 }
 
 /// Howard Hinnant's days-to-civil algorithm.
@@ -120,9 +129,9 @@ impl DayGroup {
 
 /// Describes a message time relative to `now`, the way the list column shows it:
 /// clock time for today, weekday for the past week, otherwise a short date.
-pub fn relative_label(ts: Timestamp, now: Timestamp, utc_offset_minutes: i32) -> String {
-    let (date, time, weekday) = civil(ts, utc_offset_minutes);
-    let (today, _, _) = civil(now, utc_offset_minutes);
+pub fn relative_label(ts: Timestamp, now: Timestamp, zone: &TimeZone) -> String {
+    let (date, time, weekday) = civil_in_zone(ts, zone);
+    let (today, _, _) = civil_in_zone(now, zone);
     let day_delta = days_from_civil(today.year, today.month, today.day)
         - days_from_civil(date.year, date.month, date.day);
     if day_delta == 0 {
@@ -143,9 +152,16 @@ pub fn relative_label(ts: Timestamp, now: Timestamp, utc_offset_minutes: i32) ->
     }
 }
 
-pub fn day_group(ts: Timestamp, now: Timestamp, utc_offset_minutes: i32) -> DayGroup {
-    let (date, _, weekday) = civil(ts, utc_offset_minutes);
-    let (today, _, _) = civil(now, utc_offset_minutes);
+/// The calendar day `ts` falls on in the given zone, as a day count. It changes exactly
+/// when [`day_group`] can change its answer for a fixed message.
+pub fn local_day(ts: Timestamp, zone: &TimeZone) -> i64 {
+    let (date, _, _) = civil_in_zone(ts, zone);
+    days_from_civil(date.year, date.month, date.day)
+}
+
+pub fn day_group(ts: Timestamp, now: Timestamp, zone: &TimeZone) -> DayGroup {
+    let (date, _, weekday) = civil_in_zone(ts, zone);
+    let (today, _, _) = civil_in_zone(now, zone);
     let day_delta = days_from_civil(today.year, today.month, today.day)
         - days_from_civil(date.year, date.month, date.day);
     match day_delta {
@@ -157,8 +173,8 @@ pub fn day_group(ts: Timestamp, now: Timestamp, utc_offset_minutes: i32) -> DayG
 }
 
 /// Full date and time for the reader header, e.g. `Monday, Oct 12, 2026 at 10:42 AM`.
-pub fn format_full(ts: Timestamp, utc_offset_minutes: i32) -> String {
-    let (date, time, weekday) = civil(ts, utc_offset_minutes);
+pub fn format_full(ts: Timestamp, zone: &TimeZone) -> String {
+    let (date, time, weekday) = civil_in_zone(ts, zone);
     format!(
         "{}, {} {}, {} at {}",
         WEEKDAYS[weekday as usize],
@@ -167,49 +183,6 @@ pub fn format_full(ts: Timestamp, utc_offset_minutes: i32) -> String {
         date.year,
         format_clock(time)
     )
-}
-
-/// Best-effort local UTC offset in minutes, read from the `TZ`-independent libc `localtime`.
-/// Falls back to UTC when the offset cannot be determined.
-pub fn local_utc_offset_minutes() -> i32 {
-    // Avoid a libc dependency: read /etc/localtime is complex, so use the `date` convention
-    // through the environment when present (`OVERLOOK_UTC_OFFSET_MINUTES`), else UTC.
-    std::env::var("OVERLOOK_UTC_OFFSET_MINUTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(system_offset_minutes)
-}
-
-#[cfg(unix)]
-fn system_offset_minutes() -> i32 {
-    // Parse the TZif footer of /etc/localtime is overkill for the prototype; instead ask the
-    // platform via `date +%z`, which is universally available on Linux.
-    std::process::Command::new("date")
-        .arg("+%z")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| parse_offset(s.trim()))
-        .unwrap_or(0)
-}
-
-#[cfg(not(unix))]
-fn system_offset_minutes() -> i32 {
-    0
-}
-
-fn parse_offset(s: &str) -> Option<i32> {
-    if s.len() < 5 {
-        return None;
-    }
-    let sign = match &s[0..1] {
-        "+" => 1,
-        "-" => -1,
-        _ => return None,
-    };
-    let hours: i32 = s[1..3].parse().ok()?;
-    let minutes: i32 = s[3..5].parse().ok()?;
-    Some(sign * (hours * 60 + minutes))
 }
 
 #[cfg(test)]
@@ -227,20 +200,44 @@ mod tests {
     }
 
     #[test]
-    fn relative_labels() {
-        let base = days_from_civil(2026, 10, 12) * 86_400_000 + 15 * 3_600_000;
-        assert_eq!(relative_label(base - 3_600_000, base, 0), "2:00 PM");
-        assert_eq!(relative_label(base - 86_400_000, base, 0), "Yesterday");
-        assert_eq!(relative_label(base - 3 * 86_400_000, base, 0), "Friday");
-        assert_eq!(relative_label(base - 30 * 86_400_000, base, 0), "Sep 12");
-        assert_eq!(day_group(base - 3 * 86_400_000, base, 0), DayGroup::ThisWeek("Friday".into()));
-        assert_eq!(day_group(base - 40 * 86_400_000, base, 0), DayGroup::Earlier);
+    fn local_day_turns_over_at_local_midnight() {
+        let midnight_utc = days_from_civil(2026, 10, 12) * 86_400_000;
+        assert_eq!(local_day(midnight_utc, &TimeZone::UTC), days_from_civil(2026, 10, 12));
+        assert_eq!(local_day(midnight_utc - 1, &TimeZone::UTC), days_from_civil(2026, 10, 11));
+        // Five hours behind UTC, local midnight is 05:00 UTC.
+        assert_eq!(local_day(midnight_utc + 4 * 3_600_000, &TimeZone::get("Etc/GMT+5").unwrap()), days_from_civil(2026, 10, 11));
+        assert_eq!(local_day(midnight_utc + 5 * 3_600_000, &TimeZone::get("Etc/GMT+5").unwrap()), days_from_civil(2026, 10, 12));
     }
 
     #[test]
-    fn offsets_parse() {
-        assert_eq!(parse_offset("-0700"), Some(-420));
-        assert_eq!(parse_offset("+0530"), Some(330));
-        assert_eq!(parse_offset("nope"), None);
+    fn relative_labels() {
+        let base = days_from_civil(2026, 10, 12) * 86_400_000 + 15 * 3_600_000;
+        assert_eq!(relative_label(base - 3_600_000, base, &TimeZone::UTC), "2:00 PM");
+        assert_eq!(relative_label(base - 86_400_000, base, &TimeZone::UTC), "Yesterday");
+        assert_eq!(relative_label(base - 3 * 86_400_000, base, &TimeZone::UTC), "Friday");
+        assert_eq!(relative_label(base - 30 * 86_400_000, base, &TimeZone::UTC), "Sep 12");
+        assert_eq!(day_group(base - 3 * 86_400_000, base, &TimeZone::UTC), DayGroup::ThisWeek("Friday".into()));
+        assert_eq!(day_group(base - 40 * 86_400_000, base, &TimeZone::UTC), DayGroup::Earlier);
+    }
+
+    #[test]
+    fn mail_dates_use_each_instants_offset_including_dst_and_fractional_zones() {
+        let toronto = TimeZone::get("America/Toronto").unwrap();
+        let summer = crate::tz::parse_rfc3339("2026-07-01T16:00:00Z").unwrap();
+        let winter = crate::tz::parse_rfc3339("2026-12-01T16:00:00Z").unwrap();
+        assert_eq!(civil_in_zone(summer, &toronto).1, CivilTime { hour: 12, minute: 0 });
+        assert_eq!(civil_in_zone(winter, &toronto).1, CivilTime { hour: 11, minute: 0 });
+        assert!(format_full(summer, &toronto).ends_with("12:00 PM"));
+        assert_eq!(civil_in_zone(winter, &TimeZone::get("Asia/Kolkata").unwrap()).1, CivilTime { hour: 21, minute: 30 });
+        let fold_a = crate::tz::parse_rfc3339("2026-11-01T05:30:00Z").unwrap();
+        let fold_b = crate::tz::parse_rfc3339("2026-11-01T06:30:00Z").unwrap();
+        assert_eq!(civil_in_zone(fold_a, &toronto).1, civil_in_zone(fold_b, &toronto).1);
+        let now = crate::tz::parse_rfc3339("2026-11-02T05:30:00Z").unwrap();
+        let previous = crate::tz::parse_rfc3339("2026-11-01T04:30:00Z").unwrap();
+        assert_eq!(day_group(previous, now, &toronto), DayGroup::Yesterday);
+        assert_eq!(relative_label(previous, now, &toronto), "Yesterday");
+        let phoenix = TimeZone::get("America/Phoenix").unwrap();
+        assert_eq!(civil_in_zone(summer, &phoenix).1.hour, 9);
+        assert_eq!(civil_in_zone(winter, &phoenix).1.hour, 9);
     }
 }

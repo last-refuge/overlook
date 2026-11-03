@@ -32,6 +32,10 @@ and you can read, search, write, and file mail with no connection at all.
 
 - **Mail the Outlook way.** Account and folder sidebar, message list with day groups, a generous reading
   pane you can move below the list, comfortable and compact density, resizable panes that remember their size.
+  A slim icon rail switches between Mail, Calendar, and Contacts; the toolbar keeps each module's actions
+  close at hand, with crisp two-tone icons that follow your color scheme.
+  Drag toolbar buttons into your preferred order or between the strip and More; each module remembers
+  your layout. More → Customize toolbar also offers keyboard controls and a reset option.
 - **Focused Inbox.** The Inbox splits into Focused and Other from Gmail's own hints, who you write to, and
   your choices: *Move to Other*, or *Always move messages from this sender*. Local, private, and reversible.
 - **Reading that respects you.** Received HTML uses isolated Chromium layout inside the native shell;
@@ -42,12 +46,14 @@ and you can read, search, write, and file mail with no connection at all.
   your system apps, except programs and scripts, which Overlook never launches. Every message has Reply, Forward, Print, Save
   as .eml and View source, and long threads expand or collapse in one click.
 - **Writing.** New, reply, reply all, forward, with autosave to the device, recipient suggestions from your
-  Google Contacts and people you have written to, attachments (a forward brings the original's along), several named signatures per account with a
-  picker in the composer, and `mailto:` links from other apps. Formatting as you type: bold, italics, links,
+  Google Contacts and people you have written to, attachments (a forward brings the original's along), several named HTML signatures per account (with pictures, a small
+  formatting editor, and a picker in the composer), and `mailto:` links from other apps. Formatting as you type: bold, italics, links,
   lists, quotes and code, styled live in the editor with the marks still visible, a Preview of exactly what
   recipients get, and the quoted original kept out of your way below the reply. Like Gmail, Overlook does not
   send programs, scripts, or installers (`.exe`, `.msi`, `.sh`, `.desktop`, `.AppImage` and similar), files whose
   content is one under another name, or `.zip`/`.tar` archives containing them.
+- **Drafts across devices.** Gmail and IMAP drafts sync both ways, including attachments and inline images.
+  Offline changes wait for a connection; conflicting edits are preserved as separate drafts. POP3 drafts stay local.
 - **A calendar, not an afterthought.** Day, Week, Month, and Agenda. Invitations with Accept, Tentative, and
   Decline, from the calendar or from the email itself. Create, edit, and delete events, drag them to move or
   resize, edit one occurrence of a repeating event or the whole series, invite guests and check whether they
@@ -70,8 +76,10 @@ and you can read, search, write, and file mail with no connection at all.
   SMTP. POP3 downloads and keeps your mail here, with a backup button. Scripted servers only so far; see the
   status below.
 - **Settings that do things.** Accounts and signatures, notifications, sync interval, mark-as-read timing,
-  remote content, download size, working hours, reminders, automatic replies (out of office), and more. Every
+  remote content, download size, working hours, reminders, time-zone overrides, automatic replies (out of office), and more. Every
   control takes effect immediately.
+  Mail and calendar use date-aware daylight-saving rules. Overlook checks for system time-zone changes
+  every minute and asks before switching; keeping the current zone saves an override.
 
 <p align="center">
   <img src="docs/screenshots/calendar-week-light.png" alt="Overlook calendar week view" width="920">

@@ -11,9 +11,11 @@ use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::combobox::{Combobox, ComboboxEvent, ComboboxState};
+use gpui_kit::component::searchable_list::{SearchableListItem, SearchableVec};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{Disableable, Sizable};
+use gpui_kit::component::{Disableable, Sizable, IndexPath};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use overlook_core::*;
@@ -58,7 +60,7 @@ pub struct SettingsState {
     /// Account shown on the Accounts page.
     pub account: AccountId,
     pub name_input: Entity<InputState>,
-    /// Body of the signature being edited.
+    /// HTML source of the signature being edited.
     pub signature: Entity<TextareaState>,
     pub signature_name: Entity<InputState>,
     pub selected_signature: Option<String>,
@@ -73,13 +75,39 @@ pub struct SettingsState {
     pub attachments_dir: Entity<InputState>,
     pub work_start: Entity<InputState>,
     pub work_end: Entity<InputState>,
+    pub time_zone: Entity<ComboboxState<SearchableVec<ZoneChoice>>>,
     pub caldav: Option<super::calendar_setup::CalendarSetup>,
     pub _subscriptions: Vec<Subscription>,
 }
 
+#[derive(Clone)]
+pub struct ZoneChoice { definition: Option<overlook_core::tz::ZoneDefinition>, title: SharedString }
+impl SearchableListItem for ZoneChoice {
+    type Value = Option<overlook_core::tz::ZoneDefinition>;
+    fn title(&self) -> SharedString { self.title.clone() }
+    fn value(&self) -> &Self::Value { &self.definition }
+}
+
+pub(super) fn time_zone_choices(selected: &Option<overlook_core::tz::ZoneDefinition>) -> Vec<ZoneChoice> {
+    let mut definitions = vec![None];
+    definitions.extend(overlook_core::tz::available_zone_names().iter().map(|name| Some(overlook_core::tz::ZoneDefinition::Named(name.clone()))));
+    if selected.is_some() && !definitions.contains(selected) { definitions.push(selected.clone()); }
+    definitions.into_iter().map(|definition| {
+        let title = match &definition {
+            None => "Follow system".into(),
+            Some(overlook_core::tz::ZoneDefinition::Named(name)) => name.replace('_', " ").into(),
+            Some(definition) => format!("{} (kept)", definition.resolve().map(|zone| overlook_core::tz::zone_label(&zone)).unwrap_or_else(|_| "Local time".into())).into(),
+        };
+        ZoneChoice { definition, title }
+    }).collect()
+}
+
 impl MailWindow {
     pub(crate) fn save_prefs(&mut self, cx: &mut Context<Self>) {
-        self.save_setting("prefs", &self.prefs);
+        let (store, prefs) = (self.store.clone(), self.prefs.clone());
+        crate::persist::later(move || {
+            if let Err(error) = store.save_preferences(&prefs) { tracing::warn!("could not save preferences: {error}"); }
+        });
         overlook_core::tz::set_clock_24h(self.prefs.clock_24h);
         crate::notify::set_mirror(self.prefs.omarchy_notifications);
         self.reminders_enabled = self.prefs.event_reminders;
@@ -99,14 +127,16 @@ impl MailWindow {
         self.save_account_prefs(account, p);
     }
 
-    fn select_signature(&mut self, account: &AccountId, id: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn select_signature(&mut self, account: &AccountId, id: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        // Leaving a signature: let go of the pictures it no longer shows.
+        self.prune_signature_images(account);
         let p = self.account_prefs_for(account);
         let sig = id.as_deref().and_then(|i| p.signature_by_id(i)).cloned().unwrap_or_default();
         if let Some(state) = self.settings.as_mut() {
             state.selected_signature = id;
-            let (name, body) = (state.signature_name.clone(), state.signature.clone());
+            let (name, source) = (state.signature_name.clone(), state.signature.clone());
             name.update(cx, |s, cx| s.set_value(sig.name.clone(), window, cx));
-            body.update(cx, |s, cx| s.set_value(sig.body.clone(), window, cx));
+            source.update(cx, |s, cx| s.set_value(sig.html.clone(), window, cx));
         }
         cx.notify();
     }
@@ -114,7 +144,7 @@ impl MailWindow {
     fn add_signature(&mut self, account: &AccountId, window: &mut Window, cx: &mut Context<Self>) {
         let mut p = self.account_prefs_for(account);
         let id = AccountPrefs::new_signature_id();
-        p.signatures.push(Signature { id: id.clone(), name: format!("Signature {}", p.signatures.len() + 1), body: String::new() });
+        p.signatures.push(Signature { id: id.clone(), name: format!("Signature {}", p.signatures.len() + 1), ..Default::default() });
         if p.default_new.is_none() {
             p.default_new = Some(id.clone());
         }
@@ -254,7 +284,7 @@ impl MailWindow {
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("Your name").default_value(acct.display_name.clone()));
         let selected_signature = ap.default_new.clone().or_else(|| ap.signatures.first().map(|s| s.id.clone()));
         let selected = selected_signature.as_deref().and_then(|id| ap.signature_by_id(id)).cloned().unwrap_or_default();
-        let signature = cx.new(|cx| TextareaState::new(window, cx).placeholder("Jason Alexander\nLast Refuge").default_value(selected.body.clone()));
+        let signature = cx.new(|cx| TextareaState::new(window, cx).placeholder("<p><b>Jason Alexander</b><br>Last Refuge</p>").default_value(selected.html.clone()));
         let signature_name = cx.new(|cx| InputState::new(window, cx).placeholder("Signature name").default_value(selected.name.clone()));
         let vacation_subject = cx.new(|cx| InputState::new(window, cx).placeholder("Out of office"));
         let vacation_body = cx.new(|cx| TextareaState::new(window, cx).placeholder("I’m away until Monday and will reply when I’m back."));
@@ -263,8 +293,16 @@ impl MailWindow {
         let attachments_dir = cx.new(|cx| InputState::new(window, cx).placeholder("~/Downloads").default_value(self.prefs.attachments_dir.clone().unwrap_or_default()));
         let work_start = cx.new(|cx| InputState::new(window, cx).placeholder("8:00 AM").default_value(hour_text(self.prefs.work_start_hour)));
         let work_end = cx.new(|cx| InputState::new(window, cx).placeholder("6:00 PM").default_value(hour_text(self.prefs.work_end_hour)));
+        let zones = time_zone_choices(&self.prefs.time_zone);
+        let selected = zones.iter().position(|choice| choice.definition == self.prefs.time_zone).unwrap_or(0);
+        let time_zone = cx.new(|cx| ComboboxState::new(SearchableVec::new(zones), vec![IndexPath::default().row(selected)], window, cx).searchable(true));
 
         let mut subs = Vec::new();
+        subs.push(cx.subscribe_in(&time_zone, window, |this, _, event: &ComboboxEvent<SearchableVec<ZoneChoice>>, window, cx| {
+            if let ComboboxEvent::Confirm(values) = event {
+                if let Some(name) = values.first().filter(|name| **name != this.prefs.time_zone) { this.change_time_zone(name.clone(), window, cx); }
+            }
+        }));
         let for_account = acct.id.clone();
         subs.push(cx.subscribe_in(&name_input, window, move |this, state, event: &InputEvent, _window, cx| {
             if matches!(event, InputEvent::Change) {
@@ -282,11 +320,10 @@ impl MailWindow {
                 cx.notify();
             }
         }));
-        let for_account = acct.id.clone();
-        subs.push(cx.subscribe_in(&signature, window, move |this, state, event: &InputEvent, _window, cx| {
+        subs.push(cx.subscribe_in(&signature, window, move |this, state, event: &InputEvent, window, cx| {
             if matches!(event, InputEvent::Change) {
-                let body = state.read(cx).value().to_string();
-                this.update_selected_signature(&for_account, |s| s.body = body);
+                let html = state.read(cx).value().to_string();
+                this.edit_signature_html(html, window, cx);
             }
         }));
         let for_account = acct.id.clone();
@@ -343,6 +380,7 @@ impl MailWindow {
             attachments_dir,
             work_start,
             work_end,
+            time_zone,
             caldav,
             _subscriptions: subs,
         });
@@ -352,6 +390,9 @@ impl MailWindow {
 
     pub(crate) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.cancel_calendar_setup_dialog();
+        if let Some(account) = self.settings.as_ref().map(|s| s.account.clone()) {
+            self.prune_signature_images(&account);
+        }
         self.settings = None;
         self.focus_current_module(window, cx);
         cx.notify();
@@ -571,7 +612,7 @@ impl MailWindow {
                     .into_any_element(),
             ))
             .children(state.caldav.as_ref().map(|form| self.render_calendar_setup(form, cx)))
-            .child(section("Signatures", Some("Added to the end of your messages. Written like the composer: **bold**, *italic*, links.")))
+            .child(section("Signatures", Some("Added below your message, above anything you are replying to. Write HTML below, use the buttons for the basics, or paste HTML from elsewhere. Pictures you insert or paste are sent with the message.")))
             .child({
                 let acct_id = account.id.clone();
                 let selected = state.selected_signature.clone();
@@ -598,7 +639,7 @@ impl MailWindow {
             })
             .when(state.selected_signature.is_some(), |d| {
                 d.child(setting_row("Name", "How this signature appears in the composer’s picker.", Input::new(&state.signature_name).w(px(280.)).into_any_element()))
-                    .child(div().rounded(px(8.)).border_1().border_color(p.divider).h(px(140.)).child(Textarea::new(&state.signature).h_full()))
+                    .child(self.render_signature_editor(state, &p, cx))
             })
             .child(setting_row("Use for new messages", "", self.signature_picker("default-new", &account.id, false, cx)))
             .child(setting_row("Use for replies and forwards", "", self.signature_picker("default-reply", &account.id, true, cx)))
@@ -650,6 +691,8 @@ impl MailWindow {
     fn render_settings_general(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let prefs = self.prefs.clone();
         let appearance = self.appearance;
+        let system_zone = self.time_zone_prompt.as_ref().map(|zone| zone.zone().clone()).unwrap_or_else(overlook_core::tz::system_zone);
+        let time_zone_hint = format!("System: {}. {}", overlook_core::tz::zone_label(&system_zone), if prefs.time_zone.is_some() { "Your override stays active until you select Follow system." } else { "Checks every minute and asks before changing." });
         v_flex()
             .gap(px(22.))
             .child(section("Appearance", None))
@@ -679,6 +722,11 @@ impl MailWindow {
                 choice(&[("On the right", ReadingPane::Right), ("Below the list", ReadingPane::Bottom)], self.reading_pane, cx, |this, v, _w, cx| this.set_reading_pane(v, cx)),
             ))
             .child(section("Start-up and time", None))
+            .child(setting_row(
+                "Time zone",
+                &time_zone_hint,
+                Combobox::new(&self.settings.as_ref().expect("settings is open").time_zone).small().w(px(260.)).disabled(self.time_zone_pending).placeholder("Time zone").menu_width(px(320.)).menu_max_h(px(280.)).search_placeholder("Search city or time zone").into_any_element(),
+            ))
             .child(setting_row(
                 "Open Overlook in",
                 "",

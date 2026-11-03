@@ -19,5 +19,7 @@ html5ever = "0.27"
 markup5ever_rcdom = "0.3"
 markdown = "1.0"
 url = "2"
+# Decodes the images a pasted signature carries as data: URLs.
+base64 = "0.22"
 # Reads .tar.gz attachments for the outgoing attachment policy.
 flate2 = "1"

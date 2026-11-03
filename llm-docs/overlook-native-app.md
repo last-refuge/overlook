@@ -28,9 +28,38 @@ OVERLOOK_DATA_DIR=/tmp/overlook-demo cargo run -p overlook
 
 On first launch Overlook seeds a **Sample account** (“Jason Alexander <jason@example.com>”) with the fictional mailbox from the design preview. The account is labelled as a sample everywhere; its connection is simulated and starts **disconnected**.
 
+## App rail and toolbar (2 November 2026)
+
+Mail, Calendar, and Contacts live in a 48-pixel, icon-only rail. Icons are 21 pixels with
+selected-state highlighting, accessible names and shortcut tooltips; Settings stays at the bottom.
+Mail adds an 8-pixel strip of folder-pane color above the list/reader, a slimmer 5-pixel vertical gap with a right reader, and an 8-pixel horizontal gap with a bottom reader. The list has two 8-pixel top corners; the reader has an 8-pixel top-left corner and a square top-right corner. Rounded corners are covered with the gutter color, so their child backgrounds cannot paint over the curves; bottom corners stay square. Pane divider lines are hidden while their resize hit areas and cursors remain available.
+`Ctrl 1/2/3` continues to switch modules. The title bar keeps account access and contextual search;
+`Ctrl E` focuses mail/contact search or opens calendar commands.
+
+The contextual toolbar floats on the folder-pane background with 8-pixel corners, a subtle shadow, a 4-pixel horizontal inset and 3 pixels above. Its reduced inner padding preserves alignment between the first command and the wordmark. It owns mail filing/reply actions, calendar creation/navigation/view/edit actions,
+and contact creation/mail/edit actions. Per-message reply controls remain beside the message. On
+smaller windows, secondary labels collapse and less frequent mail actions stay in More. Appearance,
+layout and Sync remain common controls. All commands reuse the existing action and capability paths.
+
+The command strip is customizable per module and profile. Drag a button (or its hover handle) before
+another button to reorder it, drop it on More to hide it there, or drag a row from More onto the strip
+to show it. More → Customize toolbar exposes both saved lists with earlier/later and show/hide
+buttons, plus Reset this toolbar. Enter/Space activates the focused control; Done/Escape ends editing.
+While customizing, strip buttons are drag targets rather than executing commands. The drop markers
+show insertion positions, including the empty trailing area. Each completed edit is queued through
+the existing ordered settings writer under `toolbar.layouts`; resizing only temporarily overflows
+the saved strip into More. New/unknown commands and duplicates are normalized by the pure
+`overlook_core::toolbar` model, and reset affects only the current module. Both surfaces render and
+execute the same command definitions, including dropdowns and disabled states.
+
+The original SVG artwork in `branding/icons/` uses two-tone shapes and palette-derived colors for all
+seven built-in themes. Resource paths include the resolved theme and normal/on-action contrast
+context, so GPUI's image cache cannot retain the previous theme's colors. The sources have 128-pixel
+intrinsic dimensions and render through `img` to preserve RGB gradients.
+
 ## Focused Inbox
 
-A local view, not a Gmail feature. `overlook_core::focus::classify_focus` puts a conversation in Focused when the user said so (per-message override or per-sender rule), when the sender is someone the user has written to, or when Gmail marks the mail personal or important; promotions, social, forums, and updates go to Other, as do obvious automated senders when Gmail gives no hint. The Inbox shows Focused/Other tabs with a filter menu; the reader toolbar offers Move to Other/Focused with an "always from this sender" rule. Toggle in the layout menu. Schema v2 stores category, importance, and overrides.
+A local view, not a Gmail feature. `overlook_core::focus::classify_focus` puts a conversation in Focused when the user said so (per-message override or per-sender rule), when the sender is someone the user has written to, or when Gmail marks the mail personal or important; promotions, social, forums, and updates go to Other, as do obvious automated senders when Gmail gives no hint. The Inbox shows Focused/Other tabs with a filter menu; the mail toolbar’s More menu offers Move to Other/Focused with an "always from this sender" rule. Toggle in the layout menu. Schema v2 stores category, importance, and overrides.
 
 ## Attachments
 
@@ -49,17 +78,19 @@ Google Calendar on the same OAuth client, with the `calendar.events` and `calend
 
 ## Settings
 
-`Ctrl ,` or the gear in the header opens a Settings dialog (an overlay with a page list). Every control writes immediately and is applied without restart. Preferences live in `overlook_core::prefs` (`Prefs` per profile under the `prefs` setting, `AccountPrefs` per account under `account_prefs:<id>`).
+`Ctrl ,` or the gear at the bottom of the app rail opens a Settings dialog (an overlay with a page list). Every control writes immediately and is applied without restart. Preferences live in `overlook_core::prefs` (`Prefs` per profile under the `prefs` setting, `AccountPrefs` per account under `account_prefs:<id>`).
 
 - **Accounts**: account list, an "Add account" menu (Gmail sign-in, IMAP, POP3), your name (the sender name on outgoing mail), status with Sign in again (Gmail) or Update password (IMAP, POP3) / Sync now, **Server settings…** for IMAP and POP3 accounts, **signature** (plain text) with "include in new messages" and "include in replies and forwards" toggles, remove account from this device.
 - **IMAP accounts** (`crates/overlook-app/src/ui/account_setup.rs`): step 1 asks for name, address and password; Continue looks the domain up (built-in presets for the common providers, then Thunderbird's ISPDB, then `mail.<domain>`) and fills step 2, where host / port / security (SSL/TLS, STARTTLS, none for localhost only) and user name for IMAP and SMTP can be changed, "use the same password for sending" toggled, and **Test connection** probes both servers off the UI thread and shows the server's own error text. Saving writes the account, its server settings (store) and passwords (keyring), builds the provider and starts the first download. Folders appear as labels (Inbox, Sent, Trash, Spam, Archive by SPECIAL-USE or name, or by the **Folders on the server** overrides in step 2: Archive, Sent and Trash folder paths, and "Delete permanently when the server has no Trash folder"; everything else as a user label); mail is read over IMAP with the sync interval from General, and a second connection per account sits in `IDLE` on the Inbox so new mail triggers a sync within seconds (servers without `IDLE` are polled; the thread reconnects with backoff and stops on a refused password). On servers with `CONDSTORE`/`QRESYNC` a quiet change cycle is one `EXAMINE` per folder; otherwise flags and deletions are diffed with `UID FETCH (FLAGS)` and `UID SEARCH ALL`. The folder list is re-read hourly. Mailbox changes go to the server on the next sync: read and star are `UID STORE` flags; archive, delete, restore and label changes are moves between folders (`UID MOVE`, or copy + expunge on servers without it), and the Archive folder is created the first time it is needed. Sending goes over SMTP (the outgoing password from the keyring, or the incoming one when "use the same password" was chosen) and the message is appended to the server's Sent folder; when the connection drops after the message left, the Outbox item reads "Delivery uncertain" and offers **Send again** and **Discard** instead of resending on its own. `OVERLOOK_SIGN_IN=imap` opens the dialog at launch.
 - **POP3 accounts** (same dialog, `Add account → POP3…`, `OVERLOOK_SIGN_IN=pop3` at launch): the lookup asks the ISPDB for the `pop3` server (and has its own preset table for the providers that still offer POP3; `mail.<domain>` on port 995 otherwise), step 2 is labelled "Incoming (POP3)" and adds an **On the server** section: leave messages on the server after downloading (default on), delete from the server after N days (empty: never), and delete from the server when a message is moved to Trash. Test connection probes POP3 (sign in and `QUIT`) and SMTP. A POP3 account is download-and-keep: labels are local (Inbox, Sent, Archive, Trash, no server folders), every mailbox change completes on this device, and each sync is one POP3 session (`UIDL` diffed against the ledger of every UIDL ever seen, `TOP` for messages over 1 MB so they list before their body arrives, `RETR` through the download backlog, retention `DELE`s committed by `QUIT`). Downloaded bytes are written to `raw/<account>/<message id>.eml` before anything else and are the account's primary record: View source and attachments come from that file, a message removed from the server stays here, and the server copy is only ever deleted after its `.eml` is on disk. Sending goes over SMTP; the Sent copy is local (no server Sent folder), and an uncertain send stays in the Outbox with Send again / Discard because there is nothing to reconcile against. The "This device holds the only copy" line in Settings → Accounts and **Back up mail…** in Settings → About are the reminders that POP3 mail needs backing up. The UIDL ledger forgets a UIDL 30 days after the server stopped listing it (and caps the gone entries at 10 000), so it stays bounded by the maildrop.
-- **General**: theme, density, reading pane, start-up module (Mail / Calendar / last used), 12/24-hour clock, week start, new-mail notifications (off / Focused only / all), event reminders, sync interval (30 s to 15 min).
+- **General**: theme, density, reading pane, start-up module (Mail / Calendar / last used), time zone (Follow system or a searchable named-zone override), 12/24-hour clock, week start, new-mail notifications (off / Focused only / all), event reminders, sync interval (30 s to 15 min).
 - **Mail**: Focused Inbox, sender pictures, preview text, mark as read (when selected / after 3 s / never), remote images (block / always show), default reply (reply / reply all), quote original in replies, attachment save folder, Inbox messages to download (100 / 300 / 1,000; changing it re-lists the mailboxes and queues what is missing).
 - **Calendar**: working hours (shaded outside in Day/Week), default event length, default reminder, show declined events, event reminders.
 - **About**: version, links, data locations, keyboard reference. **Back up mail…** asks for a folder and copies `overlook.sqlite` (a consistent `VACUUM INTO` copy), `raw/` and `attachments/` into it off the UI thread; the copy opens as a profile of its own (`OVERLOOK_DATA_DIR=<that folder>`), which is the restore path for now.
 
-Signatures are appended with a blank line when composing, and above the quoted original in replies. Not yet: multiple signatures per account, automatic replies (needs the `gmail.settings.basic` scope), rules and sweep, and rich-text signatures.
+Signatures are HTML and go below the message, above the quoted original in replies (see Contacts, signatures, … below). Not yet: automatic replies (needs the `gmail.settings.basic` scope), rules and sweep, and a WYSIWYG signature editor.
+
+Mail and calendar share the selected time zone and use each timestamp's daylight-saving rules. With **Follow system**, an immediate background check and subsequent one-minute checks show a banner when the system zone differs from the last accepted zone, including after restart. **Change time zone** applies it; **Keep current** saves an override and suppresses further prompts until Follow system is selected again. An open event editor retains its labeled zone for typed times. See [time-zones.md](time-zones.md) for all-day dates, synchronization, and checks.
 
 ## Search
 
@@ -73,8 +104,10 @@ A generation counter drops results of a superseded query.
 
 ## Reader
 
-The conversation header has Expand all / Collapse all when there is more than one message. An expanded
-message has a ⋯ menu: Reply, Reply all, Forward (this message, not the latest), Mark as read/unread, Print
+The conversation header has Expand all / Collapse all when there is more than one message, and the
+toolbar has Jump to latest. Collapsed messages are separate cards with a snippet, date/time and file/star
+indicators. Every expanded message has Reply, Reply all and Forward in its header and below its body;
+these target that particular message. Its ⋯ menu also offers Mark as read/unread, Print
 (a standalone HTML page in `~/.cache/overlook/print/` opened in the browser, which prints), Save as .eml and
 View source (both from `MailProvider::fetch_raw`, Gmail's `format=raw`, with a rebuilt message as fallback).
 Clicking an expanded message's header collapses it, except the latest.
@@ -83,9 +116,11 @@ Image attachments (`Attachment::is_image`) are downloaded with the open conversa
 shown as thumbnails on their cards; clicking one opens a quick look over the window with Open, Save as and
 Esc. Other attachments open with the system application as before.
 
-Data tables survive the HTML flattening: `sanitize::is_data_table` keeps a table that has header cells or is
-a consistent grid of 2 to 8 short columns without nested tables or images, and the view lays it out as a
-grid (the vendored parser now keeps empty cells so columns stay aligned). Layout tables are still flattened.
+Repeated HTML history folds behind an expandable Message history control only when it matches an earlier
+message in this conversation; see Rendering below. Inline images already embedded in the body are omitted
+from the file cards. Up to four browser documents are live at once, prioritizing the latest message,
+the reply source and composer previews. Expand all keeps other messages readable as full native text
+when available; HTML-only messages offer Read message to open their complete browser body.
 
 ## Composer
 
@@ -96,8 +131,35 @@ styles it live: bold, italic, strikethrough, inline code, link text and URLs, he
 list markers, with the marks themselves faded. The toolbar and shortcuts (Ctrl+B/I/K, Ctrl+Shift+X
 strike, Ctrl+Shift+C code, Ctrl+Shift+8/7/9 bullets/numbers/quote, Ctrl+Shift+P preview) edit the
 text through `format_wrap`, `format_link` and `format_lines` in `ui/composer.rs`; Enter inside a
-list continues it and Enter on an empty item ends it. Preview swaps the editor for `TextView::html`
-of the rendered body.
+list continues it and Enter on an empty item ends it. Preview uses the isolated browser surface.
+
+Inline replies open immediately after the message being answered. Opening or returning to a reply brings
+the whole composer into view and follows delayed body reflow until the layout settles (bounded to eight
+seconds); mouse, keyboard or scroll input stops the reveal. Short panes align the beginning when the
+whole composer cannot fit. The editor height adapts to the pane. From and Subject are under Details for
+inline replies/forwards, and Enter skips hidden fields. New messages retain their full headers. Choosing
+Reply again returns to the existing editor; switching Reply / Reply all in Reply options or through actions
+updates recipients while retaining typed text, attachments and the draft identity.
+
+Send, Attach, Show/Hide history, Pop out, Delete draft and Save and close are in the composer's top bar.
+No Reply/Forward/New message title appears beside Send; reply switching lives in the icon options menu.
+Send/save errors appear directly below it. Standalone and popped-out composers scroll their contents
+under that bar, keeping the actions accessible with long histories or signatures. Show history is a
+display choice: it can show the original even after its outgoing quote was removed, without adding it
+back to the sent message. The existing resource-consent policy still applies.
+
+Pop out (Ctrl+Shift+O) opens a native compose window for the same draft. The handoff preserves typed
+body, raw unfinished recipient/subject fields, selections, the focused field, signature, attachments and
+preview/history choices. Input widgets are recreated for the new window, so their earlier Undo stacks
+are not transferred. Handoff waits for pending saves and attachment staging. Each popped-out editor
+holds its draft edit guard, and reopening its draft or repeating its reply action focuses that window.
+The main window remains available for reading and composing another message.
+
+Closing a compose window saves the draft, and a save failure vetoes native close. Delete draft closes
+only after local deletion succeeds. Pop-outs retain the shared main mail controller and provider handles,
+without starting another sync/reminder/update loop. Sends and Undo Send use the main window when it
+exists. If it was closed first, the pop-out stays open with queued-send feedback and Undo while the same
+controller handles delivery. Ctrl+Shift+H toggles message history.
 
 `overlook_core::compose` turns the text into the two parts of the message: `render_markdown`
 (the `markdown` crate, GFM, raw HTML escaped, single newlines as `<br>`) and `markdown_to_plain`.
@@ -129,11 +191,49 @@ colour choices (by design), and underline, which Markdown has no mark for.
   daily `fetch_contacts` (`people/me/connections` + `otherContacts`) keeps rows with pending local edits.
   Scopes: `contacts` (read-write) and `contacts.other.readonly`; without the write scope the sidebar says
   changes stay on this device and offers Sign in again. The composer suggests address-book matches first,
-  and a sender card in the reader opens or adds the person in Contacts.
-- **Signatures.** `AccountPrefs.signatures` is a list of named Markdown-flavoured signatures with
-  `default_new` / `default_reply` ids (`None` = no signature); `normalized()` migrates the old single
-  `signature` field and the two include switches. Settings → Accounts manages them (add, rename, delete, pick
-  defaults); the composer toolbar has a Signature picker that swaps the block at the end of the body.
+  and the names in a message header (From, To, Cc) open a **contact card** (`ui/contact_card.rs`).
+- **Contact cards.** Hovering a name for about a third of a second floats the card (GPUI Kit `HoverCard`);
+  clicking pins the same card under the header until it is clicked again or closed, and the hover card steps
+  aside while it is pinned. The card shows the photo, name, title and organization, every address the person
+  has (with Copy), phone, the start of their notes, and where Overlook knows them from (address book,
+  correspondent, not a contact, or you), with New message, Open in Contacts or Add to contacts, and Mail from
+  them. People are found through `MailWindow.contact_index`, an in-memory map from lower-cased address to
+  position in `contacts` that `reload_contacts` rebuilds (address-book entries win over correspondents), so
+  every name in a long thread is a constant-time lookup. The To/Cc line lists five names and then "+N more",
+  which expands that message. The hover card is not drawn by the window's own view, so its buttons reach the
+  window through a weak handle. The composer's recipient fields are plain text inputs and have no cards.
+- **Recipient completion.** Typing in To, Cc or Bcc lists suggestions below the field (address book first,
+  then people written to before) and, when one *starts with* what was typed and the caret is at the end of
+  the field, also completes it in place: the rest shows as faint ghost text after the caret, and **Tab**
+  accepts it, producing `Name <address>, ` exactly as clicking the suggestion does. `ghost_completion` and
+  `inline_suggestion` (`overlook-core/src/recipients.rs`) decide what to offer: the rest of the name followed
+  by the address, or the rest of the address; a name that needs quoting is not spelled out, and a later word
+  of a name (typing `chen` for Maya Chen) only matches in the list. The ghost is painted, never part of the
+  field's value, so it is not saved, sent or undone. It is set only when the query changes, so Escape, Enter
+  or a click dismisses it until the user types or moves again. The single-line input did not have ghost text;
+  `vendor/gpui-base` now does (see `vendor/README.md`).
+- **Signatures.** `AccountPrefs.signatures` is a list of named signatures with `default_new` /
+  `default_reply` ids (`None` = no signature). A `Signature` is **HTML** (`html`) plus the images it embeds
+  (`images`: `content_id`, file name, MIME type, base64 data, kept in the preferences so they are backed up
+  with the database). In the HTML an image is `<img src="cid:ID">`; `normalized()` migrates the old single
+  `signature` field, the two include switches, and Markdown signatures (`body`, rendered to HTML once and then
+  emptied). Settings → Accounts has the editor (`ui/signature.rs`): a name, an HTML source box, a toolbar that
+  wraps or inserts tags around the selection (bold, italic, underline, link, bulleted list, line break;
+  `overlook_core::signature`, applied as a replacement so undo still works), **Image** (PNG, JPEG, GIF or WebP
+  chosen by content, at most 1 MB each, 20 and 4 MB per signature, scanned for malware once, inserted with a
+  `width` of at most 240 px), and a preview drawn by the native `TextView::html` (so it needs no Chromium
+  process; remote pictures are held back). Pasting HTML works as pasting text; pictures it carries as `data:`
+  URLs, which mail programs do not show, become stored images and `cid:` references the moment they land
+  (`extract_data_images`). Images the HTML no longer uses are dropped when the signature is left, not on every
+  keystroke, so undo still finds them.
+  A message takes a **copy** of its signature (`Draft.signature_id` / `signature_html`, table
+  `draft_signatures`, schema v18) with the images as inline attachments (`Content-ID` `sig-…@overlook`) in the
+  draft's own folder, so editing a signature later never changes a message already written or queued.
+  `outgoing_bodies` puts it between the body and the quote: HTML as `<div class="overlook_signature">` after
+  `clean_only`, plain text after a `-- ` line; `build_raw` sends the images in `multipart/related` (the same
+  path forwarded inline images use). The composer shows it as a block under the editor with Edit (opens it in
+  Settings) and ✕, and the toolbar's Signature picker changes it; the Preview and the Outbox draw the images
+  from the draft's files. A draft closed empty or discarded deletes its staged files.
 - **Automatic replies.** `MailProvider::fetch_vacation` / `set_vacation` (Gmail `settings/vacation`, scope
   `gmail.settings.basic`). Settings → Accounts loads them when the page opens and saves with one button; the
   end date is stored exclusive, so the last day runs through midnight.
@@ -155,60 +255,26 @@ colour choices (by design), and underline, which Markdown has no mark for.
 
 ## Rendering
 
-Received HTML goes through three stages before the native view sees it, all in `overlook-core`:
+Received HTML uses the isolated Chromium surface described in
+[message rendering and isolation](../docs/message-formatting.md). Browser preparation starts from
+original stored HTML, preserves safe authored CSS and layout, and removes active content. The browser
+sandbox and resource-consent policy apply to folded and unfolded content alike. Native text renders
+plain-text mail and provides a full-text fallback for older expanded messages beyond the live-view budget.
 
-1. `prepass::prepare` works on the DOM (html5ever). It removes what a browser would hide
-   (`display:none`, `visibility:hidden`, zero font size, `max-height:0`, `mso-hide`, the `hidden`
-   attribute, `preheader` classes, 1×1 tracking pixels, `<head>`/`<title>`/`<style>`), drops spacer
-   blocks (Gmail's `<div><br></div>`, Outlook's `<p>&nbsp;</p>`), trims `<br>`s that only add blank
-   lines, rewrites `<center>` to `<div>` and `<dt>/<dd>` to blocks, protects `<pre>` whitespace, turns
-   bare URLs into links, and splits the quoted history of a reply (Gmail `gmail_quote`, `blockquote
-   type=cite`, Yahoo, Thunderbird) into `Sanitized.quoted`, taking everything after the quote start at
-   every nesting level. Forwards and Outlook's `From: / Sent: / To:` header blocks are not split: the
-   header is context for notes people write inside the quoted text, and Gmail shows it too. Every
-   embedded message header (Outlook's block, Gmail's `gmail_attr` line, a "Forwarded message" or
-   "Original Message" marker) gets a rule in front of it, so a forwarded chain reads as separate messages;
-   the reader adds the same rule when it inlines a split quote.
-2. `sanitize_html` (ammonia) enforces the tag and attribute allow-list and the remote-image policy,
-   then `flatten_tables` turns layout tables into block flow. Of an author's inline styling only the
-   text colour is kept (`style="color:…"` reduced to that one declaration, `<font color>`), because
-   colour carries meaning in annotated replies; the vendored view renders it through a `TextMark`
-   colour. The reader runs `adapt_colors` so dark colours lighten on the dark theme and near-white
-   ones darken on the light theme, hue preserved.
-3. The view, `TextView::html` from the vendored `gpui-base` (see `vendor/README.md`), renders it.
+`overlook_core::thread_history` prepares display-only history disclosures in the background. It recognizes
+Gmail/cite/Thunderbird/Yahoo quotes and Outlook reply-header boundaries, and folds a tail only when its
+normalized visible text plus image/link targets exactly match a previous full message. Forwarded blocks,
+unknown history, short ambiguous text, added notes and changed resources remain visible. The original DOM
+ancestors and styles survive, and opening Message history restores all content. Work is bounded to 64
+messages / 8 MiB, uses the browser parser's size/depth/node limits, and rejects stale generations. This
+does not change stored HTML, outgoing quotes, printing or raw source. Plain-text quoted history remains
+inline. Browser interaction changes are excluded from the initial-render cache so an expanded disclosure
+cannot be painted over a newly closed document.
 
-The reader collapses `Sanitized.quoted` behind "Show quoted text" only when the quoted text repeats an
-earlier message of the same conversation (`quote_repeats_thread`); otherwise it is shown inline, since a
-quote the reader has never seen is content, not history. It replaces `cid:
-image references with `data:` URLs built from the downloaded inline attachment (`Attachment.content_id`,
-schema v6; inline images of the open conversation are fetched automatically, up to 4 MB each; a
-one-time backfill re-fetches older messages with `cid:` references). Plain-text mail is converted by
-`text_to_html`: paragraphs, `<br>` line breaks, nested blockquotes for `>` quoting with the markers
-removed, and linked URLs.
-
-`cargo run -p overlook-core --example sanitize_dump -- file.html` prints the sanitized output for a
-saved message. The rendering review of 2026-10-12 used fourteen fixtures (Gmail reply with quoted
-thread, newsletter with preheader and tables, nested lists, Outlook/Word mail, plain text with
-quotes, code, inline cid image, headings and rules, data table, Unicode/RTL, dark-mode hostile
-colors, hidden junk and tracking, forwarded message, long paragraphs); all render correctly. Known
-remaining gaps: data tables are flattened rather than laid out as a grid; `sup`/`sub` are shown
-inline; styles and colors from the mail are ignored by design.
-
-### Repeating events, drag, guests
-
-- A repeating occurrence carries `recurring_event_id` and `original_start`. Edit and Delete on one ask for a
-  scope: this event, this and following, or all (`RecurrenceScope`, `cal_scope_prompt`). The store applies
-  the edit to the local occurrences the scope covers (`apply_series_change`, `delete_event_locally_scoped`)
-  and queues one operation with the scope. Google: "all" patches the master with the series' times shifted
-  by the same amount; "following" ends the master's RRULE with `UNTIL` just before the occurrence and creates
-  a new series from it (`recurrence_until`, `recurrence_for_split`; a COUNT is dropped because it no longer
-  adds up). The next incremental sync brings every instance back from Google.
-- In Day and Week, a block can be dragged to another time or day and its bottom edge dragged to change the end
-  (`CalDrag`, 15-minute snapping, saved as an ordinary update of that occurrence).
-- The event editor has Guests (comma-separated addresses; known guests keep their responses, the owner is
-  added as organizer), Check availability (`CalendarProvider::free_busy`, Google's `freeBusy`), and Add a
-  Google Meet link (`wants_conference` → `conferenceData.createRequest` with `conferenceDataVersion=1`).
-  Rooms are Workspace resource calendars and are not offered; a personal Gmail account has none.
+Downloaded inline `cid:` attachments are resolved to bounded data URLs for rendering. Original CID
+references and attachments remain stored. The legacy native `sanitize` / `prepass` projection still serves
+safe outgoing quote serialization and other native projections; it is not the received browser layout
+pipeline. `cargo run -p overlook-core --example sanitize_dump -- file.html` inspects that native projection.
 
 ## Gmail
 
@@ -227,11 +293,11 @@ Environment switches for development:
 | `OVERLOOK_DATA_DIR` | Profile directory |
 | `OVERLOOK_CONFIG_DIR` | Directory holding `google-oauth-client.json` (default `~/.config/overlook`) |
 | `OVERLOOK_SIGN_IN=gmail` | Start the Google sign-in at launch |
+| `OVERLOOK_SAMPLE_ONLINE=1` | Start the sample connection connected, so queued work syncs at launch |
+| `TZ` | Standard process time zone for Follow system; Settings can override it |
+| `RUST_LOG=overlook=debug` | Tracing output |
 
 Keyboard additions: `Ctrl 1` Mail, `Ctrl 2` Calendar, `Ctrl Shift A` new event, `Ctrl S` save the event editor; with the calendar focused, `↑`/`↓` select an event, `Enter` edits it, `Delete` removes it, `←`/`→` move by period, `T` goes to today, and `D`/`W`/`M`/`A` choose views. Text inputs and focused buttons retain their normal keys.
-| `OVERLOOK_SAMPLE_ONLINE=1` | Start the sample connection connected, so queued work syncs at launch |
-| `OVERLOOK_UTC_OFFSET_MINUTES` | Override the local time zone offset used for day groups |
-| `RUST_LOG=overlook=debug` | Tracing output |
 
 ## Tests
 
@@ -267,11 +333,12 @@ Reference captures from this run are in `branding/previews/overlook-native-*.png
 - **Fast message bodies.** HTML bodies render in an isolated headless Chromium (`browser_engine.rs`) as screenshot tiles. Launching Chromium is most of the wait (~190 ms of ~270 ms to first tile), so `browser_engine::prewarm` keeps one process started and idle; a new document takes it (first tile ~100 ms) and the pool starts a replacement. A process is never reused across documents. Bodies start at the reader's real width and scale (`browser_body::reader_size`) instead of a default width plus a resize. Finished renders (the opening screenful, keyed by document hash, width and scale; eight kept) show instantly when a message is opened again. After a conversation opens, `schedule_prerender` renders the latest message of the conversations above and below it off-screen into that cache, skipping any message whose remote content would load, so nothing is fetched for unopened mail. Plain-text messages are drawn natively (`TextView`), and an HTML body shows its text until the first tiles arrive.
 - **Desktop notifications** (`notify.rs`). On Omarchy (detected by `omarchy-notification-send` on `PATH` or in `/usr/share/omarchy/bin`) they go through that command with a Nerd Font glyph per kind, and clicking one runs `omarchy-launch-or-focus ai.lastrefuge.Overlook overlook`; elsewhere they use the freedesktop service. Every in-app toast goes through `ui::toast`, which also sends success, warning and error messages to Omarchy's notifications when Settings > General > Notifications > "Show in Omarchy notifications" is on (default on, shown only on Omarchy); plain information such as "Archived" stays in the app. New mail is announced (Settings "New mail": Off, Focused only, All) by comparing each fresh mail index with the previous one (`new_inbox_mail`): unread incoming Inbox messages that are new since the last index and since the window opened; one notification per message, or a summary for several. Calendar reminders use the same path.
 - **Never block the UI thread.** The store has a writer connection (sync, local changes) and a read-only reader connection; every read-only `Store` method uses the reader (`with_read`), which under WAL never waits for a sync's write. Settings and attachment paths are written by `persist::later`, one background thread that applies writes in order. `watchdog.rs`: the window beats a heartbeat every 200 ms and a watcher thread logs any UI stall of a second or more, with the last step the window marked (`watchdog::mark`) and the thread's kernel state (running, or waiting on a lock, the disk, the GPU). Logs go to stderr and to `overlook.log` in the data folder (kept to about 4 MiB plus `overlook.log.old`); look there first when Hyprland reports Overlook as not responding.
-- **Outbox.** Send validates recipients, moves the draft to `Queued`, and records a `SendDraft` operation in the same transaction. Queued and failed items can be edited (which cancels the send) until submission begins. Sent is reported only after the provider returns a receipt; `complete_send` stores the Sent copy, removes the draft, and marks the operation applied atomically.
+- **Draft sync.** Gmail and IMAP drafts synchronize in both directions through `draft_sync.rs`; POP3 and Sample drafts stay local. Schema v19 stores server versions, saved baselines, and exact pending upload bytes independently of local draft rows. See [draft synchronization](draft-sync.md) for conflict handling, MIME fidelity, retry recovery, and verification.
+- **Outbox.** Send validates recipients, moves the draft to `Queued`, and records a `SendDraft` operation in the same transaction. Queued and failed items can be edited (which cancels the send) until submission begins. Sent is reported only after the provider returns a receipt; `complete_send` stores the Sent copy, removes the draft, and marks the operation applied atomically. Gmail submits an existing synced draft through `drafts.send`; remote draft cleanup is durable after a successful send.
 - **Uncertain delivery.** If the provider reports a dropped connection after accepting a message, the draft and operation become `Uncertain`, replay stops, and the next cycle calls `reconcile_send` before any retry.
 - **Sync engine** (`crates/overlook-app/src/sync.rs`) runs on a background thread: probe → `Syncing` → replay pending operations by `seq` → `UpToDate` with a timestamp, or `Offline` / `SignInRequired` / `SyncFailed(reason)`. It runs at startup when reachable, after each local change while connected, every 30 seconds, and from Sync now / F5.
-- **Themes.** `theme.rs` holds Light (Soft stone, approved 23 October 2026) and Dark (matching `branding/tokens.json`) plus Gray, Blue, White, Alexander, and Pink, and projects the active palette onto the component library. Light uses stone reading/compose surfaces with charcoal text and pine accents. Its HTML defaults have zero CSS specificity and defer to sender styles and legacy body color attributes. The browser cache includes the resolved colorway, and pre-rendering uses the same themed preparation as opening a message. The preference is stored in `settings`; Follow system selects Light or Dark from the window appearance, which GPUI reads from the desktop settings portal. Switching changes display colors only, never stored messages or outgoing mail formatting.
-- **Received HTML** is sanitized by `overlook_core::sanitize` (allowlisted tags and bounded inline presentation, no stylesheets/scripts/forms/frames, `http(s)`/`mailto`/`cid` only, remote images blocked by default). The native renderer preserves hard breaks, distinct flow/paragraph spacing, and inherited typography. Composer quotes and Outbox previews enforce the same resource consent. See [the formatting review and regression workflow](../docs/message-formatting.md) for supported behavior and browser-layout limitations.
+- **Themes.** `theme.rs` holds Light (Soft stone, approved 23 October 2026) and Dark (matching `branding/tokens.json`) plus Gray, Blue, White, Alexander, and Pink, and projects the active palette onto the component library. Light uses stone chrome, a pale green message list, charcoal text and pine accents. Alexander uses #1F343F navigation and gutters, #E0EAF0 selected-message backgrounds, a #3E687E New message button, cool neutral hovers, white mail surfaces and amber accents; shared tokens keep folders, mail rows, app-rail highlights, icons and component controls consistent. Email paper remains light in every theme, with zero-specificity HTML defaults that defer to sender styles and legacy body color attributes. Pre-rendering and opening a message share the same light document and cache. The preference is stored in `settings`; Follow system selects Light or Dark from the window appearance, which GPUI reads from the desktop settings portal. Switching changes display colors only, never stored messages or outgoing mail formatting.
+- **Received HTML** uses `overlook_core::browser` preparation and an isolated Chromium document, preserving safe authored CSS/layout with active content disabled and remote resources blocked by default. Display-only thread history folding precedes preparation; stored mail is unchanged. Composer and Outbox previews enforce the same resource consent. See [the formatting review and regression workflow](../docs/message-formatting.md) for policy and limits.
 - **Fonts.** Inter and Source Serif 4 Display are embedded and registered at startup; the wordmark is the outlined SVG.
 
 ### Keyboard
@@ -284,12 +351,38 @@ Composer header fields: `Enter` moves to the next field.
 
 The sidebar and list panes are resizable; sizes persist in `settings`. The layout menu in the header switches the reading pane between right and below, and density between comfortable and compact; both persist.
 
+### The message list
+
+`ui/list.rs` draws the list with GPUI's virtual `list()`: only the rows in view are laid out, and the
+`ListState` caches the height it measured for every row it has seen. Four rules keep that honest:
+
+- **Every row goes through `full_width`.** The list lays each item out as a root with a definite width and
+  a content-sized height, so a row that does not ask for the width is only as wide as its text (the list
+  looked "not filling the window"). The wrapper is a full-width column, so a new kind of row cannot
+  forget it. Do not put `.w_full()` on individual rows instead.
+- **Rows are rebuilt only when their inputs change** (`refresh_list_rows`): the data generation
+  (`list_data_generation`, bumped in `refresh_mail` and `reload_drafts`, the only places the lists are
+  assigned), the view, whether a search is active, and today's date for the day headings. Anything that
+  starts feeding `list_rows` from somewhere else must bump the generation or extend `RowsKey`, or the list
+  will not repaint. A change then splices only the rows that differ (`changed_span`).
+- **Anything that changes a row's height remeasures the list** (`RowLayout`: density, sender pictures,
+  previews). Add a new height-affecting setting to `RowLayout`; `ListState::remeasure` keeps the scroll
+  position.
+- **Rows carry what they need and nothing more.** A row's drag names its conversation
+  (`DraggedMail::Conversation`) and the message ids are looked up when the drag lands, because the row is
+  rebuilt on every repaint of a visible row.
+
+The list has 12 px of padding below the last row, set on the `list()` itself so it is part of the scroll
+extent. There is no automated layout test: GPUI's `test-support` feature adds about 20 crates (proptest,
+borsh, postage, ...) to `Cargo.lock`, which the release SBOMs and the CASA evidence are generated from.
+After a GPUI upgrade, look at the list at both densities by eye.
+
 ## Known gaps (tracked for the next sessions)
 
 - IMAP, SMTP and POP3 have only ever synced against the scripted servers in `scripts/spike-mail-servers.py` and the in-crate fakes; public servers were probed up to the login exchange over TLS and STARTTLS (Fastmail, Gmail, iCloud, Microsoft 365, Yahoo, Zoho) but no real account has been read from or written to. XOAUTH2 (Microsoft 365, Outlook.com, Gmail without an app password) is not implemented. `IDLE` has not been observed across a laptop sleep. POP3: restore is manual (stop Overlook, replace the data directory with a backup); `APOP` and `SASL` logins are not offered (`USER`/`PASS` over TLS or STLS only). After an uncertain send the account reads "Offline" until the next sync. See the interoperability matrix in `llm-docs/imap-pop3-implementation-plan.md`.
 
 - Gmail: no attachment download for received mail yet, no progressive download beyond the newest 150 messages, no `cid:` inline images, and bodies are fetched one request per message (the Gmail batch endpoint would cut request count).
-- Composer is plain text. Rich text, signatures, and HTML output are phase 1 items; `body_html` is already stored separately.
+- The composer body is Markdown-flavoured text that is sent as HTML; signatures are HTML.
 - Attachment download for received mail is not implemented (cards show “Not downloaded”). Outgoing attachments are copied into the protected `outgoing/` store and persisted with the draft.
 - Multi-select and drag-and-drop are not implemented.
 - Hyprland draws no title bar; the kit’s window controls are not shown there. GNOME and KDE behaviour, fractional scaling, and screen readers (Orca) have not been checked yet.

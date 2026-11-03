@@ -12,6 +12,7 @@ pub mod gmail;
 pub mod imap;
 pub mod mime;
 pub mod outgoing;
+pub mod drafts;
 pub mod pop3;
 pub mod sample;
 pub mod secure_error;
@@ -132,6 +133,29 @@ pub enum SendOutcome {
 
 pub trait MailProvider: Send + Sync {
     fn kind(&self) -> ProviderKind;
+
+    fn supports_drafts(&self) -> bool { false }
+
+    /// A complete listing, including every page. Failure must never look like an empty
+    /// mailbox: callers use absence to reconcile remote deletions.
+    fn list_drafts(&self, _account: &Account) -> BoxFuture<'_, Result<Vec<RemoteDraft>, ProviderError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn fetch_draft(&self, _account: &Account, _remote: &RemoteDraft) -> BoxFuture<'_, Result<Option<Vec<u8>>, ProviderError>> {
+        Box::pin(async { Err(ProviderError::Rejected("Draft synchronization is unavailable".into())) })
+    }
+
+    /// The exact persisted RFC 822 bytes include a unique Message-ID for this upload.
+    /// Reconcile that id before retrying a create/APPEND. `None` means the remote version
+    /// changed or disappeared; preserve both sides rather than overwriting it.
+    fn put_draft(&self, _account: &Account, _remote: Option<&RemoteDraft>, _raw: &[u8], _message_id: &str, _thread_id: Option<&str>) -> BoxFuture<'_, Result<Option<RemoteDraft>, ProviderError>> {
+        Box::pin(async { Err(ProviderError::Rejected("Draft synchronization is unavailable".into())) })
+    }
+
+    fn delete_remote_draft(&self, _account: &Account, _remote: &RemoteDraft) -> BoxFuture<'_, Result<(), ProviderError>> {
+        Box::pin(async { Err(ProviderError::Rejected("Draft synchronization is unavailable".into())) })
+    }
 
     /// Checks actual provider reachability (not just network availability).
     fn probe(&self) -> BoxFuture<'_, Result<(), ProviderError>>;

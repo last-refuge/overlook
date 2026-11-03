@@ -5,14 +5,20 @@ mod calendar;
 mod calendar_setup;
 mod calendar_changes;
 mod composer;
+mod composer_window;
+mod contact_card;
 mod contacts;
 mod mail_highlight;
 mod palette;
 mod list;
 mod settings;
+mod signature;
 mod reader;
 mod sidebar;
+mod shell;
+mod toolbar;
 mod widgets;
+mod time_zone;
 
 use overlook_provider::gmail::api::SessionExpiry;
 use crate::assets::icon;
@@ -25,12 +31,12 @@ use crate::SETTING_APPEARANCE;
 pub use account_setup::{AccountSetup, SetupMode};
 pub use calendar::{CalView, Module, NewEvent};
 pub use composer::Composer;
+pub(crate) use composer_window::WindowSetup;
 pub use settings::{SettingsPage, SettingsState};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{
     h_resizable, resizable_panel, v_resizable, ResizableState, Sizable, TitleBar, WindowExt,
@@ -43,7 +49,7 @@ use overlook_core::*;
 use overlook_provider::sample::SampleProvider;
 use overlook_store::{LocalChange, ListFilter, MailIndex, MailboxView, Store};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -93,6 +99,8 @@ actions!(
         FormatNumbers,
         FormatQuote,
         TogglePreview,
+        ToggleMessageHistory,
+        PopOutComposer,
     ]
 );
 
@@ -154,6 +162,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-shift-p", OpenCommandPalette, Some(WINDOW_CONTEXT)),
         KeyBinding::new("escape", Escape, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-enter", SendMessage, Some(WINDOW_CONTEXT)),
+        KeyBinding::new("ctrl-shift-o", PopOutComposer, Some(WINDOW_CONTEXT)),
+        KeyBinding::new("ctrl-shift-h", ToggleMessageHistory, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-r", Reply, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-shift-r", ReplyAll, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-f", Forward, Some(WINDOW_CONTEXT)),
@@ -246,10 +256,19 @@ pub enum OnlineSearch {
     Failed(String),
 }
 
+/// The mail a drag carries. A row in the list names its conversation and leaves the
+/// messages to be looked up when the drag lands; building their ids for every row on every
+/// repaint cost far more than the rare drag that needs them.
+#[derive(Clone, Debug)]
+pub enum DraggedMail {
+    Conversation(ConversationId),
+    Messages(Vec<MessageId>),
+}
+
 /// A conversation being dragged from the list onto the sidebar.
 #[derive(Clone, Debug)]
 pub struct ConversationDrag {
-    pub message_ids: Vec<MessageId>,
+    pub mail: DraggedMail,
     pub title: String,
     pub count: usize,
 }
@@ -284,6 +303,27 @@ pub enum ListRow {
     Group(SharedString, usize),
     Conversation(ConversationSummary),
     Draft(Draft),
+}
+
+/// What the list's rows were last built from. Building them copies every conversation, so
+/// that waits for one of these to change instead of repeating on every repaint.
+#[derive(Clone, PartialEq)]
+struct RowsKey {
+    /// Bumped whenever the conversations, drafts or Outbox are reloaded.
+    data: u64,
+    view: MailboxView,
+    searching: bool,
+    /// Today, because the day groups ("Today", "Yesterday") move at midnight.
+    today: i64,
+    time_zone_revision: u64,
+}
+
+/// The settings that decide how tall a row is.
+#[derive(Clone, Copy, PartialEq)]
+struct RowLayout {
+    compact: bool,
+    avatars: bool,
+    previews: bool,
 }
 
 /// Hands a received attachment to the desktop, except programs and scripts: those are
@@ -398,7 +438,10 @@ pub struct MailWindow {
     signin: Option<SignIn>,
     /// The account whose mail the window shows.
     account: Account,
-    utc_offset: i32,
+    time_zone: overlook_core::tz::TimeZone,
+    time_zone_revision: u64,
+    time_zone_pending: bool,
+    time_zone_prompt: Option<overlook_core::tz::DetectedZone>,
     outgoing_dir: PathBuf,
 
     view: MailboxView,
@@ -441,6 +484,13 @@ pub struct MailWindow {
     /// so a change re-measures just the rows that differ.
     list_state: ListState,
     shown_rows: std::rc::Rc<std::cell::RefCell<Vec<ListRow>>>,
+    /// Counts reloads of the data `list_rows` reads, so a repaint can tell nothing changed.
+    list_data_generation: u64,
+    rows_key: std::cell::RefCell<Option<RowsKey>>,
+    /// Rows shown that are not day headings, for the count beside the title.
+    rows_total: std::cell::Cell<usize>,
+    /// The row layout the list's cached heights were measured with.
+    row_layout: std::cell::Cell<Option<RowLayout>>,
     drafts: Vec<Draft>,
     outbox: Vec<Draft>,
     status: AccountStatus,
@@ -448,10 +498,21 @@ pub struct MailWindow {
     selected: Option<ConversationId>,
     outbox_selected: Option<DraftId>,
     thread: Vec<Message>,
+    thread_history: HashMap<MessageId, String>,
+    thread_history_generation: Arc<AtomicU64>,
+    thread_history_task: Option<Task<()>>,
+    thread_history_pending: bool,
+    live_browser_messages: std::cell::RefCell<HashSet<String>>,
     expanded: BTreeSet<MessageId>,
     remote_allowed: BTreeSet<MessageId>,
     /// The message whose sender's contact card is open.
-    pub(crate) contact_card: Option<MessageId>,
+    /// The name whose card is pinned under a message header: the message and the lower-cased
+    /// address.
+    pub(crate) contact_card: Option<(MessageId, String)>,
+    /// Messages whose recipient list is shown in full rather than as "+N more".
+    recipients_expanded: BTreeSet<MessageId>,
+    /// Lower-cased address → position in `contacts`.
+    contact_index: HashMap<String, usize>,
     // Contacts module state.
     pub(crate) contacts: Vec<Contact>,
     pub(crate) contact_selected: Option<String>,
@@ -470,9 +531,14 @@ pub struct MailWindow {
     pub(crate) browser_bodies: std::cell::RefCell<HashMap<String, (u64, usize, Entity<crate::browser_body::BrowserBody>)>>,
 
     composer: Option<Composer>,
+    composer_owner: Option<composer_window::ComposerOwner>,
+    detached_composers: HashMap<DraftId, composer_window::DetachedComposer>,
     appearance: AppearancePreference,
     density: Density,
     reading_pane: ReadingPane,
+    toolbar_layouts: overlook_core::toolbar::ToolbarLayouts,
+    toolbar_more_open: bool,
+    toolbar_editing: bool,
     /// Sidebar sections the user collapsed ("favorites", "labels"); persisted.
     collapsed_sections: HashSet<String>,
     /// Focused Inbox: enabled per profile, with the selected tab.
@@ -546,15 +612,20 @@ impl MailWindow {
         sample: SampleProvider,
         accounts: Vec<Account>,
         active: Option<AccountId>,
-        appearance: AppearancePreference,
+        setup: WindowSetup,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         tracing::debug!("startup: window opening after {} ms", crate::since_start_ms());
         let account = accounts.iter().find(|a| Some(&a.id) == active.as_ref()).or_else(|| accounts.first()).cloned().unwrap_or_else(no_account);
-        let mut providers: HashMap<AccountId, providers::AccountProviders> = HashMap::new();
+        let (appearance, composer_owner, shared_providers) = match setup {
+            WindowSetup::Mail(appearance) => (appearance, None, None),
+            WindowSetup::Composer { appearance, owner, providers } => (appearance, Some(owner), Some(providers)),
+        };
+        let detached = composer_owner.is_some();
+        let mut providers: HashMap<AccountId, providers::AccountProviders> = shared_providers.unwrap_or_default();
         let mut provider_issues = HashMap::new();
-        for a in &accounts {
+        for a in accounts.iter().filter(|_| !detached) {
             match providers::providers_for(a, &sample, &store) {
                 Ok(p) => {
                     providers.insert(a.id.clone(), p);
@@ -564,7 +635,7 @@ impl MailWindow {
                 }
             }
         }
-        cx.set_global(AppearanceGlobal(appearance));
+        if !detached { cx.set_global(AppearanceGlobal(appearance)); }
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search mail"));
         let contact_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search contacts"));
         let mut subs = Vec::new();
@@ -591,13 +662,17 @@ impl MailWindow {
 
         let density = store.setting::<Density>("density").ok().flatten().unwrap_or_default();
         let reading_pane = store.setting::<ReadingPane>("reading_pane").ok().flatten().unwrap_or_default();
+        let toolbar_layouts = store.setting::<overlook_core::toolbar::ToolbarLayouts>("toolbar.layouts").ok().flatten().unwrap_or_default();
         let sidebar_width = store.setting::<f32>("panes.sidebar").ok().flatten().unwrap_or(232.);
         let collapsed_sections: HashSet<String> = store.setting::<Vec<String>>("sidebar.collapsed").ok().flatten().unwrap_or_default().into_iter().collect();
         let focused_enabled = store.setting::<bool>("focused_inbox").ok().flatten().unwrap_or(true);
         let prefs: Prefs = store.setting::<Prefs>("prefs").ok().flatten().unwrap_or_default();
-        crate::notify::set_mirror(prefs.omarchy_notifications);
+        if !detached { crate::notify::set_mirror(prefs.omarchy_notifications); }
         let reminders_enabled = prefs.event_reminders;
-        overlook_core::tz::set_clock_24h(prefs.clock_24h);
+        if !detached {
+            overlook_core::tz::set_clock_24h(prefs.clock_24h);
+            overlook_core::tz::set_override(prefs.time_zone.as_ref()).ok();
+        }
         let update_last_check = store.setting::<i64>("update.last_check").ok().flatten().unwrap_or(0);
         let update_dismissed = store.setting::<String>("update.dismissed").ok().flatten();
         let account_prefs: HashMap<AccountId, AccountPrefs> = accounts
@@ -631,7 +706,10 @@ impl MailWindow {
             removing_accounts: HashSet::new(),
             signin: None,
             account,
-            utc_offset: overlook_core::time::local_utc_offset_minutes(),
+            time_zone: overlook_core::tz::current_zone(),
+            time_zone_revision: overlook_core::tz::revision(),
+            time_zone_pending: false,
+            time_zone_prompt: None,
             outgoing_dir,
             view: MailboxView::Kind(LabelKind::Inbox),
             filter: ListFilter::All,
@@ -657,16 +735,27 @@ impl MailWindow {
             unwanted_drafts: HashSet::new(),
             list_state: ListState::new(0, ListAlignment::Top, px(600.)),
             shown_rows: Default::default(),
+            list_data_generation: 0,
+            rows_key: Default::default(),
+            rows_total: Default::default(),
+            row_layout: Default::default(),
             drafts: Vec::new(),
             outbox: Vec::new(),
             status: AccountStatus::default(),
             selected: None,
             outbox_selected: None,
             thread: Vec::new(),
+            thread_history: HashMap::new(),
+            thread_history_generation: Arc::new(AtomicU64::new(0)),
+            thread_history_task: None,
+            thread_history_pending: false,
+            live_browser_messages: Default::default(),
             expanded: BTreeSet::new(),
             remote_allowed: BTreeSet::new(),
             quick_look: None,
             contact_card: None,
+            recipients_expanded: BTreeSet::new(),
+            contact_index: HashMap::new(),
             contacts: Vec::new(),
             contact_selected: None,
             contact_search,
@@ -678,9 +767,14 @@ impl MailWindow {
             inline_images: std::cell::RefCell::new(HashMap::new()),
             browser_bodies: std::cell::RefCell::new(HashMap::new()),
             composer: None,
+            composer_owner,
+            detached_composers: HashMap::new(),
             appearance,
             density,
             reading_pane,
+            toolbar_layouts,
+            toolbar_more_open: false,
+            toolbar_editing: false,
             collapsed_sections,
             focused_enabled,
             inbox_tab: FocusTab::Focused,
@@ -740,6 +834,12 @@ impl MailWindow {
             retry_attempts: HashMap::new(),
             _subscriptions: subs,
         };
+        // A composer shares providers and the store, but never starts a second
+        // synchronization loop, IDLE watcher, reminder service or update checker.
+        if detached {
+            this.reload_contacts();
+            return this;
+        }
         // The watchdog reports any stall of this thread (see `watchdog.rs`).
         crate::watchdog::start();
         cx.spawn(async move |_, cx| loop {
@@ -761,7 +861,7 @@ impl MailWindow {
         if this.selected.is_none() {
             if let Some(first) = this.conversations.first().map(|c| c.id.clone()) {
                 this.selected = Some(first);
-                this.load_thread();
+                this.load_thread(cx);
             }
         }
         this.focus_current_module(window, cx);
@@ -771,6 +871,7 @@ impl MailWindow {
         // IMAP IDLE: one thread per account asks for a sync the moment the Inbox changes.
         this.watch_idle_events(idle_rx, window, cx);
         this.refresh_idle_watchers();
+        this.watch_system_time_zone(window, cx);
         // `OVERLOOK_SIGN_IN=gmail` opens the Google sign-in immediately (first-run helper).
         match std::env::var("OVERLOOK_SIGN_IN").as_deref() {
             Ok("gmail") => this.start_google_sign_in(None, window, cx),
@@ -952,7 +1053,7 @@ impl MailWindow {
         }
         self.reload(cx);
         self.selected = self.conversations.first().map(|c| c.id.clone());
-        self.load_thread();
+        self.load_thread(cx);
         self.focus_current_module(window, cx);
         if self.module == Module::Calendar { self.ensure_caldav_range(cx); }
         cx.notify();
@@ -1377,7 +1478,7 @@ impl MailWindow {
         self.refresh_mail();
         self.reload_drafts();
         self.status = self.store.account_status(&acct).unwrap_or_default();
-        self.load_thread();
+        self.load_thread(cx);
         self.reload_calendar();
         self.reload_contacts();
         cx.notify();
@@ -1394,6 +1495,7 @@ impl MailWindow {
         } else {
             self.search_results()
         };
+        self.list_data_generation += 1;
         // Search coverage counts cached bodies, a full scan: only worth it while searching.
         self.search_coverage = if self.search_query.trim().is_empty() { String::new() } else { self.search_coverage_line(&acct) };
         let mut counts = HashMap::new();
@@ -1477,6 +1579,7 @@ impl MailWindow {
         let acct = self.account.id.clone();
         self.drafts = self.store.drafts(&acct, false).unwrap_or_default();
         self.outbox = self.store.drafts(&acct, true).unwrap_or_default();
+        self.list_data_generation += 1;
         if let Some(sel) = &self.outbox_selected {
             if !self.outbox.iter().any(|d| &d.id == sel) {
                 self.outbox_selected = None;
@@ -1484,13 +1587,16 @@ impl MailWindow {
         }
     }
 
-    fn load_thread(&mut self) {
-        self.thread = match &self.selected {
+    fn load_thread(&mut self, cx: &mut Context<Self>) {
+        let thread = match &self.selected {
             Some(id) => self.store.messages_in_conversation(&self.account.id, id).unwrap_or_default(),
             None => Vec::new(),
         };
+        let history_changed = thread.len() != self.thread.len() || thread.iter().zip(&self.thread).any(|(a, b)| a.id != b.id || a.subject != b.subject || a.body != b.body);
+        self.thread = thread;
         let unwritten = self.unwritten_changes();
         self.apply_to_thread(&unwritten);
+        if history_changed { self.prepare_thread_history(cx); }
     }
 
     /// Downloads the inline images of the open conversation that are not cached yet.
@@ -1530,7 +1636,7 @@ impl MailWindow {
         if !self.conversations.iter().any(|c| Some(&c.id) == self.selected.as_ref()) {
             self.selected = self.conversations.first().map(|c| c.id.clone());
             self.expanded.clear();
-            self.load_thread();
+            self.load_thread(cx);
         }
         self.list_focus.focus(window, cx);
         cx.notify();
@@ -1716,7 +1822,7 @@ impl MailWindow {
             subject = escape_html(&message.subject),
             from = escape_html(&message.from.to_header()),
             to = escape_html(&to),
-            date = escape_html(&overlook_core::time::format_full(message.date, self.utc_offset)),
+            date = escape_html(&overlook_core::time::format_full(message.date, &self.time_zone)),
         );
         let dir = crate::updater::cache_dir().join("print");
         let path = dir.join(format!("{}.html", message.id.as_str().replace([':', '/'], "_")));
@@ -1785,7 +1891,7 @@ impl MailWindow {
                 this.downloading.remove(&attachment.id);
                 match result {
                     Ok(path) => {
-                        this.load_thread();
+                        this.load_thread(cx);
                         match after {
                             AfterDownload::Open => open_received_attachment(&path, &attachment.filename, window, cx),
                             AfterDownload::SaveTo(target) => this.finish_save(&path, &target, window, cx),
@@ -1870,7 +1976,7 @@ impl MailWindow {
                 this.prefetching = false;
                 if fetched > 0 {
                     // The open conversation may have gained images; the index sees new paths.
-                    this.load_thread();
+                    this.load_thread(cx);
                     this.rebuild_mail_index(cx);
                     cx.notify();
                 }
@@ -1901,7 +2007,7 @@ impl MailWindow {
         if self.selected.is_none() || !self.conversations.iter().any(|c| Some(&c.id) == self.selected.as_ref()) {
             self.selected = self.conversations.first().map(|c| c.id.clone());
             self.expanded.clear();
-            self.load_thread();
+            self.load_thread(cx);
         }
         self.list_focus.focus(window, cx);
         cx.notify();
@@ -1920,7 +2026,7 @@ impl MailWindow {
         self.reload(cx);
         if !self.search_query.is_empty() && self.selected_summary().is_none() {
             self.selected = self.conversations.first().map(|c| c.id.clone());
-            self.load_thread();
+            self.load_thread(cx);
         }
         self.start_online_search(window, cx);
         cx.notify();
@@ -2017,7 +2123,7 @@ impl MailWindow {
         self.expanded.clear();
         self.reader_scroll.set_offset(point(px(0.), px(0.)));
         self.selected = id;
-        self.load_thread();
+        self.load_thread(cx);
         self.fetch_inline_images(window, cx);
         // Reading marks the conversation read: a local change with its pending operation.
         let unread: Vec<MessageId> = self.thread.iter().filter(|m| !m.is_read).map(|m| m.id.clone()).collect();
@@ -2075,12 +2181,11 @@ impl MailWindow {
                         if this.remote_allowed.contains(&m.id) || this.prefs.remote_images == RemoteImages::Allow {
                             return None;
                         }
-                        let dark = cx.palette().is_dark();
                         let (html, _) = this.browser_document(&Self::message_source(&m), Some(&m), cx.palette());
-                        if crate::browser_body::is_rendered(&html, false, dark, size) {
+                        if crate::browser_body::is_rendered(&html, false, false, size) {
                             return None;
                         }
-                        Some(crate::browser_body::prerender(html, false, dark, size, cx))
+                        Some(crate::browser_body::prerender(html, false, false, size, cx))
                     })
                     .ok()
                     .flatten();
@@ -2327,12 +2432,17 @@ impl MailWindow {
 
     /// Handles a conversation dropped onto a sidebar destination.
     pub(crate) fn drop_on_view(&mut self, drag: ConversationDrag, view: MailboxView, window: &mut Window, cx: &mut Context<Self>) {
-        let ids = drag.message_ids;
+        let ids = match drag.mail {
+            DraggedMail::Messages(ids) => ids,
+            DraggedMail::Conversation(id) => self.mail_index.message_ids_in(&id),
+        };
+        // The conversation can have left the index since the drag began.
+        let Some(newest) = ids.last().cloned() else { return };
         match view {
             MailboxView::Kind(LabelKind::Inbox) => self.move_to_inbox(ids, window, cx),
             MailboxView::Kind(LabelKind::Archive) => self.archive(ids, window, cx),
             MailboxView::Kind(LabelKind::Trash) => self.trash(ids, window, cx),
-            MailboxView::Kind(LabelKind::Starred) => self.set_starred(vec![ids.last().cloned().unwrap_or_else(|| ids[0].clone())], true, window, cx),
+            MailboxView::Kind(LabelKind::Starred) => self.set_starred(vec![newest], true, window, cx),
             MailboxView::Label(label_id) => self.move_to_label(ids, label_id, window, cx),
             _ => crate::ui::toast(window, cx, crate::notify::Level::Info, "Messages can be dropped on Inbox, Archive, Trash, Starred, or a label."),
         }
@@ -2378,7 +2488,8 @@ impl MailWindow {
         draft.cc = m.cc;
         draft.bcc = m.bcc;
         draft.subject = m.subject;
-        draft.body_text = format!("{}{}", m.body, self.account_prefs_for(&self.account.id).signature_block(false));
+        draft.body_text = m.body;
+        self.apply_signature(&mut draft, self.default_signature_id(false).as_deref());
         self.set_module(Module::Mail, window, cx);
         self.outbox_selected = None;
         self.open_composer(draft, window, cx);
@@ -2386,7 +2497,7 @@ impl MailWindow {
 
     pub(crate) fn compose_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut draft = Draft::new(self.account.id.clone(), DraftKind::New, now());
-        draft.body_text = self.account_prefs_for(&self.account.id).signature_block(false);
+        self.apply_signature(&mut draft, self.default_signature_id(false).as_deref());
         self.outbox_selected = None;
         self.open_composer(draft, window, cx);
     }
@@ -2404,15 +2515,17 @@ impl MailWindow {
 
     /// Replies to or forwards one particular message of the conversation.
     pub(crate) fn reply_to(&mut self, kind: DraftKind, source: Message, window: &mut Window, cx: &mut Context<Self>) {
+        if self.reuse_reply(kind, &source, window, cx) { return; }
         let mut draft = Draft::in_response_to_with(self.account.id.clone(), kind, &source, &self.owner(), now(), self.prefs.quote_on_reply);
-        // The quoted original is appended at send time and shown collapsed under the editor;
-        // the body starts with two blank lines for the reply and the signature below them.
-        draft.body_text = self.account_prefs_for(&self.account.id).signature_block(true);
+        // The quoted original is appended at send time and shown collapsed under the editor, and
+        // the signature goes between what is written and the quote.
+        self.apply_signature(&mut draft, self.default_signature_id(true).as_deref());
         // Open at once; the new draft is written in the background. Until it commits, the
         // composer is not marked saved (nothing has been typed yet, so nothing can be lost).
         let store = self.store.clone();
         let to_save = draft.clone();
         self.open_composer(draft, window, cx);
+        if let Some(c) = &mut self.composer { c.pending_saves += 1; }
         let draft_id = to_save.id.clone();
         if kind == DraftKind::Forward {
             // A forward carries the original's attachments along with its text.
@@ -2422,9 +2535,11 @@ impl MailWindow {
         cx.spawn_in(window, async move |this, cx| {
             let result = cx.background_spawn(async move { store.save_editing_draft(&to_save) }).await;
             let _ = this.update_in(cx, |this, window, cx| {
+                if let Some(c) = this.composer.as_mut().filter(|c| c.draft.id == draft_id) { c.pending_saves = c.pending_saves.saturating_sub(1); }
                 match result {
                     Ok(_) if this.unwanted_drafts.remove(&draft_id) => {
                         let _ = this.store.delete_draft(&draft_account, &draft_id);
+                        this.forget_staged_files(&draft_id);
                         this.reload_drafts();
                     }
                     Ok(_) => {
@@ -2442,12 +2557,13 @@ impl MailWindow {
     }
 
     pub(crate) fn open_draft(&mut self, id: DraftId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.activate_detached_draft(&id, cx) { return; }
         if let Ok(Some(draft)) = self.store.draft(&id) {
             if let Some(conv) = draft.conversation_id.clone() {
                 // Show the conversation being replied to, if it is in this view.
                 if self.conversations.iter().any(|c| c.id == conv) {
                     self.selected = Some(conv);
-                    self.load_thread();
+                    self.load_thread(cx);
                 }
             }
             self.open_composer(draft, window, cx);
@@ -2620,6 +2736,9 @@ impl MailWindow {
                     }
                 }
                 this.reload(cx);
+                if outcome.draft_conflicts > 0 {
+                    crate::ui::toast(window, cx, crate::notify::Level::Warning, "A draft changed on another device. Your work was preserved; review Drafts and the Outbox before sending.");
+                }
                 if matches!(outcome.state, Some(SyncState::UpToDate)) && account.id == this.account.id {
                     this.prefetch_attachments(cx);
                 }
@@ -2666,7 +2785,8 @@ impl MailWindow {
             self.format_link(window, cx);
             return;
         }
-        let input = self.search_input.clone();
+        if self.module == Module::Calendar { self.open_palette(window, cx); return; }
+        let input = if self.module == Module::Contacts { self.contact_search.clone() } else { self.search_input.clone() };
         input.update(cx, |s, cx| {
             s.focus(window, cx);
             s.select_all(window, cx);
@@ -2976,148 +3096,6 @@ impl MailWindow {
 
     // ---------------------------------------------------------------- header
 
-    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = *cx.palette();
-        let owner = self.owner();
-        let appearance = self.appearance;
-        let reading_pane = self.reading_pane;
-        let density = self.density;
-        let focused_enabled = self.focused_enabled;
-        let reminders_enabled = self.reminders_enabled;
-        let this = cx.entity().downgrade();
-        let this2 = cx.entity().downgrade();
-
-        let appearance_icon = if p.is_dark() { "moon" } else { "sun" };
-
-        TitleBar::new()
-            .h(px(64.))
-            .bg(p.surface)
-            .border_b_1()
-            .border_color(p.divider)
-            .child(
-                h_flex()
-                    .size_full()
-                    .items_center()
-                    .gap(px(20.))
-                    .pl(px(10.))
-                    .pr(px(8.))
-                    .child(brand_lockup(&p))
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap(px(2.))
-                            .p(px(3.))
-                            .rounded(px(8.))
-                            .bg(p.sidebar)
-                            .border_1()
-                            .border_color(p.divider)
-                            .child(
-                                segment_with_icon("module-mail", icon("mail").size(px(15.)), "Mail", self.module == Module::Mail, &p)
-                                    .tooltip(|window, cx| Tooltip::new("Mail (Ctrl 1)").build(window, cx))
-                                    .on_click(cx.listener(|this, _, window, cx| this.set_module(Module::Mail, window, cx))),
-                            )
-                            .child(
-                                segment_with_icon("module-calendar", icon("calendar").size(px(15.)), "Calendar", self.module == Module::Calendar, &p)
-                                    .tooltip(|window, cx| Tooltip::new("Calendar (Ctrl 2)").build(window, cx))
-                                    .on_click(cx.listener(|this, _, window, cx| this.set_module(Module::Calendar, window, cx))),
-                            )
-                            .child(
-                                segment_with_icon("module-contacts", icon("users").size(px(15.)), "Contacts", self.module == Module::Contacts, &p)
-                                    .tooltip(|window, cx| Tooltip::new("Contacts (Ctrl 3)").build(window, cx))
-                                    .on_click(cx.listener(|this, _, window, cx| this.set_module(Module::Contacts, window, cx))),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .max_w(px(480.))
-                            .h(px(37.))
-                            .child(
-                                Input::new(&self.search_input)
-                                    .prefix(icon("search").size(px(16.)).text_color(p.muted))
-                                    .suffix(kbd("Ctrl E", &p))
-                                    .cleanable(true),
-                            ),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("appearance-menu")
-                            .ghost()
-                            .icon(icon(appearance_icon).size(px(17.)))
-                            .tooltip(format!("Appearance: {}", appearance.label()))
-                            .dropdown_menu(move |menu, window, _cx| {
-                                let system = theme::system_appearance(window.appearance());
-                                let mut menu = menu.label("Appearance");
-                                for pref in AppearancePreference::ALL {
-                                    let this = this.clone();
-                                    let label = if pref == AppearancePreference::FollowSystem {
-                                        match system {
-                                            SystemAppearance::Dark => "Follow system (currently Dark)".to_owned(),
-                                            SystemAppearance::Light => "Follow system (currently Light)".to_owned(),
-                                            SystemAppearance::Unknown => "Follow system".to_owned(),
-                                        }
-                                    } else {
-                                        pref.label().to_owned()
-                                    };
-                                    menu = menu.item(PopupMenuItem::new(label).checked(pref == appearance).on_click(
-                                        move |_, window, cx| {
-                                            let _ = this.update(cx, |this, cx| this.set_appearance(pref, window, cx));
-                                        },
-                                    ));
-                                }
-                                menu
-                            }),
-                    )
-                    .child(
-                        Button::new("view-menu")
-                            .ghost()
-                            .icon(icon("panels-top-left").size(px(17.)))
-                            .tooltip("Layout")
-                            .dropdown_menu(move |menu, _window, _cx| {
-                                let a = this2.clone();
-                                let b = this2.clone();
-                                let c = this2.clone();
-                                let d = this2.clone();
-                                let r = this2.clone();
-                                menu.label("Reading pane")
-                                    .item(PopupMenuItem::new("On the right").checked(reading_pane == ReadingPane::Right).on_click(move |_, _w, cx| {
-                                        let _ = a.update(cx, |this, cx| this.set_reading_pane(ReadingPane::Right, cx));
-                                    }))
-                                    .item(PopupMenuItem::new("Below the list").checked(reading_pane == ReadingPane::Bottom).on_click(move |_, _w, cx| {
-                                        let _ = b.update(cx, |this, cx| this.set_reading_pane(ReadingPane::Bottom, cx));
-                                    }))
-                                    .separator()
-                                    .label("Density")
-                                    .item(PopupMenuItem::new(if density == Density::Compact { "Comfortable" } else { "Compact" }).on_click(move |_, window, cx| {
-                                        let _ = c.update(cx, |this, cx| this.toggle_density(window, cx));
-                                    }))
-                                    .separator()
-                                    .label("Inbox")
-                                    .item(PopupMenuItem::new("Focused Inbox").checked(focused_enabled).on_click(move |_, _w, cx| {
-                                        let _ = d.update(cx, |this, cx| this.toggle_focused_inbox(cx));
-                                    }))
-                                    .separator()
-                                    .label("Calendar")
-                                    .item(PopupMenuItem::new("Event reminders").checked(reminders_enabled).on_click(move |_, _w, cx| {
-                                        let _ = r.update(cx, |this, cx| {
-                                            this.reminders_enabled = !this.reminders_enabled;
-                                            this.save_setting("reminders", &this.reminders_enabled);
-                                            cx.notify();
-                                        });
-                                    }))
-                            }),
-                    )
-                    .child(
-                        Button::new("open-settings")
-                            .ghost()
-                            .icon(icon("settings").size(px(17.)))
-                            .tooltip("Settings (Ctrl ,)")
-                            .on_click(cx.listener(|this, _, window, cx| this.open_settings(SettingsPage::General, window, cx))),
-                    )
-                    .child(owner_avatar(&owner, 29., &p).ml(px(6.)).mr(px(8.))),
-            )
-    }
-
     // ------------------------------------------------------------ status bar
 
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3134,7 +3112,7 @@ impl MailWindow {
             SyncState::SyncFailed(reason) => (p.warning, format!("Sync failed: {reason}")),
         };
         let last = status.last_successful_sync.map(|ts| {
-            let (_, t, _) = overlook_core::time::civil(ts, self.utc_offset);
+            let (_, t, _) = overlook_core::time::civil_in_zone(ts, &self.time_zone);
             format!("Last synced {}", format_clock(t))
         });
         let unread: usize = self.conversations.iter().filter(|c| c.is_unread()).count();
@@ -3314,14 +3292,18 @@ impl MailWindow {
                 .into_any_element();
         }
         let sidebar = self.render_sidebar(cx).into_any_element();
-        let list = self.render_list(cx).into_any_element();
-        let reader = self.render_reader(cx).into_any_element();
+        let gutter = cx.palette().navigation_palette().sidebar;
+        // Keep the resize hit areas and cursors, with no painted pane dividers.
+        let handles: gpui_kit::base::ResizeHandleRenderer = std::rc::Rc::new(|_, _, _| Some(Empty.into_any_element()));
+        let list = mail_pane(self.render_list(cx), gutter, px(8.)).into_any_element();
+        let reader = mail_pane(self.render_reader(cx), gutter, px(0.)).into_any_element();
 
         let content = match self.reading_pane {
             ReadingPane::Right => h_resizable("content-h")
                 .with_state(&self.content_panes_h)
+                .with_handle_appearance(handles.clone())
                 .child(resizable_panel().size(px(self.list_width)).size_range(px(260.)..px(640.)).child(list))
-                .child(resizable_panel().child(reader))
+                .child(resizable_panel().bg(gutter).pl(px(5.)).child(reader))
                 .on_resize(cx.listener(|this, state: &Entity<ResizableState>, _window, cx| {
                     if let Some(w) = state.read(cx).sizes().first() {
                         this.list_width = f32::from(*w);
@@ -3330,8 +3312,9 @@ impl MailWindow {
                 })),
             ReadingPane::Bottom => v_resizable("content-v")
                 .with_state(&self.content_panes_v)
+                .with_handle_appearance(handles.clone())
                 .child(resizable_panel().size(px(self.list_height)).size_range(px(160.)..px(900.)).child(list))
-                .child(resizable_panel().child(reader))
+                .child(resizable_panel().bg(gutter).pt(px(8.)).child(reader))
                 .on_resize(cx.listener(|this, state: &Entity<ResizableState>, _window, cx| {
                     if let Some(h) = state.read(cx).sizes().first() {
                         this.list_height = f32::from(*h);
@@ -3342,8 +3325,9 @@ impl MailWindow {
 
         h_resizable("main")
             .with_state(&self.panes)
+            .with_handle_appearance(handles)
             .child(resizable_panel().size(px(self.sidebar_width)).size_range(px(180.)..px(360.)).child(sidebar))
-            .child(resizable_panel().child(content))
+            .child(resizable_panel().bg(gutter).pt(px(8.)).child(content))
             .on_resize(cx.listener(|this, state: &Entity<ResizableState>, _window, cx| {
                 if let Some(w) = state.read(cx).sizes().first() {
                     this.sidebar_width = f32::from(*w);
@@ -3412,7 +3396,8 @@ impl Focusable for MailWindow {
 }
 
 impl Render for MailWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.composer_owner.is_some() { return self.render_composer_window(cx).into_any_element(); }
         crate::watchdog::mark("render");
         if !self.first_frame_logged {
             self.first_frame_logged = true;
@@ -3439,6 +3424,8 @@ impl Render for MailWindow {
             .on_action(cx.listener(Self::on_toggle_preview))
             .on_action(cx.listener(Self::on_escape))
             .on_action(cx.listener(Self::on_send))
+            .on_action(cx.listener(Self::on_toggle_message_history))
+            .on_action(cx.listener(Self::on_pop_out_composer))
             .on_action(cx.listener(Self::on_reply))
             .on_action(cx.listener(Self::on_reply_all))
             .on_action(cx.listener(Self::on_forward))
@@ -3473,11 +3460,16 @@ impl Render for MailWindow {
             .font_family("Inter")
             .text_size(px(13.))
             .relative()
-            .child(self.render_header(cx))
-            .children(self.render_update_banner(cx))
-            .children(self.render_banner(cx))
-            .child(div().flex_1().min_h_0().child(self.render_body(cx)))
-            .child(self.render_status_bar(cx))
+            .child(h_flex().size_full().min_h_0()
+                .child(self.render_app_rail(cx))
+                .child(v_flex().flex_1().min_w_0().h_full()
+                    .child(self.render_header(cx))
+                    .child(self.render_app_toolbar(window.viewport_size().width - px(shell::RAIL_WIDTH), cx))
+                    .children(self.render_update_banner(cx))
+                    .children(self.render_banner(cx))
+                    .children(self.render_time_zone_prompt(cx))
+                    .child(div().flex_1().min_h_0().child(self.render_body(cx)))
+                    .child(self.render_status_bar(cx))))
             .when(self.settings.is_some(), |d| d.child(self.render_settings(cx)))
             .when(self.account_setup.is_some(), |d| d.child(self.render_account_setup(cx)))
             .when(self.quick_look.is_some(), |d| d.child(self.render_quick_look(cx)))
@@ -3503,11 +3495,9 @@ impl MailWindow {
             .relative()
             .child(
                 TitleBar::new()
-                    .h(px(64.))
+                    .h(px(52.))
                     .bg(p.surface)
-                    .border_b_1()
-                    .border_color(p.divider)
-                    .child(h_flex().size_full().items_center().pl(px(10.)).child(brand_lockup(&p))),
+                    .child(h_flex().size_full().items_center().pl(px(12.)).child(brand_lockup(&p))),
             )
             .children(self.render_banner(cx))
             .child(

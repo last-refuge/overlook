@@ -150,21 +150,9 @@ impl MailWindow {
             .size_full()
             .bg(p.sidebar)
             .text_color(p.foreground)
-            .border_r_1()
-            .border_color(p.divider)
-            .pt(px(18.))
+            .pt(px(4.))
             .px(px(11.))
             .pb(px(14.))
-            .child(
-                Button::new("new-message")
-                    .primary()
-                    .icon(icon("square-pen").size(px(16.)))
-                    .label("New message")
-                    .tooltip("New message (Ctrl N)")
-                    .w_full()
-                    .h(px(38.))
-                    .on_click(cx.listener(|this, _, window, cx| this.compose_new(window, cx))),
-            )
             .child(nav)
             .child(
                 h_flex()
@@ -188,15 +176,6 @@ impl MailWindow {
                             ),
                     )
                     .child(div().flex_1())
-                    .child(
-                        Button::new("sync-now")
-                            .ghost()
-                            .xsmall()
-                            .icon(icon("refresh-cw").size(px(14.)).text_color(p.muted))
-                            .tooltip("Sync now")
-                            .loading(self.is_syncing_active())
-                            .on_click(cx.listener(|this, _, window, cx| this.sync_now(window, cx))),
-                    )
                     .child(
                         Button::new("account-menu")
                             .ghost()

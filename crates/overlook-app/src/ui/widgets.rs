@@ -6,6 +6,13 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use overlook_core::Address;
 
+/// GPUI clips children to a rectangle; cover the top notches after the pane paints.
+pub fn mail_pane(body: impl IntoElement, backdrop: Hsla, top_right_radius: Pixels) -> Div {
+    div().relative().size_full().overflow_hidden()
+        .child(body)
+        .child(gpui_kit::base::RoundedFrameCover::top(px(8.), top_right_radius).backdrop(backdrop))
+}
+
 /// Circular initials avatar in the brand's muted green-gray.
 pub fn avatar(address: &Address, size: f32, p: &Palette) -> Div {
     div()
@@ -76,11 +83,6 @@ pub fn segmented(p: &Palette) -> Div {
 /// child at the call site.
 pub fn segment(id: impl Into<ElementId>, label: impl Into<SharedString>, selected: bool, p: &Palette) -> Stateful<Div> {
     segment_base(id, selected, p).child(label.into())
-}
-
-/// A [`segment`] with an icon before its label.
-pub fn segment_with_icon(id: impl Into<ElementId>, icon: impl IntoElement, label: impl Into<SharedString>, selected: bool, p: &Palette) -> Stateful<Div> {
-    segment_base(id, selected, p).child(icon).child(label.into())
 }
 
 fn segment_base(id: impl Into<ElementId>, selected: bool, p: &Palette) -> Stateful<Div> {

@@ -9,6 +9,7 @@
 pub mod api;
 pub mod calendar;
 pub mod mapping;
+mod drafts;
 pub mod oauth;
 pub mod provider;
 

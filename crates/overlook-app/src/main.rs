@@ -16,6 +16,7 @@ mod single_instance;
 mod updater;
 mod providers;
 mod sync;
+mod draft_sync;
 mod theme;
 mod ui;
 
@@ -85,6 +86,21 @@ pub fn seed_sample_account(store: &Store) -> anyhow::Result<Account> {
 fn open_store() -> anyhow::Result<(Arc<Store>, Vec<Account>)> {
     let dir = data_dir();
     let store = Store::open(&dir.join("overlook.sqlite"))?;
+    let previous_zone = overlook_core::tz::current_zone();
+    let mut prefs = store.setting::<Prefs>("prefs").ok().flatten().unwrap_or_default();
+    if overlook_core::tz::set_override(prefs.time_zone.as_ref()).is_err() {
+        prefs.time_zone = None;
+        overlook_core::tz::set_override(None).ok();
+        store.set_setting("prefs", &prefs)?;
+    }
+    if prefs.time_zone.is_none() {
+        // Retain the last accepted zone until the first background check asks
+        // about a system change that occurred while Overlook was closed.
+        if let Some(previous) = store.calendar_time_zone()?.and_then(overlook_core::tz::DetectedZone::new) {
+            overlook_core::tz::update_system_zone(previous);
+        }
+    }
+    store.project_calendar_time_zone(&previous_zone, &overlook_core::tz::current_definition())?;
     let accounts = store.accounts()?;
     Ok((Arc::new(store), accounts))
 }
@@ -314,7 +330,7 @@ fn main() {
         let accounts = accounts.clone();
         let provider = provider.clone();
         gpui_kit::open_window(options, cx, move |window, cx| {
-            cx.new(|cx| ui::MailWindow::new(store, provider, accounts, active, preference, window, cx))
+            cx.new(|cx| ui::MailWindow::new(store, provider, accounts, active, ui::WindowSetup::Mail(preference), window, cx))
         })
         .expect("failed to open the Overlook window");
         cx.activate(true);

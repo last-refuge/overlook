@@ -46,6 +46,15 @@ impl RecipientQuery {
         self.value[self.token.clone()].trim().trim_matches('"')
     }
 
+    /// Whether the caret is at the very end of the field, straight after the recipient being
+    /// typed. Only then can a suggestion be shown after the text without covering anything.
+    pub fn completes_at_end(&self) -> bool {
+        self.selection.is_empty()
+            && self.selection.end == self.value.len()
+            && self.token.end == self.value.len()
+            && !self.value.ends_with(char::is_whitespace)
+    }
+
     /// Replace only the active recipient, preserving all other addresses and
     /// separators. At the end of a field, leave room to enter another recipient.
     pub fn replacement(
@@ -69,6 +78,50 @@ impl RecipientQuery {
         };
         Some((range, header))
     }
+}
+
+/// `candidate` without the start that `typed` spells, ignoring case; `None` when it does
+/// not start that way.
+fn strip_prefix_ignore_case<'a>(candidate: &'a str, typed: &str) -> Option<&'a str> {
+    let mut chars = candidate.char_indices();
+    let mut end = 0;
+    for t in typed.chars() {
+        let (i, c) = chars.next()?;
+        if c != t && !c.to_lowercase().eq(t.to_lowercase()) {
+            return None;
+        }
+        end = i + c.len_utf8();
+    }
+    Some(&candidate[end..])
+}
+
+/// What to show after `typed` when `address` continues it: the rest of the name and then
+/// the address, which is how it is written once chosen, or the rest of the address. `None`
+/// when neither starts with what was typed. A later word of the name can still match, and
+/// the list below the field covers that; only a start can be completed in place.
+pub fn ghost_completion(typed: &str, address: &Address) -> Option<String> {
+    let typed = typed.trim();
+    if typed.is_empty() {
+        return None;
+    }
+    if let Some(name) = address.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        // A name that has to be quoted would not read as what it becomes, so it is not offered.
+        if address.to_header() == format!("{name} <{}>", address.email) {
+            if let Some(rest) = strip_prefix_ignore_case(name, typed) {
+                return Some(format!("{rest} <{}>", address.email));
+            }
+        }
+    }
+    strip_prefix_ignore_case(&address.email, typed).filter(|rest| !rest.is_empty()).map(str::to_owned)
+}
+
+/// The suggestion to offer inside the field: the first one that continues what is being
+/// typed, with the text to show. `None` unless the caret is at the end of the field.
+pub fn inline_suggestion<'a>(query: &RecipientQuery, suggestions: &'a [Address]) -> Option<(&'a Address, String)> {
+    if !query.completes_at_end() {
+        return None;
+    }
+    suggestions.iter().find_map(|a| ghost_completion(query.text(), a).map(|ghost| (a, ghost)))
 }
 
 /// Split composer address lists without treating punctuation inside quoted
@@ -104,6 +157,75 @@ pub(crate) fn recipient_ranges(input: &str) -> Vec<Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn maya() -> Address {
+        Address::named("Maya Chen", "maya@northstar.example")
+    }
+
+    #[test]
+    fn a_name_is_completed_to_the_address_it_stands_for() {
+        assert_eq!(ghost_completion("ma", &maya()).as_deref(), Some("ya Chen <maya@northstar.example>"));
+        assert_eq!(ghost_completion("MAYA c", &maya()).as_deref(), Some("hen <maya@northstar.example>"));
+        // The whole name is typed: what is left is the address.
+        assert_eq!(ghost_completion("Maya Chen", &maya()).as_deref(), Some(" <maya@northstar.example>"));
+    }
+
+    #[test]
+    fn an_address_is_completed_to_the_rest_of_the_address() {
+        let unnamed = Address::new(None, "sam@example.com");
+        assert_eq!(ghost_completion("sa", &unnamed).as_deref(), Some("m@example.com"));
+        assert_eq!(ghost_completion("maya@no", &maya()).as_deref(), Some("rthstar.example"));
+        assert_eq!(ghost_completion("MAYA@", &maya()).as_deref(), Some("northstar.example"));
+        assert_eq!(ghost_completion("sam@example.com", &unnamed), None, "nothing is left to add");
+    }
+
+    #[test]
+    fn only_a_start_is_completed_in_place() {
+        assert_eq!(ghost_completion("chen", &maya()), None, "a later word of the name only matches in the list");
+        assert_eq!(ghost_completion("northstar", &maya()), None);
+        assert_eq!(ghost_completion("", &maya()), None);
+        assert_eq!(ghost_completion("  ", &maya()), None);
+        assert_eq!(ghost_completion("maya chens", &maya()), None, "typing past the name leaves nothing to complete");
+    }
+
+    #[test]
+    fn a_name_that_needs_quoting_is_not_spelled_out_but_its_address_still_completes() {
+        let jane = Address::named("Doe, Jane", "jane@example.com");
+        assert_eq!(ghost_completion("Doe", &jane), None);
+        assert_eq!(ghost_completion("jan", &jane).as_deref(), Some("e@example.com"));
+    }
+
+    #[test]
+    fn completion_ignores_case_across_scripts() {
+        let emile = Address::named("Émile Zola", "emile@example.fr");
+        assert_eq!(ghost_completion("ém", &emile).as_deref(), Some("ile Zola <emile@example.fr>"));
+        assert_eq!(ghost_completion("ÉMI", &emile).as_deref(), Some("le Zola <emile@example.fr>"));
+        let tokyo = Address::named("東京 太郎", "taro@example.jp");
+        assert_eq!(ghost_completion("東", &tokyo).as_deref(), Some("京 太郎 <taro@example.jp>"));
+    }
+
+    #[test]
+    fn a_suggestion_is_offered_in_the_field_only_with_the_caret_at_the_end() {
+        let list = vec![Address::named("Maya Chen", "maya@northstar.example"), Address::named("Mateo Ruiz", "mateo@example.com")];
+        let at = |value: &str, selection: Range<usize>| RecipientQuery::new(RecipientField::To, value, selection).unwrap();
+        let end = |value: &str| at(value, value.len()..value.len());
+
+        let (address, ghost) = inline_suggestion(&end("ma"), &list).unwrap();
+        assert_eq!((address.email.as_str(), ghost.as_str()), ("maya@northstar.example", "ya Chen <maya@northstar.example>"));
+        // The first suggestion that continues the text wins, not just the first.
+        let (address, _) = inline_suggestion(&end("mat"), &list).unwrap();
+        assert_eq!(address.email, "mateo@example.com");
+
+        // After other recipients is still the end of the field.
+        assert!(inline_suggestion(&end("lee@example.com, ma"), &list).is_some());
+        // In the middle of the text, or of the word, or with a selection, it would cover text.
+        assert_eq!(inline_suggestion(&at("ma, last@example.com", 2..2), &list), None);
+        assert_eq!(inline_suggestion(&at("ma", 1..1), &list), None);
+        assert_eq!(inline_suggestion(&at("ma", 0..2), &list), None);
+        // After a trailing space the text no longer ends in what is being typed.
+        assert_eq!(inline_suggestion(&end("ma "), &list), None);
+        assert_eq!(inline_suggestion(&end("ma"), &[]), None);
+    }
 
     fn complete(
         field: RecipientField,

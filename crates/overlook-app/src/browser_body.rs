@@ -400,6 +400,8 @@ pub struct BrowserBody {
     height: u32,
     error: Option<&'static str>,
     has_rendered: bool,
+    layout_ready: bool,
+    cache_initial_layout: bool,
     buttons: u32,
     native_scroll: Option<ScrollHandle>,
     /// The message as plain text, shown natively until the first tiles arrive.
@@ -458,6 +460,8 @@ impl BrowserBody {
             height,
             error: None,
             has_rendered: finished.is_some(),
+            layout_ready: finished.is_some(),
+            cache_initial_layout: true,
             buttons: 0,
             native_scroll: None,
             placeholder,
@@ -466,6 +470,9 @@ impl BrowserBody {
 
     /// Keeps the current paint as this document's finished render.
     fn remember(&self) {
+        // A user's open <details> or nested-scroll position is not the initial
+        // state of this HTML. Reopening must not paint it over a fresh closed DOM.
+        if !self.cache_initial_layout { return; }
         if let Some(size) = self.last_resize {
             remember_render(FinishedRender {
                 key: render_key(self.document_hash, size),
@@ -480,6 +487,8 @@ impl BrowserBody {
         self.native_scroll = Some(scroll);
     }
 
+    pub fn layout_is_ready(&self) -> bool { self.layout_ready || self.error.is_some() }
+
     pub fn set_document(
         &mut self,
         document: String,
@@ -492,6 +501,8 @@ impl BrowserBody {
             return;
         }
         self.document_hash = hash;
+        self.layout_ready = false;
+        self.cache_initial_layout = true;
         let retain_paint = allow_remote == self.prepared.allow_remote && dark == self.prepared.dark;
         self.prepared = RetryDocument::new(document, allow_remote, dark);
         if retain_paint {
@@ -518,6 +529,8 @@ impl BrowserBody {
         self.height = 300;
         self.error = None;
         self.has_rendered = false;
+        self.layout_ready = false;
+        self.cache_initial_layout = true;
         self.buttons = 0;
         self.last_resize = None;
         cx.notify();
@@ -552,6 +565,7 @@ impl BrowserBody {
         }
         let resized = self.last_resize != Some(size);
         if resized {
+            self.layout_ready = false;
             // Establish a revision floor from everything already queued before
             // resize. None of those geometry events may repopulate the surface.
             for event in &events {
@@ -588,6 +602,7 @@ impl BrowserBody {
                         continue;
                     }
                     let height = height.clamp(1, MAX_DOCUMENT_HEIGHT);
+                    self.layout_ready = true;
                     if self.error.is_none() && self.height != height {
                         self.height = height;
                         self.requested.set(None);
@@ -715,6 +730,7 @@ impl BrowserBody {
     }
 
     fn keyboard(&mut self, stroke: &Keystroke, down: bool) {
+        if down { self.cache_initial_layout = false; }
         if self.error.is_some() { return; }
         if down && (stroke.modifiers.control || stroke.modifiers.platform) {
             match stroke.key.as_str() {
@@ -742,7 +758,7 @@ impl BrowserBody {
         } else {
             None
         };
-        let key = text.unwrap_or(&key);
+        let key = if stroke.key.chars().count() == 1 { text.unwrap_or(&key) } else { &key };
         let m = &stroke.modifiers;
         let modifiers = u32::from(m.alt)
             | (u32::from(m.control) << 1)
@@ -785,7 +801,7 @@ impl Render for BrowserBody {
         let placeholder = (!self.has_rendered && self.error.is_none() && self.tiles.cached.is_empty())
             .then(|| self.placeholder.clone())
             .flatten()
-            .map(|text| div().absolute().inset_0().px(px(16.)).py(px(12.)).text_size(px(14.)).line_height(px(21.)).child(text));
+            .map(|text| div().absolute().inset_0().px(px(8.)).py(px(8.)).text_size(px(14.)).line_height(px(21.)).child(text));
         let content = {
             div()
                 .size_full()
@@ -833,6 +849,7 @@ impl Render for BrowserBody {
             )
             .on_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
                 if this.error.is_some() { return; }
+                this.cache_initial_layout = false;
                 this.focus.focus(window, cx);
                 let (button, mask) = mouse_button(event.button);
                 this.buttons |= mask;

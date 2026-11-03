@@ -1192,6 +1192,10 @@ impl Actor {
                 let mut p = json!({"type":kind,"key":key,"code":code,"modifiers":modifiers & 15,"windowsVirtualKeyCode":virtual_key});
                 if let Some(text) = text {
                     p["text"] = json!(text);
+                } else if kind == "keyDown" && key == "Enter" && modifiers & 7 == 0 {
+                    // Chromium's default summary/button activation needs the
+                    // Enter character as well as the physical key code.
+                    p["text"] = json!("\r");
                 }
                 self.cdp.call("Input.dispatchKeyEvent", p)?;
                 if kind != "keyUp" && (key == "Tab" || modifiers & 8 != 0) {
@@ -2451,11 +2455,11 @@ mod tests {
 
     #[test]
     #[ignore = "runs real sandboxed Chromium"]
-    fn chromium_light_paper_defaults_preserve_authored_colors() {
+    fn chromium_email_paper_defaults_preserve_authored_colors() {
         let palette = crate::theme::Palette::light();
         let mut actor = Actor::start(Arc::new(AtomicBool::new(false)), false).unwrap();
         for (source, paper, ink) in [
-            ("<p>Synthetic unstyled message</p>", [255, 255, 255], "rgb(41, 51, 46)"),
+            ("<p>Synthetic unstyled message</p>", [255, 255, 255], "rgb(32, 36, 43)"),
             ("<style>body{background:#203040;color:#fafafa}</style><p>Authored stylesheet</p>", [32, 48, 64], "rgb(250, 250, 250)"),
             ("<body style='background:#203040;color:#fafafa'><p>Authored inline style</p></body>", [32, 48, 64], "rgb(250, 250, 250)"),
             ("<body bgcolor='#203040' text='#fafafa'><p>Authored legacy attributes</p></body>", [32, 48, 64], "rgb(250, 250, 250)"),
@@ -2471,26 +2475,21 @@ mod tests {
 
     #[test]
     #[ignore = "runs real sandboxed Chromium"]
-    fn chromium_dark_paper_is_actually_painted_dark() {
-        let document = overlook_core::browser::prepare_document(
-            "<div style='height:100px;background:white;color:black'>Synthetic dark paper</div>",
-        );
+    fn chromium_email_paper_stays_light_in_dark_shell() {
         let mut actor = Actor::start(Arc::new(AtomicBool::new(false)), false).unwrap();
-        actor.load(&document.html, true).unwrap();
-        let (png, _, _) = actor.frame().unwrap();
-        let pixels = image::load_from_memory(&png).unwrap().into_rgb8();
-        let paper = pixels.get_pixel(400, 50).0;
-        assert!(
-            paper.iter().all(|c| *c < 100),
-            "Dark mode must paint dark paper, got {paper:?}"
-        );
-        assert_eq!(
-            actor
-                .cdp
-                .eval("matchMedia('(prefers-color-scheme: dark)').matches".into())
-                .unwrap(),
-            true
-        );
+        for theme in [overlook_core::ResolvedTheme::Light, overlook_core::ResolvedTheme::Dark, overlook_core::ResolvedTheme::Pink] {
+            let palette = crate::theme::Palette::for_theme(theme);
+            let document = palette.prepare_browser_document(
+                "<style>@media(prefers-color-scheme:dark){body{background:black;color:white}}</style><div style='height:100px;background:white;color:black'>Fictional light paper</div>",
+            );
+            actor.load(&document.html, false).unwrap();
+            let (png, _, _) = actor.frame().unwrap();
+            let pixels = image::load_from_memory(&png).unwrap().into_rgb8();
+            assert_eq!(pixels.get_pixel(400, 50).0, [255, 255, 255], "{theme:?}");
+            assert_eq!(actor.cdp.eval("getComputedStyle(document.body).backgroundColor".into()).unwrap(), "rgb(255, 255, 255)");
+            assert_eq!(actor.cdp.eval("getComputedStyle(document.body).color".into()).unwrap(), "rgb(32, 36, 43)");
+            assert_eq!(actor.cdp.eval("matchMedia('(prefers-color-scheme: dark)').matches".into()).unwrap(), false);
+        }
     }
 
     #[test]
@@ -2591,6 +2590,40 @@ mod tests {
                 .unwrap(),
             360
         );
+    }
+
+    #[test]
+    #[ignore = "runs real sandboxed Chromium with synthetic thread history"]
+    fn chromium_thread_history_expands_and_collapses_with_pointer_and_keyboard() {
+        use overlook_core::thread_history::{HistoryBody, HistoryMessage};
+        let old = "<p>The synthetic project update is ready for the team to review.</p><div style='height:2400px'>Earlier discussion</div>";
+        let source = format!("<p>Thanks, we will review the update.</p><div id=divRplyFwdMsg>From: Test sender<br>Sent: Monday</div>{old}");
+        let messages = [
+            HistoryMessage { id: "old".into(), subject: "Test".into(), body: HistoryBody::Html(old.into()) },
+            HistoryMessage { id: "reply".into(), subject: "Re: Test".into(), body: HistoryBody::Html(source) },
+        ];
+        let folded = overlook_core::thread_history::prepare(&messages, || true).remove(&overlook_core::MessageId::from("reply")).unwrap();
+        let document = overlook_core::browser::prepare_document(&folded);
+        let mut actor = Actor::start(Arc::new(AtomicBool::new(false)), false).unwrap();
+        actor.load(&document.html, false).unwrap();
+        actor.refresh_layout(&|_| {}).unwrap();
+        let closed = actor.document_height;
+        assert!(closed < 300);
+        let point = actor.cdp.eval("(()=>{const r=document.querySelector('summary').getBoundingClientRect();return [r.x+10,r.y+10]})()".into()).unwrap();
+        let (x,y) = (point[0].as_f64().unwrap(),point[1].as_f64().unwrap());
+        for (kind,buttons) in [("mousePressed",1),("mouseReleased",0)] {
+            actor.input(Input::Mouse(kind.into(), x, y, "left".into(), buttons, 1), &|_| {}).unwrap();
+        }
+        actor.refresh_layout(&|_| {}).unwrap();
+        assert!(actor.document_height > closed + 2000);
+        assert_eq!(actor.cdp.eval("document.querySelector('details').open".into()).unwrap(), true);
+        // The summary remains keyboard-operable with sender scripts disabled.
+        assert_eq!(actor.cdp.eval("document.activeElement.localName".into()).unwrap(), "summary");
+        actor.input(Input::Key("keyDown".into(), "Enter".into(), "Enter".into(), 0, None), &|_| {}).unwrap();
+        actor.input(Input::Key("keyUp".into(), "Enter".into(), "Enter".into(), 0, None), &|_| {}).unwrap();
+        actor.refresh_layout(&|_| {}).unwrap();
+        assert_eq!(actor.cdp.eval("document.querySelector('details').open".into()).unwrap(), false);
+        assert_eq!(actor.document_height, closed);
     }
 
     #[test]
