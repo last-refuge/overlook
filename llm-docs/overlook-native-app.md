@@ -109,8 +109,28 @@ the whole composer into view and follows delayed body reflow until the layout se
 seconds); mouse, keyboard or scroll input stops the reveal. Short panes align the beginning when the
 whole composer cannot fit. The editor height adapts to the pane. From and Subject are under Details for
 inline replies/forwards, and Enter skips hidden fields. New messages retain their full headers. Choosing
-Reply again returns to the existing editor; switching Reply / Reply all in the heading or through actions
+Reply again returns to the existing editor; switching Reply / Reply all in Reply options or through actions
 updates recipients while retaining typed text, attachments and the draft identity.
+
+Send, Attach, Show/Hide history, Pop out, Delete draft and Save and close are in the composer's top bar.
+No Reply/Forward/New message title appears beside Send; reply switching lives in the icon options menu.
+Send/save errors appear directly below it. Standalone and popped-out composers scroll their contents
+under that bar, keeping the actions accessible with long histories or signatures. Show history is a
+display choice: it can show the original even after its outgoing quote was removed, without adding it
+back to the sent message. The existing resource-consent policy still applies.
+
+Pop out (Ctrl+Shift+O) opens a native compose window for the same draft. The handoff preserves typed
+body, raw unfinished recipient/subject fields, selections, the focused field, signature, attachments and
+preview/history choices. Input widgets are recreated for the new window, so their earlier Undo stacks
+are not transferred. Handoff waits for pending saves and attachment staging. Each popped-out editor
+holds its draft edit guard, and reopening its draft or repeating its reply action focuses that window.
+The main window remains available for reading and composing another message.
+
+Closing a compose window saves the draft, and a save failure vetoes native close. Delete draft closes
+only after local deletion succeeds. Pop-outs retain the shared main mail controller and provider handles,
+without starting another sync/reminder/update loop. Sends and Undo Send use the main window when it
+exists. If it was closed first, the pop-out stays open with queued-send feedback and Undo while the same
+controller handles delivery. Ctrl+Shift+H toggles message history.
 
 `overlook_core::compose` turns the text into the two parts of the message: `render_markdown`
 (the `markdown` crate, GFM, raw HTML escaped, single newlines as `<br>`) and `markdown_to_plain`.

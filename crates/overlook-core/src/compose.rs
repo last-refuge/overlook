@@ -248,6 +248,12 @@ pub fn quote_preview(draft: &Draft, source: &Message, policy: RemoteContent) -> 
     outgoing_preview(&Draft { body_text: String::new(), signature_html: None, ..draft.clone() }, Some(source), policy)
 }
 
+/// Read the original history even after it was excluded from the outgoing message.
+/// Visibility is a display choice; it never changes the draft's quote setting.
+pub fn history_preview(draft: &Draft, source: &Message, policy: RemoteContent) -> String {
+    quote_preview(&Draft { include_quote: true, ..draft.clone() }, source, policy)
+}
+
 /// Preview a draft (including Outbox items) without bypassing local image consent.
 pub fn outgoing_preview(draft: &Draft, source: Option<&Message>, policy: RemoteContent) -> String {
     clean_only(&outgoing_bodies(draft, source).html, policy)
@@ -348,6 +354,23 @@ mod tests {
         assert!(out.html.contains("<blockquote") && out.html.contains("Thursday works."), "{}", out.html);
         draft.include_quote = false;
         assert_eq!(outgoing_bodies(&draft, Some(&source())).text, "Thursday it is.");
+    }
+
+    #[test]
+    fn reading_history_does_not_restore_an_excluded_outgoing_quote() {
+        let source = message_with_body("<p>Original discussion</p><img src='https://images.example/history.png'>");
+        for kind in [DraftKind::Reply, DraftKind::ReplyAll, DraftKind::Forward] {
+            let mut draft = Draft::new(AccountId::from("a"), kind, 0);
+            draft.body_text = "Authored answer".into();
+            draft.include_quote = false;
+            let before = draft.clone();
+            let history = history_preview(&draft, &source, RemoteContent::Blocked);
+            assert!(history.contains("Original discussion"));
+            assert!(!history.contains("Authored answer") && !history.contains("https://images.example/history.png"));
+            assert!(history_preview(&draft, &source, RemoteContent::Allowed).contains("https://images.example/history.png"));
+            assert_eq!(draft, before);
+            assert!(!outgoing_bodies(&draft, Some(&source)).html.contains("Original discussion"));
+        }
     }
 
     #[test]

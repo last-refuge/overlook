@@ -53,9 +53,9 @@ impl MailWindow {
         }));
     }
 
-    fn prune_browser_bodies(&self) {
+    pub(super) fn prune_browser_bodies(&self) {
         let mut active = std::collections::HashSet::new();
-        let reserved = self.composer.as_ref().map_or(0, |c| usize::from(c.preview) + usize::from(c.quote_shown && c.draft.include_quote));
+        let reserved = self.composer.as_ref().map_or(0, |c| usize::from(c.preview) + usize::from(c.quote_shown));
         let reading = self.outbox_selected.is_none() && (self.composer.is_none() || self.composer_is_inline());
         if let Some(summary) = self.selected_summary().filter(|_| reading) {
             active.insert(format!("message-{}", summary.latest_message_id));
@@ -70,7 +70,7 @@ impl MailWindow {
         *self.live_browser_messages.borrow_mut() = active.clone();
         if let Some(c) = &self.composer {
             if c.preview { active.insert(format!("preview-{}", c.draft.id)); }
-            if c.quote_shown && c.draft.include_quote { active.insert(format!("quote-{}", c.draft.id)); }
+            if c.quote_shown { active.insert(format!("quote-{}", c.draft.id)); }
         }
         if let Some(id) = &self.outbox_selected { active.insert(format!("outbox-{id}")); }
         self.browser_bodies.borrow_mut().retain(|key, _| active.contains(key));
