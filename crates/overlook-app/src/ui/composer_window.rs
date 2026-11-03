@@ -301,10 +301,13 @@ impl MailWindow {
     pub(super) fn notify_owner(&self, cx: &mut Context<Self>) {
         if let Some(owner) = self.window_owner() {
             let parent = owner.parent.clone();
+            // This window's account changed in the store; the main window recounts it.
+            let changed = self.account.id.clone();
             cx.defer(move |cx| {
                 parent.update(cx, |this, cx| {
+                    this.mark_counts_stale([changed.clone()]);
                     this.reload(cx);
-                    this.reload_folder_windows(cx);
+                    this.reload_folder_windows([changed], cx);
                 });
             });
         }

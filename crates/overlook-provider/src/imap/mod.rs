@@ -445,13 +445,8 @@ impl Conn {
         let command = format!("LIST \"\" \"*\" RETURN (SUBSCRIBED STATUS ({}))", self.status_items());
         let data = match self.session().run(&command) {
             Ok((data, _)) => data,
-            Err(imap::Error::Bad(e)) => {
-                info!("imap: LIST-STATUS refused ({}); using LIST and STATUS", e.information);
-                self.caps.list_status = false;
-                return Ok(None);
-            }
-            Err(imap::Error::No(e)) => {
-                info!("imap: LIST-STATUS refused ({}); using LIST and STATUS", e.information);
+            Err(e @ (imap::Error::Bad(_) | imap::Error::No(_))) => {
+                info!("imap: LIST-STATUS refused ({e}); using LIST and STATUS");
                 self.caps.list_status = false;
                 return Ok(None);
             }
@@ -960,8 +955,8 @@ impl ImapProvider {
             let mut relist_needed = false;
             let paths: Vec<String> = cp.folders.keys().cloned().collect();
             for path in paths {
-                let flags_due = cp.folders.get(&path).is_some_and(|c| c.label_kind() == LabelKind::Inbox) || cp.cycle % FLAG_REFRESH_EVERY == 0;
-                let fresh = cp.folders.get(&path).is_none_or(|c| c.fresh);
+                let (is_inbox, fresh) = cp.folders.get(&path).map_or((false, true), |c| (c.label_kind() == LabelKind::Inbox, c.fresh));
+                let flags_due = is_inbox || cp.cycle % FLAG_REFRESH_EVERY == 0;
                 // Unchanged since the last read: don't open it. The open folder's `STATUS`
                 // is not relied on (RFC 3501), so it is always read.
                 let status = if verify || conn.selected.as_ref().is_some_and(|s| s.path == path) || fresh {

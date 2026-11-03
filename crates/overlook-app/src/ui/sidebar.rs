@@ -67,9 +67,8 @@ impl Metrics {
 impl MailWindow {
     /// What the sidebar calls an account: its account name, or else its address.
     pub(crate) fn account_name(&self, id: &AccountId) -> String {
-        let name = self.account_prefs_for(id).name;
-        if !name.trim().is_empty() {
-            return name.trim().to_owned();
+        if let Some(name) = self.account_prefs.get(id).map(|p| p.name.trim()).filter(|n| !n.is_empty()) {
+            return name.to_owned();
         }
         self.accounts.iter().find(|a| &a.id == id).map(|a| a.email.clone()).unwrap_or_else(|| id.0.clone())
     }
@@ -114,18 +113,32 @@ impl MailWindow {
         self.account_labels = labels;
     }
 
-    /// Recounts the other accounts' badges from the store, off the UI thread. Requests
-    /// that arrive while one runs are folded into a single follow-up.
+    /// Asks for the badges of `accounts` to be recounted at the next `reload`: after a sync
+    /// of that account, a change made to it from another window, or a switch away from it.
+    pub(crate) fn mark_counts_stale(&mut self, accounts: impl IntoIterator<Item = AccountId>) {
+        self.account_counts_stale.extend(accounts);
+    }
+
+    /// Every account's badges are recounted at the next `reload` (the Focused Inbox switch
+    /// changes what the Inbox badge counts).
+    pub(crate) fn mark_all_counts_stale(&mut self) {
+        let ids: Vec<AccountId> = self.accounts.iter().map(|a| a.id.clone()).collect();
+        self.mark_counts_stale(ids);
+    }
+
+    /// Recounts the badges of the accounts marked stale, off the UI thread. Loading an
+    /// account's index reads every message header it has, so only accounts whose mail may
+    /// have changed are recounted. Requests that arrive while one runs wait for the next.
     pub(crate) fn refresh_account_counts(&mut self, cx: &mut Context<Self>) {
         if self.account_counts_running {
-            self.account_counts_again = true;
             return;
         }
-        let others: Vec<(AccountId, String)> = self.accounts.iter().filter(|a| a.id != self.account.id).map(|a| (a.id.clone(), a.email.clone())).collect();
+        let stale = std::mem::take(&mut self.account_counts_stale);
+        let others: Vec<(AccountId, String)> = self.accounts.iter().filter(|a| a.id != self.account.id && stale.contains(&a.id)).map(|a| (a.id.clone(), a.email.clone())).collect();
         if others.is_empty() {
-            self.account_counts.clear();
             return;
         }
+        tracing::debug!("sidebar: recounting {} other account(s)", others.len());
         self.account_counts_running = true;
         let store = self.store.clone();
         let focused = self.focused_enabled;
@@ -145,8 +158,8 @@ impl MailWindow {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.account_counts_running = false;
-                this.account_counts = counts;
-                if std::mem::take(&mut this.account_counts_again) {
+                this.account_counts.extend(counts);
+                if !this.account_counts_stale.is_empty() {
                     this.refresh_account_counts(cx);
                 }
                 cx.notify();
@@ -361,9 +374,9 @@ impl MailWindow {
 
     /// Favorites rows with their accounts; a folder name shared by several rows carries the
     /// account name. Pins of removed accounts or deleted labels are skipped.
-    fn favorite_rows(&self, p: &crate::theme::Palette) -> Vec<(AccountId, Nav)> {
+    fn favorite_rows(&self, favorites: &[Favorite], p: &crate::theme::Palette) -> Vec<(AccountId, Nav)> {
         let mut rows: Vec<(AccountId, Nav)> = Vec::new();
-        for f in self.favorites() {
+        for f in favorites.iter().cloned() {
             if !self.accounts.iter().any(|a| a.id == f.account) {
                 continue;
             }
@@ -392,10 +405,13 @@ impl MailWindow {
         let status = self.status.clone();
         let outbox = status.outbox_items;
         let drafts = self.drafts.len();
+        // Read once per render, not per row: every row consults the pinned list.
+        let pinned_list: std::rc::Rc<Vec<Favorite>> = std::rc::Rc::new(self.favorites());
+        let ordered_accounts = self.sidebar_accounts();
 
         // `section` and `account` keep element ids unique: a folder can be in Favorites and
         // in its account's list, and every account has an Inbox.
-        let nav_button = |this: &Self, section: &str, account: &AccountId, nav: Nav, cx: &mut Context<Self>| {
+        let nav_button = |this: &Self, section: &str, account: &AccountId, nav: Nav, favorites: &std::rc::Rc<Vec<Favorite>>, cx: &mut Context<Self>| {
             let in_active = account == &this.account.id;
             let current = in_active && this.view == nav.view && this.search_query.is_empty();
             // The active account counts from its live index; the others from their last
@@ -415,13 +431,12 @@ impl MailWindow {
             let color = nav.color;
             let target = account.clone();
             let favorite = favorite_for(account, &nav.view);
-            let favorites = this.favorites();
             let pinned = favorites.contains(&favorite);
             // Favorites rows can be dragged within Favorites and moved from their menu.
             let in_favorites = section == "favorites";
             let place = favorites.iter().position(|f| f == &favorite);
             let (can_up, can_down) = (place.is_some_and(|i| i > 0), place.is_some_and(|i| i + 1 < favorites.len()));
-            let order = std::rc::Rc::new(favorites);
+            let order = favorites.clone();
             let fav_drag = super::FavoriteDrag { favorite: favorite.clone(), name: nav.label.to_string() };
             let drop_target = favorite.clone();
             let (menu_account, menu_view) = (account.clone(), nav.view.clone());
@@ -596,7 +611,7 @@ impl MailWindow {
         };
 
         let owner = self.owner();
-        let accounts: Vec<(Account, String)> = self.sidebar_accounts().into_iter().map(|a| { let name = self.account_name(&a.id); (a, name) }).collect();
+        let accounts: Vec<(Account, String)> = ordered_accounts.iter().map(|a| (a.clone(), self.account_name(&a.id))).collect();
         let sidebar_mode = self.prefs.sidebar_mode;
         let active_id = self.account.id.clone();
         let active_email = self.account.email.clone();
@@ -636,13 +651,13 @@ impl MailWindow {
         let favorites: Vec<AnyElement> = if favorites_collapsed {
             Vec::new()
         } else {
-            self.favorite_rows(&p).into_iter().map(|(account, nav)| nav_button(self, "favorites", &account, nav, cx).into_any_element()).collect()
+            self.favorite_rows(&pinned_list, &p).into_iter().map(|(account, nav)| nav_button(self, "favorites", &account, nav, &pinned_list, cx).into_any_element()).collect()
         };
 
         // The account tree: every account in the saved order, or just the one in use.
         let all_accounts = self.prefs.sidebar_mode == SidebarMode::AllAccounts;
         let shown: Vec<Account> = if all_accounts {
-            self.sidebar_accounts()
+            ordered_accounts
         } else {
             self.accounts.iter().filter(|a| a.id == self.account.id).cloned().collect()
         };
@@ -681,7 +696,7 @@ impl MailWindow {
             } else {
                 header.into_any_element()
             };
-            let folders = (!collapsed).then(|| v_flex().gap(px(m.row_gap)).children(self.account_folders(&a.id, &p).into_iter().map(|nav| nav_button(self, "account", &a.id, nav, cx))));
+            let folders = (!collapsed).then(|| v_flex().gap(px(m.row_gap)).children(self.account_folders(&a.id, &p).into_iter().map(|nav| nav_button(self, "account", &a.id, nav, &pinned_list, cx))));
             // The whole block (header and folders) takes the drop. The line marks where the
             // account lands: `move_account` puts it after this block when it comes from above
             // and before it when it comes from below.

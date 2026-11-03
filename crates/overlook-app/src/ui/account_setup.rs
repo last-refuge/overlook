@@ -122,9 +122,7 @@ impl AccountSetup {
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn capitalised_local_part(email: &str) -> String {
-    let local = email.split('@').next().unwrap_or(email);
-    let mut chars = local.chars();
-    chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_else(|| local.to_owned())
+    overlook_core::text::capitalize(email.split('@').next().unwrap_or(email))
 }
 
 /// Identifies what a probe tested: both endpoints and the passwords, hashed so the setup

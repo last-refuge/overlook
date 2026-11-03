@@ -1,7 +1,7 @@
 //! `MailProvider` for Gmail.
 
 use super::api::{ApiError, GmailClient};
-use super::mapping::{self, base64url_encode, gmail_id, label_from_json, message_from_json};
+use super::mapping::{self, base64url_encode, gmail_id, inside_inbox, label_from_json, message_from_json};
 use crate::outgoing::build_gmail_raw as build_raw;
 use crate::{draft_message_id, folder_name_problem, AppliedChanges, BoxFuture, MailProvider, MailboxSnapshot, ProviderError, RemoteChanges, RenamedFolder, SendContext, SendOutcome, SentReceipt};
 use overlook_core::time::Timestamp;
@@ -171,12 +171,23 @@ fn labels_inside(label: &Label, labels: &[Label]) -> Vec<Label> {
     labels.iter().filter(|l| l.kind == LabelKind::User && l.id != label.id && l.name.starts_with(&prefix)).cloned().collect()
 }
 
+/// The Gmail id of `label` when it is one of the user's own labels; system labels and
+/// labels not yet on the server can't be `verb` ("renamed", "moved", "deleted").
+fn own_label<'a>(label: &'a Label, verb: &str) -> Result<&'a ProviderId, ProviderError> {
+    label.provider_id.as_ref().filter(|_| label.kind == LabelKind::User).ok_or_else(|| ProviderError::Rejected(format!("only your own labels can be {verb}")))
+}
+
+/// Whether another label than `except` already has `name` (Gmail ignores case).
+fn name_taken(labels: &[Label], except: &LabelId, name: &str) -> bool {
+    labels.iter().any(|l| &l.id != except && l.name.eq_ignore_ascii_case(name))
+}
+
 impl GmailProvider {
     /// Renames `label` to `target` and the labels `inside` it to match: Gmail nests by name
     /// and does not rename children itself. Returns every label renamed, `label` first. A
     /// child that fails is logged and left under its old name, as the server has it.
     fn rename_with_children(&self, account: &Account, label: &Label, target: &str, inside: Vec<Label>) -> Result<Vec<RenamedFolder>, ProviderError> {
-        let id = label.provider_id.as_ref().ok_or_else(|| ProviderError::Rejected("only your own labels can be renamed".into()))?;
+        let id = own_label(label, "renamed")?;
         let v = with_inbox_spelling(target, |name| self.client.patch(&format!("labels/{}", id.0), &json!({ "name": name })))?;
         let renamed = label_from_json(&account.id, &v, label.sort_order).ok_or_else(|| ProviderError::Temporary("Gmail did not return the renamed label".into()))?;
         let mut changed = vec![RenamedFolder { old: label.clone(), new: renamed.clone() }];
@@ -679,14 +690,12 @@ impl MailProvider for GmailProvider {
             None => name.trim().to_owned(),
         };
         let inside = labels_inside(&label, labels);
-        let clash = labels.iter().any(|l| l.id != label.id && l.name.eq_ignore_ascii_case(&full));
+        let clash = name_taken(labels, &label.id, &full);
         Box::pin(async move {
             if let Some(problem) = problem {
                 return Err(ProviderError::Rejected(problem));
             }
-            if label.provider_id.is_none() || label.kind != LabelKind::User {
-                return Err(ProviderError::Rejected("only your own labels can be renamed".into()));
-            }
+            own_label(&label, "renamed")?;
             if full == label.name {
                 return Ok(Vec::new());
             }
@@ -707,13 +716,10 @@ impl MailProvider for GmailProvider {
             None => Ok(leaf.clone()),
         };
         let inside = labels_inside(&label, labels);
-        let taken = |name: &str| labels.iter().any(|l| l.id != label.id && l.name.eq_ignore_ascii_case(name));
-        let clash = target.as_ref().ok().filter(|t| taken(t)).cloned();
+        let clash = target.as_ref().ok().filter(|t| name_taken(labels, &label.id, t)).cloned();
         Box::pin(async move {
             let target = target?;
-            if label.provider_id.is_none() || label.kind != LabelKind::User {
-                return Err(ProviderError::Rejected("only your own labels can be moved".into()));
-            }
+            own_label(&label, "moved")?;
             if target.eq_ignore_ascii_case(&label.name) {
                 return Ok(Vec::new());
             }
@@ -730,9 +736,7 @@ impl MailProvider for GmailProvider {
     fn delete_folder(&self, _account: &Account, label: &Label) -> BoxFuture<'_, Result<(), ProviderError>> {
         let label = label.clone();
         Box::pin(async move {
-            let Some(id) = label.provider_id.as_ref().filter(|_| label.kind == LabelKind::User) else {
-                return Err(ProviderError::Rejected("only your own labels can be deleted".into()));
-            };
+            let id = own_label(&label, "deleted")?;
             match self.client.delete(&format!("labels/{}", id.0)) {
                 Ok(_) | Err(ApiError::NotFound) => Ok(()),
                 Err(e) => Err(e.into()),
@@ -854,7 +858,7 @@ pub fn person_json(c: &Contact, etag: Option<&str>) -> Value {
 /// clients such as Outlook create there and show under the Inbox. "INBOX" is a reserved
 /// label name, so try "Inbox/…" first and the IMAP spelling "INBOX/…" if Google refuses it.
 fn with_inbox_spelling(full: &str, mut call: impl FnMut(&str) -> Result<serde_json::Value, ApiError>) -> Result<serde_json::Value, ApiError> {
-    let Some(rest) = full.get(..6).filter(|p| p.eq_ignore_ascii_case("inbox/")).map(|_| &full[6..]) else {
+    let Some(rest) = inside_inbox(full) else {
         return call(full);
     };
     match call(&format!("Inbox/{rest}")) {

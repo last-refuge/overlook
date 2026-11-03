@@ -27,6 +27,12 @@ pub fn gmail_id(account: &AccountId, local: &str) -> Option<String> {
     local.strip_prefix(&format!("{}:", account.0)).map(str::to_owned)
 }
 
+/// The part of a label name after an "Inbox/" prefix in any spelling ("INBOX/Receipts" →
+/// "Receipts"), or `None` for a label that is not inside the Inbox.
+pub(super) fn inside_inbox(name: &str) -> Option<&str> {
+    name.get(..6).filter(|p| p.eq_ignore_ascii_case("inbox/")).map(|_| &name[6..])
+}
+
 /// Maps a Gmail label. Returns `None` for Gmail-internal labels Overlook models as flags
 /// or views (UNREAD, STARRED, DRAFT, IMPORTANT, CHAT, categories).
 pub fn label_from_json(account: &AccountId, v: &Value, sort_order: i32) -> Option<Label> {
@@ -50,8 +56,8 @@ pub fn label_from_json(account: &AccountId, v: &Value, sort_order: i32) -> Optio
         LabelKind::Trash => "Trash".to_owned(),
         LabelKind::Spam => "Spam".to_owned(),
         // IMAP clients (Outlook) create folders inside the Inbox as "INBOX/Name".
-        _ => match name.get(..6).filter(|p| p.eq_ignore_ascii_case("inbox/")) {
-            Some(_) => format!("Inbox/{}", &name[6..]),
+        _ => match inside_inbox(name) {
+            Some(rest) => format!("Inbox/{rest}"),
             None => name.to_owned(),
         },
     };

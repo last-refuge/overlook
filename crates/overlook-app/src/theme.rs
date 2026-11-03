@@ -218,12 +218,11 @@ fn component_colors(theme: ResolvedTheme) -> serde_json::Value {
     let base = if theme.is_dark() { DARK_JSON } else { LIGHT_JSON };
     let mut colors: serde_json::Value = serde_json::from_str(base).expect("valid color tokens");
     let p = Palette::for_theme(theme);
-    if theme == ResolvedTheme::Dark {
-        // The dark tokens are written in this palette already.
-    } else if theme.is_dark() {
-        dark_component_colors(&mut colors, &p);
-    } else {
+    if !theme.is_dark() {
         light_component_colors(&mut colors, &p);
+    } else if theme != ResolvedTheme::Dark {
+        // The dark tokens are written in the built-in Dark palette already.
+        dark_component_colors(&mut colors, &p);
     }
     if theme == ResolvedTheme::Light {
         colors["input.border"] = serde_json::Value::String(color_hex(p.control_border));
@@ -427,6 +426,14 @@ pub fn apply_preference(pref: AppearancePreference, system: SystemAppearance, cx
 /// The desktop theme's palette and the file text it came from.
 static DESKTOP: std::sync::RwLock<Option<(String, Palette)>> = std::sync::RwLock::new(None);
 
+/// Bumped whenever the desktop colors change, for caches keyed on them (tinted icons).
+static DESKTOP_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The current desktop colors' generation; see [`DESKTOP_GENERATION`].
+pub fn desktop_generation() -> u64 {
+    DESKTOP_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Omarchy's current theme: `~/.local/state/omarchy/current/theme` (older releases kept it
 /// under `~/.config/omarchy/current/theme`).
 fn omarchy_theme_dirs() -> Vec<std::path::PathBuf> {
@@ -483,6 +490,7 @@ fn refresh_desktop_colors() -> bool {
         return false;
     }
     *slot = source.and_then(|text| desktop_palette(&text).map(|p| (text, p)));
+    DESKTOP_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     true
 }
 
@@ -495,10 +503,7 @@ pub fn desktop_theme() -> Option<ResolvedTheme> {
 pub fn desktop_theme_name() -> Option<String> {
     desktop_theme()?;
     let name = omarchy_theme_dirs().into_iter().find_map(|dir| std::fs::read_to_string(dir.with_file_name("theme.name")).ok())?;
-    let words: Vec<String> = name.trim().split(['-', '_', ' ']).filter(|w| !w.is_empty()).map(|w| {
-        let mut chars = w.chars();
-        chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_default()
-    }).collect();
+    let words: Vec<String> = name.trim().split(['-', '_', ' ']).filter(|w| !w.is_empty()).map(overlook_core::text::capitalize).collect();
     (!words.is_empty()).then(|| words.join(" "))
 }
 

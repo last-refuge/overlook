@@ -66,14 +66,6 @@ pub enum OperationKind {
     DeleteContact { contact_id: String, resource_name: Option<String> },
 }
 
-fn capitalized(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-        None => String::new(),
-    }
-}
-
 impl OperationKind {
     /// Short human description for status surfaces and logs.
     pub fn describe(&self) -> String {
@@ -91,7 +83,7 @@ impl OperationKind {
             OperationKind::Trash { message_ids } => format!("Delete {}", n(message_ids)),
             OperationKind::Untrash { message_ids } => format!("Restore {}", n(message_ids)),
             OperationKind::DeleteForever { folder: Some(LabelKind::Spam), .. } => "Empty Junk".into(),
-            OperationKind::DeleteForever { folder: Some(kind), .. } => format!("Empty {}", capitalized(kind.as_key())),
+            OperationKind::DeleteForever { folder: Some(kind), .. } => format!("Empty {}", crate::text::capitalize(kind.as_key())),
             OperationKind::DeleteForever { message_ids, .. } => format!("Permanently delete {}", n(message_ids)),
             OperationKind::SendDraft { .. } => "Send message".to_owned(),
             OperationKind::RespondToEvent { response, .. } => format!("Respond to invitation ({})", response.label()),

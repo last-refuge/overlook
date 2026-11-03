@@ -138,17 +138,22 @@ impl MailWindow {
         });
     }
 
-    /// Re-reads the store in every folder window, after this (main) window synced or wrote.
-    pub(crate) fn reload_folder_windows(&self, cx: &mut Context<Self>) {
+    /// Re-reads the store in every folder window, after this (main) window synced or wrote
+    /// `changed` accounts. Each window keeps its own badge counts, so it is told which
+    /// accounts to recount; otherwise a folder window on another account would keep the
+    /// old badges of the one that changed.
+    pub(crate) fn reload_folder_windows(&self, changed: impl IntoIterator<Item = AccountId>, cx: &mut Context<Self>) {
         let editors: Vec<WeakEntity<MailWindow>> = self.folder_windows.iter().map(|f| f.editor.clone()).collect();
         if editors.is_empty() {
             return;
         }
+        let changed: Vec<AccountId> = changed.into_iter().collect();
         cx.defer(move |cx| {
             for editor in editors {
                 editor
                     .update(cx, |this, cx| {
                         this.reload_account_labels();
+                        this.mark_counts_stale(changed.iter().cloned());
                         this.reload(cx);
                         cx.notify();
                     })
@@ -198,6 +203,7 @@ impl MailWindow {
                         if this.focused_enabled != enabled {
                             this.focused_enabled = enabled;
                             this.inbox_tab = FocusTab::Focused;
+                            this.mark_all_counts_stale();
                             this.reload(cx);
                             // The main window passes it on to the other folder windows.
                             this.share_focused_inbox(cx);

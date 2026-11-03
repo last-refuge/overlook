@@ -108,14 +108,9 @@ fn color_icon_path(icon: ColorIcon, theme: ResolvedTheme, on_action: bool) -> Sh
         .map_or("light", |(name, _)| name);
     let tone = if on_action { "action" } else { "normal" };
     match theme {
-        // The desktop colors change at runtime; their fingerprint keeps the image cache
-        // from serving icons tinted for the previous desktop theme.
-        ResolvedTheme::SystemLight | ResolvedTheme::SystemDark => {
-            use std::hash::{Hash, Hasher};
-            let mut hash = std::collections::hash_map::DefaultHasher::new();
-            format!("{:?}", Palette::for_theme(theme)).hash(&mut hash);
-            format!("overlook/color/{key}.{:08x}/{tone}/{}", hash.finish() as u32, icon.file()).into()
-        }
+        // The desktop colors change at runtime; their generation in the path keeps the
+        // image cache from serving icons tinted for the previous desktop theme.
+        ResolvedTheme::SystemLight | ResolvedTheme::SystemDark => format!("overlook/color/{key}.{}/{tone}/{}", crate::theme::desktop_generation(), icon.file()).into(),
         _ => format!("overlook/color/{key}/{tone}/{}", icon.file()).into(),
     }
 }

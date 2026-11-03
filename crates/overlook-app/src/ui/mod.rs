@@ -614,9 +614,10 @@ pub struct MailWindow {
     /// Sidebar badges of the accounts other than the active one (the active one's are
     /// `counts`), including Drafts and Outbox; recounted in the background on every reload.
     account_counts: HashMap<AccountId, HashMap<MailboxView, usize>>,
-    /// A recount is running; `account_counts_again` asks for one more when it ends.
+    /// Accounts whose badges the next `reload` recounts; see `mark_counts_stale`.
+    account_counts_stale: HashSet<AccountId>,
+    /// A recount is running; what turns stale meanwhile is recounted when it ends.
     account_counts_running: bool,
-    account_counts_again: bool,
     /// Focused Inbox: enabled per profile, with the selected tab.
     focused_enabled: bool,
     inbox_tab: FocusTab,
@@ -868,8 +869,8 @@ impl MailWindow {
             collapsed_sections,
             account_labels: HashMap::new(),
             account_counts: HashMap::new(),
+            account_counts_stale: HashSet::new(),
             account_counts_running: false,
-            account_counts_again: false,
             focused_enabled,
             inbox_tab: FocusTab::Focused,
             downloading: HashSet::new(),
@@ -930,6 +931,9 @@ impl MailWindow {
             retry_attempts: HashMap::new(),
             _subscriptions: subs,
         };
+        // Every window starts with every other account's badges to count: the first
+        // `reload` recounts them, in the main window and in a folder window alike.
+        this.mark_all_counts_stale();
         // A composer shares providers and the store, but never starts a second
         // synchronization loop, IDLE watcher, reminder service or update checker.
         if let Some((_, view)) = folder {
@@ -1284,6 +1288,8 @@ impl MailWindow {
         self.caldav_requested.remove(&id);
         self.provider_issues.remove(&id);
         self.syncing.remove(&id);
+        self.account_counts.remove(&id);
+        self.account_counts_stale.remove(&id);
         self.refresh_idle_watchers();
         self.accounts = self.store.accounts().unwrap_or_default();
         crate::ui::toast(window, cx, crate::notify::Level::Info, format!("Removed {} from this device.", account.email));
@@ -1521,9 +1527,7 @@ impl MailWindow {
                     id: AccountId(format!("gmail:{email}")),
                     provider: ProviderKind::Gmail,
                     display_name: result.user.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| {
-                        let local = email.split('@').next().unwrap_or(&email);
-                        let mut chars = local.chars();
-                        chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_else(|| local.to_owned())
+                        overlook_core::text::capitalize(email.split('@').next().unwrap_or(&email))
                     }),
                     email: email.clone(),
                     created_at: now(),
@@ -1598,6 +1602,7 @@ impl MailWindow {
                 counts.insert(MailboxView::Kind(LabelKind::Drafts), self.drafts.len());
                 counts.insert(MailboxView::Kind(LabelKind::Outbox), self.outbox.len());
                 self.account_counts.insert(old.clone(), counts);
+                self.account_counts_stale.insert(old.clone());
                 self.other_indexes.insert(old, previous);
             }
             match self.other_indexes.remove(&acct) {
@@ -1779,6 +1784,7 @@ impl MailWindow {
         self.focused_enabled = !self.focused_enabled;
         self.save_setting("focused_inbox", &self.focused_enabled);
         self.inbox_tab = FocusTab::Focused;
+        self.mark_all_counts_stale();
         self.reload(cx);
         self.share_focused_inbox(cx);
     }
@@ -2446,7 +2452,7 @@ impl MailWindow {
                         this.refresh_mail();
                     }
                 }
-                for acct in accounts {
+                for acct in accounts.iter().cloned() {
                     this.next_retry.remove(&acct);
                     if this.connected(&acct) {
                         this.sync_account(acct, window, cx);
@@ -2456,7 +2462,7 @@ impl MailWindow {
                 if this.folder_owner.is_some() {
                     this.notify_owner(cx);
                 } else {
-                    this.reload_folder_windows(cx);
+                    this.reload_folder_windows(accounts, cx);
                 }
                 cx.notify();
             });
@@ -2901,8 +2907,9 @@ impl MailWindow {
                         this.refresh_idle_watchers();
                     }
                 }
+                this.mark_counts_stale([account.id.clone()]);
                 this.reload(cx);
-                this.reload_folder_windows(cx);
+                this.reload_folder_windows([account.id.clone()], cx);
                 if verify && !outcome.verified {
                     // Offline or failed before the check ran: check on the next sync instead.
                     this.verify_pending.insert(account.id.clone());

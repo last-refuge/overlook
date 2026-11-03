@@ -198,11 +198,12 @@ impl MailWindow {
     /// after an IMAP rename, the messages' new places) come from the server.
     fn after_folder_change(&mut self, account: &AccountId, window: &mut Window, cx: &mut Context<Self>) {
         self.reload_account_labels();
+        self.mark_counts_stale([account.clone()]);
         self.reload(cx);
         if self.folder_owner.is_some() {
             self.notify_owner(cx);
         } else {
-            self.reload_folder_windows(cx);
+            self.reload_folder_windows([account.clone()], cx);
         }
         self.sync_account(account.clone(), window, cx);
         cx.notify();
