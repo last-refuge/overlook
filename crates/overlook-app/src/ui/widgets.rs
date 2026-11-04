@@ -63,11 +63,6 @@ pub fn kbd(text: impl Into<SharedString>, p: &Palette) -> Div {
         .child(text.into())
 }
 
-/// Small colored dot for user labels.
-pub fn color_dot(color: Hsla) -> Div {
-    div().flex_none().size(px(7.)).rounded_full().bg(color)
-}
-
 /// Thin horizontal divider.
 pub fn divider(p: &Palette) -> Div {
     div().w_full().h(px(1.)).bg(p.divider)

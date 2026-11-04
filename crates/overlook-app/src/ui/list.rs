@@ -329,7 +329,7 @@ impl MailWindow {
             .iter()
             .filter_map(|id| self.labels.iter().find(|l| &l.id == id))
             .find(|l| l.kind == LabelKind::User)
-            .map(|l| l.name.clone());
+            .map(|l| overlook_core::sidebar::folder_title(&l.name).to_owned());
         let conv_id = c.id.clone();
         let star_id = c.latest_message_id.clone();
         let starred = c.starred;

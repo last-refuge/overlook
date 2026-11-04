@@ -15,8 +15,12 @@ use gpui_kit::base::{h_flex, v_flex};
 use overlook_core::*;
 use overlook_store::MailboxView;
 
-/// How far each level of the folder tree is indented.
-const DEPTH_STEP: f32 = 18.;
+/// How far each level of the folder tree is indented: a child's arrow sits under its parent's
+/// icon.
+const DEPTH_STEP: f32 = 16.;
+/// Where a row's icon starts, past the column for the disclosure arrow. Section titles start
+/// here too, so arrows, icons and titles each keep one left edge.
+const ICON_INSET: f32 = 18.;
 
 /// Name and icon of a mailbox that is not a user label; `None` for user labels.
 pub(super) fn system_folder(kind: LabelKind) -> Option<(&'static str, &'static str)> {
@@ -58,8 +62,8 @@ struct Metrics {
 impl Metrics {
     fn for_density(density: Density) -> Self {
         match density {
-            Density::Comfortable => Self { row_height: 35., row_gap: 3., header_top: 14., header_bottom: 4., header_padding: 4., divider_gap: 12., footer_top: 16., bottom: 14. },
-            Density::Compact => Self { row_height: 28., row_gap: 1., header_top: 8., header_bottom: 2., header_padding: 2., divider_gap: 8., footer_top: 10., bottom: 8. },
+            Density::Comfortable => Self { row_height: 32., row_gap: 2., header_top: 14., header_bottom: 4., header_padding: 4., divider_gap: 12., footer_top: 16., bottom: 14. },
+            Density::Compact => Self { row_height: 26., row_gap: 1., header_top: 8., header_bottom: 2., header_padding: 2., divider_gap: 8., footer_top: 10., bottom: 8. },
         }
     }
 }
@@ -329,8 +333,9 @@ impl MailWindow {
         }
     }
 
-    /// One account's folders: the fixed mailboxes, then its user labels.
-    fn account_folders(&self, account: &AccountId, p: &crate::theme::Palette) -> Vec<Nav> {
+    /// One account's rows: its fixed mailboxes, with what is inside the Inbox and Trash, and
+    /// then its own folders.
+    fn account_folders(&self, account: &AccountId, p: &crate::theme::Palette) -> (Vec<Nav>, Vec<Nav>) {
         let active = account == &self.account.id;
         let show_outbox = if active {
             self.status.outbox_items > 0 || matches!(self.view, MailboxView::Kind(LabelKind::Outbox))
@@ -396,8 +401,7 @@ impl MailWindow {
                 out.extend(inside);
             }
         }
-        out.extend(branch(TreeRoot::Top, 0));
-        out
+        (out, branch(TreeRoot::Top, 0))
     }
 
     /// Favorites rows with their accounts; a folder name shared by several rows carries the
@@ -410,7 +414,7 @@ impl MailWindow {
             }
             let nav = match (f.kind, &f.label) {
                 (LabelKind::User, Some(id)) => match self.labels_of(&f.account).iter().find(|l| &l.id == id && l.kind == LabelKind::User) {
-                    Some(l) => Nav { label: l.name.clone().into(), icon: "folder", view: MailboxView::Label(id.clone()), color: p.label_color(l.color.as_deref()), depth: 0, expander: None, container: false },
+                    Some(l) => Nav { label: overlook_core::sidebar::folder_title(&l.name).to_owned().into(), icon: "folder", view: MailboxView::Label(id.clone()), color: p.label_color(l.color.as_deref()), depth: 0, expander: None, container: false },
                     None => continue,
                 },
                 (kind, _) => match system_folder(kind) {
@@ -530,25 +534,24 @@ impl MailWindow {
                 })
                 .h_flex()
                 .items_center()
-                .gap(px(10.))
+                .gap(px(9.))
                 .min_h(px(if in_favorites { m.row_height - 4. } else { m.row_height }))
-                .px(px(11.))
-                // Each level is one icon and gap further in.
-                .when(nav.depth > 0, |d| d.pl(px(11. + DEPTH_STEP * nav.depth as f32)))
+                .pl(px(ICON_INSET + DEPTH_STEP * nav.depth as f32))
+                .pr(px(10.))
                 .when_some(expander, |d, (key, collapsed)| {
                     // In the row's left padding, so the icons stay in line with the other rows.
                     d.child(
                         div()
                             .id(SharedString::from(format!("expand-{key}")))
                             .absolute()
-                            .left(px(DEPTH_STEP * nav.depth as f32 - 2.))
+                            .left(px(2. + DEPTH_STEP * nav.depth as f32))
                             .top_0()
                             .bottom_0()
-                            .w(px(13.))
+                            .w(px(14.))
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(icon(if collapsed { "chevron-right" } else { "chevron-down" }).size(px(11.)).text_color(p.muted))
+                            .child(icon(if collapsed { "chevron-right" } else { "chevron-down" }).size(px(12.)).text_color(p.muted))
                             .on_click(cx.listener(move |this, _, _window, cx| {
                                 cx.stop_propagation();
                                 this.toggle_section(&key, cx);
@@ -563,17 +566,13 @@ impl MailWindow {
                 .font_weight(if current { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
                 .when(current, |d| d.bg(p.selection))
                 .when(!current, |d| d.hover(|d| d.bg(p.hover)))
-                .child(match color {
-                    Some(c) => color_dot(c).mx(px(4.)).into_any_element(),
-                    None => icon(nav.icon)
-                        .size(px(16.))
-                        .text_color(if current { p.accent } else { p.muted })
-                        .into_any_element(),
-                })
+                // One shape for every folder; a label's color only tints it.
+                .child(icon(nav.icon).flex_none().size(px(16.)).text_color(color.unwrap_or(if current { p.accent } else { p.muted })))
                 .child(div().flex_1().truncate().child(nav.label.clone()))
                 .when(count > 0, |d| {
                     d.child(
                         div()
+                            .flex_none()
                             .text_size(px(11.))
                             .text_color(if current { p.accent } else { p.muted })
                             .child(count.to_string()),
@@ -684,15 +683,18 @@ impl MailWindow {
             SyncState::SignInRequired | SyncState::SyncFailed(_) => p.warning,
         };
 
+        // Puts a 12px arrow in the same column as the rows' arrows.
+        const HEADER_ARROW_INSET: f32 = 3.;
         let section_header = |key: String, text: String, collapsed: bool, top: f32, cx: &mut Context<Self>| {
             div()
                 .id(SharedString::from(format!("section-{key}")))
                 .h_flex()
                 .items_center()
-                .gap(px(5.))
+                .gap(px(ICON_INSET - HEADER_ARROW_INSET - 12.))
                 .mt(px(top))
                 .mb(px(m.header_bottom))
-                .px(px(11.))
+                .pl(px(HEADER_ARROW_INSET))
+                .pr(px(10.))
                 .py(px(m.header_padding))
                 .rounded(px(6.))
                 .cursor_pointer()
@@ -703,6 +705,26 @@ impl MailWindow {
                 .child(icon(if collapsed { "chevron-right" } else { "chevron-down" }).size(px(12.)).text_color(p.muted))
                 .child(div().flex_1().min_w_0().truncate().child(text))
                 .on_click(cx.listener(move |this, _, _window, cx| this.toggle_section(&key, cx)))
+        };
+
+        // An account's title and its Folders title: right-click for a new top-level folder,
+        // or drop a folder here to move it to the top level.
+        let top_level_target = |title: Stateful<Div>, account: &AccountId, cx: &mut Context<Self>| -> AnyElement {
+            if !self.manages_folders(account) {
+                return title.into_any_element();
+            }
+            let (me, account) = (cx.entity().downgrade(), account.clone());
+            let over_account = account.clone();
+            title
+                .drag_over::<super::FolderDrag>(move |style, drag, _, _| if drag.fits(&over_account, None) { style.bg(p.selection).border_1().border_color(p.accent) } else { style })
+                .on_drop(cx.listener(|this, drag: &super::FolderDrag, window, cx| this.move_folder(drag.clone(), None, window, cx)))
+                .context_menu(move |menu, _window, _cx| {
+                    let (t, account) = (me.clone(), account.clone());
+                    menu.item(PopupMenuItem::new("New Folder…").on_click(move |_, window, cx| {
+                        t.update(cx, |this, cx| this.open_folder_prompt(account.clone(), super::folder_manage::FolderPromptMode::New { parent: None }, window, cx)).ok();
+                    }))
+                })
+                .into_any_element()
         };
 
         let favorites_collapsed = self.collapsed_sections.contains("favorites");
@@ -734,27 +756,25 @@ impl MailWindow {
             // The first header sits right under the Favorites line, whose own margin is the gap.
             let top = if i == 0 { 0. } else { m.header_top };
             let header = section_header(key, name, collapsed, top, cx)
+                .font_weight(FontWeight::SEMIBOLD)
                 .when(a.id == self.account.id && all_accounts, |d| d.text_color(p.foreground))
                 .when(reorderable, |d| d.on_drag(drag, |d: &super::AccountDrag, _pos, _window, cx| cx.new(|_| super::DragPreview { label: d.name.clone() })));
-            // Right-click on the account: a new top-level folder.
-            let header: AnyElement = if self.manages_folders(&a.id) {
-                let (me, account) = (cx.entity().downgrade(), a.id.clone());
-                let over_account = a.id.clone();
-                header
-                    // Dropping a folder on its account moves it to the top level.
-                    .drag_over::<super::FolderDrag>(move |style, drag, _, _| if drag.fits(&over_account, None) { style.bg(p.selection).border_1().border_color(p.accent) } else { style })
-                    .on_drop(cx.listener(|this, drag: &super::FolderDrag, window, cx| this.move_folder(drag.clone(), None, window, cx)))
-                    .context_menu(move |menu, _window, _cx| {
-                        let (t, account) = (me.clone(), account.clone());
-                        menu.item(PopupMenuItem::new("New Folder…").on_click(move |_, window, cx| {
-                            t.update(cx, |this, cx| this.open_folder_prompt(account.clone(), super::folder_manage::FolderPromptMode::New { parent: None }, window, cx)).ok();
-                        }))
-                    })
-                    .into_any_element()
-            } else {
-                header.into_any_element()
-            };
-            let folders = (!collapsed).then(|| v_flex().gap(px(m.row_gap)).children(self.account_folders(&a.id, &p).into_iter().map(|nav| nav_button(self, "account", &a.id, nav, &pinned_list, cx))));
+            let header = top_level_target(header, &a.id, cx);
+            let folders = (!collapsed).then(|| {
+                let (mailboxes, folders) = self.account_folders(&a.id, &p);
+                let mailboxes = v_flex().gap(px(m.row_gap)).children(mailboxes.into_iter().map(|nav| nav_button(self, "account", &a.id, nav, &pinned_list, cx)));
+                let mut column = v_flex().child(mailboxes);
+                if !folders.is_empty() {
+                    let key = format!("folders:{}", a.id.0);
+                    let folded = self.collapsed_sections.contains(&key);
+                    let title = section_header(key, "Folders".into(), folded, m.header_top, cx);
+                    column = column.child(top_level_target(title, &a.id, cx));
+                    if !folded {
+                        column = column.child(v_flex().gap(px(m.row_gap)).children(folders.into_iter().map(|nav| nav_button(self, "account", &a.id, nav, &pinned_list, cx))));
+                    }
+                }
+                column
+            });
             // The whole block (header and folders) takes the drop. The line marks where the
             // account lands: `move_account` puts it after this block when it comes from above
             // and before it when it comes from below.
@@ -791,7 +811,7 @@ impl MailWindow {
             .when(!favorites_collapsed, |d| d.child(v_flex().gap(px(m.row_gap)).children(favorites)))
             // Favorites span every account; the line separates them from the account tree,
             // with the same gap above and below.
-            .child(div().flex_none().h(px(1.)).my(px(m.divider_gap)).mx(px(11.)).bg(p.divider))
+            .child(div().flex_none().h(px(1.)).my(px(m.divider_gap)).mx(px(8.)).bg(p.divider))
             .children(account_blocks)
             .child(div().h(px(m.bottom)))
             .overflow_y_scrollbar();
@@ -803,7 +823,7 @@ impl MailWindow {
             // Same top inset as the list and reader panes (`main` layout in mod.rs), so the first
             // header lines up with their top edge.
             .pt(px(8.))
-            .px(px(11.))
+            .px(px(6.))
             .pb(px(m.bottom))
             .child(nav)
             // The account switcher at the bottom is for one-at-a-time mode; with every
@@ -812,7 +832,8 @@ impl MailWindow {
                 h_flex()
                     .items_center()
                     .gap(px(9.))
-                    .px(px(6.))
+                    // The avatar is centered over the rows' icons.
+                    .px(px(ICON_INSET + 8. - 15.))
                     .pt(px(m.footer_top))
                     .child(owner_avatar(&owner, 30., &p))
                     .child(

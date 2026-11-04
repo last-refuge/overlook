@@ -14,6 +14,7 @@
   <url type="homepage">https://lastrefuge.ai/</url>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="1.6.16" date="2026-11-04"><description><p>Tidy the sidebar: folders sort alphabetically and nest under the Inbox in any spelling, your own folders get a collapsible section, and arrows, icons and names line up.</p></description></release>
     <release version="1.6.15" date="2026-11-04"><description><p>Add account and folder management, folder windows, persistent Undo and history, settings search, and Omarchy theme integration. Improve IMAP synchronization and folder-only mailbox support.</p></description></release>
     <release version="1.5.7" date="2026-10-23"><description><p>Fix recipient autocomplete in To, Cc and Bcc, preserve surrounding recipients when editing replies, and handle quoted contact names correctly.</p></description></release>
     <release version="0.1.0" date="2026-10-12"><description><p>Foundation prototype.</p></description></release>

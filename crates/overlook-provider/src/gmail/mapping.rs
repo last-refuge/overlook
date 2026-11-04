@@ -77,7 +77,7 @@ pub fn label_from_json(account: &AccountId, v: &Value, sort_order: i32) -> Optio
     })
 }
 
-/// Reduces a Gmail label color to one of Overlook's label dot tokens.
+/// Reduces a Gmail label color to one of Overlook's label color tokens.
 fn color_token(hex: &str) -> String {
     let rgb = u32::from_str_radix(hex.trim_start_matches('#'), 16).unwrap_or(0);
     let (r, g, b) = ((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255);

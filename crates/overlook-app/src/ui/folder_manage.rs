@@ -271,7 +271,7 @@ impl MailWindow {
     /// `None` at the top.
     fn folder_parent_label(&self, account: &AccountId, label: &Label) -> Option<LabelId> {
         let parent = overlook_core::sidebar::folder_parent(&label.name)?;
-        self.labels_of(account).iter().find(|l| l.name == parent && matches!(l.kind, LabelKind::User | LabelKind::Container | LabelKind::Inbox)).map(|l| l.id.clone())
+        self.labels_of(account).iter().find(|l| overlook_core::sidebar::same_folder(&l.name, parent) && matches!(l.kind, LabelKind::User | LabelKind::Container | LabelKind::Inbox)).map(|l| l.id.clone())
     }
 
     fn move_folder_to_trash(&mut self, account: Account, label: Label, trash: Label, window: &mut Window, cx: &mut Context<Self>) {
@@ -457,7 +457,7 @@ impl MailWindow {
             },
             overlook_store::Reversal::RecreateLabel { name, message_ids } => {
                 let parent_name = overlook_core::sidebar::folder_parent(name);
-                let parent = parent_name.and_then(|p| labels.iter().find(|l| l.name == p).cloned());
+                let parent = parent_name.and_then(|p| labels.iter().find(|l| overlook_core::sidebar::same_folder(&l.name, p)).cloned());
                 let leaf = match (&parent, parent_name) {
                     (Some(_), Some(p)) => name[p.len()..].trim_start_matches(" / ").trim_start_matches('/').to_owned(),
                     _ => name.clone(),

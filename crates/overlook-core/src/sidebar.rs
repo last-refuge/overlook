@@ -59,7 +59,7 @@ pub struct TreeRow<'a> {
 /// sits under the nearest ancestor that exists ("Work / A / B" under "Work" when there is no
 /// "Work / A"); "Inbox / …" names with no such ancestor sit under the Inbox, and names inside
 /// `trash` (the Trash folder's name) under Trash. Names nest by " / " (IMAP) or "/" (Gmail).
-/// Siblings keep the order given.
+/// Siblings are in alphabetical order, whatever order the server lists them in.
 pub fn folder_tree<'a>(names: &[&'a str], root: TreeRoot, trash: Option<&str>) -> Vec<TreeRow<'a>> {
     // The first folder of each name; a repeated name nests under the first.
     let mut index_of: HashMap<&str, usize> = HashMap::with_capacity(names.len());
@@ -79,7 +79,7 @@ pub fn folder_tree<'a>(names: &[&'a str], root: TreeRoot, trash: Option<&str>) -
                 placed = Some((Some(p), TreeRoot::Top, leaf));
                 break;
             }
-            if parent == "Inbox" {
+            if is_inbox(parent) {
                 placed = Some((None, TreeRoot::Inbox, leaf));
                 break;
             }
@@ -97,6 +97,9 @@ pub fn folder_tree<'a>(names: &[&'a str], root: TreeRoot, trash: Option<&str>) -
         }
         leaves.push(leaf);
     }
+    for kids in &mut children {
+        kids.sort_by_cached_key(|&i| leaves[i].to_lowercase());
+    }
     let mut rows = Vec::with_capacity(names.len());
     let mut stack: Vec<(usize, usize)> = children[0].iter().rev().map(|&i| (i, 0)).collect();
     while let Some((i, depth)) = stack.pop() {
@@ -113,6 +116,24 @@ pub fn folder_parent(name: &str) -> Option<&str> {
     name.rsplit_once(" / ").or_else(|| name.rsplit_once('/')).map(|(parent, _)| parent)
 }
 
+/// Whether `name` is the Inbox, which IMAP defines in any case. Labels stored by older builds
+/// keep Gmail's "INBOX/…" spelling until they are next fetched.
+pub fn is_inbox(name: &str) -> bool {
+    name.eq_ignore_ascii_case("Inbox")
+}
+
+/// Whether two folder names mean the same folder.
+pub fn same_folder(a: &str, b: &str) -> bool {
+    a == b || (is_inbox(a) && is_inbox(b))
+}
+
+/// What to call a folder outside the tree: its name without the Inbox it sits in, "News" for
+/// "Inbox/News" or "INBOX / News". Other parents stay: "Work / Clients" says where it is.
+pub fn folder_title(name: &str) -> &str {
+    let inside = name.get(5..).filter(|_| is_inbox(&name[..5])).and_then(|rest| rest.strip_prefix(" / ").or_else(|| rest.strip_prefix('/')));
+    inside.filter(|rest| !rest.is_empty()).unwrap_or(name)
+}
+
 /// Whether `name` is `ancestor` or somewhere inside it.
 pub fn folder_within(name: &str, ancestor: &str) -> bool {
     name == ancestor || name.strip_prefix(ancestor).is_some_and(|rest| rest.starts_with(" / ") || rest.starts_with('/'))
@@ -122,7 +143,7 @@ pub fn folder_within(name: &str, ancestor: &str) -> bool {
 /// and keeps the folder out of itself.
 pub fn can_move_folder(moving: &str, target: Option<&str>) -> bool {
     match target {
-        Some(t) => !folder_within(t, moving) && folder_parent(moving) != Some(t),
+        Some(t) => !folder_within(t, moving) && !folder_parent(moving).is_some_and(|parent| same_folder(parent, t)),
         None => folder_parent(moving).is_some(),
     }
 }
@@ -235,11 +256,57 @@ mod tests {
     }
 
     #[test]
+    fn the_inbox_is_found_in_any_spelling() {
+        let names = ["INBOX/News", "inbox / Receipts", "Inbox/Contractors/West", "Inbox2/Old"];
+        let rows = |root| folder_tree(&names, root, None).into_iter().map(|r| r.leaf).collect::<Vec<_>>();
+        assert_eq!(rows(TreeRoot::Inbox), ["Contractors/West", "News", "Receipts"]);
+        assert_eq!(rows(TreeRoot::Top), ["Inbox2/Old"]);
+        assert!(!can_move_folder("INBOX/News", Some("Inbox")), "already there");
+        assert!(same_folder("INBOX", "Inbox"));
+        assert!(!same_folder("Inbox2", "Inbox"));
+    }
+
+    #[test]
+    fn siblings_sort_alphabetically_at_every_level() {
+        // A real Gmail account's order, which is the order the labels were created in.
+        let names = ["Routed", "Backlog/Oct-2026", "FYI/Notifications", "Routed/Ex-employee", "FYI/Billing", "@Waiting On", "@Needs Reply", "action", "@Review", "Backlog", "FYI"];
+        let rows: Vec<_> = folder_tree(&names, TreeRoot::Top, None).into_iter().map(|r| (r.depth, r.leaf)).collect();
+        assert_eq!(
+            rows,
+            [
+                (0, "@Needs Reply"),
+                (0, "@Review"),
+                (0, "@Waiting On"),
+                (0, "action"),
+                (0, "Backlog"),
+                (1, "Oct-2026"),
+                (0, "FYI"),
+                (1, "Billing"),
+                (1, "Notifications"),
+                (0, "Routed"),
+                (1, "Ex-employee"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_folder_inside_the_inbox_is_titled_without_it() {
+        assert_eq!(folder_title("INBOX/News"), "News");
+        assert_eq!(folder_title("Inbox / Receipts"), "Receipts");
+        assert_eq!(folder_title("Inbox/Contractors/West"), "Contractors/West");
+        assert_eq!(folder_title("Work / Clients"), "Work / Clients");
+        assert_eq!(folder_title("Inbox2/Old"), "Inbox2/Old");
+        assert_eq!(folder_title("Inbox"), "Inbox");
+        assert_eq!(folder_title("Inbox/"), "Inbox/");
+        assert_eq!(folder_title("Ünbox/News"), "Ünbox/News");
+    }
+
+    #[test]
     fn deleted_folders_nest_under_trash() {
         let names = ["Work", "Trash / Old", "Trash / Old / Clients", "Deleted Items / Other"];
         let rows = |root| folder_tree(&names, root, Some("Trash")).into_iter().map(|r| (names[r.index], r.depth, r.leaf)).collect::<Vec<_>>();
         assert_eq!(rows(TreeRoot::Trash), [("Trash / Old", 0, "Old"), ("Trash / Old / Clients", 1, "Clients")]);
-        assert_eq!(rows(TreeRoot::Top), [("Work", 0, "Work"), ("Deleted Items / Other", 0, "Deleted Items / Other")]);
+        assert_eq!(rows(TreeRoot::Top), [("Deleted Items / Other", 0, "Deleted Items / Other"), ("Work", 0, "Work")]);
         // Without a Trash folder, nothing is taken out of the top level.
         assert_eq!(folder_tree(&names, TreeRoot::Top, None).len(), 4);
     }

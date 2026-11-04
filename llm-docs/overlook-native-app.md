@@ -351,6 +351,8 @@ Composer header fields: `Enter` moves to the next field.
 
 The sidebar and list panes are resizable; sizes persist in `settings`. The layout menu in the header switches the reading pane between right and below, and density between comfortable and compact; both persist.
 
+The sidebar folder tree (`core::sidebar::folder_tree`, `ui/sidebar.rs`) keeps three left edges: disclosure arrows, icons with section titles (`ICON_INSET`), and names. Each level moves all three by `DEPTH_STEP`. Every folder has the same folder icon, tinted when its label has a color. Each account lists its mailboxes, with what is inside the Inbox and Trash under them, then a collapsible **Folders** section. Siblings sort alphabetically, because Gmail lists labels in creation order. The Inbox is matched in any case, and `folder_title` drops it from names shown outside the tree (Favorites, title bar, chips, menus).
+
 ### The message list
 
 `ui/list.rs` draws the list with GPUI's virtual `list()`: only the rows in view are laid out, and the

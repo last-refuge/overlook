@@ -112,14 +112,14 @@ impl MailWindow {
             out.push(entry(&format!("Go to {name}"), None, PaletteCommand::View(MailboxView::Kind(kind))));
         }
         let mut user: Vec<&Label> = self.labels.iter().filter(|l| l.kind == LabelKind::User).collect();
-        user.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        user.sort_by_cached_key(|l| overlook_core::sidebar::folder_title(&l.name).to_lowercase());
         for l in &user {
-            out.push(entry(&format!("Go to {}", l.name), Some("label"), PaletteCommand::View(MailboxView::Label(l.id.clone()))));
+            out.push(entry(&format!("Go to {}", overlook_core::sidebar::folder_title(&l.name)), Some("label"), PaletteCommand::View(MailboxView::Label(l.id.clone()))));
         }
         if self.multi_selected() || !self.thread.is_empty() {
             out.push(entry("Move to…", Some("V"), action(Box::new(MoveSelected))));
             for l in &user {
-                out.push(entry(&format!("Move to {}", l.name), Some("label"), PaletteCommand::MoveTo(MailboxView::Label(l.id.clone()))));
+                out.push(entry(&format!("Move to {}", overlook_core::sidebar::folder_title(&l.name)), Some("label"), PaletteCommand::MoveTo(MailboxView::Label(l.id.clone()))));
             }
         }
         for a in self.accounts.iter().filter(|a| a.id != self.account.id) {
