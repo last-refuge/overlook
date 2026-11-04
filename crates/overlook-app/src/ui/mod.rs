@@ -683,6 +683,9 @@ pub struct MailWindow {
     pub(crate) cal_scope_prompt: Option<calendar::ScopePrompt>,
     /// An event being dragged in the time grid.
     pub(crate) cal_drag: Option<calendar::CalDrag>,
+    pub(crate) cal_range_drag: Option<calendar::CalRangeDrag>,
+    /// The left button just went down on an event, for the column underneath to see.
+    pub(crate) cal_press_on_event: bool,
     pub(crate) reminders_enabled: bool,
     /// Reminders already shown this session: (event, minutes before).
     pub(crate) notified: HashSet<(EventId, i32)>,
@@ -932,6 +935,8 @@ impl MailWindow {
             new_event: None,
             cal_scope_prompt: None,
             cal_drag: None,
+            cal_range_drag: None,
+            cal_press_on_event: false,
             reminders_enabled,
             notified: HashSet::new(),
             snoozed_reminders: HashMap::new(),
@@ -4019,6 +4024,7 @@ impl Render for MailWindow {
                     .child(self.render_status_bar(cx))))
             .when(self.settings.is_some(), |d| d.child(self.render_settings(cx)))
             .when(self.account_setup.is_some(), |d| d.child(self.render_account_setup(cx)))
+            .when(self.module == Module::Calendar && self.new_event.as_ref().is_some_and(|f| f.dragged.is_some()), |d| d.child(self.render_event_modal(cx)))
             .when(self.folder_prompt.is_some(), |d| d.child(self.render_folder_prompt(cx)))
             .when(self.history.is_some(), |d| d.child(self.render_history(cx)))
             .when(self.quick_look.is_some(), |d| d.child(self.render_quick_look(cx)))
