@@ -146,7 +146,7 @@ when there is one. **Update now** downloads the release, verifies its checksum, 
 through a polkit password dialog when Overlook was installed with pacman, or by swapping the binary when it
 lives in your own prefix. Then **Restart Overlook**. Nothing about you is sent during the check.
 
-Overlook starts with a **sample mailbox** so you can see how it works before connecting anything. The sample
+On first launch, choose to load a **sample mailbox** or start empty and connect your own account. The sample
 account's connection is a switch in the status bar; flip it to watch offline changes sync.
 
 ## Connect Gmail
