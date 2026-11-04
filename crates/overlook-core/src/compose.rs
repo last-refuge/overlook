@@ -283,6 +283,44 @@ mod tests {
     }
 
     #[test]
+    fn a_resent_message_goes_out_as_its_original_html_until_edited() {
+        let source = Message {
+            id: MessageId::generate(),
+            account_id: AccountId::from("a"),
+            conversation_id: ConversationId::from("c"),
+            provider_id: None,
+            from: Address::named("Jason", "jason@example.com"),
+            to: vec![Address::named("Maya", "maya@northstar.example")],
+            cc: vec![],
+            bcc: vec![],
+            reply_to: None,
+            subject: "Launch creative".into(),
+            snippet: String::new(),
+            body: Body { text: None, html: Some("<p>Hello <b>Maya</b></p>".into()) },
+            date: 0,
+            is_read: true,
+            is_starred: false,
+            is_outgoing: true,
+            label_ids: Default::default(),
+            attachments: vec![],
+            rfc_message_id: None,
+            in_reply_to: None,
+            references: vec![],
+            category: None,
+            is_important: false,
+            focus_override: None,
+            invitation: None,
+        };
+        let mut draft = Draft::resend_of(AccountId::from("a"), &source, 0);
+        let out = outgoing_bodies(&draft, None);
+        assert!(out.html.contains("<b>Maya</b>"), "{}", out.html);
+        assert_eq!(out.text.trim(), "Hello Maya");
+        draft.body_text = "Hello **again**".into();
+        let out = outgoing_bodies(&draft, None);
+        assert!(out.html.contains("<strong>again</strong>") && !out.html.contains("<b>Maya</b>"), "{}", out.html);
+    }
+
+    #[test]
     fn renders_mail_markdown() {
         let html = render_markdown("Hi **Maya**,\nsee *this* and ~~that~~ at https://ex.com/a\n\n- one\n- two\n\n> quoted");
         assert!(html.contains("<strong>Maya</strong>"), "{html}");

@@ -475,7 +475,7 @@ impl MailWindow {
                 }
                 this.reload_drafts();
                 this.schedule_draft_sync(window, cx);
-                this.notify_composer_owner(cx);
+                this.notify_owner(cx);
                 cx.notify();
             });
         })
@@ -495,7 +495,7 @@ impl MailWindow {
                 c.last_saved = Some(now());
                 self.reload_drafts();
                 self.schedule_draft_sync(window, cx);
-                self.notify_composer_owner(cx);
+                self.notify_owner(cx);
                 cx.notify();
                 true
             }
@@ -550,7 +550,7 @@ impl MailWindow {
             self.forget_staged_files(&c.draft.id);
             self.reload_drafts();
             self.schedule_draft_sync(window, cx);
-            self.notify_composer_owner(cx);
+            self.notify_owner(cx);
             if self.composer_owner.is_some() { window.remove_window(); }
             else {
                 crate::ui::toast(window, cx, crate::notify::Level::Info, "Draft discarded.");
@@ -565,7 +565,7 @@ impl MailWindow {
     pub(super) fn schedule_draft_sync(&self, window: &mut Window, cx: &mut Context<Self>) {
         if !matches!(self.account.provider, ProviderKind::Gmail | ProviderKind::Imap) { return; }
         let account = self.account.id.clone();
-        if self.sync_through_composer_owner(&account, Duration::from_millis(1500), window, cx) { return; }
+        if self.sync_through_owner(&account, Duration::from_millis(1500), window, cx) { return; }
         let editor = self.composer.as_ref().map(|c| (c.draft.id.clone(), c.save_generation));
         cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(1500)).await;
@@ -624,14 +624,17 @@ impl MailWindow {
             (true, 0) => "Sending…".to_owned(),
             (true, s) => format!("Sending in {s} seconds."),
         };
-        let id = draft.id.clone();
-        let account = draft.account_id.clone();
-        self.toast_with_undo(text, move |this, window, cx| this.undo_send(account.clone(), id.clone(), window, cx), window, cx);
+        let subject = match draft.subject.trim() {
+            "" => "(no subject)".to_owned(),
+            s => format!("“{s}”"),
+        };
+        let reversal = overlook_store::Reversal::CancelSend { draft_id: draft.id.clone() };
+        self.record(draft.account_id.clone(), "Sent".into(), subject, reversal, Some(text), window, cx);
         if self.composer_owner.is_none() { self.list_focus.focus(window, cx); }
         if online {
             let account = draft.account_id.clone();
             let wait = if delay == 0 { Duration::ZERO } else { Duration::from_millis(u64::from(delay) * 1000 + 300) };
-            if self.sync_through_composer_owner(&account, wait, window, cx) { return; }
+            if self.sync_through_owner(&account, wait, window, cx) { return; }
             if delay == 0 {
                 self.sync_account(account, window, cx);
             } else {
@@ -642,17 +645,6 @@ impl MailWindow {
             }
         }
         cx.notify();
-    }
-
-    /// Takes a just-sent message back out of the Outbox into the composer.
-    pub(super) fn undo_send(&mut self, account: AccountId, id: DraftId, window: &mut Window, cx: &mut Context<Self>) {
-        match self.store.cancel_send(&account, &id) {
-            Ok(_) => {
-                self.reload(cx);
-                self.open_draft(id, window, cx);
-            }
-            Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Warning, format!("Too late to undo: {e}")),
-        }
     }
 
     pub(super) fn attach_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {

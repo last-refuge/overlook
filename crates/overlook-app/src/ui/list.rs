@@ -5,7 +5,7 @@ use super::{ListRow, MailWindow, RowLayout, RowsKey};
 use crate::assets::icon;
 use crate::theme::ActivePalette;
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{Sizable, StyledExt};
 use gpui_kit::prelude::*;
@@ -15,6 +15,9 @@ use overlook_core::status::draft_state_label;
 use overlook_core::time::{day_group, relative_label, DayGroup};
 use overlook_core::*;
 use overlook_store::{ListFilter, MailboxView};
+
+/// Explains IMAP folders that hold folders but no mail (`\Noselect`).
+pub(super) const FOLDER_ONLY_HELP_URL: &str = "https://github.com/last-refuge/overlook/blob/main/docs/folder-only-mailboxes.md";
 
 /// Wraps every row the list draws. The list lays each item out as a root with a definite
 /// width and a height that fits its content, and a root that does not ask for the width is
@@ -163,7 +166,12 @@ impl MailWindow {
                 SyncState::SyncFailed(reason) | SyncState::Paused(reason) if nothing_local && !self.is_syncing_active() => reason.clone(),
                 _ => "Your inbox will appear here in a moment.".to_owned(),
             };
+            let container = match &self.view {
+                MailboxView::Label(id) => self.labels.iter().any(|l| &l.id == id && l.kind == LabelKind::Container),
+                _ => false,
+            };
             let (title, hint): (String, String) = match (&self.view, self.search_query.is_empty()) {
+                _ if container => ("This folder only holds other folders.".into(), "Mail cannot be stored here. Create a folder inside it to file messages.".into()),
                 _ if nothing_local => ("Downloading recent mail…".into(), paused_hint),
                 (_, false) => ("No results".into(), "Try another name or keyword.".into()),
                 (MailboxView::Kind(LabelKind::Inbox), _) if focus_split && inbox_tab == FocusTab::Other => ("Nothing in Other.".into(), "Newsletters and automated mail land here.".into()),
@@ -177,9 +185,19 @@ impl MailWindow {
                 .pt(px(72.))
                 .gap(px(6.))
                 .text_color(p.muted)
-                .child(icon("inbox").size(px(28.)).text_color(p.divider))
+                .child(icon(if container { "folder" } else { "inbox" }).size(px(28.)).text_color(p.divider))
                 .child(div().text_size(px(14.)).font_weight(FontWeight::MEDIUM).text_color(p.foreground).child(title))
                 .child(div().text_size(px(12.)).child(hint))
+                .when(container, |d| {
+                    d.child(
+                        Button::new("folder-only-help")
+                            .ghost()
+                            .small()
+                            .icon(icon("external-link").size(px(14.)))
+                            .label("About folder-only mailboxes")
+                            .on_click(|_, _, cx| cx.open_url(FOLDER_ONLY_HELP_URL)),
+                    )
+                })
                 .into_any_element()
         } else {
             let view = cx.entity();
@@ -299,6 +317,9 @@ impl MailWindow {
     fn render_conversation_row(&self, c: &ConversationSummary, compact: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *cx.palette();
         let selected = self.selected.as_ref() == Some(&c.id);
+        let marked = self.marked.contains(&c.id);
+        // A marked row is tinted like the open one; only the open one gets the edge bar.
+        let highlighted = selected || marked;
         let unread = c.is_unread();
         let now = overlook_core::time::now();
         let time = relative_label(c.latest, now, &self.time_zone);
@@ -313,7 +334,17 @@ impl MailWindow {
         let star_id = c.latest_message_id.clone();
         let starred = c.starred;
         let pending = c.pending;
-        let drag = super::ConversationDrag { mail: super::DraggedMail::Conversation(c.id.clone()), title: c.subject.clone(), count: c.message_count };
+        // Dragging one row of a marked set drags the whole set.
+        let drag = if marked && self.multi_selected() {
+            let n = self.marked.len();
+            super::ConversationDrag { mail: super::DraggedMail::Selection, title: format!("{n} conversations"), count: 0 }
+        } else {
+            super::ConversationDrag { mail: super::DraggedMail::Conversation(c.id.clone()), title: c.subject.clone(), count: c.message_count }
+        };
+        let me = cx.entity().downgrade();
+        let menu_id = c.id.clone();
+        let has_junk = self.labels.iter().any(|l| l.kind == LabelKind::Spam);
+        let can_delete_forever = self.can_delete_forever();
 
         div()
             .id(SharedString::from(format!("conv-{}", c.id)))
@@ -325,11 +356,11 @@ impl MailWindow {
             .py(px(if compact { 8. } else { 12. }))
             .rounded(px(7.))
             .border_b_1()
-            .border_color(if selected { gpui_kit::transparent_black() } else { p.divider })
+            .border_color(if highlighted { gpui_kit::transparent_black() } else { p.divider })
             .cursor_pointer()
-            .when(selected, |d| d.bg(p.selection))
-            .when(!selected && unread, |d| d.bg(p.list_unread()))
-            .when(!selected, |d| d.hover(|d| d.bg(p.hover)))
+            .when(highlighted, |d| d.bg(p.selection))
+            .when(!highlighted && unread, |d| d.bg(p.list_unread()))
+            .when(!highlighted, |d| d.hover(|d| d.bg(p.hover)))
             // Unread and selected both mark the left edge, like Outlook: unread with the
             // accent bar, selected with the same bar on the tinted background. Alexander's
             // light blue selection carries itself, so its amber bar marks unread mail only.
@@ -435,7 +466,123 @@ impl MailWindow {
                 let label = if d.count > 1 { format!("{} · {} messages", d.title, d.count) } else { d.title.clone() };
                 cx.new(|_| super::DragPreview { label })
             })
-            .on_click(cx.listener(move |this, _, window, cx| this.select_conversation(Some(conv_id.clone()), window, cx)))
+            .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
+                let modifiers = e.modifiers();
+                if modifiers.control {
+                    this.toggle_marked(conv_id.clone(), window, cx);
+                } else if modifiers.shift {
+                    this.extend_marked_to(conv_id.clone(), window, cx);
+                } else {
+                    this.select_conversation(Some(conv_id.clone()), window, cx);
+                }
+            }))
+            .context_menu(move |menu, window, cx| Self::row_menu(menu, me.clone(), &menu_id, has_junk, can_delete_forever, window, cx))
+    }
+
+    /// The right-click menu of a conversation row. The row joins the selection first, so
+    /// every item acts on the same rows the toolbar would.
+    fn row_menu(
+        mut menu: PopupMenu,
+        me: WeakEntity<Self>,
+        id: &ConversationId,
+        has_junk: bool,
+        can_delete_forever: bool,
+        window: &mut Window,
+        cx: &mut Context<PopupMenu>,
+    ) -> PopupMenu {
+        let state = me.update(cx, |this, cx| {
+            this.mark_for_menu(id, window, cx);
+            (this.selection_state(), this.view == MailboxView::Kind(LabelKind::Sent))
+        });
+        let Ok((state, in_sent)) = state else { return menu };
+        let multi = state.count > 1;
+        let act = |me: &WeakEntity<Self>, f: fn(&mut Self, &mut Window, &mut Context<Self>)| {
+            let me = me.clone();
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                me.update(cx, |this, cx| f(this, window, cx)).ok();
+            }
+        };
+        if !multi {
+            menu = menu
+                .item(PopupMenuItem::new("Reply").icon(icon("reply")).action(Box::new(super::Reply)).on_click(act(&me, |this, window, cx| {
+                    this.select_conversation(this.selected.clone(), window, cx);
+                    this.reply_default(window, cx);
+                })))
+                .item(PopupMenuItem::new("Reply All").icon(icon("reply-all")).action(Box::new(super::ReplyAll)).on_click(act(&me, |this, window, cx| {
+                    this.select_conversation(this.selected.clone(), window, cx);
+                    this.reply(DraftKind::ReplyAll, window, cx);
+                })))
+                .item(PopupMenuItem::new("Forward").icon(icon("forward")).action(Box::new(super::Forward)).on_click(act(&me, |this, window, cx| {
+                    this.select_conversation(this.selected.clone(), window, cx);
+                    this.reply(DraftKind::Forward, window, cx);
+                })));
+            if in_sent {
+                // A Sent conversation can also hold the replies that came back: resend the
+                // newest message of our own.
+                menu = menu.item(PopupMenuItem::new("Resend This Message…").icon(icon("send")).on_click(act(&me, |this, window, cx| {
+                    this.select_conversation(this.selected.clone(), window, cx);
+                    let source = this.thread.iter().filter(|m| m.is_outgoing).max_by_key(|m| m.date)
+                        .or_else(|| this.thread.iter().max_by_key(|m| m.date))
+                        .cloned();
+                    if let Some(m) = source { this.resend_message(m, window, cx); }
+                })));
+            }
+            menu = menu.separator();
+        }
+        let (read_label, read_icon) = if state.any_unread { ("Mark as Read", "mail-open") } else { ("Mark as Unread", "mail") };
+        menu = menu.item(PopupMenuItem::new(read_label).icon(icon(read_icon)).action(Box::new(super::ToggleRead)).on_click(act(&me, |this, window, cx| {
+            this.on_toggle_read(&super::ToggleRead, window, cx);
+        })));
+        let (star_label, star_icon) = if state.all_starred { ("Unstar", "star-off") } else { ("Star", "star") };
+        menu = menu.item(PopupMenuItem::new(star_label).icon(icon(star_icon)).action(Box::new(super::ToggleStar)).on_click(act(&me, |this, window, cx| {
+            this.on_toggle_star(&super::ToggleStar, window, cx);
+        })));
+        menu = menu.separator();
+        menu = menu.item(PopupMenuItem::new("Move to…").icon(icon("folder-input")).action(Box::new(super::MoveSelected)).on_click(act(&me, |this, window, cx| {
+            this.open_move_palette(window, cx);
+        })));
+        let (archive_label, archive_icon) = if state.all_in_trash {
+            ("Restore", "archive-restore")
+        } else if !state.any_in_inbox {
+            ("To Inbox", "inbox")
+        } else {
+            ("Archive", "archive")
+        };
+        menu = menu.item(PopupMenuItem::new(archive_label).icon(icon(archive_icon)).action(Box::new(super::ArchiveSelected)).on_click(act(&me, |this, window, cx| {
+            this.on_archive(&super::ArchiveSelected, window, cx);
+        })));
+        if has_junk {
+            if state.all_in_junk {
+                menu = menu.item(PopupMenuItem::new("Not Junk").icon(icon("shield-check")).on_click(act(&me, |this, window, cx| {
+                    let ids = this.target_message_ids();
+                    this.move_to_inbox(ids, window, cx);
+                })));
+            } else {
+                menu = menu.item(PopupMenuItem::new("Move to Junk").icon(icon("shield-alert")).on_click(act(&me, |this, window, cx| {
+                    let drag = super::ConversationDrag { mail: super::DraggedMail::Selection, title: String::new(), count: 0 };
+                    this.drop_on_view(drag, MailboxView::Kind(LabelKind::Spam), window, cx);
+                })));
+            }
+        }
+        if !state.all_in_trash {
+            menu = menu.item(PopupMenuItem::new("Delete").icon(icon("trash")).action(Box::new(super::TrashSelected)).on_click(act(&me, |this, window, cx| {
+                this.on_trash(&super::TrashSelected, window, cx);
+            })));
+        }
+        if can_delete_forever {
+            menu = menu.item(PopupMenuItem::new("Delete Permanently…").icon(icon("shredder")).action(Box::new(super::DeleteForeverSelected)).on_click(act(&me, |this, window, cx| {
+                this.on_delete_forever(&super::DeleteForeverSelected, window, cx);
+            })));
+        }
+        if !multi {
+            menu = menu.separator().item(PopupMenuItem::new("Print…").icon(icon("printer")).on_click(act(&me, |this, window, cx| {
+                this.select_conversation(this.selected.clone(), window, cx);
+                if let Some(m) = this.thread.iter().max_by_key(|m| m.date).cloned() {
+                    this.print_message(m, window, cx);
+                }
+            })));
+        }
+        menu
     }
 
     fn render_draft_row(&self, d: &Draft, cx: &mut Context<Self>) -> impl IntoElement {

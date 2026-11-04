@@ -82,6 +82,15 @@ pub struct FakeFolder {
 }
 
 impl FakeFolder {
+    /// The `STATUS` items Overlook asks for.
+    pub fn status_items(&self, condstore: bool) -> String {
+        let mut items = format!("MESSAGES {} UIDNEXT {} UIDVALIDITY {}", self.messages.len(), self.next_uid, self.uidvalidity);
+        if condstore {
+            items.push_str(&format!(" HIGHESTMODSEQ {}", self.highest_modseq.max(1)));
+        }
+        items
+    }
+
     pub fn new(path: &str, attributes: &[&str], uidvalidity: u32) -> Self {
         Self { path: path.into(), attributes: attributes.iter().map(|a| a.to_string()).collect(), delimiter: "/".into(), uidvalidity, messages: BTreeMap::new(), next_uid: 1, highest_modseq: 1, expunged: Vec::new(), generation: 0 }
     }
@@ -151,6 +160,9 @@ pub struct FakeState {
     pub connections: usize,
     /// Close the connection of the next `IDLE` in progress without a word (a dropped link).
     pub kill_idle: bool,
+    /// Write mailbox names in `LIST`, `LSUB` and `STATUS` lines as literals (`{N}` and the
+    /// raw bytes) instead of quoted strings, as some servers do.
+    pub literal_names: bool,
 }
 
 impl Default for FakeState {
@@ -169,6 +181,7 @@ impl Default for FakeState {
             log: Vec::new(),
             connections: 0,
             kill_idle: false,
+            literal_names: false,
         }
     }
 }
@@ -335,12 +348,24 @@ impl Connection {
                 "IDLE" => self.idle(tag)?,
                 "LIST" | "LSUB" => {
                     let s = self.state.lock().unwrap();
+                    // LIST-EXTENDED / LIST-STATUS: `RETURN (SUBSCRIBED STATUS (...))`.
+                    let upper = args.to_ascii_uppercase();
+                    let extended = cmd == "LIST" && upper.contains(" RETURN ") && s.has_capability("LIST-STATUS");
+                    let condstore = s.has_capability("CONDSTORE") || s.has_capability("QRESYNC");
                     let mut lines = Vec::new();
                     for f in &s.folders {
                         if cmd == "LSUB" && !s.subscribed.contains(&f.path) {
                             continue;
                         }
-                        lines.push(format!("* {cmd} ({}) \"{}\" {}", f.attributes.join(" "), f.delimiter, quote(&f.path)));
+                        let mut attributes = f.attributes.clone();
+                        if extended && upper.contains("SUBSCRIBED") && s.subscribed.contains(&f.path) {
+                            attributes.push("\\Subscribed".into());
+                        }
+                        let name = if s.literal_names { format!("{{{}}}\r\n{}", f.path.len(), f.path) } else { quote(&f.path) };
+                        lines.push(format!("* {cmd} ({}) \"{}\" {name}", attributes.join(" "), f.delimiter));
+                        if extended && upper.contains("STATUS") && !f.attributes.iter().any(|a| a.eq_ignore_ascii_case("\\Noselect")) {
+                            lines.push(format!("* STATUS {name} ({})", f.status_items(condstore)));
+                        }
                     }
                     drop(s);
                     for l in lines {
@@ -398,6 +423,68 @@ impl Connection {
                         drop(s);
                         self.say(&format!("{tag} OK Create completed."))?;
                     }
+                }
+                "RENAME" => {
+                    let (from, rest) = split_quoted(args);
+                    let to = unquote(rest);
+                    let mut s = self.state.lock().unwrap();
+                    if !s.has_folder(&from) {
+                        drop(s);
+                        self.say(&format!("{tag} NO [NONEXISTENT] Mailbox doesn't exist"))?;
+                    } else if s.has_folder(&to) {
+                        drop(s);
+                        self.say(&format!("{tag} NO [ALREADYEXISTS] Mailbox already exists"))?;
+                    } else {
+                        // The folder and everything under it move (RFC 3501 §6.3.5).
+                        for f in s.folders.iter_mut() {
+                            let child = format!("{from}{}", f.delimiter);
+                            if f.path == from {
+                                f.path = to.clone();
+                            } else if let Some(rest) = f.path.strip_prefix(&child) {
+                                f.path = format!("{to}{}{rest}", f.delimiter);
+                            }
+                        }
+                        drop(s);
+                        self.say(&format!("{tag} OK Rename completed."))?;
+                    }
+                }
+                "DELETE" => {
+                    let path = unquote(args);
+                    let mut s = self.state.lock().unwrap();
+                    if !s.has_folder(&path) {
+                        drop(s);
+                        self.say(&format!("{tag} NO [NONEXISTENT] Mailbox doesn't exist"))?;
+                    } else {
+                        s.folders.retain(|f| f.path != path);
+                        s.subscribed.remove(&path);
+                        drop(s);
+                        self.say(&format!("{tag} OK Delete completed."))?;
+                    }
+                }
+                "STATUS" => {
+                    let (path, _) = split_quoted(args);
+                    let s = self.state.lock().unwrap();
+                    let condstore = s.has_capability("CONDSTORE") || s.has_capability("QRESYNC");
+                    let line = s.folders.iter().find(|f| f.path == path).map(|f| format!("* STATUS {} ({})", quote(&f.path), f.status_items(condstore)));
+                    drop(s);
+                    match line {
+                        Some(line) => {
+                            self.say(&line)?;
+                            self.say(&format!("{tag} OK Status completed."))?;
+                        }
+                        None => self.say(&format!("{tag} NO [NONEXISTENT] Mailbox doesn't exist"))?,
+                    }
+                }
+                "SUBSCRIBE" | "UNSUBSCRIBE" => {
+                    let path = unquote(args);
+                    let mut s = self.state.lock().unwrap();
+                    if cmd == "SUBSCRIBE" {
+                        s.subscribed.insert(path);
+                    } else {
+                        s.subscribed.remove(&path);
+                    }
+                    drop(s);
+                    self.say(&format!("{tag} OK {cmd} completed."))?;
                 }
                 "UID" => {
                     let (sub, sargs) = args.split_once(' ').unwrap_or((args, ""));

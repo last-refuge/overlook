@@ -4,6 +4,17 @@ use super::*;
 use crate::assets::{color_icon, ColorIcon as C};
 
 pub(super) const RAIL_WIDTH: f32 = 48.;
+/// The title bar and the command toolbar share one control size and one vertical inset so
+/// their contents sit on the same rhythm; the inset follows the density setting.
+pub(super) const HEADER_CONTROL_HEIGHT: f32 = 36.;
+
+pub(super) fn header_height(density: Density) -> f32 {
+    let inset = match density {
+        Density::Comfortable => 8.,
+        Density::Compact => 4.,
+    };
+    HEADER_CONTROL_HEIGHT + inset * 2.
+}
 
 impl MailWindow {
     pub(super) fn render_app_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -17,7 +28,7 @@ impl MailWindow {
             .border_r_1()
             .border_color(p.divider.opacity(0.6))
             .child(
-                div().h(px(52.)).w_full().flex_none().child(
+                div().h(px(header_height(self.density))).w_full().flex_none().child(
                     div()
                         .size_full()
                         .flex()
@@ -88,6 +99,26 @@ impl MailWindow {
             )
             .child(div().flex_1())
             .child(
+                Button::new("rail-history")
+                    .ghost()
+                    .w(px(38.))
+                    .h(px(40.))
+                    .p(px(4.))
+                    .mb(px(4.))
+                    .toggled(self.history.is_some())
+                    .when(self.history.is_some(), |b| b.bg(p.selection))
+                    .accessibility_label("Change history")
+                    .tooltip("Change history (Ctrl H)")
+                    .child(color_icon(C::History, 20., &p))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if this.history.is_some() {
+                            this.close_history(window, cx)
+                        } else {
+                            this.open_history(window, cx)
+                        }
+                    })),
+            )
+            .child(
                 Button::new("rail-settings")
                     .ghost()
                     .w(px(38.))
@@ -120,7 +151,7 @@ impl MailWindow {
             Module::Calendar => Button::new("calendar-commands")
                 .ghost()
                 .w_full()
-                .h(px(36.))
+                .h(px(HEADER_CONTROL_HEIGHT))
                 .justify_start()
                 .bg(p.message_surface())
                 .icon(icon("search").size(px(16.)))
@@ -129,7 +160,7 @@ impl MailWindow {
                 .on_click(cx.listener(|this, _, window, cx| this.open_palette(window, cx)))
                 .into_any_element(),
         };
-        TitleBar::new().h(px(52.)).bg(p.surface).child(
+        TitleBar::new().h(px(header_height(self.density))).bg(p.surface).child(
             h_flex()
                 .size_full()
                 .items_center()
@@ -150,7 +181,7 @@ impl MailWindow {
                 .child(
                     Button::new("account-settings")
                         .ghost()
-                        .size(px(36.))
+                        .size(px(HEADER_CONTROL_HEIGHT))
                         .p(px(3.))
                         .rounded_full()
                         .accessibility_label("Account settings")
@@ -161,59 +192,6 @@ impl MailWindow {
                         })),
                 ),
         )
-    }
-
-    pub(super) fn mail_move_menu(
-        &self,
-        button: Button,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let labels: Vec<(LabelId, String)> = self
-            .labels
-            .iter()
-            .filter(|l| l.kind == LabelKind::User)
-            .map(|l| (l.id.clone(), l.name.clone()))
-            .collect();
-        let ids = self.selected_message_ids();
-        let this = cx.entity().downgrade();
-        button.dropdown_menu(move |mut menu, _, _| {
-            for (label, view) in [
-                ("Inbox", MailboxView::Kind(LabelKind::Inbox)),
-                ("Archive", MailboxView::Kind(LabelKind::Archive)),
-                ("Trash", MailboxView::Kind(LabelKind::Trash)),
-            ] {
-                let this = this.clone();
-                let ids = ids.clone();
-                menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                    let drag = ConversationDrag {
-                        mail: DraggedMail::Messages(ids.clone()),
-                        title: String::new(),
-                        count: 0,
-                    };
-                    this.update(cx, |this, cx| {
-                        this.drop_on_view(drag, view.clone(), window, cx)
-                    })
-                    .ok();
-                }));
-            }
-            if !labels.is_empty() {
-                menu = menu.separator().label("Labels");
-            }
-            for (id, name) in &labels {
-                let this = this.clone();
-                let ids = ids.clone();
-                let id = id.clone();
-                menu = menu.item(PopupMenuItem::new(name.clone()).on_click(
-                    move |_, window, cx| {
-                        this.update(cx, |this, cx| {
-                            this.move_to_label(ids.clone(), id.clone(), window, cx)
-                        })
-                        .ok();
-                    },
-                ));
-            }
-            menu
-        })
     }
 
     pub(super) fn appearance_menu(
@@ -229,10 +207,11 @@ impl MailWindow {
             for pref in AppearancePreference::ALL {
                 let this = this.clone();
                 let label = if pref == AppearancePreference::FollowSystem {
-                    match system {
-                        SystemAppearance::Dark => "Follow system (currently Dark)".to_owned(),
-                        SystemAppearance::Light => "Follow system (currently Light)".to_owned(),
-                        SystemAppearance::Unknown => "Follow system".to_owned(),
+                    match (theme::desktop_theme_name(), system) {
+                        (Some(name), _) => format!("Follow system (currently {name})"),
+                        (None, SystemAppearance::Dark) => "Follow system (currently Dark)".to_owned(),
+                        (None, SystemAppearance::Light) => "Follow system (currently Light)".to_owned(),
+                        (None, SystemAppearance::Unknown) => "Follow system".to_owned(),
                     }
                 } else {
                     pref.label().to_owned()

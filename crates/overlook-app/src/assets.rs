@@ -87,6 +87,7 @@ color_icons! {
     Appearance => "appearance",
     Layout => "layout",
     Settings => "settings",
+    History => "history",
 }
 
 const ICON_THEMES: &[(&str, ResolvedTheme)] = &[
@@ -97,16 +98,22 @@ const ICON_THEMES: &[(&str, ResolvedTheme)] = &[
     ("white", ResolvedTheme::White),
     ("alexander", ResolvedTheme::Alexander),
     ("pink", ResolvedTheme::Pink),
+    ("system-light", ResolvedTheme::SystemLight),
+    ("system-dark", ResolvedTheme::SystemDark),
 ];
 
 fn color_icon_path(icon: ColorIcon, theme: ResolvedTheme, on_action: bool) -> SharedString {
     let key = ICON_THEMES
         .iter()
         .find(|(_, value)| *value == theme)
-        .unwrap()
-        .0;
+        .map_or("light", |(name, _)| name);
     let tone = if on_action { "action" } else { "normal" };
-    format!("overlook/color/{key}/{tone}/{}", icon.file()).into()
+    match theme {
+        // The desktop colors change at runtime; their generation in the path keeps the
+        // image cache from serving icons tinted for the previous desktop theme.
+        ResolvedTheme::SystemLight | ResolvedTheme::SystemDark => format!("overlook/color/{key}.{}/{tone}/{}", crate::theme::desktop_generation(), icon.file()).into(),
+        _ => format!("overlook/color/{key}/{tone}/{}", icon.file()).into(),
+    }
 }
 
 pub fn color_icon(icon: ColorIcon, size: f32, palette: &Palette) -> Img {
@@ -132,6 +139,9 @@ fn themed_icon(path: &str) -> Option<Vec<u8>> {
     if parts.next().is_some() || !matches!(tone, "normal" | "action") {
         return None;
     }
+    // A desktop theme's key carries a colors fingerprint after the dot; the colors
+    // themselves are read fresh from the current desktop palette.
+    let key = key.split_once('.').map_or(key, |(name, _)| name);
     let (_, theme) = ICON_THEMES.iter().find(|(name, _)| *name == key)?;
     let (_, source) = COLOR_ASSETS.iter().find(|(name, _)| *name == file)?;
     let p = Palette::for_theme(*theme);
@@ -275,8 +285,10 @@ mod tests {
                     colors.iter().any(|[r, g, b]| r != g || g != b),
                     "{icon:?} became monochrome"
                 );
+                // Without desktop colors, the desktop themes fall back to Light and Dark.
+                let built_in = !matches!(theme, ResolvedTheme::SystemLight | ResolvedTheme::SystemDark);
                 assert!(
-                    rendered_themes.insert(image.as_bytes(0).unwrap().to_vec()),
+                    !built_in || rendered_themes.insert(image.as_bytes(0).unwrap().to_vec()),
                     "{icon:?}: {theme:?} reused another theme's colors"
                 );
                 let on_action = assets

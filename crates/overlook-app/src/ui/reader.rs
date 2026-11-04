@@ -215,6 +215,36 @@ impl MailWindow {
             ).into_any_element();
         }
 
+        if self.multi_selected() {
+            let n = self.marked.len();
+            return container
+                .child(
+                    v_flex()
+                        .size_full()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(8.))
+                        .child(svg().path("overlook/symbolic.svg").size(px(44.)).text_color(p.divider))
+                        .child(div().text_size(px(15.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child(format!("{n} conversations selected")))
+                        .child(
+                            h_flex()
+                                .gap(px(6.))
+                                .items_center()
+                                .text_size(px(12.))
+                                .text_color(p.muted)
+                                .child(kbd("E", &p))
+                                .child("archive")
+                                .child(kbd("Del", &p))
+                                .child("delete")
+                                .child(kbd("U", &p))
+                                .child("mark read")
+                                .child(kbd("Esc", &p))
+                                .child("clear"),
+                        ),
+                )
+                .into_any_element();
+        }
+
         let Some(summary) = self.selected_summary() else {
             return container
                 .child(
@@ -756,10 +786,12 @@ impl MailWindow {
         } else {
             self.pdf_thumbs.get(&a.id).cloned()
         };
+        let tip: SharedString = attachment_tooltip(a).into();
         attachment_card(a, &p, downloading, thumb)
             .id(SharedString::from(format!("att-{}", a.id)))
             .cursor_pointer()
             .hover(|d| d.bg(p.hover))
+            .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
             .child(
                 Button::new(SharedString::from(format!("save-{}", a.id)))
                     .ghost()
@@ -934,10 +966,22 @@ fn embedded_in_body(attachment: &Attachment, body: &Body) -> bool {
 }
 
 fn attachment_card(a: &Attachment, p: &crate::theme::Palette, downloading: bool, thumbnail: Option<std::path::PathBuf>) -> Div {
-    let badge_bg = match a.badge().as_str() {
-        "PDF" => (c(0xFBE9E7, p), c(0xA13E37, p)),
-        "FIG" | "PNG" | "JPG" | "SVG" => (c(0xEEE8FA, p), c(0x6E55B7, p)),
+    use overlook_core::attachment_policy::{risk, Risk};
+    // Programs and scripts get a red badge, archives and macro documents a yellow one,
+    // so the hazard is visible before anyone clicks.
+    let risk = risk(&a.filename);
+    let badge_bg = match (risk, a.badge().as_str()) {
+        (Risk::Dangerous, _) => (p.error.opacity(if p.is_dark() { 0.25 } else { 0.12 }), p.error),
+        (Risk::Caution, _) => (p.warning.opacity(if p.is_dark() { 0.25 } else { 0.15 }), p.warning),
+        (_, "PDF") => (c(0xFBE9E7, p), c(0xA13E37, p)),
+        // SVG is a caution badge above (scripts can ride in it), so it never gets here.
+        (_, "FIG" | "PNG" | "JPG") => (c(0xEEE8FA, p), c(0x6E55B7, p)),
         _ => (p.chip, p.muted),
+    };
+    let ext_color = match risk {
+        Risk::Dangerous => Some(p.error),
+        Risk::Caution => Some(p.warning),
+        Risk::Safe => None,
     };
     h_flex()
         .items_center()
@@ -968,7 +1012,19 @@ fn attachment_card(a: &Attachment, p: &crate::theme::Palette, downloading: bool,
             v_flex()
                 .flex_1()
                 .min_w_0()
-                .child(div().truncate().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child(a.filename.clone()))
+                .child({
+                    // Keep the extension visible however long the name is: the stem
+                    // shrinks with an ellipsis while the ".ext" tail never does.
+                    let (stem, ext) = split_extension(&a.filename);
+                    h_flex()
+                        .min_w_0()
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(div().min_w_0().truncate().child(stem.to_owned()))
+                        .when(!ext.is_empty(), |d| {
+                            d.child(div().flex_none().when_some(ext_color, |d, color| d.text_color(color).font_weight(FontWeight::SEMIBOLD)).child(ext.to_owned()))
+                        })
+                })
                 .child(
                     div()
                         .text_size(px(11.))
@@ -982,6 +1038,27 @@ fn attachment_card(a: &Attachment, p: &crate::theme::Palette, downloading: bool,
                         }),
                 ),
         )
+}
+
+/// Hover text for an attachment card: the full name (the card truncates long ones) plus
+/// a warning line for risky types.
+fn attachment_tooltip(a: &Attachment) -> String {
+    use overlook_core::attachment_policy::{risk, Risk};
+    match risk(&a.filename) {
+        Risk::Dangerous => format!("{}\nProgram or script. Overlook won’t open it; only save it if you trust the sender.", a.filename),
+        Risk::Caution => format!("{}\nCan carry hidden programs or macros, or lead to a fake sign-in page. Check the sender before opening.", a.filename),
+        Risk::Safe => a.filename.clone(),
+    }
+}
+
+/// Splits `report.final.pdf` into (`report.final`, `.pdf`) so the extension can be
+/// pinned while the stem truncates. Dotfiles and names without a short extension
+/// return an empty tail.
+fn split_extension(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(i) if i > 0 && name.len() - i <= 12 && !name[i + 1..].contains(' ') => name.split_at(i),
+        _ => (name, ""),
+    }
 }
 
 fn c(hex: u32, p: &crate::theme::Palette) -> Hsla {
@@ -1061,6 +1138,16 @@ fn email_paper(body: impl IntoElement) -> Div {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn split_extension_pins_the_real_extension() {
+        assert_eq!(super::split_extension("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.txt"), ("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", ".txt"));
+        assert_eq!(super::split_extension("report.final.pdf"), ("report.final", ".pdf"));
+        assert_eq!(super::split_extension("archive.tar.gz"), ("archive.tar", ".gz"));
+        assert_eq!(super::split_extension("README"), ("README", ""));
+        assert_eq!(super::split_extension(".bashrc"), (".bashrc", ""));
+        assert_eq!(super::split_extension("Notes from the meeting. Final"), ("Notes from the meeting. Final", ""));
+    }
+
     #[test]
     fn inline_images_are_not_duplicated_but_orphans_remain_accessible() {
         let image = overlook_core::Attachment { id: "image".into(), message_id: "message".into(), filename: "logo.png".into(), mime_type: "image/png".into(), size_bytes: 12, local_path: None, provider_id: None, content_id: Some("logo@example.test".into()) };

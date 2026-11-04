@@ -57,12 +57,12 @@ pub mod fake;
 mod tests;
 
 use crate::mime::{headers_from_rfc822, message_from_rfc822, MessageFlags};
-use crate::{build_raw, draft_message_id, smtp, AppliedChanges, BoxFuture, MailProvider, MailboxSnapshot, ProviderError, RemoteChanges, SendContext, SendOutcome, SentReceipt};
+use crate::{build_raw, draft_message_id, folder_name_problem, smtp, AppliedChanges, BoxFuture, MailProvider, MailboxSnapshot, ProviderError, RemoteChanges, RemoteState, RenamedFolder, SendContext, SendOutcome, SentReceipt};
 mod drafts;
 use connection::{map_error, Session};
 use folders::FolderInfo;
 use imap::types::{Flag, UnsolicitedResponse};
-use imap_proto::types::{MessageSection, Response, ResponseCode, SectionPath, UidSetMember};
+use imap_proto::types::{MailboxDatum, MessageSection, Response, ResponseCode, SectionPath, StatusAttribute, UidSetMember};
 use overlook_core::time::now;
 use overlook_core::*;
 use serde::{Deserialize, Serialize};
@@ -74,7 +74,9 @@ use tracing::{debug, info, warn};
 /// Socket connect/read/write timeout. A hung server must not stall the sync thread.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How often the folder list is re-read.
+/// How often a change cycle re-reads the folder list on a server without LIST-STATUS (with
+/// it, the list is what tells which folders changed, so it is read every cycle). Writes
+/// made here and verifying syncs re-list at once.
 const LIST_INTERVAL_MS: i64 = 60 * 60 * 1000;
 
 /// Every nth change cycle refreshes flags in folders other than the Inbox.
@@ -89,6 +91,12 @@ const SEP: char = '\u{1f}';
 /// failed after SMTP accepted the message). The sync engine adopts such a row for the
 /// server copy with the same Message-ID when one appears.
 const LOCAL_PLACEHOLDER: &str = "local\u{1f}";
+
+/// The start every message provider id in the folder at `path` shares. A folder renamed
+/// or moved on the server rewrites its messages' ids from the old prefix to the new.
+pub fn folder_id_prefix(path: &str) -> String {
+    format!("{path}{SEP}")
+}
 
 /// Whether a provider id names a locally built Sent copy rather than a server message.
 pub fn is_local_placeholder(id: &ProviderId) -> bool {
@@ -120,6 +128,36 @@ pub struct FolderCursor {
     pub subscribed: bool,
     /// Listed but not yet selected (added between folder listings).
     pub fresh: bool,
+    /// `UIDNEXT` and the message count when the folder was last read. With them a `STATUS`
+    /// shows that nothing arrived or left without opening the folder; 0 when unknown.
+    pub uid_next: u32,
+    pub exists: u32,
+}
+
+/// A folder listing with each folder's `STATUS`, by path.
+type ListedWithStatus = (Vec<FolderInfo>, HashMap<String, FolderStatus>);
+
+/// Per folder: path, kind, delimiter, special use, subscribed.
+type FolderShape = Vec<(String, String, Option<String>, Option<String>, bool)>;
+
+/// A folder's state from `STATUS` (or `LIST … RETURN (STATUS …)`), without opening it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FolderStatus {
+    pub uidvalidity: u32,
+    pub uid_next: u32,
+    pub exists: u32,
+    /// `HIGHESTMODSEQ`; `None` when the server has no CONDSTORE.
+    pub highest_modseq: Option<u64>,
+}
+
+/// Whether a folder can be skipped this cycle because `status` matches what was read last
+/// time: same UIDVALIDITY, nothing new (`UIDNEXT`), nothing gone (message count) and, with
+/// CONDSTORE, no flag change (`HIGHESTMODSEQ`). Without CONDSTORE flag changes are invisible
+/// to `STATUS`, so the folder is read whenever its flag refresh is due (`flags_due`).
+pub fn folder_unchanged(cursor: &FolderCursor, status: &FolderStatus, condstore: bool, flags_due: bool) -> bool {
+    let same = !cursor.fresh && cursor.uidvalidity != 0 && cursor.uidvalidity == status.uidvalidity && cursor.uid_next != 0 && cursor.uid_next == status.uid_next && cursor.exists == status.exists;
+    let flags_same = if condstore { cursor.highest_modseq != 0 && status.highest_modseq == Some(cursor.highest_modseq) } else { !flags_due };
+    same && flags_same
 }
 
 impl FolderCursor {
@@ -213,6 +251,8 @@ pub struct Capabilities {
     pub idle: bool,
     /// `LITERAL+` / `LITERAL-`: non-synchronising literals, used for non-ASCII search words.
     pub literal_plus: bool,
+    /// `LIST-STATUS` (RFC 5819): one `LIST` returns every folder's `STATUS` too.
+    pub list_status: bool,
 }
 
 /// The folder a connection has open.
@@ -231,10 +271,18 @@ struct Conn {
     /// A write created a folder; the next change cycle must re-list so the checkpoint
     /// tracks it. Survives reconnects.
     relist_pending: bool,
+    /// Folders renamed or moved here (old path, new path), not yet applied to a checkpoint.
+    /// The next listing moves their cursors to the new paths instead of dropping them, so
+    /// the folders keep what was downloaded.
+    renamed: Vec<(String, String)>,
     /// The Sent folder path from the last listing, for `APPEND` and `reconcile_send`.
     sent_path: Option<String>,
     /// Every selectable folder from the last listing with its label kind, for search.
     folders: Vec<(String, LabelKind)>,
+    /// Folders the server lists as selectable but refuses to open (Dovecot keeps the name
+    /// of a deleted parent while children remain). They are shown as folder-only and left
+    /// alone instead of being dropped and re-added every cycle; a verifying cycle retries.
+    unopenable: HashSet<String>,
 }
 
 impl Conn {
@@ -376,18 +424,108 @@ impl Conn {
         Ok((present, seen, flagged))
     }
 
+    /// `LIST` and `LSUB`, read from the raw lines so a name the server sends as a literal
+    /// is kept as is while a quoted one is unescaped (see [`folders::decode_name`]).
     fn list_folders(&mut self) -> Result<Vec<FolderInfo>, ProviderError> {
-        let names = self.session().list(Some(""), Some("*")).map_err(|e| map_error(&e))?;
-        let mut folders: Vec<FolderInfo> = names.iter().map(FolderInfo::from_name).collect();
+        let (data, _) = self.session().run("LIST \"\" \"*\"").map_err(|e| map_error(&e))?;
+        let (mut folders, _) = parse_list_status(&data).ok_or_else(|| ProviderError::Temporary("could not read the LIST response".into()))?;
         // Subscriptions are informational; a server without LSUB support is not an error.
-        if let Ok(subscribed) = self.session().lsub(Some(""), Some("*")) {
-            let set: HashSet<String> = subscribed.iter().map(|n| n.name().to_owned()).collect();
-            for f in &mut folders {
-                f.subscribed = set.contains(&f.path);
+        if let Ok((data, _)) = self.session().run("LSUB \"\" \"*\"") {
+            if let Some((subscribed, _)) = parse_list_status(&data) {
+                let set: HashSet<String> = subscribed.into_iter().map(|f| f.path).collect();
+                for f in &mut folders {
+                    f.subscribed = set.contains(&f.path);
+                }
             }
         }
         Ok(folders)
     }
+
+    /// The `STATUS` items to ask for.
+    fn status_items(&self) -> &'static str {
+        if self.caps.condstore { "MESSAGES UIDNEXT UIDVALIDITY HIGHESTMODSEQ" } else { "MESSAGES UIDNEXT UIDVALIDITY" }
+    }
+
+    /// `LIST "" "*" RETURN (SUBSCRIBED STATUS (…))`: every folder, its subscription and its
+    /// state in one round trip. `None` when the server turns the command down, so the caller
+    /// falls back to `LIST` + `STATUS` (and stops trying on this connection).
+    fn list_with_status(&mut self) -> Result<Option<ListedWithStatus>, ProviderError> {
+        let command = format!("LIST \"\" \"*\" RETURN (SUBSCRIBED STATUS ({}))", self.status_items());
+        let data = match self.session().run(&command) {
+            Ok((data, _)) => data,
+            Err(e @ (imap::Error::Bad(_) | imap::Error::No(_))) => {
+                info!("imap: LIST-STATUS refused ({e}); using LIST and STATUS");
+                self.caps.list_status = false;
+                return Ok(None);
+            }
+            Err(e) => return Err(map_error(&e)),
+        };
+        // A partial list would make every folder after the bad line look deleted, so a
+        // response this parser can't read in full falls back to plain LIST.
+        match parse_list_status(&data) {
+            Some(found) => Ok(Some(found)),
+            None => {
+                warn!("imap: could not read the LIST-STATUS response; using LIST and STATUS");
+                self.caps.list_status = false;
+                Ok(None)
+            }
+        }
+    }
+
+    /// `STATUS` of one folder; `None` when the server has no answer for it (a `\Noselect`
+    /// folder, one removed meanwhile) or it is the open folder, whose `STATUS` RFC 3501
+    /// says not to rely on. The caller then opens the folder as before.
+    fn status_of(&mut self, path: &str) -> Result<Option<FolderStatus>, ProviderError> {
+        if self.selected.as_ref().is_some_and(|s| s.path == path) {
+            return Ok(None);
+        }
+        // Sent by hand: the library would match the reply by the name as the server
+        // escapes it, which differs from `path` for names with a quote or a backslash.
+        let command = format!("STATUS {} ({})", quote_mailbox(path), self.status_items());
+        match self.session().run(&command) {
+            Ok((data, _)) => Ok(parse_list_status(&data).and_then(|(_, mut statuses)| statuses.remove(path))),
+            Err(imap::Error::No(_)) | Err(imap::Error::Bad(_)) => Ok(None),
+            Err(e) => Err(map_error(&e)),
+        }
+    }
+}
+
+/// The folders and `STATUS` lines of a `LIST`, `LSUB` or `LIST … RETURN (SUBSCRIBED
+/// STATUS …)` response. `None` when any line can't be parsed: the list would be incomplete.
+fn parse_list_status(data: &[u8]) -> Option<ListedWithStatus> {
+    let (mut folders, mut statuses) = (Vec::new(), HashMap::new());
+    let mut rest = data;
+    while !rest.is_empty() {
+        let Ok((next, response)) = imap_proto::parser::parse_response(rest) else {
+            let line = rest.split(|b| *b == b'\n').next().unwrap_or_default();
+            debug!("imap: unparsed LIST-STATUS line: {}", String::from_utf8_lossy(line));
+            return None;
+        };
+        let line = &rest[..rest.len() - next.len()];
+        match response {
+            Response::MailboxData(MailboxDatum::List { name_attributes, delimiter, name }) => {
+                let attributes: Vec<String> = name_attributes.iter().map(folders::attribute_name).collect();
+                let subscribed = attributes.iter().any(|a| a.eq_ignore_ascii_case("\\Subscribed"));
+                folders.push(FolderInfo { path: folders::decode_name(line, &name), delimiter: delimiter.map(|d| d.into_owned()), attributes, subscribed });
+            }
+            Response::MailboxData(MailboxDatum::Status { mailbox, status }) => {
+                let mut s = FolderStatus::default();
+                for item in status {
+                    match item {
+                        StatusAttribute::UidValidity(v) => s.uidvalidity = v,
+                        StatusAttribute::UidNext(v) => s.uid_next = v,
+                        StatusAttribute::Messages(v) => s.exists = v,
+                        StatusAttribute::HighestModSeq(v) => s.highest_modseq = Some(v),
+                        _ => {}
+                    }
+                }
+                statuses.insert(folders::decode_name(line, &mailbox), s);
+            }
+            _ => {}
+        }
+        rest = next;
+    }
+    Some((folders, statuses))
 }
 
 /// What a `CHANGEDSINCE` fetch reported.
@@ -438,7 +576,7 @@ impl ImapProvider {
             outgoing_password: None,
             inbox_limit: 100,
             timeout: DEFAULT_TIMEOUT,
-            conn: Mutex::new(Conn { session: None, selected: None, caps: Capabilities::default(), relist_pending: false, sent_path: None, folders: Vec::new() }),
+            conn: Mutex::new(Conn { session: None, selected: None, caps: Capabilities::default(), relist_pending: false, renamed: Vec::new(), sent_path: None, folders: Vec::new(), unopenable: HashSet::new() }),
             send_phases: Mutex::new(HashMap::new()),
         }
     }
@@ -506,6 +644,7 @@ impl ImapProvider {
             qresync: false,
             idle: caps.has_str("IDLE"),
             literal_plus: caps.has_str("LITERAL+") || caps.has_str("LITERAL-"),
+            list_status: caps.has_str("LIST-STATUS"),
         };
         // QRESYNC must be enabled per connection (RFC 7162); a server that answers without
         // `* ENABLED QRESYNC` gets the CONDSTORE path, or the plain one.
@@ -703,11 +842,32 @@ impl ImapProvider {
     /// folders that disappeared.
     fn relist(&self, conn: &mut Conn, account: &Account, cp: &mut Checkpoint) -> Result<(Vec<Label>, Vec<ProviderId>), ProviderError> {
         let listed = conn.list_folders()?;
-        let classified = folders::classify(&listed, self.servers.imap.as_ref());
+        Ok(self.relist_from(conn, account, cp, &listed))
+    }
+
+    /// [`Self::relist`] from a listing already read. A user folder the server refused to
+    /// open is shown as folder-only; a system folder (Inbox, Sent, Trash, …) keeps its
+    /// kind, since losing it would reject deletes and sent copies over one refused
+    /// `EXAMINE`, and is simply tried again.
+    fn relist_from(&self, conn: &mut Conn, account: &Account, cp: &mut Checkpoint, listed: &[FolderInfo]) -> (Vec<Label>, Vec<ProviderId>) {
+        let mut classified = folders::classify(listed, self.servers.imap.as_ref());
+        for (info, kind) in &mut classified {
+            if *kind == LabelKind::User && conn.unopenable.contains(&info.path) {
+                *kind = LabelKind::Container;
+            }
+        }
         let labels = folders::labels_for(&account.id, &classified);
         let mut deleted = Vec::new();
+        for (old, new) in std::mem::take(&mut conn.renamed) {
+            if let Some(cursor) = cp.folders.remove(&old) {
+                cp.folders.insert(new, cursor);
+            }
+        }
         let mut next: BTreeMap<String, FolderCursor> = BTreeMap::new();
         for (info, kind) in &classified {
+            if *kind == LabelKind::Container {
+                continue;
+            }
             let mut cursor = cp.folders.remove(&info.path).unwrap_or_else(|| FolderCursor { fresh: true, ..Default::default() });
             cursor.kind = kind.as_key().to_owned();
             cursor.delimiter = info.delimiter.clone();
@@ -722,7 +882,22 @@ impl ImapProvider {
         cp.listed_at = now();
         conn.remember_folders(&classified);
         conn.relist_pending = false;
-        Ok((labels, deleted))
+        (labels, deleted)
+    }
+
+    /// What changes the label list: paths, kinds, nesting and subscriptions.
+    fn folder_shape(cp: &Checkpoint) -> FolderShape {
+        cp.folders.iter().map(|(p, c)| (p.clone(), c.kind.clone(), c.delimiter.clone(), c.special_use.clone(), c.subscribed)).collect()
+    }
+
+    /// The folder list, plus each folder's state when the server gives it with the list.
+    fn list_and_status(conn: &mut Conn) -> Result<ListedWithStatus, ProviderError> {
+        if conn.caps.list_status {
+            if let Some(found) = conn.list_with_status()? {
+                return Ok(found);
+            }
+        }
+        Ok((conn.list_folders()?, HashMap::new()))
     }
 
     /// Selects the newest N of a folder as its cursor and returns their provider ids,
@@ -742,7 +917,8 @@ impl ImapProvider {
     fn snapshot(&self, account: &Account) -> Result<MailboxSnapshot, ProviderError> {
         self.with_session(|conn| {
             let mut cp = Checkpoint { version: Checkpoint::VERSION, ..Default::default() };
-            let (labels, _) = self.relist(conn, account, &mut cp)?;
+            conn.unopenable.clear();
+            let (mut labels, _) = self.relist(conn, account, &mut cp)?;
             let mut ids: Vec<ProviderId> = Vec::new();
             // Inbox first so the first bodies downloaded are the ones shown first.
             let mut order: Vec<String> = cp.folders.keys().cloned().collect();
@@ -752,7 +928,8 @@ impl ImapProvider {
                 let mailbox = match conn.examine(&path) {
                     Ok(m) => m,
                     Err(ProviderError::Rejected(reason)) => {
-                        warn!("imap: skipping folder {path}: {reason}");
+                        warn!("imap: folder {path} cannot be opened ({reason}); shown as folder-only");
+                        conn.unopenable.insert(path.clone());
                         continue;
                     }
                     Err(e) => return Err(e),
@@ -760,33 +937,94 @@ impl ImapProvider {
                 let uidvalidity = mailbox.uid_validity.unwrap_or(0);
                 let server = if mailbox.exists == 0 { BTreeSet::new() } else { conn.uid_search_all()? };
                 ids.extend(self.reset_folder(conn, &path, cursor, uidvalidity, mailbox.highest_mod_seq.unwrap_or(0), &server)?);
+                cursor.uid_next = mailbox.uid_next.unwrap_or(0);
+                cursor.exists = mailbox.exists;
+            }
+            if !conn.unopenable.is_empty() {
+                // Listed again so the refused folders become containers without cursors.
+                labels = self.relist(conn, account, &mut cp)?.0;
             }
             info!("imap: {} folders, {} recent messages queued for download", cp.folders.len(), ids.len());
             Ok(MailboxSnapshot { labels, messages: Vec::new(), message_ids: ids, checkpoint: Some(cp.to_json()) })
         })
     }
 
-    fn changes(&self, account: &Account, checkpoint: &str) -> Result<RemoteChanges, ProviderError> {
+    /// One change cycle. `verify` checks instead of trusting shortcuts: every folder is
+    /// opened (no `STATUS` skip), deletions come from the full UID list and flags from a full
+    /// fetch (no `CHANGEDSINCE`), the label list is always reported, and `complete` lists
+    /// every message held so the engine can repair the store.
+    fn changes(&self, account: &Account, checkpoint: &str, verify: bool) -> Result<RemoteChanges, ProviderError> {
         let base = Checkpoint::parse(checkpoint)?;
         self.with_session(|conn| {
             let mut cp = base.clone();
             cp.cycle += 1;
             let mut changes = RemoteChanges::default();
-            if cp.folders.is_empty() || conn.relist_pending || now() - cp.listed_at > LIST_INTERVAL_MS {
-                let (labels, deleted) = self.relist(conn, account, &mut cp)?;
-                changes.labels = Some(labels);
-                changes.deleted_provider_ids.extend(deleted);
+            if verify {
+                // A folder that could not be opened before gets another try.
+                conn.unopenable.clear();
             }
+            // With LIST-STATUS the folder list comes every cycle: the same command says which
+            // folders changed, and a folder made, renamed or removed elsewhere shows at the
+            // next sync. Without it the list is read hourly (or when forced) and each folder
+            // gets a `STATUS` below before it is opened.
+            let force = verify || cp.folders.is_empty() || conn.relist_pending;
+            let statuses = if force || conn.caps.list_status || now() - cp.listed_at > LIST_INTERVAL_MS {
+                let before = Self::folder_shape(&cp);
+                let (listed, statuses) = Self::list_and_status(conn)?;
+                let (labels, deleted) = self.relist_from(conn, account, &mut cp, &listed);
+                if force || Self::folder_shape(&cp) != before {
+                    changes.labels = Some(labels);
+                }
+                changes.deleted_provider_ids.extend(deleted);
+                statuses
+            } else {
+                HashMap::new()
+            };
+            // Verifying: what each folder holds beyond the tracked window, by provider id.
+            let mut untracked: Vec<ProviderId> = Vec::new();
+            let mut skipped = 0usize;
             let mut vanished: Vec<String> = Vec::new();
             let mut relist_needed = false;
             let paths: Vec<String> = cp.folders.keys().cloned().collect();
             for path in paths {
+                let (is_inbox, fresh) = cp.folders.get(&path).map_or((false, true), |c| (c.label_kind() == LabelKind::Inbox, c.fresh));
+                let flags_due = is_inbox || cp.cycle % FLAG_REFRESH_EVERY == 0;
+                // Unchanged since the last read: don't open it. The open folder's `STATUS`
+                // is not relied on (RFC 3501), so it is always read.
+                let status = if verify || conn.selected.as_ref().is_some_and(|s| s.path == path) || fresh {
+                    None
+                } else if let Some(s) = statuses.get(&path) {
+                    Some(*s)
+                } else if !conn.caps.list_status {
+                    conn.status_of(&path)?
+                } else {
+                    None
+                };
                 let cursor = cp.folders.get_mut(&path).expect("present");
+                if status.is_some_and(|s| folder_unchanged(cursor, &s, conn.caps.condstore, flags_due)) {
+                    skipped += 1;
+                    continue;
+                }
                 let mailbox = match conn.examine(&path) {
                     Ok(m) => m,
-                    Err(ProviderError::Rejected(reason)) => {
-                        info!("imap: folder {path} is gone ({reason}); removing its messages");
+                    // A failed read of a previously synchronized folder is not evidence
+                    // that its mail was deleted. Keep the old checkpoint and cache so a
+                    // later cycle can retry, even for a server's generic NO response.
+                    Err(e @ ProviderError::Rejected(_)) if !cursor.fresh => {
+                        if conn.list_folders()?.iter().any(|f| f.path == path) {
+                            return Err(e);
+                        }
+                        // A fresh LIST confirms that the folder really disappeared.
                         changes.deleted_provider_ids.extend(cursor.known_set().into_iter().map(|uid| MessageRef::provider_id(&path, cursor.uidvalidity, uid)));
+                        vanished.push(path.clone());
+                        relist_needed = true;
+                        continue;
+                    }
+                    Err(ProviderError::Rejected(reason)) => {
+                        info!("imap: new folder {path} cannot be opened ({reason}); shown as folder-only");
+                        // Still listed next time, it is treated as folder-only rather than
+                        // dropped and re-added for ever.
+                        conn.unopenable.insert(path.clone());
                         vanished.push(path.clone());
                         relist_needed = true;
                         continue;
@@ -802,6 +1040,12 @@ impl ImapProvider {
                     }
                     let server = if mailbox.exists == 0 { BTreeSet::new() } else { conn.uid_search_all()? };
                     changes.message_ids.extend(self.reset_folder(conn, &path, cursor, uidvalidity, server_modseq, &server)?);
+                    if verify {
+                        let kept = cursor.known_set();
+                        untracked.extend(server.difference(&kept).map(|uid| MessageRef::provider_id(&path, uidvalidity, *uid)));
+                    }
+                    cursor.uid_next = mailbox.uid_next.unwrap_or(0);
+                    cursor.exists = mailbox.exists;
                     continue;
                 }
                 let mut known = cursor.known_set();
@@ -809,7 +1053,7 @@ impl ImapProvider {
                 let limit = self.folder_limit(cursor.label_kind()).max(200);
                 // The fast path needs CONDSTORE on both sides of the cursor; QRESYNC (enabled
                 // on this connection) additionally makes VANISHED report deletions.
-                let fast = conn.caps.condstore && cursor.highest_modseq > 0 && server_modseq > 0;
+                let fast = !verify && conn.caps.condstore && cursor.highest_modseq > 0 && server_modseq > 0;
                 let qresync = fast && conn.caps.qresync;
                 // Without QRESYNC the whole UID list is the only way to see deletions.
                 let server_all: Option<BTreeSet<u32>> = if qresync {
@@ -865,7 +1109,7 @@ impl ImapProvider {
                     }
                 } else {
                     // Flag changes: the Inbox every cycle, other folders now and then.
-                    let refresh = cursor.label_kind() == LabelKind::Inbox || cp.cycle % FLAG_REFRESH_EVERY == 0;
+                    let refresh = verify || cursor.label_kind() == LabelKind::Inbox || cp.cycle % FLAG_REFRESH_EVERY == 0;
                     if refresh && !old.is_empty() {
                         let (_, now_seen, now_flagged) = conn.flags_for(&old)?;
                         let changed: BTreeSet<u32> = old.iter().filter(|u| seen.contains(u) != now_seen.contains(u) || flagged.contains(u) != now_flagged.contains(u)).copied().collect();
@@ -883,8 +1127,16 @@ impl ImapProvider {
                 };
                 cursor.highest_uid = cursor.highest_uid.max(top.unwrap_or(0));
                 cursor.highest_modseq = if conn.caps.condstore { server_modseq } else { 0 };
+                if verify {
+                    if let Some(all) = &server_all {
+                        untracked.extend(all.difference(&known).map(|uid| MessageRef::provider_id(&path, uidvalidity, *uid)));
+                    }
+                }
                 cursor.set_flags(&known, &seen, &flagged);
+                cursor.uid_next = mailbox.uid_next.unwrap_or(0);
+                cursor.exists = mailbox.exists;
             }
+            debug!("imap: {} of {} folders unchanged, not opened", skipped, cp.folders.len());
             for path in vanished {
                 cp.folders.remove(&path);
             }
@@ -892,6 +1144,16 @@ impl ImapProvider {
                 let (labels, deleted) = self.relist(conn, account, &mut cp)?;
                 changes.labels = Some(labels);
                 changes.deleted_provider_ids.extend(deleted);
+            }
+            if verify {
+                let mut complete = Vec::new();
+                for (path, c) in &cp.folders {
+                    let (seen, flagged) = (uidset::decode(&c.seen), uidset::decode(&c.flagged));
+                    complete.extend(c.known_set().into_iter().map(|uid| RemoteState { provider_id: MessageRef::provider_id(path, c.uidvalidity, uid), read: seen.contains(&uid), starred: flagged.contains(&uid) }));
+                }
+                info!("imap: verified {} folders, {} messages tracked, {} more held", cp.folders.len(), complete.len(), untracked.len());
+                changes.complete = Some(complete);
+                changes.untracked = untracked;
             }
             changes.checkpoint = Some(cp.to_json());
             Ok(changes)
@@ -1032,6 +1294,8 @@ impl ImapProvider {
             OperationKind::Archive { .. } => self.move_messages(account, messages, labels, Target::Archive),
             OperationKind::Trash { .. } => self.move_messages(account, messages, labels, Target::Trash),
             OperationKind::Untrash { .. } => self.move_messages(account, messages, labels, Target::Inbox),
+            OperationKind::DeleteForever { folder: Some(kind), .. } => self.empty_folder(labels, *kind),
+            OperationKind::DeleteForever { provider_ids, .. } => self.delete_forever(provider_ids),
             OperationKind::AddLabel { label_id, .. } => self.move_messages(account, messages, labels, Target::Label(label_id.clone())),
             OperationKind::RemoveLabel { label_id, .. } => self.move_messages(account, messages, labels, Target::RemoveLabel(label_id.clone())),
             OperationKind::SendDraft { .. } => Err(ProviderError::Rejected("drafts are sent through the Outbox".into())),
@@ -1070,13 +1334,8 @@ impl ImapProvider {
     /// `INBOX<delimiter>` when every folder lives under the Inbox (Courier, some Dovecot
     /// layouts), so a folder created on demand lands beside the others.
     fn namespace_prefix(labels: &[Label]) -> String {
-        let paths: Vec<&str> = labels.iter().filter(|l| l.kind != LabelKind::Inbox).filter_map(|l| l.provider_id.as_ref()).map(|p| p.0.as_str()).collect();
-        for prefix in ["INBOX.", "INBOX/"] {
-            if !paths.is_empty() && paths.iter().all(|p| p.len() > prefix.len() && p[..prefix.len()].eq_ignore_ascii_case(prefix)) {
-                return prefix.to_owned();
-            }
-        }
-        String::new()
+        let paths = labels.iter().filter(|l| l.kind != LabelKind::Inbox).filter_map(|l| l.provider_id.as_ref()).map(|p| p.0.as_str());
+        folders::inbox_namespace_prefix(paths).unwrap_or_default().to_owned()
     }
 
     /// Where a move goes. `created` is the label to report when the folder has to be made.
@@ -1165,6 +1424,213 @@ impl ImapProvider {
                 }
             }
             Ok(changes)
+        })
+    }
+
+    /// The server's hierarchy delimiter for `path`'s level: the delimiter `LIST` reports for
+    /// that folder (or for any folder, at the top level), else "/".
+    fn delimiter_for(conn: &mut Conn, path: Option<&str>) -> Result<(String, Vec<FolderInfo>), ProviderError> {
+        let folders = conn.list_folders()?;
+        let delimiter = path
+            .and_then(|p| folders.iter().find(|f| f.path == p))
+            .or_else(|| folders.iter().find(|f| f.delimiter.as_deref().is_some_and(|d| !d.is_empty())))
+            .and_then(|f| f.delimiter.clone())
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| "/".to_owned());
+        Ok((delimiter, folders))
+    }
+
+    /// The label a user folder at `path` will have after the next listing.
+    fn user_label(account: &Account, path: &str, delimiter: &str, labels: &[Label], sort_order: i32) -> Label {
+        let info = FolderInfo { path: path.to_owned(), delimiter: Some(delimiter.to_owned()), attributes: Vec::new(), subscribed: true };
+        let namespace = !Self::namespace_prefix(labels).is_empty();
+        Label { id: folders::label_id(&account.id, path), account_id: account.id.clone(), kind: LabelKind::User, name: info.display_name_in(namespace), provider_id: Some(ProviderId(path.to_owned())), color: None, sort_order }
+    }
+
+    /// Moves the session off `path` before it is renamed or deleted. `EXAMINE INBOX` rather
+    /// than `CLOSE`, which would expunge messages flagged `\Deleted` elsewhere.
+    /// A folder inside `path` is left too: renaming a parent renames its children.
+    fn leave_folder(conn: &mut Conn, path: &str) -> Result<(), ProviderError> {
+        let inside = |s: &str| s == path || s.strip_prefix(path).is_some_and(|rest| rest.starts_with(['/', '.']));
+        if conn.selected.as_ref().is_some_and(|s| inside(&s.path)) {
+            conn.open("INBOX", false)?;
+        }
+        Ok(())
+    }
+
+    /// Renames `old` to `new` on the server (the folders inside go with it), and returns
+    /// every folder that changed, `label` first. The next listing keeps their cursors.
+    fn rename_path(conn: &mut Conn, account: &Account, label: &Label, (old, new): (&str, &str), delimiter: &str, folders: &[FolderInfo], labels: &[Label]) -> Result<Vec<RenamedFolder>, ProviderError> {
+        Self::leave_folder(conn, old)?;
+        conn.session().rename(old, new).map_err(|e| map_error(&e))?;
+        let _ = conn.session().unsubscribe(old);
+        let _ = conn.session().subscribe(new);
+        let sort_order = labels.iter().find(|l| l.id == label.id).map(|l| l.sort_order).unwrap_or(label.sort_order);
+        let mut changed = vec![RenamedFolder { old: label.clone(), new: Self::user_label(account, new, delimiter, labels, sort_order) }];
+        let mut paths = vec![(old.to_owned(), new.to_owned())];
+        let inner = format!("{old}{delimiter}");
+        for f in folders.iter().filter(|f| f.path.starts_with(&inner)) {
+            let moved = format!("{new}{}", &f.path[old.len()..]);
+            if let Some(was) = labels.iter().find(|l| l.provider_id.as_ref().is_some_and(|p| p.0 == f.path)) {
+                let now = Self::user_label(account, &moved, delimiter, labels, was.sort_order);
+                changed.push(RenamedFolder { old: was.clone(), new: Label { kind: was.kind, color: was.color.clone(), ..now } });
+            }
+            paths.push((f.path.clone(), moved));
+        }
+        conn.renamed.extend(paths);
+        conn.relist_pending = true;
+        Ok(changed)
+    }
+
+    fn make_folder(&self, account: &Account, name: &str, parent: Option<&Label>, labels: &[Label]) -> Result<Label, ProviderError> {
+        let parent_path = parent.and_then(|p| p.provider_id.as_ref()).map(|p| p.0.clone());
+        self.with_session(|conn| {
+            let (delimiter, folders) = Self::delimiter_for(conn, parent_path.as_deref())?;
+            if let Some(problem) = folder_name_problem(name, &delimiter) {
+                return Err(ProviderError::Rejected(problem));
+            }
+            if let Some(p) = parent_path.as_deref().and_then(|p| folders.iter().find(|f| f.path == p)).filter(|f| !f.allows_children()) {
+                let shown = parent.map(|l| l.name.as_str()).unwrap_or(p.path.as_str());
+                return Err(ProviderError::Rejected(format!("This server doesn’t allow folders inside “{shown}”.")));
+            }
+            let leaf = folders::encode_mutf7(name);
+            let path = match &parent_path {
+                Some(p) => format!("{p}{delimiter}{leaf}"),
+                None => format!("{}{leaf}", Self::namespace_prefix(labels)),
+            };
+            if folders.iter().any(|f| f.path.eq_ignore_ascii_case(&path)) {
+                return Err(ProviderError::Rejected(format!("There is already a folder called “{name}” there.")));
+            }
+            conn.session().create(&path).map_err(|e| map_error(&e))?;
+            // Most servers list new folders without a subscription, but some clients
+            // (and some servers' LIST) only show subscribed ones.
+            let _ = conn.session().subscribe(&path);
+            conn.relist_pending = true;
+            info!("imap: created folder {path}");
+            Ok(Self::user_label(account, &path, &delimiter, labels, labels.len() as i32))
+        })
+    }
+
+    fn move_user_folder(&self, account: &Account, label: &Label, parent: Option<&Label>, labels: &[Label]) -> Result<Vec<RenamedFolder>, ProviderError> {
+        let Some(old) = label.provider_id.as_ref().filter(|_| label.kind == LabelKind::User).map(|p| p.0.clone()) else {
+            return Err(ProviderError::Rejected("only your own folders can be moved".into()));
+        };
+        let parent_path = match parent {
+            // Trash takes deleted folders, so they can be restored.
+            Some(p) if matches!(p.kind, LabelKind::User | LabelKind::Container | LabelKind::Inbox | LabelKind::Trash) => Some(p.provider_id.as_ref().map(|id| id.0.clone()).ok_or_else(|| ProviderError::Rejected("that folder isn’t on the server yet".into()))?),
+            Some(_) => return Err(ProviderError::Rejected("folders can go only inside your own folders, folder-only parents, the Inbox or Trash".into())),
+            None => None,
+        };
+        self.with_session(|conn| {
+            let (delimiter, folders) = Self::delimiter_for(conn, Some(&old))?;
+            let leaf = old.rsplit_once(delimiter.as_str()).map(|(_, leaf)| leaf).unwrap_or(&old).to_owned();
+            if let Some(p) = &parent_path {
+                if p == &old || p.starts_with(&format!("{old}{delimiter}")) {
+                    return Err(ProviderError::Rejected(format!("“{}” can’t go inside itself.", label.name)));
+                }
+                if folders.iter().find(|f| &f.path == p).is_some_and(|f| !f.allows_children()) {
+                    let shown = parent.map(|l| l.name.as_str()).unwrap_or(p.as_str());
+                    return Err(ProviderError::Rejected(format!("This server doesn’t allow folders inside “{shown}”.")));
+                }
+            }
+            let new = match &parent_path {
+                Some(p) => format!("{p}{delimiter}{leaf}"),
+                None => format!("{}{leaf}", Self::namespace_prefix(labels)),
+            };
+            if new == old {
+                return Ok(Vec::new());
+            }
+            if folders.iter().any(|f| f.path.eq_ignore_ascii_case(&new)) {
+                return Err(ProviderError::Rejected(format!("There is already a folder called “{}” there.", folders::decode_mutf7(&leaf))));
+            }
+            let changed = Self::rename_path(conn, account, label, (&old, &new), &delimiter, &folders, labels)?;
+            info!("imap: moved folder {old} to {new}");
+            Ok(changed)
+        })
+    }
+
+    fn rename_user_folder(&self, account: &Account, label: &Label, name: &str, labels: &[Label]) -> Result<Vec<RenamedFolder>, ProviderError> {
+        let Some(old) = label.provider_id.as_ref().filter(|_| label.kind == LabelKind::User).map(|p| p.0.clone()) else {
+            return Err(ProviderError::Rejected("only your own folders can be renamed".into()));
+        };
+        self.with_session(|conn| {
+            let (delimiter, folders) = Self::delimiter_for(conn, Some(&old))?;
+            if let Some(problem) = folder_name_problem(name, &delimiter) {
+                return Err(ProviderError::Rejected(problem));
+            }
+            let leaf = folders::encode_mutf7(name);
+            let new = match old.rsplit_once(delimiter.as_str()) {
+                Some((parent, _)) => format!("{parent}{delimiter}{leaf}"),
+                None => leaf,
+            };
+            if new == old {
+                return Ok(Vec::new());
+            }
+            if folders.iter().any(|f| f.path.eq_ignore_ascii_case(&new) && !f.path.eq_ignore_ascii_case(&old)) {
+                return Err(ProviderError::Rejected(format!("There is already a folder called “{name}” there.")));
+            }
+            let changed = Self::rename_path(conn, account, label, (&old, &new), &delimiter, &folders, labels)?;
+            info!("imap: renamed folder {old} to {new}");
+            Ok(changed)
+        })
+    }
+
+    fn delete_user_folder(&self, label: &Label) -> Result<(), ProviderError> {
+        let Some(path) = label.provider_id.as_ref().filter(|_| label.kind == LabelKind::User).map(|p| p.0.clone()) else {
+            return Err(ProviderError::Rejected("only your own folders can be deleted".into()));
+        };
+        self.with_session(|conn| {
+            Self::leave_folder(conn, &path)?;
+            conn.session().delete(&path).map_err(|e| map_error(&e))?;
+            let _ = conn.session().unsubscribe(&path);
+            conn.relist_pending = true;
+            info!("imap: deleted folder {path}");
+            Ok(())
+        })
+    }
+
+    /// "Empty Folder": `\Deleted` + expunge by the provider ids the operation carries (the
+    /// local rows are already gone). A folder that is gone or whose UIDVALIDITY changed is
+    /// skipped: its UIDs no longer name these messages.
+    fn delete_forever(&self, provider_ids: &[ProviderId]) -> Result<AppliedChanges, ProviderError> {
+        let mut groups: Vec<((String, u32), BTreeSet<u32>)> = Vec::new();
+        for r in provider_ids.iter().filter_map(MessageRef::parse) {
+            let key = (r.folder, r.uidvalidity);
+            match groups.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, uids)) => {
+                    uids.insert(r.uid);
+                }
+                None => groups.push((key, BTreeSet::from([r.uid]))),
+            }
+        }
+        if groups.is_empty() {
+            return Ok(AppliedChanges::default());
+        }
+        self.with_session(|conn| {
+            for ((path, uidvalidity), uids) in &groups {
+                if !conn.select_for(path, *uidvalidity)? {
+                    info!("imap: {path} changed under us; {} permanent deletes skipped", uids.len());
+                    continue;
+                }
+                Self::delete_and_expunge(conn, uids)?;
+            }
+            Ok(AppliedChanges::default())
+        })
+    }
+
+    /// Empties the folder of `kind` on the server: every message in it, not only the ones
+    /// the client has downloaded (a snapshot caches a few of Trash and Junk).
+    fn empty_folder(&self, labels: &[Label], kind: LabelKind) -> Result<AppliedChanges, ProviderError> {
+        let Some(path) = Self::kind_path(labels, kind) else {
+            return Err(ProviderError::Rejected("that folder is not on the server".into()));
+        };
+        self.with_session(|conn| {
+            let mailbox = conn.select(path)?;
+            if mailbox.exists > 0 {
+                conn.session().uid_store("1:*", "+FLAGS.SILENT (\\Deleted)").map_err(|e| map_error(&e))?;
+                conn.session().expunge().map_err(|e| map_error(&e))?;
+            }
+            Ok(AppliedChanges::default())
         })
     }
 
@@ -1454,6 +1920,30 @@ pub fn decode_part(mime_headers: &[u8], body: &[u8]) -> Vec<u8> {
 impl MailProvider for ImapProvider {
     fn supports_drafts(&self) -> bool { true }
 
+    fn manages_folders(&self) -> bool { true }
+
+    fn supports_delete_forever(&self) -> bool { true }
+
+    fn create_folder(&self, account: &Account, name: &str, parent: Option<&Label>, labels: &[Label]) -> BoxFuture<'_, Result<Label, ProviderError>> {
+        let (account, name, parent, labels) = (account.clone(), name.trim().to_owned(), parent.cloned(), labels.to_vec());
+        Box::pin(async move { self.make_folder(&account, &name, parent.as_ref(), &labels) })
+    }
+
+    fn rename_folder(&self, account: &Account, label: &Label, name: &str, labels: &[Label]) -> BoxFuture<'_, Result<Vec<RenamedFolder>, ProviderError>> {
+        let (account, label, name, labels) = (account.clone(), label.clone(), name.trim().to_owned(), labels.to_vec());
+        Box::pin(async move { self.rename_user_folder(&account, &label, &name, &labels) })
+    }
+
+    fn move_folder(&self, account: &Account, label: &Label, parent: Option<&Label>, labels: &[Label]) -> BoxFuture<'_, Result<Vec<RenamedFolder>, ProviderError>> {
+        let (account, label, parent, labels) = (account.clone(), label.clone(), parent.cloned(), labels.to_vec());
+        Box::pin(async move { self.move_user_folder(&account, &label, parent.as_ref(), &labels) })
+    }
+
+    fn delete_folder(&self, _account: &Account, label: &Label) -> BoxFuture<'_, Result<(), ProviderError>> {
+        let label = label.clone();
+        Box::pin(async move { self.delete_user_folder(&label) })
+    }
+
     fn list_drafts(&self, _account: &Account) -> BoxFuture<'_, Result<Vec<RemoteDraft>, ProviderError>> {
         Box::pin(async move { self.draft_listing() })
     }
@@ -1488,7 +1978,13 @@ impl MailProvider for ImapProvider {
     fn fetch_changes(&self, account: &Account, checkpoint: &str) -> BoxFuture<'_, Result<RemoteChanges, ProviderError>> {
         let account = account.clone();
         let checkpoint = checkpoint.to_owned();
-        Box::pin(async move { self.changes(&account, &checkpoint) })
+        Box::pin(async move { self.changes(&account, &checkpoint, false) })
+    }
+
+    fn verify_changes(&self, account: &Account, checkpoint: &str) -> BoxFuture<'_, Result<RemoteChanges, ProviderError>> {
+        let account = account.clone();
+        let checkpoint = checkpoint.to_owned();
+        Box::pin(async move { self.changes(&account, &checkpoint, true) })
     }
 
     fn fetch_messages(&self, account: &Account, ids: &[ProviderId], _labels: &[Label]) -> BoxFuture<'_, Result<Vec<Message>, ProviderError>> {
@@ -1552,9 +2048,45 @@ mod unit {
     }
 
     #[test]
+    fn a_folder_is_skipped_only_when_status_shows_nothing_changed() {
+        let read = FolderCursor { uidvalidity: 7, uid_next: 10, exists: 4, highest_modseq: 42, ..Default::default() };
+        let same = FolderStatus { uidvalidity: 7, uid_next: 10, exists: 4, highest_modseq: Some(42) };
+        assert!(folder_unchanged(&read, &same, true, true));
+        assert!(!folder_unchanged(&read, &FolderStatus { uid_next: 11, ..same }, true, false), "new mail");
+        assert!(!folder_unchanged(&read, &FolderStatus { exists: 3, ..same }, true, false), "a message left");
+        assert!(!folder_unchanged(&read, &FolderStatus { highest_modseq: Some(43), ..same }, true, false), "a flag changed");
+        assert!(!folder_unchanged(&read, &FolderStatus { uidvalidity: 8, ..same }, true, false), "UIDVALIDITY changed");
+        assert!(!folder_unchanged(&FolderCursor { fresh: true, ..read.clone() }, &same, true, false), "never read");
+        assert!(!folder_unchanged(&FolderCursor { uid_next: 0, ..read.clone() }, &same, true, false), "state unknown (old checkpoint)");
+        // Without CONDSTORE, flags only show by reading: skip unless the flag refresh is due.
+        let plain = FolderStatus { highest_modseq: None, ..same };
+        let read_plain = FolderCursor { highest_modseq: 0, ..read };
+        assert!(folder_unchanged(&read_plain, &plain, false, false));
+        assert!(!folder_unchanged(&read_plain, &plain, false, true));
+    }
+
+    #[test]
+    fn list_status_responses_give_folders_subscriptions_and_state() {
+        let data = b"* LIST (\\HasNoChildren \\Subscribed) \"/\" \"INBOX\"\r\n* STATUS \"INBOX\" (MESSAGES 4 UIDNEXT 10 UIDVALIDITY 7 HIGHESTMODSEQ 42)\r\n* LIST (\\Noselect \\HasChildren) \"/\" \"Work\"\r\n* LIST (\\HasNoChildren) \"/\" \"Work/Entw&APw-rfe\"\r\n* STATUS \"Work/Entw&APw-rfe\" (MESSAGES 0 UIDNEXT 1 UIDVALIDITY 9)\r\nA4 OK List completed.\r\n";
+        let (folders, statuses) = parse_list_status(data).expect("parsed");
+        let summary: Vec<(&str, bool)> = folders.iter().map(|f| (f.path.as_str(), f.subscribed)).collect();
+        assert_eq!(summary, vec![("INBOX", true), ("Work", false), ("Work/Entw&APw-rfe", false)]);
+        assert!(!folders[1].selectable());
+        assert_eq!(statuses["INBOX"], FolderStatus { uidvalidity: 7, uid_next: 10, exists: 4, highest_modseq: Some(42) });
+        assert_eq!(statuses["Work/Entw&APw-rfe"], FolderStatus { uidvalidity: 9, uid_next: 1, exists: 0, highest_modseq: None });
+        assert!(!statuses.contains_key("Work"), "a \\Noselect folder has no STATUS");
+    }
+
+    #[test]
+    fn a_list_status_line_that_cannot_be_read_gives_no_list_rather_than_part_of_one() {
+        let data = b"* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n* LIST (((garbage\r\n* LIST (\\HasNoChildren) \"/\" \"Work\"\r\nA4 OK List completed.\r\n";
+        assert!(parse_list_status(data).is_none(), "Work would otherwise look deleted");
+    }
+
+    #[test]
     fn checkpoint_round_trips_and_rejects_other_versions() {
         let mut cp = Checkpoint { version: Checkpoint::VERSION, listed_at: 5, cycle: 2, folders: BTreeMap::new() };
-        cp.folders.insert("INBOX".into(), FolderCursor { kind: "inbox".into(), uidvalidity: 7, highest_uid: 9, highest_modseq: 42, known: "3:9".into(), seen: "3:5".into(), flagged: "9".into(), delimiter: Some("/".into()), special_use: None, subscribed: true, fresh: false });
+        cp.folders.insert("INBOX".into(), FolderCursor { kind: "inbox".into(), uidvalidity: 7, highest_uid: 9, highest_modseq: 42, known: "3:9".into(), seen: "3:5".into(), flagged: "9".into(), delimiter: Some("/".into()), special_use: None, subscribed: true, fresh: false, uid_next: 10, exists: 7 });
         let json = cp.to_json();
         assert_eq!(Checkpoint::parse(&json).unwrap(), cp);
         assert_eq!(Checkpoint::parse("12345"), Err(ProviderError::CheckpointExpired), "a Gmail history id is not ours");
@@ -1564,6 +2096,7 @@ mod unit {
         assert_eq!((rows[0].path.as_str(), rows[0].uidvalidity, rows[0].highest_uid, rows[0].highest_modseq, rows[0].delimiter.as_deref()), ("INBOX", Some(7), 9, Some(42), Some("/")));
         let old: Checkpoint = Checkpoint::parse(r#"{"version":1,"folders":{"INBOX":{"kind":"inbox","uidvalidity":7,"highest_uid":9,"known":"3:9"}}}"#).unwrap();
         assert_eq!(old.folders["INBOX"].highest_modseq, 0, "a checkpoint written before CONDSTORE support still parses");
+        assert_eq!((old.folders["INBOX"].uid_next, old.folders["INBOX"].exists), (0, 0), "one written before STATUS skipping reads every folder once");
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! same transaction. The sync engine replays operations per account in `seq` order.
 
 use crate::ids::*;
+use crate::model::LabelKind;
 use crate::time::Timestamp;
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +23,16 @@ pub enum OperationKind {
     Trash { message_ids: Vec<MessageId> },
     /// Restore from Trash to Inbox.
     Untrash { message_ids: Vec<MessageId> },
+    /// Delete for good ("Empty Folder"). The local rows go at once, so unlike the other
+    /// changes this one carries the provider ids the server needs. With `folder` the
+    /// server empties that whole folder, including messages the client never downloaded.
+    DeleteForever {
+        message_ids: Vec<MessageId>,
+        #[serde(default)]
+        provider_ids: Vec<ProviderId>,
+        #[serde(default)]
+        folder: Option<LabelKind>,
+    },
     /// Submit a queued draft. The draft row holds the content.
     SendDraft { draft_id: DraftId },
     /// Answer an invitation.
@@ -71,6 +82,9 @@ impl OperationKind {
             OperationKind::Archive { message_ids } => format!("Archive {}", n(message_ids)),
             OperationKind::Trash { message_ids } => format!("Delete {}", n(message_ids)),
             OperationKind::Untrash { message_ids } => format!("Restore {}", n(message_ids)),
+            OperationKind::DeleteForever { folder: Some(LabelKind::Spam), .. } => "Empty Junk".into(),
+            OperationKind::DeleteForever { folder: Some(kind), .. } => format!("Empty {}", crate::text::capitalize(kind.as_key())),
+            OperationKind::DeleteForever { message_ids, .. } => format!("Permanently delete {}", n(message_ids)),
             OperationKind::SendDraft { .. } => "Send message".to_owned(),
             OperationKind::RespondToEvent { response, .. } => format!("Respond to invitation ({})", response.label()),
             OperationKind::CreateEvent { .. } => "Create event".to_owned(),
@@ -116,7 +130,8 @@ impl OperationKind {
             | OperationKind::RemoveLabel { message_ids, .. }
             | OperationKind::Archive { message_ids }
             | OperationKind::Trash { message_ids }
-            | OperationKind::Untrash { message_ids } => message_ids,
+            | OperationKind::Untrash { message_ids }
+            | OperationKind::DeleteForever { message_ids, .. } => message_ids,
             OperationKind::SendDraft { .. }
             | OperationKind::RespondToEvent { .. }
             | OperationKind::CreateEvent { .. }

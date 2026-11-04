@@ -13,7 +13,7 @@ pub(crate) enum PaletteCommand {
     Action(Rc<dyn Action>),
     Module(Module),
     View(MailboxView),
-    MoveTo(LabelId),
+    MoveTo(MailboxView),
     Account(AccountId),
     Settings(SettingsPage),
 }
@@ -22,10 +22,22 @@ pub(crate) enum PaletteCommand {
 pub(crate) struct PaletteEntry {
     pub title: SharedString,
     pub hint: Option<SharedString>,
+    /// A heading drawn above the entry when the one before it belongs to another group.
+    pub section: Option<SharedString>,
+    /// An icon drawn before the title.
+    pub icon: Option<&'static str>,
     pub command: PaletteCommand,
 }
 
+/// What the palette lists: every command, or only places mail can be moved to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaletteMode {
+    Commands,
+    MoveTo,
+}
+
 pub(crate) struct CommandPalette {
+    pub mode: PaletteMode,
     pub input: Entity<InputState>,
     pub selected: usize,
     pub _subscription: Subscription,
@@ -61,6 +73,8 @@ impl MailWindow {
         let entry = |title: &str, hint: Option<&str>, command: PaletteCommand| PaletteEntry {
             title: SharedString::from(title.to_owned()),
             hint: hint.map(|h| SharedString::from(h.to_owned())),
+            section: None,
+            icon: None,
             command,
         };
         let action = |a: Box<dyn Action>| PaletteCommand::Action(Rc::from(a));
@@ -73,6 +87,8 @@ impl MailWindow {
             entry("Delete", Some("Del"), action(Box::new(TrashSelected))),
             entry("Mark read or unread", Some("U"), action(Box::new(ToggleRead))),
             entry("Star or unstar", Some("S"), action(Box::new(ToggleStar))),
+            entry("Undo", Some("Ctrl+Z"), action(Box::new(UndoLast))),
+            entry("Show change history", Some("Ctrl+H"), action(Box::new(ShowHistory))),
             entry("Search mail", Some("Ctrl+E"), action(Box::new(FocusSearch))),
             entry("Sync now", Some("F5"), action(Box::new(SyncNow))),
             entry("New event", Some("Ctrl+Shift+A"), action(Box::new(NewEventAction))),
@@ -80,6 +96,9 @@ impl MailWindow {
             entry("Go to Calendar", Some("Ctrl+2"), PaletteCommand::Module(Module::Calendar)),
             entry("Go to Contacts", Some("Ctrl+3"), PaletteCommand::Module(Module::Contacts)),
         ];
+        if self.renamable_open_folder().is_some() {
+            out.push(entry("Rename folder", Some("F2"), action(Box::new(RenameFolder))));
+        }
         for (name, kind) in [
             ("Inbox", LabelKind::Inbox),
             ("Starred", LabelKind::Starred),
@@ -97,9 +116,10 @@ impl MailWindow {
         for l in &user {
             out.push(entry(&format!("Go to {}", l.name), Some("label"), PaletteCommand::View(MailboxView::Label(l.id.clone()))));
         }
-        if !self.thread.is_empty() {
+        if self.multi_selected() || !self.thread.is_empty() {
+            out.push(entry("Move to…", Some("V"), action(Box::new(MoveSelected))));
             for l in &user {
-                out.push(entry(&format!("Move to {}", l.name), Some("label"), PaletteCommand::MoveTo(l.id.clone())));
+                out.push(entry(&format!("Move to {}", l.name), Some("label"), PaletteCommand::MoveTo(MailboxView::Label(l.id.clone()))));
             }
         }
         for a in self.accounts.iter().filter(|a| a.id != self.account.id) {
@@ -111,8 +131,46 @@ impl MailWindow {
         out
     }
 
+    /// The Move picker: the last few destinations first, then every folder, filtered by
+    /// what is typed.
+    pub(crate) fn move_entries(&self) -> Vec<PaletteEntry> {
+        let all = self.move_destinations();
+        // Recent rows wear a clock, folder rows the icon the sidebar gives them.
+        let entry = |view: &MailboxView, name: &str, recent: bool| PaletteEntry {
+            title: SharedString::from(name.to_owned()),
+            hint: matches!(view, MailboxView::Label(_)).then(|| SharedString::from("label")),
+            section: Some(SharedString::from(if recent { "Recent" } else { "Folders" })),
+            icon: Some(match (recent, view) {
+                (true, _) => "clock",
+                (false, MailboxView::Kind(kind)) => super::sidebar::system_folder(*kind).map(|(_, icon)| icon).unwrap_or("folder"),
+                (false, MailboxView::Label(_)) => "folder",
+            }),
+            command: PaletteCommand::MoveTo(view.clone()),
+        };
+        let mut out: Vec<PaletteEntry> = self
+            .recent_moves
+            .iter()
+            .filter_map(|r| all.iter().find(|(v, _)| v == r))
+            .map(|(v, name)| entry(v, name, true))
+            .collect();
+        out.extend(all.iter().map(|(v, name)| entry(v, name, false)));
+        out
+    }
+
+    pub(crate) fn open_move_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_palette_in(PaletteMode::MoveTo, window, cx);
+    }
+
     pub(crate) fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Type a command, mailbox or label"));
+        self.open_palette_in(PaletteMode::Commands, window, cx);
+    }
+
+    fn open_palette_in(&mut self, mode: PaletteMode, window: &mut Window, cx: &mut Context<Self>) {
+        let placeholder = match mode {
+            PaletteMode::Commands => "Type a command, mailbox or label",
+            PaletteMode::MoveTo => "Move to…",
+        };
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         let subscription = cx.subscribe_in(&input, window, |this, _state, event: &InputEvent, window, cx| match event {
             InputEvent::Change => {
                 if let Some(p) = this.palette.as_mut() {
@@ -124,7 +182,7 @@ impl MailWindow {
             _ => {}
         });
         input.update(cx, |s, cx| s.focus(window, cx));
-        self.palette = Some(CommandPalette { input, selected: 0, _subscription: subscription });
+        self.palette = Some(CommandPalette { mode, input, selected: 0, _subscription: subscription });
         cx.notify();
     }
 
@@ -137,7 +195,21 @@ impl MailWindow {
     fn palette_matches(&self, cx: &App) -> Vec<PaletteEntry> {
         let Some(p) = &self.palette else { return Vec::new() };
         let query = p.input.read(cx).value().to_string();
-        filter_entries(&self.palette_entries(), &query)
+        let entries = match p.mode {
+            PaletteMode::Commands => self.palette_entries(),
+            // A recent destination is listed under Recent and under Folders. Headings go
+            // once something is typed, so only the Recent row is kept then.
+            PaletteMode::MoveTo if !query.trim().is_empty() => {
+                let mut seen: Vec<MailboxView> = Vec::new();
+                self.move_entries().into_iter().filter(|e| match &e.command {
+                    PaletteCommand::MoveTo(v) if seen.contains(v) => false,
+                    PaletteCommand::MoveTo(v) => { seen.push(v.clone()); true }
+                    _ => true,
+                }).collect()
+            }
+            PaletteMode::MoveTo => self.move_entries(),
+        };
+        filter_entries(&entries, &query)
     }
 
     fn move_palette_selection(&mut self, delta: i32, cx: &mut Context<Self>) {
@@ -166,9 +238,9 @@ impl MailWindow {
                 self.set_module(Module::Mail, window, cx);
                 self.select_view(view, window, cx);
             }
-            PaletteCommand::MoveTo(label) => {
-                let ids = self.selected_message_ids();
-                self.move_to_label(ids, label, window, cx);
+            PaletteCommand::MoveTo(view) => {
+                let drag = ConversationDrag { mail: DraggedMail::Selection, title: String::new(), count: 0 };
+                self.drop_on_view(drag, view, window, cx);
             }
             PaletteCommand::Account(id) => self.switch_account(id, window, cx),
             PaletteCommand::Settings(page) => self.open_settings(page, window, cx),
@@ -180,23 +252,42 @@ impl MailWindow {
         let Some(state) = &self.palette else { return div().into_any_element() };
         let matches = self.palette_matches(cx);
         let selected = state.selected.min(matches.len().saturating_sub(1));
-        let rows = matches.into_iter().take(PALETTE_ROWS).enumerate().map(|(i, e)| {
+        // Headings only while browsing: once filtered, the groups no longer mean much.
+        let headings = state.input.read(cx).value().trim().is_empty();
+        let mut last_section: Option<SharedString> = None;
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (i, e) in matches.into_iter().take(PALETTE_ROWS).enumerate() {
+            if headings && e.section.is_some() && e.section != last_section {
+                let heading = e.section.clone().expect("checked");
+                // A rule closes the group before, so Recent reads as its own block.
+                if i > 0 {
+                    rows.push(div().mx(px(12.)).mt(px(6.)).h(px(1.)).bg(p.divider).into_any_element());
+                }
+                rows.push(div().px(px(12.)).pt(px(if i == 0 { 2. } else { 8. })).pb(px(2.)).text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).text_color(p.muted).child(heading).into_any_element());
+                last_section = e.section.clone();
+            }
             let command = e.command.clone();
-            h_flex()
-                .id(SharedString::from(format!("palette-{i}")))
-                .items_center()
-                .justify_between()
-                .px(px(12.))
-                .h(px(34.))
-                .rounded(px(6.))
-                .cursor_pointer()
-                .text_size(px(13.))
-                .when(i == selected, |d| d.bg(p.selection).text_color(p.accent))
-                .when(i != selected, |d| d.hover(|d| d.bg(p.hover)))
-                .child(e.title.clone())
-                .children(e.hint.clone().map(|h| div().text_size(px(11.)).text_color(p.muted).child(h)))
-                .on_click(cx.listener(move |this, _, window, cx| this.run_palette_command(command.clone(), window, cx)))
-        });
+            rows.push(
+                h_flex()
+                    .id(SharedString::from(format!("palette-{i}")))
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .px(px(12.))
+                    .h(px(34.))
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .text_size(px(13.))
+                    .when(i == selected, |d| d.bg(p.selection).text_color(p.accent))
+                    .when(i != selected, |d| d.hover(|d| d.bg(p.hover)))
+                    .children(e.icon.map(|name| crate::assets::icon(name).size(px(15.)).text_color(if i == selected { p.accent } else { p.muted }).into_any_element()))
+                    // Folder paths can be long: the name gives way, the hint keeps its place.
+                    .child(div().flex_1().min_w_0().truncate().child(e.title.clone()))
+                    .children(e.hint.clone().map(|h| div().flex_none().text_size(px(11.)).text_color(p.muted).child(h)))
+                    .on_click(cx.listener(move |this, _, window, cx| this.run_palette_command(command.clone(), window, cx)))
+                    .into_any_element(),
+            );
+        }
         div()
             .id("palette-backdrop")
             .absolute()
@@ -255,7 +346,7 @@ mod tests {
     fn entries(titles: &[&str]) -> Vec<PaletteEntry> {
         titles
             .iter()
-            .map(|t| PaletteEntry { title: SharedString::from(t.to_string()), hint: None, command: PaletteCommand::Module(Module::Mail) })
+            .map(|t| PaletteEntry { title: SharedString::from(t.to_string()), hint: None, section: None, icon: None, command: PaletteCommand::Module(Module::Mail) })
             .collect()
     }
 

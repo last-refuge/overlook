@@ -82,8 +82,7 @@ pub fn seed_sample_account(store: &Store) -> anyhow::Result<Account> {
     Ok(account)
 }
 
-/// Opens the profile database and makes sure at least one account exists so the shell
-/// always has local mail to work with offline.
+/// Opens the profile database. With no accounts yet, the window offers the sample mailbox.
 fn open_store() -> anyhow::Result<(Arc<Store>, Vec<Account>)> {
     let dir = data_dir();
     let store = Store::open(&dir.join("overlook.sqlite"))?;
@@ -102,10 +101,11 @@ fn open_store() -> anyhow::Result<(Arc<Store>, Vec<Account>)> {
         }
     }
     store.project_calendar_time_zone(&previous_zone, &overlook_core::tz::current_definition())?;
-    let mut accounts = store.accounts()?;
-    if accounts.is_empty() {
-        accounts.push(seed_sample_account(&store)?);
+    // Old undo history goes; a failure here only keeps it longer.
+    if let Err(e) = store.prune_history() {
+        tracing::warn!("could not prune the change history: {e}");
     }
+    let accounts = store.accounts()?;
     Ok((Arc::new(store), accounts))
 }
 
@@ -264,12 +264,17 @@ fn main() {
             return;
         }
     }
+    if args.iter().any(|a| a == "--reload-theme") {
+        // Omarchy's theme-set hook: running instances re-read the theme; nothing starts.
+        single_instance::broadcast(single_instance::RELOAD_THEME);
+        return;
+    }
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("overlook {}", env!("CARGO_PKG_VERSION"));
         return;
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("Overlook {} — a clear view of what matters.\n\nUsage: overlook [mailto:…] [--version] [--help]\n\nEnvironment:\n  OVERLOOK_DATA_DIR      profile directory (default ~/.local/share/overlook)\n  OVERLOOK_CONFIG_DIR    directory holding google-oauth-client.json (default ~/.config/overlook)\n  OVERLOOK_SIGN_IN=gmail start the Google sign-in at launch (imap / pop3: open that account setup)\n  OVERLOOK_BROWSER_BIN  compatible Chromium executable (default PATH discovery){}", env!("CARGO_PKG_VERSION"), if cfg!(debug_assertions) { "\n  RUST_LOG=overlook=debug tracing output (development builds only)" } else { "" });
+        println!("Overlook {} — a clear view of what matters.\n\nUsage: overlook [mailto:…] [--reload-theme] [--version] [--help]\n\nEnvironment:\n  OVERLOOK_DATA_DIR      profile directory (default ~/.local/share/overlook)\n  OVERLOOK_CONFIG_DIR    directory holding google-oauth-client.json (default ~/.config/overlook)\n  OVERLOOK_SIGN_IN=gmail start the Google sign-in at launch (imap / pop3: open that account setup)\n  OVERLOOK_BROWSER_BIN  compatible Chromium executable (default PATH discovery){}", env!("CARGO_PKG_VERSION"), if cfg!(debug_assertions) { "\n  RUST_LOG=overlook=debug tracing output (development builds only)" } else { "" });
         return;
     }
     init_logging();
@@ -284,6 +289,7 @@ fn main() {
     };
     tracing::debug!("startup: store open after {} ms", since_start_ms());
     single_instance::listen();
+    theme::install_omarchy_hook();
     if let Some(link) = mailto {
         single_instance::push(link);
     }
@@ -324,12 +330,12 @@ fn main() {
             window_min_size: Some(size(px(880.), px(560.))),
             ..TitleBar::window_options()
         };
-        let active: AccountId = store
+        let active: Option<AccountId> = store
             .setting::<AccountId>("active_account")
             .ok()
             .flatten()
             .filter(|id| accounts.iter().any(|a| &a.id == id))
-            .unwrap_or_else(|| accounts[0].id.clone());
+            .or_else(|| accounts.first().map(|a| a.id.clone()));
         let store = store.clone();
         let accounts = accounts.clone();
         let provider = provider.clone();

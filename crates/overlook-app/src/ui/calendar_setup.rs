@@ -173,7 +173,7 @@ impl MailWindow {
                                 let _ = this.update(cx, |this, cx| {
                                     let mut prefs = this.account_prefs_for(&account);
                                     prefs.default_calendar = Some(key.clone());
-                                    this.save_account_prefs(&account, prefs);
+                                    this.save_account_prefs(&account, prefs, cx);
                                     cx.notify();
                                 });
                             }));

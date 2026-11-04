@@ -1,5 +1,6 @@
 //! Customizable command strip and its overflow. Both surfaces execute the same commands.
 use super::*;
+use super::shell::{header_height, HEADER_CONTROL_HEIGHT};
 use crate::assets::{color_icon, color_icon_on_action, ColorIcon as C};
 use gpui_kit::base::actions::Confirm;
 use gpui_kit::component::button::ButtonCustomVariant;
@@ -89,7 +90,7 @@ impl MailWindow {
             A::NewMessage => ("New message", Color(C::Compose), "Ctrl N"),
             A::Archive => ("Archive", Color(C::Archive), "E"),
             A::DeleteMail => ("Delete", Color(C::Delete), "Del"),
-            A::MoveMail => ("Move to", Color(C::Move), ""),
+            A::MoveMail => ("Move to", Color(C::Move), "V"),
             A::ToggleRead => ("Mark unread", Color(C::Mail), "Ctrl U"),
             A::ToggleStar => ("Star", Color(C::Star), "S"),
             A::Reply => ("Reply", Color(C::Reply), "Ctrl R"),
@@ -128,8 +129,9 @@ impl MailWindow {
         };
         let reading = self.outbox_selected.is_none()
             && (self.composer.is_none() || self.composer_is_inline());
-        let active = reading && self.selected_summary().is_some() && !self.thread.is_empty();
-        let (trash, inbox) = self.thread_state();
+        let multi = self.multi_selected();
+        let active = reading && (multi || (self.selected_summary().is_some() && !self.thread.is_empty()));
+        let (trash, inbox) = self.removal_state();
         match action {
             A::Archive => {
                 command.enabled = active;
@@ -139,27 +141,30 @@ impl MailWindow {
                 }
             }
             A::DeleteMail => command.enabled = active && !trash,
-            A::MoveMail | A::Reply | A::ReplyAll | A::Forward => command.enabled = active,
+            A::MoveMail => command.enabled = active,
+            A::Reply | A::ReplyAll | A::Forward => command.enabled = active && !multi,
             A::ToggleRead => {
                 command.enabled = active;
-                if self.thread.iter().any(|m| !m.is_read) {
+                let any_unread = if multi { self.selection_state().any_unread } else { self.thread.iter().any(|m| !m.is_read) };
+                if any_unread {
                     command.label = "Mark read".into();
                     command.glyph = Color(C::Read);
                 }
             }
             A::ToggleStar => {
                 command.enabled = active;
-                command.selected = self.selected_summary().is_some_and(|s| s.starred);
+                command.selected = if multi { self.selection_state().all_starred } else { self.selected_summary().is_some_and(|s| s.starred) };
                 if command.selected {
                     command.label = "Unstar".into();
                 }
             }
-            A::JumpLatest => command.enabled = active && self.thread.len() > 1,
+            A::JumpLatest => command.enabled = active && !multi && self.thread.len() > 1,
             A::PreviousConversation | A::NextConversation => {
                 command.enabled = reading && !self.conversations.is_empty()
             }
             A::MoveFocus | A::AlwaysMoveFocus => {
                 command.enabled = active
+                    && !multi
                     && self.focused_enabled
                     && self.view == MailboxView::Kind(LabelKind::Inbox);
                 if self.inbox_tab != FocusTab::Focused && action == A::MoveFocus {
@@ -306,7 +311,8 @@ impl MailWindow {
                 }
             }
             A::Sync => self.sync_now(window, cx),
-            A::MoveMail | A::Appearance | A::Layout | A::Unknown => {}
+            A::MoveMail => self.open_move_palette(window, cx),
+            A::Appearance | A::Layout | A::Unknown => {}
         }
         cx.notify();
     }
@@ -341,7 +347,7 @@ impl MailWindow {
         let button = Button::new(SharedString::from(format!("toolbar-{action:?}")))
             .ghost()
             .small()
-            .h(px(34.))
+            .h(px(if in_more { 34. } else { HEADER_CONTROL_HEIGHT }))
             .px(px(8.))
             .flex_none()
             .accessibility_label(label.clone())
@@ -380,7 +386,6 @@ impl MailWindow {
             return button.into_any_element();
         }
         match action {
-            A::MoveMail => self.mail_move_menu(button, cx).into_any_element(),
             A::Appearance => self.appearance_menu(button, cx).into_any_element(),
             A::Layout => self.layout_menu(button, cx).into_any_element(),
             _ => button
@@ -506,11 +511,10 @@ impl MailWindow {
         let toolbar = h_flex()
             .w_full()
             .flex_none()
-            .min_h(px(54.))
+            .h(px(header_height(self.density)))
             .items_center()
             .gap(px(2.))
             .px(px(8.))
-            .py(px(7.))
             .rounded(px(8.))
             .bg(p.message_surface())
             .shadow_sm()
@@ -529,7 +533,7 @@ impl MailWindow {
                     .id("toolbar-drop-end")
                     .flex_1()
                     .min_w(px(22.))
-                    .h(px(34.))
+                    .h(px(HEADER_CONTROL_HEIGHT))
                     .rounded(px(5.))
                     .can_drop(move |value, _, _| {
                         value
@@ -566,7 +570,7 @@ impl MailWindow {
         let trigger = Button::new("toolbar-more-button")
             .ghost()
             .small()
-            .h(px(34.))
+            .h(px(HEADER_CONTROL_HEIGHT))
             .w(px(36.))
             .icon(icon("ellipsis").size(px(19.)))
             .accessibility_label("More actions and toolbar customization")

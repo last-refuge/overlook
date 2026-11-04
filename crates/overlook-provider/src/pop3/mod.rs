@@ -344,7 +344,7 @@ impl Pop3Provider {
             _ => Checkpoint::parse(checkpoint),
         })?;
         let (upserts, message_ids, checkpoint) = self.run_cycle(account, cp)?;
-        Ok(RemoteChanges { labels: None, upserts, deleted: Vec::new(), deleted_provider_ids: Vec::new(), message_ids, checkpoint: Some(checkpoint) })
+        Ok(RemoteChanges { labels: None, upserts, deleted: Vec::new(), deleted_provider_ids: Vec::new(), message_ids, checkpoint: Some(checkpoint), complete: None, untracked: Vec::new() })
     }
 
     /// Full messages: from disk when the `.eml` exists, otherwise `RETR` (saved first). Ids

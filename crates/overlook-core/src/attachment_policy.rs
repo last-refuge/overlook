@@ -110,6 +110,39 @@ pub fn blocked_extension(filename: &str) -> Option<String> {
     BLOCKED_EXTENSIONS.contains(&extension).then(|| extension.to_owned())
 }
 
+/// Types that are not executable themselves but commonly carry something that is:
+/// archives (checked one level deep when sending, not when receiving), macro-enabled
+/// Office documents, and web pages or shortcuts that can redirect to a phishing site.
+pub const CAUTION_EXTENSIONS: &[&str] = &[
+    "zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz", "zst", "z", "arj", "lz", "lzh", "cab",
+    "docm", "dotm", "xlsm", "xltm", "xlam", "pptm", "potm", "ppam", "sldm", "xla", "one",
+    "htm", "html", "xhtml", "mht", "mhtml", "svg", "url", "webloc", "reg", "inf", "ics", "rtf",
+];
+
+/// How warily an attachment's extension should be treated in the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Risk {
+    /// Ordinary documents and media.
+    Safe,
+    /// Could contain or lead to something harmful; worth a second look at the sender.
+    Caution,
+    /// A program, script or installer: never opened from Overlook.
+    Dangerous,
+}
+
+/// Classifies a filename by its extension, with the same spoof handling as
+/// [`blocked_extension`].
+pub fn risk(filename: &str) -> Risk {
+    if blocked_extension(filename).is_some() {
+        return Risk::Dangerous;
+    }
+    let name = filename.rsplit(['/', '\\']).next().unwrap_or(filename).trim_end_matches(['.', ' ']).to_ascii_lowercase();
+    match name.rsplit_once('.') {
+        Some((_, ext)) if CAUTION_EXTENSIONS.contains(&ext) => Risk::Caution,
+        _ => Risk::Safe,
+    }
+}
+
 /// Recognizes programs and scripts by their first bytes.
 pub fn is_executable_content(content: &[u8]) -> bool {
     const MAGICS: &[&[u8]] = &[
@@ -320,6 +353,20 @@ mod tests {
             encoder.finish().unwrap();
         }
         assert_eq!(check_outgoing("src.tar.gz", &gz), Err(Refusal::BlockedInArchive { entry: "payload.exe".into() }));
+    }
+
+    #[test]
+    fn risk_tiers_by_extension() {
+        use super::{risk, Risk};
+        assert_eq!(risk("notes.txt"), Risk::Safe);
+        assert_eq!(risk("report.pdf"), Risk::Safe);
+        assert_eq!(risk("README"), Risk::Safe);
+        assert_eq!(risk("photos.zip"), Risk::Caution);
+        assert_eq!(risk("budget.XLSM"), Risk::Caution);
+        assert_eq!(risk("invoice.html"), Risk::Caution);
+        assert_eq!(risk("setup.exe"), Risk::Dangerous);
+        assert_eq!(risk("report.pdf.exe "), Risk::Dangerous);
+        assert_eq!(risk("install.sh"), Risk::Dangerous);
     }
 
     #[test]

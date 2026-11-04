@@ -27,6 +27,77 @@ pub struct SyncOutcome {
     pub uncertain: Vec<String>,
     pub failed: Vec<String>,
     pub stopped_offline: bool,
+    /// A verifying sync ran (start-up or the Sync button).
+    pub verified: bool,
+    /// The check compared the store with the provider's full list. Only providers that can
+    /// list everything (IMAP) do; for the others a verifying sync is an ordinary one.
+    pub compared: bool,
+    /// What the check repaired: stale rows removed, missing messages queued, flags fixed.
+    pub repaired: usize,
+}
+
+/// What a verifying sync must change so the store matches the provider's full list.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Repair {
+    /// Stored, but the provider no longer has them.
+    pub stale: Vec<MessageId>,
+    /// The provider has them, the store doesn't.
+    pub missing: Vec<ProviderId>,
+    /// Read/starred as the provider has them, where the store differs.
+    pub flags: Vec<(MessageId, bool, bool)>,
+}
+
+impl Repair {
+    pub fn len(&self) -> usize {
+        self.stale.len() + self.missing.len() + self.flags.len()
+    }
+}
+
+/// Compares the store's rows (`id, provider id, read, starred`) with the provider's full
+/// list: `complete` is what it tracks, with flags; `untracked` what it holds beyond that
+/// (older mail, search results), which is neither stale nor to be downloaded. Messages with a
+/// local change still on its way (`protected`) are left alone, and so are local-only Sent
+/// copies, which no server listing contains. `withheld` are provider ids a queued change
+/// removed locally before the server did (Empty Folder): they are not downloaded again.
+pub(crate) fn plan_repair(
+    rows: &[(MessageId, ProviderId, bool, bool)],
+    complete: &[overlook_provider::RemoteState],
+    untracked: &[ProviderId],
+    protected: &std::collections::BTreeSet<MessageId>,
+    withheld: &std::collections::HashSet<ProviderId>,
+) -> Repair {
+    let remote: std::collections::HashMap<&ProviderId, &overlook_provider::RemoteState> = complete.iter().map(|s| (&s.provider_id, s)).collect();
+    let held: std::collections::HashSet<&ProviderId> = untracked.iter().collect();
+    let local: std::collections::HashSet<&ProviderId> = rows.iter().map(|(_, pid, _, _)| pid).collect();
+    let mut repair = Repair::default();
+    for (id, pid, read, starred) in rows {
+        if protected.contains(id) || overlook_provider::imap::is_local_placeholder(pid) {
+            continue;
+        }
+        match remote.get(pid) {
+            None if held.contains(pid) => {}
+            None => repair.stale.push(id.clone()),
+            Some(s) if s.read != *read || s.starred != *starred => repair.flags.push((id.clone(), s.read, s.starred)),
+            Some(_) => {}
+        }
+    }
+    repair.missing = complete.iter().filter(|s| !local.contains(&s.provider_id) && !withheld.contains(&s.provider_id)).map(|s| s.provider_id.clone()).collect();
+    repair
+}
+
+/// Provider ids that queued permanent deletions carry: their rows are already gone, and the
+/// server still has them until the deletion replays.
+fn pending_deletions(store: &Store, account: &AccountId) -> std::collections::HashSet<ProviderId> {
+    store
+        .pending_operations(account)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|op| match op.kind {
+            OperationKind::DeleteForever { provider_ids, .. } => Some(provider_ids),
+            _ => None,
+        })
+        .flatten()
+        .collect()
 }
 
 /// Recorded on a send operation the provider could neither confirm nor rule out.
@@ -337,7 +408,7 @@ fn pending_moves(store: &Store, account: &AccountId) -> std::collections::BTreeS
 /// `deferred` collects messages whose remote deletion was held back for a pending move,
 /// with the provider id that vanished; `run_sync` deletes them after the replay when the
 /// move could not find them either.
-fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outcome: &mut SyncOutcome, deferred: &mut Vec<(MessageId, ProviderId)>) -> Result<usize, ProviderError> {
+fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outcome: &mut SyncOutcome, deferred: &mut Vec<(MessageId, ProviderId)>, verify: bool) -> Result<usize, ProviderError> {
     let acct = &account.id;
     let protected = store.pending_message_ids(acct).unwrap_or_default();
     let moving = pending_moves(store, acct);
@@ -378,7 +449,7 @@ fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outco
     };
 
     match checkpoint {
-        Some(cp) if have_messages => match pollster_block(provider.fetch_changes(account, &cp)) {
+        Some(cp) if have_messages => match pollster_block(if verify { provider.verify_changes(account, &cp) } else { provider.fetch_changes(account, &cp) }) {
             Ok(mut changes) => {
                 if let Some(labels) = &changes.labels {
                     store.replace_labels(acct, labels).map_err(|e| ProviderError::Temporary(e.to_string()))?;
@@ -409,6 +480,26 @@ fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outco
                 if !changes.message_ids.is_empty() {
                     enqueue_bodies(store, acct, std::mem::take(&mut changes.message_ids));
                 }
+                if let Some(complete) = changes.complete.take() {
+                    // Pending changes may have been queued meanwhile; read them again.
+                    let protected = store.pending_message_ids(acct).unwrap_or_default();
+                    let withheld = pending_deletions(store, acct);
+                    let rows = store.message_states(acct).unwrap_or_default();
+                    let repair = plan_repair(&rows, &complete, &changes.untracked, &protected, &withheld);
+                    if repair.len() > 0 {
+                        info!("sync check for {}: {} stale, {} missing, {} flags fixed", account.email, repair.stale.len(), repair.missing.len(), repair.flags.len());
+                    }
+                    if !repair.stale.is_empty() {
+                        store.delete_messages(&repair.stale).map_err(|e| ProviderError::Temporary(e.to_string()))?;
+                    }
+                    if !repair.flags.is_empty() {
+                        store.set_remote_flags(acct, &repair.flags).map_err(|e| ProviderError::Temporary(e.to_string()))?;
+                    }
+                    outcome.repaired += repair.len();
+                    outcome.compared = true;
+                    enqueue(store, acct, repair.missing, true);
+                }
+                outcome.verified |= verify;
                 drain_backlog(store, provider, account, outcome)?;
                 extend_coverage(outcome)?;
                 // One-time: re-fetch messages whose calendar part was stored before
@@ -678,7 +769,9 @@ async fn replay_operations(
     final_state
 }
 
-pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calendar: Option<Arc<dyn CalendarProvider>>, account: Account) -> SyncOutcome {
+/// One sync of an account. `verify` checks everything against the provider and repairs
+/// drift (see [`MailProvider::verify_changes`]); otherwise only changes are fetched.
+pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calendar: Option<Arc<dyn CalendarProvider>>, account: Account, verify: bool) -> SyncOutcome {
     let mut outcome = SyncOutcome::default();
     let acct = account.id.clone();
 
@@ -723,7 +816,7 @@ pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calend
     }
 
     let mut deferred: Vec<(MessageId, ProviderId)> = Vec::new();
-    if let Err(err) = download(&store, provider.as_ref(), &account, &mut outcome, &mut deferred) {
+    if let Err(err) = download(&store, provider.as_ref(), &account, &mut outcome, &mut deferred, verify) {
         warn!("download paused for {}: {err}", account.email);
         outcome.rate_limited = matches!(err, ProviderError::RateLimited(_));
         let state = state_for(&err);
@@ -836,7 +929,7 @@ mod tests {
         let first = store.messages_for_account(&account.id).unwrap()[0].id.clone();
         store.apply_change(&account.id, overlook_store::LocalChange::SetStarred { message_ids: vec![first], starred: true }).unwrap();
         queued_draft(&store, &account);
-        let outcome = block_on(run_sync(store.clone(), arc(&provider), None, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), arc(&provider), None, account.clone(), false));
         assert!(outcome.stopped_offline);
         assert_eq!(store.pending_count(&account.id).unwrap(), 2);
         assert_eq!(store.account_status(&account.id).unwrap().state, SyncState::Offline);
@@ -856,7 +949,7 @@ mod tests {
         store.upsert_account(&account).unwrap();
         let provider = SampleProvider::new().with_latency(Duration::ZERO);
         provider.set_online(true);
-        let outcome = block_on(run_sync(store.clone(), arc(&provider), None, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), arc(&provider), None, account.clone(), false));
         assert!(outcome.downloaded > 0);
         assert!(store.message_count(&account.id).unwrap() > 0);
         assert_eq!(store.checkpoint(&account.id).unwrap().as_deref(), Some("sample-1"));
@@ -871,7 +964,7 @@ mod tests {
         let draft = queued_draft(&store, &account);
         store.apply_change(&account.id, overlook_store::LocalChange::Archive { message_ids: vec![first] }).unwrap();
         provider.set_online(true);
-        let outcome = block_on(run_sync(store.clone(), arc(&provider), None, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), arc(&provider), None, account.clone(), false));
         assert_eq!(outcome.applied, 3);
         assert_eq!(outcome.sent, vec!["Agenda".to_owned()]);
         assert_eq!(store.pending_count(&account.id).unwrap(), 0);
@@ -888,12 +981,12 @@ mod tests {
         let draft = queued_draft(&store, &account);
         provider.set_online(true);
         provider.drop_next_send();
-        let outcome = block_on(run_sync(store.clone(), arc(&provider), None, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), arc(&provider), None, account.clone(), false));
         assert_eq!(outcome.uncertain, vec!["Agenda".to_owned()]);
         assert_eq!(store.draft(&draft.id).unwrap().unwrap().state, DraftState::Uncertain);
         assert_eq!(store.pending_operations(&account.id).unwrap()[0].state, OperationState::Uncertain);
 
-        let outcome = block_on(run_sync(store.clone(), arc(&provider), None, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), arc(&provider), None, account.clone(), false));
         assert_eq!(outcome.sent, vec!["Agenda".to_owned()]);
         assert!(store.draft(&draft.id).unwrap().is_none());
         let sent: Vec<_> = store
@@ -912,7 +1005,7 @@ mod tests {
         let draft = queued_draft(&store, &account);
         store.cancel_send(&account.id, &draft.id).unwrap();
         provider.set_online(true);
-        let outcome = block_on(run_sync(store.clone(), arc(&provider), None, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), arc(&provider), None, account.clone(), false));
         assert!(outcome.sent.is_empty());
         assert_eq!(store.drafts(&account.id, false).unwrap().len(), 1);
     }
@@ -1028,9 +1121,64 @@ mod tests {
     }
 
     #[test]
+    fn a_sync_check_repairs_stale_rows_flags_and_missing_mail() {
+        let (store, account, provider) = imap_seeded();
+        block_on(run_sync(store.clone(), provider.clone(), None, account.clone(), false));
+        let pid = |uid: &str| ProviderId(format!("INBOX\u{1f}1\u{1f}{uid}"));
+        let state = |uid: &str, read: bool| overlook_provider::RemoteState { provider_id: pid(uid), read, starred: false };
+        // The server: 1 was read elsewhere, 2 is gone, 3 unchanged, 9 never reached the store.
+        *provider.changes.lock().unwrap() = Some(RemoteChanges { complete: Some(vec![state("1", true), state("3", false), state("9", false)]), checkpoint: Some("cursor-2".into()), ..Default::default() });
+        let outcome = block_on(run_sync(store.clone(), provider.clone(), None, account.clone(), true));
+        assert!(outcome.verified && outcome.compared);
+        assert_eq!(outcome.repaired, 3, "one stale row, one flag, one missing message");
+        assert!(by_rfc(&store, "<a@x>").is_read);
+        assert!(store.message_id_for_provider_id(&account.id, &pid("2")).unwrap().is_none());
+        assert!(!by_rfc(&store, "<z@x>").is_read);
+
+        // Without a check nothing is compared, even when the provider reports a full list.
+        *provider.changes.lock().unwrap() = Some(RemoteChanges { checkpoint: Some("cursor-3".into()), ..Default::default() });
+        let outcome = block_on(run_sync(store.clone(), provider.clone(), None, account.clone(), false));
+        assert!(!outcome.verified && outcome.repaired == 0);
+    }
+
+    #[test]
+    fn a_repair_keeps_mail_outside_the_tracked_window_and_skips_queued_deletions() {
+        let id = |s: &str| MessageId::from(s);
+        let pid = |s: &str| ProviderId(format!("INBOX\u{1f}1\u{1f}{s}"));
+        let state = |uid: &str| overlook_provider::RemoteState { provider_id: pid(uid), read: false, starred: false };
+        // "old" came from an online search: the server holds it outside the tracked window.
+        let rows = vec![(id("a"), pid("1"), false, false), (id("old"), pid("50"), false, false)];
+        let complete = vec![state("1"), state("7"), state("8")];
+        // 8 was emptied from the folder here; the deletion has not reached the server yet.
+        let withheld: std::collections::HashSet<ProviderId> = [pid("8")].into_iter().collect();
+        let repair = plan_repair(&rows, &complete, &[pid("50"), pid("60")], &Default::default(), &withheld);
+        assert_eq!(repair, Repair { stale: vec![], missing: vec![pid("7")], flags: vec![] }, "60 is not downloaded, 8 not brought back");
+    }
+
+    #[test]
+    fn a_repair_leaves_pending_changes_and_local_sent_copies_alone() {
+        let id = |s: &str| MessageId::from(s);
+        let pid = |s: &str| ProviderId(s.into());
+        let rows = vec![
+            (id("a"), pid("INBOX\u{1f}1\u{1f}1"), false, false),
+            (id("b"), pid("INBOX\u{1f}1\u{1f}2"), false, false),
+            (id("c"), pid("local\u{1f}<sent@x>"), true, false),
+            (id("d"), pid("INBOX\u{1f}1\u{1f}4"), true, false),
+        ];
+        let complete = vec![overlook_provider::RemoteState { provider_id: pid("INBOX\u{1f}1\u{1f}1"), read: true, starred: true }];
+        // "a" has a local change on its way, so its flags are not overwritten; "b" and "d" are gone.
+        let protected: std::collections::BTreeSet<MessageId> = [id("a"), id("d")].into_iter().collect();
+        let repair = plan_repair(&rows, &complete, &[], &protected, &Default::default());
+        assert_eq!(repair, Repair { stale: vec![id("b")], missing: vec![], flags: vec![] });
+        let repair = plan_repair(&rows, &complete, &[], &Default::default(), &Default::default());
+        assert_eq!(repair.flags, vec![(id("a"), true, true)]);
+        assert_eq!(repair.stale, vec![id("b"), id("d")], "the local Sent copy is never stale");
+    }
+
+    #[test]
     fn threads_messages_for_providers_without_thread_ids() {
         let (store, account, provider) = imap_seeded();
-        let outcome = block_on(run_sync(store.clone(), provider.clone(), None, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), provider.clone(), None, account.clone(), false));
         assert_eq!(outcome.state, Some(SyncState::UpToDate));
         let (a, b, z) = (by_rfc(&store, "<a@x>"), by_rfc(&store, "<b@x>"), by_rfc(&store, "<z@x>"));
         assert_eq!(a.conversation_id.as_str(), "imap:j:<a@x>");
@@ -1044,7 +1192,7 @@ mod tests {
             checkpoint: Some("cursor-2".into()),
             ..Default::default()
         });
-        block_on(run_sync(store.clone(), provider.clone(), None, account.clone()));
+        block_on(run_sync(store.clone(), provider.clone(), None, account.clone(), false));
         assert_eq!(by_rfc(&store, "<c@x>").conversation_id, a.conversation_id);
         assert_eq!(by_rfc(&store, "<p@x>").conversation_id, z.conversation_id, "a parent downloaded after its reply joins the reply's conversation");
         assert_eq!(store.messages_in_conversation(&account.id, &a.conversation_id).unwrap().len(), 3);
@@ -1053,7 +1201,7 @@ mod tests {
     #[test]
     fn move_seen_elsewhere_keeps_the_local_message() {
         let (store, account, provider) = imap_seeded();
-        block_on(run_sync(store.clone(), provider.clone(), None, account.clone()));
+        block_on(run_sync(store.clone(), provider.clone(), None, account.clone(), false));
         let before = by_rfc(&store, "<b@x>");
         assert!(!before.is_starred);
 
@@ -1064,7 +1212,7 @@ mod tests {
         let mut reappeared = raw_message("9", "Archive", "<b@x>", Some("<a@x>"), &["<a@x>"], 2_000, false);
         reappeared.is_starred = true;
         *provider.changes.lock().unwrap() = Some(RemoteChanges { upserts: vec![reappeared], deleted: vec![before.id.clone()], checkpoint: Some("cursor-2".into()), ..Default::default() });
-        block_on(run_sync(store.clone(), provider.clone(), None, account.clone()));
+        block_on(run_sync(store.clone(), provider.clone(), None, account.clone(), false));
 
         let all = store.messages_by_rfc_id(&account.id, "<b@x>").unwrap();
         assert_eq!(all.len(), 1, "no duplicate after the move");
@@ -1081,13 +1229,13 @@ mod tests {
     #[test]
     fn header_only_changes_queue_bodies_that_complete_the_same_row() {
         let (store, account, provider) = imap_seeded();
-        block_on(run_sync(store.clone(), provider.clone(), None, account.clone()));
+        block_on(run_sync(store.clone(), provider.clone(), None, account.clone(), false));
         let header = raw_message("7", "INBOX", "<h@x>", None, &[], 7_000, false);
         let mut full = raw_message("7", "INBOX", "<h@x>", None, &[], 7_000, true);
         full.id = MessageId::from("imap:j:some-other-uuid");
         provider.bodies.lock().unwrap().insert("INBOX\u{1f}1\u{1f}7".into(), full);
         *provider.changes.lock().unwrap() = Some(RemoteChanges { upserts: vec![header.clone()], message_ids: vec![ProviderId("INBOX\u{1f}1\u{1f}7".into())], checkpoint: Some("cursor-2".into()), ..Default::default() });
-        let outcome = block_on(run_sync(store.clone(), provider.clone(), None, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), provider.clone(), None, account.clone(), false));
         assert_eq!(outcome.state, Some(SyncState::UpToDate));
         assert_eq!(provider.fetched.lock().unwrap().as_slice(), ["INBOX\u{1f}1\u{1f}7"]);
         let rows = store.messages_by_rfc_id(&account.id, "<h@x>").unwrap();
@@ -1121,7 +1269,7 @@ mod tests {
         let store = Arc::new(Store::open(&path).unwrap());
         store.upsert_account(&account).unwrap();
         store.set_servers(&account.id, &servers).unwrap();
-        let outcome = block_on(run_sync(store.clone(), provider.clone(), None, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), provider.clone(), None, account.clone(), false));
         assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
         let labels = store.labels(&account.id).unwrap();
         assert!(labels.iter().any(|l| l.kind == LabelKind::Inbox));
@@ -1143,7 +1291,7 @@ mod tests {
         // "Restart": reopen the database; the checkpoint drives an incremental cycle.
         let store = Arc::new(Store::open(&path).unwrap());
         let before = store.message_count(&account.id).unwrap();
-        let outcome = block_on(run_sync(store.clone(), provider.clone(), None, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), provider.clone(), None, account.clone(), false));
         assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
         assert_eq!(store.message_count(&account.id).unwrap(), before, "a quiet cycle changes nothing");
         assert!(!store.imap_folders(&account.id).unwrap().is_empty(), "folder rows are mirrored from the checkpoint");
@@ -1154,7 +1302,7 @@ mod tests {
     #[test]
     fn deletions_by_provider_id_and_folder_rows_are_recorded() {
         let (store, account, provider) = imap_seeded();
-        block_on(run_sync(store.clone(), provider.clone(), None, account.clone()));
+        block_on(run_sync(store.clone(), provider.clone(), None, account.clone(), false));
         assert!(store.imap_folders(&account.id).unwrap().is_empty(), "the scripted checkpoint is not an IMAP checkpoint");
         let z = by_rfc(&store, "<z@x>");
         let mut cp = overlook_provider::imap::Checkpoint { version: overlook_provider::imap::Checkpoint::VERSION, ..Default::default() };
@@ -1164,7 +1312,7 @@ mod tests {
             checkpoint: Some(cp.to_json()),
             ..Default::default()
         });
-        let outcome = block_on(run_sync(store.clone(), provider.clone(), None, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), provider.clone(), None, account.clone(), false));
         assert_eq!(outcome.state, Some(SyncState::UpToDate));
         assert!(store.message(&z.id).unwrap().is_none(), "resolved through the provider id");
         assert_eq!(store.message_count(&account.id).unwrap(), 2, "an unknown provider id is ignored");
@@ -1176,11 +1324,11 @@ mod tests {
     #[test]
     fn applied_changes_rewrite_provider_ids() {
         let (store, account, provider) = imap_seeded();
-        block_on(run_sync(store.clone(), provider.clone(), None, account.clone()));
+        block_on(run_sync(store.clone(), provider.clone(), None, account.clone(), false));
         let m = by_rfc(&store, "<z@x>");
         store.apply_change(&account.id, overlook_store::LocalChange::Archive { message_ids: vec![m.id.clone()] }).unwrap();
         *provider.applied.lock().unwrap() = AppliedChanges { provider_ids: vec![(m.id.clone(), ProviderId("Archive\u{1f}1\u{1f}3".into()), LabelId::from("imap:j:Archive"))], labels: Vec::new() };
-        let outcome = block_on(run_sync(store.clone(), provider.clone(), None, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), provider.clone(), None, account.clone(), false));
         assert_eq!(outcome.applied, 1);
         let moved = store.message(&m.id).unwrap().unwrap();
         assert_eq!(moved.provider_id.as_ref().unwrap().as_str(), "Archive\u{1f}1\u{1f}3");
@@ -1273,7 +1421,7 @@ mod tests {
         let env = imap_env("replay");
         let live = imap_provider(&env);
         let store = open_store(&env);
-        let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone(), false));
         assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
         assert!(backlog(&store, &env.account.id).is_empty());
         assert_eq!(store.message_count(&env.account.id).unwrap(), 3);
@@ -1293,7 +1441,7 @@ mod tests {
         draft.conversation_id = Some(first.conversation_id.clone());
         store.save_draft(&draft).unwrap();
         store.queue_send(&draft).unwrap();
-        let outcome = block_on(run_sync(store.clone(), offline_provider(&env), None, env.account.clone()));
+        let outcome = block_on(run_sync(store.clone(), offline_provider(&env), None, env.account.clone(), false));
         assert_eq!(outcome.state, Some(SyncState::Offline));
         assert_eq!(store.pending_count(&env.account.id).unwrap(), 4);
         assert!(env.imap.lock().commands("UID STORE") == 0 && env.smtp.seen.lock().unwrap().is_empty(), "nothing reached the servers");
@@ -1302,7 +1450,7 @@ mod tests {
         // Restart while offline: the queue is read back from disk, then the server is back.
         let store = open_store(&env);
         assert_eq!(store.pending_count(&env.account.id).unwrap(), 4);
-        let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone(), false));
         assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
         assert_eq!((outcome.applied, outcome.sent.clone(), outcome.failed.clone()), (4, vec!["Re: First".to_owned()], vec![]));
         assert_eq!(store.pending_count(&env.account.id).unwrap(), 0);
@@ -1332,7 +1480,7 @@ mod tests {
 
         // The next cycle sees the server's view of the same moves and changes nothing.
         let before = store.message_count(&env.account.id).unwrap();
-        let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone(), false));
         assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
         assert_eq!(store.message_count(&env.account.id).unwrap(), before, "no duplicates after the moves and the Sent copy");
         let sent = imap_message(&store, &env, "Re: First");
@@ -1347,7 +1495,7 @@ mod tests {
         let env = imap_env("crash");
         let live = imap_provider(&env);
         let store = open_store(&env);
-        block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
+        block_on(run_sync(store.clone(), live.clone(), None, env.account.clone(), false));
         let third = imap_message(&store, &env, "Third");
         store.apply_change(&env.account.id, overlook_store::LocalChange::Archive { message_ids: vec![third.id.clone()] }).unwrap();
         let labels = store.labels(&env.account.id).unwrap();
@@ -1360,7 +1508,7 @@ mod tests {
 
         let store = open_store(&env);
         let fresh = imap_provider(&env);
-        let outcome = block_on(run_sync(store.clone(), fresh.clone(), None, env.account.clone()));
+        let outcome = block_on(run_sync(store.clone(), fresh.clone(), None, env.account.clone(), false));
         assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
         assert_eq!(outcome.applied, 1);
         let s = env.imap.lock();
@@ -1379,10 +1527,10 @@ mod tests {
         let env = imap_env("uncertain");
         let live = imap_provider(&env);
         let store = open_store(&env);
-        block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
+        block_on(run_sync(store.clone(), live.clone(), None, env.account.clone(), false));
         let draft = queued_draft(&store, &env.account);
         env.smtp.set(Behaviour::DropAfterData);
-        let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone(), false));
         assert_eq!(outcome.uncertain, vec!["Agenda".to_owned()]);
         assert_eq!(store.draft(&draft.id).unwrap().unwrap().state, DraftState::Uncertain);
 
@@ -1391,7 +1539,7 @@ mod tests {
         env.smtp.set(Behaviour::Normal);
         let first = imap_message(&store, &env, "First");
         store.apply_change(&env.account.id, overlook_store::LocalChange::SetRead { message_ids: vec![first.id.clone()], read: true }).unwrap();
-        let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone(), false));
         assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
         assert_eq!((outcome.applied, outcome.sent.len(), outcome.uncertain.len()), (1, 0, 0));
         assert_eq!(env.smtp.seen.lock().unwrap().len(), 1, "not sent again on its own");
@@ -1404,7 +1552,7 @@ mod tests {
         // "Send again": a fresh attempt that succeeds and lands in Sent.
         store.resend(&draft.account_id, &draft.id).unwrap();
         assert_eq!(store.draft(&draft.id).unwrap().unwrap().state, DraftState::Queued);
-        let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone(), false));
         assert_eq!(outcome.sent, vec!["Agenda".to_owned()]);
         assert_eq!(env.smtp.seen.lock().unwrap().len(), 2);
         assert_eq!(env.imap.lock().folder("Sent").messages.len(), 1);
@@ -1414,13 +1562,13 @@ mod tests {
         // "Discard": the draft and its send are gone.
         let draft = queued_draft(&store, &env.account);
         env.smtp.set(Behaviour::DropAfterData);
-        block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
+        block_on(run_sync(store.clone(), live.clone(), None, env.account.clone(), false));
         assert_eq!(store.draft(&draft.id).unwrap().unwrap().state, DraftState::Uncertain);
         store.discard_send(&draft.account_id, &draft.id).unwrap();
         assert!(store.draft(&draft.id).unwrap().is_none());
         assert_eq!(store.pending_count(&env.account.id).unwrap(), 0);
         env.smtp.set(Behaviour::Normal);
-        let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone(), false));
         assert_eq!((outcome.state, outcome.sent.len()), (Some(SyncState::UpToDate), 0));
         assert_eq!(env.smtp.seen.lock().unwrap().len(), 3, "the discarded message was never sent again");
     }
@@ -1430,10 +1578,10 @@ mod tests {
         let env = imap_env("sentcopy");
         let live = imap_provider(&env);
         let store = open_store(&env);
-        block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
+        block_on(run_sync(store.clone(), live.clone(), None, env.account.clone(), false));
         let draft = queued_draft(&store, &env.account);
         env.imap.lock().fail_next = Some(("APPEND".into(), "NO [OVERQUOTA] Quota exceeded".into()));
-        let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone(), false));
         assert_eq!(outcome.sent, vec!["Agenda".to_owned()]);
         let local = imap_message(&store, &env, "Agenda");
         assert!(local.provider_id.as_ref().is_some_and(is_local_placeholder));
@@ -1445,7 +1593,7 @@ mod tests {
         env.smtp.wait_for_connections(1);
         let data = env.smtp.messages().remove(0);
         env.imap.lock().folder_mut("Sent").add(FakeMessage::new(&["\\Seen"], "14-Oct-2026 12:00:00 +0000", data));
-        let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone(), false));
         assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
         let sent: Vec<Message> = store.messages_for_account(&env.account.id).unwrap().into_iter().filter(|m| m.subject == "Agenda").collect();
         assert_eq!(sent.len(), 1, "de-duplicated by Message-ID");
@@ -1535,7 +1683,7 @@ mod tests {
         store.upsert_account(&account).unwrap();
         store.set_servers(&account.id, &servers).unwrap();
         let live = Arc::new(ImapProvider::new(servers, "secret").with_timeout(Duration::from_secs(5)).with_inbox_limit(20));
-        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone(), false));
         assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
         eprintln!("capabilities: {:?}", live.capabilities());
 
@@ -1551,7 +1699,7 @@ mod tests {
         assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(IdleEvent::Changed));
         let latency = started.elapsed();
         assert!(latency < Duration::from_secs(5), "reported after {latency:?}");
-        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone(), false));
         assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
         let delivered = store.messages_for_account(&account.id).unwrap().into_iter().find(|m| m.subject == subject).expect("the delivered message is in the store");
         assert!(delivered.body.is_cached() && delivered.label_ids.iter().any(|l| l.as_str().ends_with(":INBOX")));
@@ -1592,7 +1740,7 @@ mod tests {
         let pid = std::process::id();
 
         let store = open();
-        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone(), false));
         assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
         let baseline = store.message_count(&account.id).unwrap();
         eprintln!("initial sync: {baseline} messages");
@@ -1611,9 +1759,9 @@ mod tests {
             assert!(other.line().contains("APPENDUID"));
         }
         Raw::connect(imap_port).imap("XDROPAFTER UID FETCH 2");
-        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone(), false));
         assert_eq!(outcome.state, Some(SyncState::Offline), "both fetch attempts were cut: {outcome:?}");
-        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone(), false));
         assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
         let late = find(&store, &new_rfc);
         assert!(late.body.is_cached(), "resumed where it left off");
@@ -1626,14 +1774,14 @@ mod tests {
         store.apply_change(&account.id, overlook_store::LocalChange::SetStarred { message_ids: vec![plain.id.clone()], starred: true }).unwrap();
         store.apply_change(&account.id, overlook_store::LocalChange::Archive { message_ids: vec![plain.id.clone()] }).unwrap();
         Raw::connect(imap_port).imap("XDROPAFTER UID MOVE");
-        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone(), false));
         assert_eq!((outcome.state.clone(), outcome.applied), (Some(SyncState::UpToDate), 2), "{outcome:?}");
         let plain = store.message(&plain.id).unwrap().unwrap();
         assert_eq!(folder_of(&plain), "Archive");
         assert!(plain.label_ids.iter().any(|l| l.as_str().ends_with(":Archive")));
         assert_eq!(Raw::imap_login(imap_port).search("Archive", "<plain-1@example.com>").len(), 1, "one copy on the server");
         assert!(Raw::imap_login(imap_port).search("INBOX", "<plain-1@example.com>").is_empty());
-        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone(), false));
         assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
         assert_eq!(store.message_count(&account.id).unwrap(), baseline + 1, "the move did not duplicate or lose anything");
         assert!(store.labels(&account.id).unwrap().iter().any(|l| l.kind == LabelKind::Archive));
@@ -1648,21 +1796,21 @@ mod tests {
         store.queue_send(&draft).unwrap();
         let rfc = overlook_provider::draft_message_id(&draft);
         assert!(Raw::connect(smtp_port).smtp("XDROPAFTERDATA").starts_with("250"));
-        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone(), false));
         assert_eq!(outcome.uncertain, vec![draft.subject.clone()], "{outcome:?}");
-        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone(), false));
         assert_eq!((outcome.state.clone(), outcome.sent.len()), (Some(SyncState::UpToDate), 0), "{outcome:?}");
         assert_eq!(store.draft(&draft.id).unwrap().unwrap().state, DraftState::Uncertain);
         assert!(Raw::imap_login(imap_port).search("Sent", &rfc).is_empty(), "nothing in Sent yet");
         store.resend(&draft.account_id, &draft.id).unwrap();
-        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone(), false));
         assert_eq!(outcome.sent, vec![draft.subject.clone()], "{outcome:?}");
         let on_server = Raw::imap_login(imap_port).search("Sent", &rfc);
         assert_eq!(on_server.len(), 1);
         let sent = find(&store, &rfc);
         assert_eq!(folder_of(&sent), "Sent");
         assert!(sent.label_ids.iter().any(|l| l.as_str().ends_with(":Sent")) && sent.is_outgoing);
-        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone(), false));
         assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
         let again = find(&store, &rfc);
         assert_eq!((again.id.clone(), again.body.is_cached(), again.label_ids.len()), (sent.id.clone(), true, 1), "the Sent copy is one message after the next sync");
@@ -1677,13 +1825,13 @@ mod tests {
         let mut unreachable = servers.clone();
         unreachable.incoming = ServerEndpoint::new("127.0.0.1", dead.port(), Security::None, "spike");
         let offline = Arc::new(ImapProvider::new(unreachable, "secret").with_timeout(Duration::from_secs(2)));
-        let outcome = block_on(run_sync(store.clone(), offline, None, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), offline, None, account.clone(), false));
         assert_eq!(outcome.state, Some(SyncState::Offline));
         assert_eq!(store.pending_count(&account.id).unwrap(), 2);
         drop(store);
         let store = open();
         assert_eq!(store.pending_count(&account.id).unwrap(), 2);
-        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone(), false));
         assert_eq!((outcome.state.clone(), outcome.applied), (Some(SyncState::UpToDate), 2), "{outcome:?}");
         assert_eq!(folder_of(&store.message(&contract.id).unwrap().unwrap()), "Trash");
         assert_eq!(Raw::imap_login(imap_port).search("Trash", "<work-1@example.com>").len(), 1);
@@ -1701,7 +1849,7 @@ mod tests {
             other.imap(&format!("UID MOVE {multi_uid} \"Work/Clients\""));
         }
         let before = store.message_count(&account.id).unwrap();
-        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone(), false));
         assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
         assert!(store.message(&late.id).unwrap().unwrap().is_read, "the flag set elsewhere arrived");
         let moved = store.message(&multi.id).unwrap().unwrap();
@@ -1789,7 +1937,7 @@ mod tests {
             let env = pop_env("pop3-once");
             let provider = pop_provider(&env, None);
             let store = pop_store(&env);
-            let outcome = block_on(run_sync(store.clone(), provider.clone(), None, env.account.clone()));
+            let outcome = block_on(run_sync(store.clone(), provider.clone(), None, env.account.clone(), false));
             assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
             assert_eq!(subjects(&store, &env), vec!["First", "Re: First", "Second"]);
             assert!(backlog(&store, &env.account.id).is_empty());
@@ -1807,7 +1955,7 @@ mod tests {
 
             // Poll again, several times: nothing new, nothing doubled.
             for _ in 0..3 {
-                let outcome = block_on(run_sync(store.clone(), provider.clone(), None, env.account.clone()));
+                let outcome = block_on(run_sync(store.clone(), provider.clone(), None, env.account.clone(), false));
                 assert_eq!((outcome.state, outcome.downloaded), (Some(SyncState::UpToDate), 0));
             }
             assert_eq!(store.message_count(&env.account.id).unwrap(), 3);
@@ -1819,7 +1967,7 @@ mod tests {
             env.pop3.lock().add(PopMessage::new("U4", pop_raw("new@example.com", "Fourth", "<fourth@example.com>", "Tue, 13 Oct 2026 09:00:00 +0000")));
             let store = pop_store(&env);
             let restarted = pop_provider(&env, None);
-            let outcome = block_on(run_sync(store.clone(), restarted.clone(), None, env.account.clone()));
+            let outcome = block_on(run_sync(store.clone(), restarted.clone(), None, env.account.clone(), false));
             assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
             assert_eq!(store.message_count(&env.account.id).unwrap(), 4);
             assert!(store.message(&first.id).unwrap().unwrap().is_read, "local flags survive the replayed SetRead and the restart");
@@ -1833,10 +1981,10 @@ mod tests {
             let env = pop_env("pop3-retention");
             let store = pop_store(&env);
             let delete_now = pop_provider(&env, Some(Pop3Policy { leave_on_server: false, ..Default::default() }));
-            block_on(run_sync(store.clone(), delete_now.clone(), None, env.account.clone()));
+            block_on(run_sync(store.clone(), delete_now.clone(), None, env.account.clone(), false));
             assert_eq!(store.message_count(&env.account.id).unwrap(), 3);
             assert!(env.pop3.lock().deleted.is_empty(), "deletion waits for the next cycle, after the store committed");
-            block_on(run_sync(store.clone(), delete_now.clone(), None, env.account.clone()));
+            block_on(run_sync(store.clone(), delete_now.clone(), None, env.account.clone(), false));
             {
                 let s = env.pop3.lock();
                 assert!(s.uidls().is_empty(), "every downloaded message was deleted from the server");
@@ -1849,8 +1997,8 @@ mod tests {
             let env2 = pop_env("pop3-days");
             let store2 = pop_store(&env2);
             let after_30 = pop_provider(&env2, Some(Pop3Policy { delete_after_days: Some(30), ..Default::default() }));
-            block_on(run_sync(store2.clone(), after_30.clone(), None, env2.account.clone()));
-            block_on(run_sync(store2.clone(), after_30.clone(), None, env2.account.clone()));
+            block_on(run_sync(store2.clone(), after_30.clone(), None, env2.account.clone(), false));
+            block_on(run_sync(store2.clone(), after_30.clone(), None, env2.account.clone(), false));
             assert_eq!(env2.pop3.lock().uidls().len(), 3);
             // Age one entry by editing the stored checkpoint, as time would.
             let cp = store2.checkpoint(&env2.account.id).unwrap().unwrap();
@@ -1858,7 +2006,7 @@ mod tests {
             parsed.entries.get_mut("U1").unwrap().seen_at -= 31 * 86_400_000;
             store2.set_checkpoint(&env2.account.id, Some(&parsed.to_json())).unwrap();
             let fresh = pop_provider(&env2, Some(Pop3Policy { delete_after_days: Some(30), ..Default::default() }));
-            block_on(run_sync(store2.clone(), fresh, None, env2.account.clone()));
+            block_on(run_sync(store2.clone(), fresh, None, env2.account.clone(), false));
             assert_eq!(env2.pop3.lock().deleted, vec!["U1"]);
             assert_eq!(store2.message_count(&env2.account.id).unwrap(), 3);
         }
@@ -1868,7 +2016,7 @@ mod tests {
             let env = pop_env("pop3-trash-send");
             let store = pop_store(&env);
             let provider = pop_provider(&env, Some(Pop3Policy { delete_on_server_when_trashed: true, ..Default::default() }));
-            block_on(run_sync(store.clone(), provider.clone(), None, env.account.clone()));
+            block_on(run_sync(store.clone(), provider.clone(), None, env.account.clone(), false));
             let second = imap_message_named(&store, &env.account.id, "Second");
             store.apply_change(&env.account.id, overlook_store::LocalChange::Trash { message_ids: vec![second.id.clone()] }).unwrap();
             let first = imap_message_named(&store, &env.account.id, "First");
@@ -1882,7 +2030,7 @@ mod tests {
             store.save_draft(&draft).unwrap();
             store.queue_send(&draft).unwrap();
 
-            let outcome = block_on(run_sync(store.clone(), provider.clone(), None, env.account.clone()));
+            let outcome = block_on(run_sync(store.clone(), provider.clone(), None, env.account.clone(), false));
             assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
             assert_eq!((outcome.applied, outcome.sent.clone(), outcome.failed.clone()), (3, vec!["Re: First".to_owned()], vec![]));
             assert_eq!(env.pop3.lock().deleted, vec!["U2"], "only the trashed message left the server");
@@ -1900,7 +2048,7 @@ mod tests {
             assert_eq!(store.message_count(&env.account.id).unwrap(), 4);
 
             // Another poll: the Trash and Archive labels hold, the sent copy is not re-downloaded.
-            block_on(run_sync(store.clone(), provider.clone(), None, env.account.clone()));
+            block_on(run_sync(store.clone(), provider.clone(), None, env.account.clone(), false));
             assert_eq!(store.message_count(&env.account.id).unwrap(), 4);
             assert_eq!(store.message(&second.id).unwrap().unwrap().label_ids.len(), 1);
 
@@ -1912,10 +2060,10 @@ mod tests {
             draft2.body_text = "?".into();
             store.save_draft(&draft2).unwrap();
             store.queue_send(&draft2).unwrap();
-            let outcome = block_on(run_sync(store.clone(), provider.clone(), None, env.account.clone()));
+            let outcome = block_on(run_sync(store.clone(), provider.clone(), None, env.account.clone(), false));
             assert_eq!(outcome.uncertain, vec!["Uncertain".to_owned()]);
             env.smtp.set(Behaviour::Normal);
-            let outcome = block_on(run_sync(store.clone(), provider.clone(), None, env.account.clone()));
+            let outcome = block_on(run_sync(store.clone(), provider.clone(), None, env.account.clone(), false));
             assert!(outcome.sent.is_empty(), "not resent on its own");
             assert_eq!(store.drafts(&env.account.id, true).unwrap()[0].state, DraftState::Uncertain);
         }
@@ -1947,18 +2095,18 @@ mod tests {
             store.upsert_account(&account).unwrap();
 
             let keep = provider(None);
-            let outcome = block_on(run_sync(store.clone(), keep.clone(), None, account.clone()));
+            let outcome = block_on(run_sync(store.clone(), keep.clone(), None, account.clone(), false));
             assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
             let count = store.message_count(&account.id).unwrap();
             eprintln!("initial download: {count} messages, {} .eml files", std::fs::read_dir(dir.join("raw")).map(|d| d.count()).unwrap_or(0));
             assert!(count >= 3);
             for _ in 0..2 {
-                let outcome = block_on(run_sync(store.clone(), keep.clone(), None, account.clone()));
+                let outcome = block_on(run_sync(store.clone(), keep.clone(), None, account.clone(), false));
                 assert_eq!((outcome.state, outcome.downloaded), (Some(SyncState::UpToDate), 0), "repeated polls download nothing");
             }
             assert_eq!(store.message_count(&account.id).unwrap(), count);
             let restarted = provider(None);
-            block_on(run_sync(store.clone(), restarted, None, account.clone()));
+            block_on(run_sync(store.clone(), restarted, None, account.clone(), false));
             assert_eq!(store.message_count(&account.id).unwrap(), count, "a fresh provider reads the ledger from the checkpoint");
             eprintln!("repeated polls: still {count} messages");
 
@@ -1969,7 +2117,7 @@ mod tests {
             draft.body_text = "Sent through the spike SMTP.".into();
             store.save_draft(&draft).unwrap();
             store.queue_send(&draft).unwrap();
-            let outcome = block_on(run_sync(store.clone(), keep.clone(), None, account.clone()));
+            let outcome = block_on(run_sync(store.clone(), keep.clone(), None, account.clone(), false));
             assert_eq!(outcome.sent, vec![draft.subject.clone()], "{outcome:?}");
             let sent = store.messages_for_account(&account.id).unwrap().into_iter().find(|m| m.subject == draft.subject).unwrap();
             assert!(sent.label_ids.iter().any(|l| l.as_str().ends_with(":sent")));
@@ -1983,7 +2131,7 @@ mod tests {
             parsed.entries.get_mut(&oldest).unwrap().seen_at -= 31 * 86_400_000;
             store.set_checkpoint(&account.id, Some(&parsed.to_json())).unwrap();
             let after_30 = provider(Some(Pop3Policy { delete_after_days: Some(30), ..Default::default() }));
-            block_on(run_sync(store.clone(), after_30, None, account.clone()));
+            block_on(run_sync(store.clone(), after_30, None, account.clone(), false));
             let rows = store.pop3_seen(&account.id).unwrap();
             assert_eq!(rows.iter().filter(|r| r.deleted_on_server).map(|r| r.uidl.clone()).collect::<Vec<_>>(), vec![oldest.clone()]);
             assert_eq!(store.message_count(&account.id).unwrap(), count + 1, "deleting on the server removes nothing locally");
@@ -1991,10 +2139,10 @@ mod tests {
 
             // leave-on-server off: everything downloaded leaves the server.
             let delete = provider(Some(Pop3Policy { leave_on_server: false, ..Default::default() }));
-            block_on(run_sync(store.clone(), delete.clone(), None, account.clone()));
+            block_on(run_sync(store.clone(), delete.clone(), None, account.clone(), false));
             let rows = store.pop3_seen(&account.id).unwrap();
             assert!(rows.iter().all(|r| r.deleted_on_server), "{rows:?}");
-            let outcome = block_on(run_sync(store.clone(), delete, None, account.clone()));
+            let outcome = block_on(run_sync(store.clone(), delete, None, account.clone(), false));
             assert_eq!((outcome.state, outcome.downloaded), (Some(SyncState::UpToDate), 0));
             assert_eq!(store.message_count(&account.id).unwrap(), count + 1);
             eprintln!("leave on server off: the spike INBOX is empty, {} messages still local", count + 1);
@@ -2017,12 +2165,12 @@ mod tests {
             let env = pop_env("pop3-labels-backup");
             let store = pop_store(&env);
             let provider = pop_provider(&env, None);
-            block_on(run_sync(store.clone(), provider.clone(), None, env.account.clone()));
+            block_on(run_sync(store.clone(), provider.clone(), None, env.account.clone(), false));
             let user = Label { id: LabelId::from("pop3:jason@example.com:user:projects"), account_id: env.account.id.clone(), kind: LabelKind::User, name: "Projects".into(), provider_id: None, color: Some("plum".into()), sort_order: 10 };
             store.upsert_label(&user).unwrap();
             // A lost checkpoint forces a full snapshot: the local label stays, nothing doubles.
             store.set_checkpoint(&env.account.id, Some("not a pop3 checkpoint")).unwrap();
-            let outcome = block_on(run_sync(store.clone(), pop_provider(&env, None), None, env.account.clone()));
+            let outcome = block_on(run_sync(store.clone(), pop_provider(&env, None), None, env.account.clone(), false));
             assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
             assert_eq!(store.message_count(&env.account.id).unwrap(), 3);
             assert!(store.labels(&env.account.id).unwrap().iter().any(|l| l.id == user.id));
