@@ -73,6 +73,16 @@ pub fn local_datetime_in(date: Date, time: Time, zone: &TimeZone) -> Option<Time
         .ok().map(|z| to_millis(&z))
 }
 
+/// The time `minutes` past midnight by the clock on `day`'s local date; 24:00 is the next
+/// midnight.
+pub fn at_minutes(day: Timestamp, minutes: i32) -> Timestamp {
+    if minutes >= 24 * 60 {
+        return add_days(day, 1);
+    }
+    let time = Time::new((minutes / 60) as i8, (minutes % 60) as i8, 0, 0).unwrap_or_default();
+    local_datetime(local_date(day), time)
+}
+
 /// All-day dates are civil dates, not elapsed UTC hours. Keep their dates intact
 /// when the display zone changes, including pending local event edits.
 pub fn reproject_all_day(event: &mut crate::Event, old: &TimeZone, new: &TimeZone) -> Result<(), String> {
@@ -196,6 +206,15 @@ pub fn to_rfc3339(ts: Timestamp) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn minutes_on_the_clock_become_a_time_on_that_day() {
+        let day = date_start(parse_date("2026-07-15").unwrap());
+        assert_eq!(minutes_into_day(at_minutes(day, 570)), 570);
+        assert_eq!(local_date(at_minutes(day, 570)), local_date(day));
+        assert_eq!(at_minutes(day, 0), day);
+        assert_eq!(at_minutes(day, 24 * 60), add_days(day, 1));
+    }
 
     #[test]
     fn week_and_day_math() {

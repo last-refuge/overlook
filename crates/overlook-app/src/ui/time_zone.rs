@@ -209,6 +209,7 @@ impl MailWindow {
         };
         self.cal_scrolled_for.set(None);
         self.cal_drag = None;
+        self.cal_range_drag = None;
         self.rows_key.borrow_mut().take();
         if let Some(original) = self
             .new_event
