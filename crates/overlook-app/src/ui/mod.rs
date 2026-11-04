@@ -1618,7 +1618,7 @@ impl MailWindow {
                 LabelKind::Container => "Folder",
             }
             .to_owned(),
-            MailboxView::Label(id) => self.labels.iter().find(|l| &l.id == id).map(|l| l.name.clone()).unwrap_or_default(),
+            MailboxView::Label(id) => self.labels.iter().find(|l| &l.id == id).map(|l| overlook_core::sidebar::folder_title(&l.name).to_owned()).unwrap_or_default(),
         }
     }
 
@@ -2818,8 +2818,8 @@ impl MailWindow {
         }
         out.push((MailboxView::Kind(LabelKind::Trash), "Trash".to_owned()));
         let mut user: Vec<&Label> = self.labels.iter().filter(|l| l.kind == LabelKind::User).collect();
-        user.sort_by_key(|l| l.name.to_lowercase());
-        out.extend(user.into_iter().map(|l| (MailboxView::Label(l.id.clone()), l.name.clone())));
+        user.sort_by_cached_key(|l| overlook_core::sidebar::folder_title(&l.name).to_lowercase());
+        out.extend(user.into_iter().map(|l| (MailboxView::Label(l.id.clone()), overlook_core::sidebar::folder_title(&l.name).to_owned())));
         out.retain(|(v, _)| v != &self.view);
         out
     }

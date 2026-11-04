@@ -278,7 +278,7 @@ impl MailWindow {
             .iter()
             .filter_map(|id| self.labels.iter().find(|l| &l.id == id))
             .filter(|l| l.kind == LabelKind::User)
-            .map(|l| l.name.clone())
+            .map(|l| overlook_core::sidebar::folder_title(&l.name).to_owned())
             .collect();
 
         let header = v_flex()
