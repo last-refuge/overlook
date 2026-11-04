@@ -1387,6 +1387,23 @@ fn folders_move_with_their_children_and_never_into_themselves() {
 }
 
 #[test]
+fn folders_can_move_into_unselectable_parents() {
+    let mut state = mailbox();
+    state.folders.push(FakeFolder::new("Projects", &["\\Noselect", "\\HasChildren"], 0));
+    state.folders.push(FakeFolder::new("Projects/Existing", &["\\HasNoChildren"], 1760400012));
+    let server = serve(state);
+    let p = provider(&server);
+    let acct = account();
+    let (labels, _, _) = synced(&server, &p);
+    let work = labels.iter().find(|l| l.name == "Work").unwrap();
+    let projects = labels.iter().find(|l| l.name == "Projects").unwrap();
+    assert_eq!(projects.kind, LabelKind::Container);
+    let moved = block(p.move_folder(&acct, work, Some(projects), &labels)).unwrap();
+    assert_eq!(moved[0].new.provider_id, Some(ProviderId("Projects/Work".into())));
+    assert!(server.lock().has_folder("Projects/Work/Clients"));
+}
+
+#[test]
 fn a_deleted_folder_moves_into_trash_with_its_children_and_back() {
     let server = serve(mailbox());
     let p = provider(&server);
@@ -1571,6 +1588,26 @@ fn a_system_folder_the_server_refuses_to_open_keeps_its_kind() {
     assert!(changes.labels.as_ref().is_none_or(|labels| labels.iter().any(|l| l.name == "Trash" && l.kind == LabelKind::Trash)));
     let opened = server.state.lock().unwrap().log.iter().filter(|l| l.to_ascii_uppercase().contains("EXAMINE \"TRASH\"")).count();
     assert!(opened >= 2, "tried again: {:?}", server.state.lock().unwrap().log);
+}
+
+#[test]
+fn a_refused_examine_preserves_previously_synced_mail_for_retry() {
+    let server = serve(mailbox());
+    let p = provider(&server);
+    let acct = account();
+    let (_, messages, cp) = synced(&server, &p);
+    assert!(messages.iter().any(|m| m.subject == "Contract"));
+    for verify in [false, true] {
+        // Force an ordinary cycle past the unchanged-folder STATUS shortcut as well.
+        server.lock().folder_mut("Work/Clients").add(note("New contract"));
+        server.lock().fail_next = Some(("EXAMINE \"WORK/CLIENTS\"".into(), "NO Permission denied".into()));
+        let refused = if verify { block(p.verify_changes(&acct, &cp)) } else { block(p.fetch_changes(&acct, &cp)) };
+        assert!(matches!(refused, Err(ProviderError::Rejected(_))), "a failed read must not report cached messages deleted: {refused:?}");
+        let retry = block(p.verify_changes(&acct, &cp)).unwrap();
+        assert!(retry.deleted_provider_ids.is_empty());
+        assert!(retry.complete.unwrap().iter().any(|m| m.provider_id == pid("Work/Clients", 1760400002, 1)));
+        assert!(retry.labels.unwrap().iter().any(|l| l.name == "Work / Clients" && l.kind == LabelKind::User));
+    }
 }
 
 #[test]

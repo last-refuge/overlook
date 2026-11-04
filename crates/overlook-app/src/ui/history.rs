@@ -202,7 +202,10 @@ impl MailWindow {
                 UndoStep::Done(true)
             }
             Reversal::CancelSend { draft_id } => match self.store.cancel_send(&entry.account_id, draft_id) {
-                Ok(_) => {
+                Ok(draft) => {
+                    if self.account.id != draft.account_id {
+                        self.switch_account(draft.account_id, window, cx);
+                    }
                     self.reload(cx);
                     self.open_draft(draft_id.clone(), window, cx);
                     UndoStep::Done(true)

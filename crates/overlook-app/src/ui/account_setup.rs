@@ -305,13 +305,14 @@ impl MailWindow {
         setup.busy = Some("Looking up the server settings…");
         setup.generation += 1;
         let generation = setup.generation;
+        let identity = setup.email.entity_id();
         cx.notify();
         let protocol = setup.incoming_protocol();
         cx.spawn_in(window, async move |this, cx| {
             let suggestion = cx.background_spawn(async move { autoconfig::lookup_for(protocol, &email) }).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 let Some(setup) = this.account_setup.as_mut() else { return };
-                if setup.generation != generation {
+                if setup.generation != generation || setup.email.entity_id() != identity {
                     return;
                 }
                 setup.busy = None;
@@ -550,14 +551,27 @@ impl MailWindow {
         setup.busy = Some(if then_save { "Checking the connection before saving…" } else { "Testing the connection…" });
         setup.generation += 1;
         let generation = setup.generation;
+        let identity = setup.email.entity_id();
         let kind = setup.kind;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let lines = cx.background_spawn(async move { probe_servers(kind, &servers, password, out_password) }).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                let Some(setup) = this.account_setup.as_mut().filter(|s| s.generation == generation) else { return };
-                let ok = lines.iter().all(|(ok, _)| *ok);
+                if !this.account_setup.as_ref().is_some_and(|s| s.generation == generation && s.email.entity_id() == identity) {
+                    return;
+                }
+                // Inputs remain editable during the probe. Never save settings that
+                // differ from the ones tested, or apply a result to a reopened dialog.
+                let still_current = this.setup_prepared(cx).is_ok_and(|(.., current_key)| current_key == key);
+                let setup = this.account_setup.as_mut().expect("the checked dialog is still open");
                 setup.busy = None;
+                if !still_current {
+                    setup.checked = None;
+                    setup.error = Some("Settings changed during the connection check. Check them again before saving.".into());
+                    cx.notify();
+                    return;
+                }
+                let ok = lines.iter().all(|(ok, _)| *ok);
                 setup.test_result = lines;
                 setup.checked = Some((key, ok));
                 if then_save && ok {

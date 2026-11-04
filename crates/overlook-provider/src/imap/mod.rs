@@ -1007,9 +1007,21 @@ impl ImapProvider {
                 }
                 let mailbox = match conn.examine(&path) {
                     Ok(m) => m,
-                    Err(ProviderError::Rejected(reason)) => {
-                        info!("imap: folder {path} cannot be opened ({reason}); removing its messages");
+                    // A failed read of a previously synchronized folder is not evidence
+                    // that its mail was deleted. Keep the old checkpoint and cache so a
+                    // later cycle can retry, even for a server's generic NO response.
+                    Err(e @ ProviderError::Rejected(_)) if !cursor.fresh => {
+                        if conn.list_folders()?.iter().any(|f| f.path == path) {
+                            return Err(e);
+                        }
+                        // A fresh LIST confirms that the folder really disappeared.
                         changes.deleted_provider_ids.extend(cursor.known_set().into_iter().map(|uid| MessageRef::provider_id(&path, cursor.uidvalidity, uid)));
+                        vanished.push(path.clone());
+                        relist_needed = true;
+                        continue;
+                    }
+                    Err(ProviderError::Rejected(reason)) => {
+                        info!("imap: new folder {path} cannot be opened ({reason}); shown as folder-only");
                         // Still listed next time, it is treated as folder-only rather than
                         // dropped and re-added for ever.
                         conn.unopenable.insert(path.clone());
@@ -1505,8 +1517,8 @@ impl ImapProvider {
         };
         let parent_path = match parent {
             // Trash takes deleted folders, so they can be restored.
-            Some(p) if matches!(p.kind, LabelKind::User | LabelKind::Inbox | LabelKind::Trash) => Some(p.provider_id.as_ref().map(|id| id.0.clone()).ok_or_else(|| ProviderError::Rejected("that folder isn’t on the server yet".into()))?),
-            Some(_) => return Err(ProviderError::Rejected("folders can go only inside your own folders, the Inbox or Trash".into())),
+            Some(p) if matches!(p.kind, LabelKind::User | LabelKind::Container | LabelKind::Inbox | LabelKind::Trash) => Some(p.provider_id.as_ref().map(|id| id.0.clone()).ok_or_else(|| ProviderError::Rejected("that folder isn’t on the server yet".into()))?),
+            Some(_) => return Err(ProviderError::Rejected("folders can go only inside your own folders, folder-only parents, the Inbox or Trash".into())),
             None => None,
         };
         self.with_session(|conn| {

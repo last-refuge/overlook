@@ -703,7 +703,9 @@ magenta = "#ad8ee6"
         std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         install_hook_in(&dir, &fake);
         let hook = dir.join("omarchy/hooks/theme-set.d/overlook");
-        let out = std::process::Command::new("bash").arg(&hook).env("PATH", "/usr/bin:/bin").output().unwrap();
+        // Never find an installed Overlook: older versions treat --reload-theme as an
+        // ordinary launch, which would open the real profile and leave this test waiting.
+        let out = std::process::Command::new("/bin/bash").arg(&hook).env("PATH", &dir).output().unwrap();
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "called --reload-theme");
         // A second build does not take the hook over while the first one's binary exists.
