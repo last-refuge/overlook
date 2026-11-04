@@ -10,6 +10,9 @@ Released in [Overlook 1.6.9](https://github.com/last-refuge/overlook/releases/ta
 - An open composer protects its draft from incoming replacements/deletions. Changes from another device reconcile once it closes. A stale upload acknowledgment updates only server bookkeeping, never newer text.
 - Offline saves/deletions remain durable. POP3 and Sample drafts remain local.
 
+- A recipient that is not yet a complete address stays in the local draft only (`outgoing::finished`), because autosave can upload mid-typing and Gmail refuses the whole draft with `400 Invalid To header`. It reaches the server once finished, and another device does not see it until then.
+- A draft the server refuses is named in the sync error, stays local, and is retried on the next sync. The other drafts, imports and deletions in that sync still run. Other errors, such as being offline, still end the sync straight away.
+
 ## Store and reconciliation
 
 `overlook-store/src/draft_sync.rs` keeps an independently owned `draft_sync` row for each saved draft. It survives deletion of the `drafts` row so discarding or sending during an upload cannot orphan a remote draft. The baseline contains the exact acknowledged local snapshot. Bookkeeping, timestamps, and cached Markdown HTML do not count as content edits.

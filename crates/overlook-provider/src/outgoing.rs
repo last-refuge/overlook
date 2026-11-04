@@ -11,6 +11,11 @@ fn mailbox(address: &Address) -> Result<Mailbox, String> {
     Ok(Mailbox::new(address.name.clone().filter(|n| !n.trim().is_empty()), email))
 }
 
+/// The recipients that are complete addresses.
+fn finished(addresses: &[Address]) -> impl Iterator<Item = Mailbox> + '_ {
+    addresses.iter().filter(|a| a.looks_valid()).filter_map(|a| mailbox(a).ok())
+}
+
 /// Returns the raw message bytes. `rfc_id` is the Message-ID (with angle brackets).
 pub fn build_raw(account: &Account, draft: &Draft, in_reply_to: Option<&Message>, rfc_id: &str) -> Result<Vec<u8>, String> {
     build_message(account, draft, in_reply_to, rfc_id, false, false)
@@ -35,13 +40,13 @@ fn build_message(account: &Account, draft: &Draft, in_reply_to: Option<&Message>
         .user_agent("Overlook".to_owned());
     if keep_bcc { builder = builder.keep_bcc(); }
     if editing {
-        use lettre::message::header::{HeaderName, HeaderValue};
+        // A recipient still being typed stays in the local draft only: Gmail refuses the whole
+        // draft over a malformed one ("Invalid To header"). The set envelope lets a draft have
+        // no recipients at all.
         builder = builder.envelope(lettre::address::Envelope::new(None, vec!["draft@invalid.example".parse().map_err(|e| format!("{e}"))?]).map_err(|e| e.to_string())?).keep_bcc();
-        for (name, addresses) in [("To", &draft.to), ("Cc", &draft.cc), ("Bcc", &draft.bcc)] {
-            if !addresses.is_empty() {
-                builder = builder.raw_header(HeaderValue::new(HeaderName::new_from_ascii_str(name), addresses.iter().map(Address::to_header).collect::<Vec<_>>().join(", ")));
-            }
-        }
+        for mailbox in finished(&draft.to) { builder = builder.to(mailbox); }
+        for mailbox in finished(&draft.cc) { builder = builder.cc(mailbox); }
+        for mailbox in finished(&draft.bcc) { builder = builder.bcc(mailbox); }
     } else {
         for a in &draft.to { builder = builder.to(mailbox(a)?); }
         for a in &draft.cc { builder = builder.cc(mailbox(a)?); }
@@ -139,6 +144,34 @@ pub fn message_to_raw(message: &Message) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    fn draft_account() -> Account {
+        Account { id: AccountId::from("draft-test"), provider: ProviderKind::Gmail, display_name: "Test".into(), email: "me@example.com".into(), created_at: 0 }
+    }
+
+    #[test]
+    fn a_draft_leaves_out_recipients_still_being_typed() {
+        let account = draft_account();
+        let mut draft = Draft::new(account.id.clone(), DraftKind::New, 0);
+        draft.to = ["jason", "jason@", "jason@mortgage", "@example.com", "Jason <jason@exam", "a b@example.com", "done@example.com"].map(|text| Address::new(None, text)).to_vec();
+        draft.cc = vec![Address::new(None, "half@")];
+        let raw = build_draft_raw(&account, &draft, None, "<draft@example.com>").unwrap();
+        let parsed = mail_parser::MessageParser::default().parse(&raw).unwrap();
+        let to: Vec<Option<&str>> = parsed.to().unwrap().iter().map(|a| a.address()).collect();
+        assert_eq!(to, [Some("done@example.com")]);
+        assert!(parsed.cc().is_none());
+    }
+
+    #[test]
+    fn a_draft_encodes_each_recipient_name_on_its_own() {
+        let account = draft_account();
+        let mut draft = Draft::new(account.id.clone(), DraftKind::New, 0);
+        draft.to = vec![Address::new(Some("Zoë Müller".into()), "zoe@example.com"), Address::new(Some("Doe, Jane".into()), "jane@example.com")];
+        let raw = build_draft_raw(&account, &draft, None, "<draft@example.com>").unwrap();
+        let parsed = mail_parser::MessageParser::default().parse(&raw).unwrap();
+        let to: Vec<(Option<&str>, Option<&str>)> = parsed.to().unwrap().iter().map(|a| (a.name(), a.address())).collect();
+        assert_eq!(to, [(Some("Zoë Müller"), Some("zoe@example.com")), (Some("Doe, Jane"), Some("jane@example.com"))]);
+    }
+
     #[test]
     fn drafts_allow_unfinished_recipients_and_keep_bcc_and_original_html() {
         let account = Account { id: AccountId::from("draft-test"), provider: ProviderKind::Gmail, display_name: "Test".into(), email: "me@example.com".into(), created_at: 0 };
@@ -154,7 +187,7 @@ mod tests {
         draft.bcc = vec![Address::new(None, "hidden@example.com")];
         let raw = build_draft_raw(&account, &draft, None, "<draft@example.com>").unwrap();
         let text = String::from_utf8(raw).unwrap();
-        assert!(text.contains("To: unfinished\r\n"));
+        assert!(!text.contains("\r\nTo:"), "an unfinished recipient stays local");
         assert!(text.contains("Bcc: hidden@example.com\r\n"));
         assert!(text.contains("In-Reply-To: <parent@example.com>"));
         draft.to = vec![Address::new(None, "friend@example.com")];

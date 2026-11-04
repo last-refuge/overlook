@@ -12,6 +12,8 @@ struct State {
     writes: usize,
     lose_reply: bool,
     list_error: bool,
+    /// Refuse an upload whose message contains this text.
+    refuse: Option<&'static str>,
     after_write: Option<Box<dyn FnOnce() + Send>>,
 }
 
@@ -141,6 +143,9 @@ impl MailProvider for Fake {
         Box::pin(async move {
             let (result, lose_reply, hook) = {
                 let mut s = self.state.lock().unwrap();
+                if s.refuse.is_some_and(|text| String::from_utf8_lossy(&raw).contains(text)) {
+                    return Err(ProviderError::Rejected("Gmail returned 400: Invalid To header".into()));
+                }
                 if let Some((r, _)) = s
                     .drafts
                     .values()
@@ -217,6 +222,58 @@ fn account(kind: ProviderKind) -> Account {
 
 fn sync(store: &Store, fake: &Fake, account: &Account, dir: &Path) -> Result<usize, ProviderError> {
     block(synchronize(store, fake, account, dir))
+}
+
+#[test]
+fn a_refused_draft_is_named_and_does_not_hold_up_the_others() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory().unwrap();
+    let account = account(ProviderKind::Gmail);
+    store.upsert_account(&account).unwrap();
+    let fake = Fake::new(ProviderKind::Gmail);
+    // Three, so a good draft comes after the refused one whatever order they are read in.
+    for subject in ["Good one", "Refused", "Good two"] {
+        let mut draft = Draft::new(account.id.clone(), DraftKind::New, 1);
+        draft.subject = subject.into();
+        draft.body_text = "Body".into();
+        store.save_draft(&draft).unwrap();
+    }
+    fake.state.lock().unwrap().refuse = Some("Subject: Refused");
+    let error = sync(&store, &fake, &account, dir.path()).unwrap_err();
+    assert!(error.to_string().contains("Couldn’t upload “Refused”. Gmail returned 400"), "{error}");
+    assert_eq!(fake.state.lock().unwrap().drafts.len(), 2, "the others are uploaded");
+    assert_eq!(store.drafts(&account.id, false).unwrap().len(), 3, "the refused draft is kept");
+    // It goes through once the server takes it.
+    fake.state.lock().unwrap().refuse = None;
+    sync(&store, &fake, &account, dir.path()).unwrap();
+    assert_eq!(fake.state.lock().unwrap().drafts.len(), 3);
+}
+
+#[test]
+fn a_recipient_still_being_typed_stays_in_the_local_draft() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory().unwrap();
+    let account = account(ProviderKind::Gmail);
+    store.upsert_account(&account).unwrap();
+    let fake = Fake::new(ProviderKind::Gmail);
+    let mut draft = Draft::new(account.id.clone(), DraftKind::New, 1);
+    draft.subject = "Half typed".into();
+    draft.to = vec![Address::new(None, "jason@")];
+    store.save_draft(&draft).unwrap();
+    // A server that refuses this address, as Gmail does, never sees it.
+    fake.state.lock().unwrap().refuse = Some("jason@");
+    sync(&store, &fake, &account, dir.path()).unwrap();
+    sync(&store, &fake, &account, dir.path()).unwrap();
+    assert_eq!(fake.state.lock().unwrap().writes, 1, "uploaded once, without echoing back");
+    assert_eq!(store.draft(&draft.id).unwrap().unwrap().to, draft.to);
+    // Finishing the address uploads it.
+    draft.to = vec![Address::new(None, "jason@example.com")];
+    store.save_draft(&draft).unwrap();
+    fake.state.lock().unwrap().refuse = None;
+    sync(&store, &fake, &account, dir.path()).unwrap();
+    let state = fake.state.lock().unwrap();
+    assert_eq!(state.writes, 2);
+    assert!(String::from_utf8_lossy(&state.drafts.values().next().unwrap().1).contains("To: jason@example.com"));
 }
 
 #[test]
