@@ -14,6 +14,7 @@
   <url type="homepage">https://lastrefuge.ai/</url>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="1.6.18" date="2026-11-04"><description><p>Stop half-typed recipients from failing draft sync, and keep one refused draft from holding up the others.</p></description></release>
     <release version="1.6.17" date="2026-11-04"><description><p>Create calendar events by dragging across empty time, right-click an event to edit, duplicate or delete it, and confirm before deleting an event that has guests.</p></description></release>
     <release version="1.6.16" date="2026-11-04"><description><p>Tidy the sidebar: folders sort alphabetically and nest under the Inbox in any spelling, your own folders get a collapsible section, and arrows, icons and names line up.</p></description></release>
     <release version="1.6.15" date="2026-11-04"><description><p>Add account and folder management, folder windows, persistent Undo and history, settings search, and Omarchy theme integration. Improve IMAP synchronization and folder-only mailbox support.</p></description></release>

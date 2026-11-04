@@ -161,7 +161,14 @@ fn prepare_upload(
     })
 }
 
-/// Return the number of local versions recovered or preserved as conflict copies.
+/// A refusal from the server, saying which draft it was about.
+fn refused(draft: &Draft, error: ProviderError) -> ProviderError {
+    let subject = if draft.subject.trim().is_empty() { "(no subject)" } else { draft.subject.trim() };
+    ProviderError::Rejected(format!("Couldn’t upload “{subject}”. {error}"))
+}
+
+/// Return the number of local versions recovered or preserved as conflict copies. A draft the
+/// server refuses is reported at the end and retried next time, without holding up the rest.
 pub async fn synchronize(
     store: &Store,
     provider: &dyn MailProvider,
@@ -172,11 +179,19 @@ pub async fn synchronize(
         return Ok(0);
     }
     let mut conflicts = 0;
+    let mut rejected = None;
 
     // Complete unknown outcomes before examining deletions or creating anything new.
     for entry in store.draft_sync_entries(&account.id).map_err(storage)? {
         if let Some(pending) = &entry.pending {
-            finish_upload(store, provider, account, &entry, pending).await?;
+            match finish_upload(store, provider, account, &entry, pending).await {
+                Err(error @ ProviderError::Rejected(_)) => {
+                    rejected.get_or_insert(refused(&pending.draft, error));
+                }
+                other => {
+                    other?;
+                }
+            }
         }
     }
 
@@ -276,17 +291,27 @@ pub async fn synchronize(
             }
         }
         if dirty && !local.is_empty() {
-            let pending = prepare_upload(store, account, &local, &entry)?;
-            if store.begin_draft_upload(&pending).map_err(storage)?
-                && finish_upload(store, provider, account, &entry, &pending).await?
-            {
-                // New/updated copies were not in this listing. Old ids remain known
-                // so a replaced IMAP UID is never re-imported from this snapshot.
-                for saved in store.draft_sync_entries(&account.id).map_err(storage)? {
-                    if let Some(remote) = saved.remote {
-                        known.insert(remote.id);
+            let uploaded = async {
+                let pending = prepare_upload(store, account, &local, &entry)?;
+                Ok(store.begin_draft_upload(&pending).map_err(storage)?
+                    && finish_upload(store, provider, account, &entry, &pending).await?)
+            }
+            .await;
+            match uploaded {
+                Ok(true) => {
+                    // New/updated copies were not in this listing. Old ids remain known
+                    // so a replaced IMAP UID is never re-imported from this snapshot.
+                    for saved in store.draft_sync_entries(&account.id).map_err(storage)? {
+                        if let Some(remote) = saved.remote {
+                            known.insert(remote.id);
+                        }
                     }
                 }
+                Ok(false) => {}
+                Err(error @ ProviderError::Rejected(_)) => {
+                    rejected.get_or_insert(refused(&local, error));
+                }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -305,7 +330,10 @@ pub async fn synchronize(
     // A discard/send can land while an upload is in flight. Clean up in this cycle;
     // failures leave the independent sync entry durable for the next cycle.
     flush_deletions(store, provider, account).await?;
-    Ok(conflicts)
+    match rejected {
+        Some(error) => Err(error),
+        None => Ok(conflicts),
+    }
 }
 
 pub async fn flush_deletions(
