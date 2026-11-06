@@ -670,6 +670,8 @@ pub struct MailWindow {
     pub(crate) cal_event_modal: Option<EventId>,
     /// Holds the modal's keyboard focus, which keeps the calendar's keys from acting behind it.
     pub(crate) cal_modal_focus: FocusHandle,
+    /// The event details' scroll position, in the side panel or the modal.
+    pub(crate) cal_detail_scroll: ScrollHandle,
     /// Running while a first click holds the side panel back, in case a second click follows.
     pub(crate) cal_panel_wait: Option<Task<()>>,
     pub(crate) cal_status: SyncState,
@@ -929,6 +931,7 @@ impl MailWindow {
             cal_guests_expanded: None,
             cal_event_modal: None,
             cal_modal_focus: cx.focus_handle(),
+            cal_detail_scroll: ScrollHandle::new(),
             cal_panel_wait: None,
             cal_status: SyncState::Offline,
             caldav_connection: None,
@@ -3625,6 +3628,7 @@ impl MailWindow {
             (None, false) => len - 1,
         };
         self.cal_selected = Some(self.cal_events[next].id.clone());
+        self.reset_detail_scroll();
         cx.notify();
     }
     fn on_cal_select_next(&mut self, _: &CalendarSelectNext, window: &mut Window, cx: &mut Context<Self>) {

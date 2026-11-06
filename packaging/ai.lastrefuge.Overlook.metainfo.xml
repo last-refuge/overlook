@@ -14,6 +14,7 @@
   <url type="homepage">https://lastrefuge.ai/</url>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="1.6.20" date="2026-11-06"><description><p>Fix the calendar event modal, which showed only its buttons instead of the event's details.</p></description></release>
     <release version="1.6.19" date="2026-11-06"><description><p>Double-click a calendar event to open its details in a modal, expand long guest lists to see everyone, and scroll the event details.</p></description></release>
     <release version="1.6.18" date="2026-11-04"><description><p>Stop half-typed recipients from failing draft sync, and keep one refused draft from holding up the others.</p></description></release>
     <release version="1.6.17" date="2026-11-04"><description><p>Create calendar events by dragging across empty time, right-click an event to edit, duplicate or delete it, and confirm before deleting an event that has guests.</p></description></release>
