@@ -664,6 +664,14 @@ pub struct MailWindow {
     pub(crate) cal_events: Vec<Event>,
     pub(crate) calendars: Vec<Calendar>,
     pub(crate) cal_selected: Option<EventId>,
+    /// The event whose details list all of its guests.
+    pub(crate) cal_guests_expanded: Option<EventId>,
+    /// The event whose details are open in a modal, after a double click.
+    pub(crate) cal_event_modal: Option<EventId>,
+    /// Holds the modal's keyboard focus, which keeps the calendar's keys from acting behind it.
+    pub(crate) cal_modal_focus: FocusHandle,
+    /// Running while a first click holds the side panel back, in case a second click follows.
+    pub(crate) cal_panel_wait: Option<Task<()>>,
     pub(crate) cal_status: SyncState,
     pub(crate) caldav_connection: Option<CalendarConnection>,
     pub(crate) caldav_cached: bool,
@@ -918,6 +926,10 @@ impl MailWindow {
             cal_events: Vec::new(),
             calendars: Vec::new(),
             cal_selected: None,
+            cal_guests_expanded: None,
+            cal_event_modal: None,
+            cal_modal_focus: cx.focus_handle(),
+            cal_panel_wait: None,
             cal_status: SyncState::Offline,
             caldav_connection: None,
             caldav_cached: false,
@@ -3282,6 +3294,8 @@ impl MailWindow {
         } else if self.cal_scope_prompt.is_some() {
             self.cal_scope_prompt = None;
             cx.notify();
+        } else if self.event_in_modal().is_some() {
+            self.close_event_details(window, cx);
         } else if !self.marked.is_empty() {
             self.marked.clear();
             cx.notify();
@@ -4025,6 +4039,7 @@ impl Render for MailWindow {
             .when(self.settings.is_some(), |d| d.child(self.render_settings(cx)))
             .when(self.account_setup.is_some(), |d| d.child(self.render_account_setup(cx)))
             .when(self.module == Module::Calendar && self.new_event.as_ref().is_some_and(|f| f.dragged.is_some()), |d| d.child(self.render_event_modal(cx)))
+            .when(self.event_in_modal().is_some(), |d| d.child(self.render_event_details_modal(cx)))
             .when(self.folder_prompt.is_some(), |d| d.child(self.render_folder_prompt(cx)))
             .when(self.history.is_some(), |d| d.child(self.render_history(cx)))
             .when(self.quick_look.is_some(), |d| d.child(self.render_quick_look(cx)))

@@ -280,6 +280,54 @@ impl MailWindow {
         self.cal_events.iter().find(|e| &e.id == id)
     }
 
+    /// A click on an event selects it, and a second click on the same event opens its details
+    /// in a modal. Opening the side panel narrows the grid, which would move the event out from
+    /// under that second click, so a panel that isn't already open waits to see if one comes.
+    fn click_event(&mut self, id: EventId, click: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let second_click = is_double_click(click) && self.cal_selected.as_ref() == Some(&id);
+        let panel_open = self.new_event.is_some() || (self.selected_event().is_some() && self.cal_panel_wait.is_none() && self.event_in_modal().is_none());
+        self.new_event = None;
+        self.cal_selected = Some(id.clone());
+        if second_click {
+            self.cal_panel_wait = None;
+            self.cal_event_modal = Some(id);
+            self.cal_modal_focus.focus(window, cx);
+        } else {
+            self.cal_event_modal = None;
+            if !panel_open {
+                self.cal_panel_wait = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(PANEL_WAIT).await;
+                    this.update(cx, |this, cx| {
+                        this.cal_panel_wait = None;
+                        cx.notify();
+                    })
+                    .ok();
+                }));
+            }
+        }
+        cx.notify();
+    }
+
+    /// The event whose details are showing in a modal.
+    pub(super) fn event_in_modal(&self) -> Option<&Event> {
+        let open = self.module == Module::Calendar && self.new_event.is_none() && self.cal_event_modal.is_some() && self.cal_event_modal == self.cal_selected;
+        if open { self.selected_event() } else { None }
+    }
+
+    /// Closes the modal for one of the event's actions, which keeps the event selected.
+    fn leave_event_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cal_event_modal.take().is_some() {
+            self.cal_focus.focus(window, cx);
+        }
+    }
+
+    /// Closes the event's details, wherever they are showing.
+    pub(crate) fn close_event_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.leave_event_modal(window, cx);
+        self.cal_selected = None;
+        cx.notify();
+    }
+
     fn calendar_of(&self, event: &Event) -> Option<&Calendar> {
         self.calendars.iter().find(|c| c.id == event.calendar_id)
     }
@@ -300,6 +348,7 @@ impl MailWindow {
         self.new_event = None;
         self.reload_calendar();
         self.ensure_caldav_range(cx);
+        self.cal_event_modal = None;
         self.cal_selected = Some(id);
         cx.notify();
     }
@@ -384,6 +433,7 @@ impl MailWindow {
     /// Edit or delete on a repeating event asks for the scope first.
     pub(crate) fn request_edit_event(&mut self, id: EventId, window: &mut Window, cx: &mut Context<Self>) {
         if self.store.event(&id).ok().flatten().is_some_and(|e| !self.can_edit_calendar_event(&e)) { return; }
+        self.leave_event_modal(window, cx);
         match self.store.event(&id).ok().flatten() {
             Some(e) if e.is_recurring_instance() => {
                 self.cal_scope_prompt = Some(ScopePrompt { event_id: id, action: ScopeAction::Edit });
@@ -395,6 +445,7 @@ impl MailWindow {
 
     pub(crate) fn request_delete_event(&mut self, id: EventId, window: &mut Window, cx: &mut Context<Self>) {
         if self.store.event(&id).ok().flatten().is_some_and(|e| !self.can_edit_calendar_event(&e)) { return; }
+        self.leave_event_modal(window, cx);
         match self.store.event(&id).ok().flatten() {
             Some(e) if e.is_recurring_instance() => {
                 self.cal_scope_prompt = Some(ScopePrompt { event_id: id, action: ScopeAction::Delete });
@@ -462,6 +513,7 @@ impl MailWindow {
         };
         let form = Self::form_from_event(&event, if own { guest_text(&event.attendees) } else { String::new() }, window, cx);
         let add_meet = own && (event.conference_url.is_some() || event.wants_conference);
+        self.leave_event_modal(window, cx);
         self.cal_selected = None;
         self.cal_scope_prompt = None;
         self.new_event = Some(NewEvent { add_meet, calendar, duplicate_of: Some(event), ..form });
@@ -1000,7 +1052,8 @@ impl MailWindow {
         let detail: Option<AnyElement> = match &self.new_event {
             Some(form) if form.dragged.is_some() => None,
             Some(_) => Some(self.render_new_event(cx).into_any_element()),
-            None => self.selected_event().map(|e| self.render_event_detail(e, cx).into_any_element()),
+            None if self.cal_panel_wait.is_some() || self.event_in_modal().is_some() => None,
+            None => self.selected_event().map(|e| self.render_event_detail(e, cx).size_full().into_any_element()),
         };
 
         v_flex()
@@ -1355,11 +1408,7 @@ impl MailWindow {
             .child(div().font_weight(FontWeight::SEMIBOLD).truncate().child(e.display_title()))
             .when(height >= 36., |d| d.child(div().text_size(px(11.)).text_color(p.muted).truncate().child(format!("{} – {}", tz::format_clock(e.start), tz::format_clock(e.end)))))
             .when(height >= 54. && e.location.is_some(), |d| d.child(div().text_size(px(11.)).text_color(p.muted).truncate().child(e.location.clone().unwrap_or_default())))
-            .on_click(cx.listener(move |this, _, _w, cx| {
-                this.new_event = None;
-                this.cal_selected = Some(id.clone());
-                cx.notify();
-            }))
+            .on_click(cx.listener(move |this, click: &ClickEvent, window, cx| this.click_event(id.clone(), click, window, cx)))
             .context_menu(self.event_menu(e, cx))
     }
 
@@ -1379,11 +1428,7 @@ impl MailWindow {
             .truncate()
             .cursor_pointer()
             .child(e.display_title())
-            .on_click(cx.listener(move |this, _, _w, cx| {
-                this.new_event = None;
-                this.cal_selected = Some(id.clone());
-                cx.notify();
-            }))
+            .on_click(cx.listener(move |this, click: &ClickEvent, window, cx| this.click_event(id.clone(), click, window, cx)))
             .context_menu(self.event_menu(e, cx))
     }
 
@@ -1458,11 +1503,7 @@ impl MailWindow {
                                 .cursor_pointer()
                                 .when(self.cal_selected.as_ref() == Some(&e.id), |d| d.bg(fill.opacity(1.0)))
                                 .child(label)
-                                .on_click(cx.listener(move |this, _, _w, cx| {
-                                    this.new_event = None;
-                                    this.cal_selected = Some(id.clone());
-                                    cx.notify();
-                                }))
+                                .on_click(cx.listener(move |this, click: &ClickEvent, window, cx| this.click_event(id.clone(), click, window, cx)))
                                 .context_menu(self.event_menu(e, cx))
                         }))
                         .when(more > 0, |d| {
@@ -1533,11 +1574,7 @@ impl MailWindow {
                         .child(v_flex().flex_1().min_w_0().child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).truncate().child(e.display_title())).children(e.location.clone().map(|l| div().text_size(px(11.)).text_color(p.muted).truncate().child(l))))
                         .when(e.pending, |r| r.child(icon("cloud-off").size(px(13.)).text_color(p.warning)))
                         .child(div().size(px(10.)).rounded_full().bg(fill.opacity(1.0)))
-                        .on_click(cx.listener(move |this, _, _w, cx| {
-                            this.new_event = None;
-                            this.cal_selected = Some(id.clone());
-                            cx.notify();
-                        }))
+                        .on_click(cx.listener(move |this, click: &ClickEvent, window, cx| this.click_event(id.clone(), click, window, cx)))
                         .context_menu(self.event_menu(e, cx)),
                 );
             }
@@ -1548,7 +1585,7 @@ impl MailWindow {
         list.overflow_y_scrollbar()
     }
 
-    fn render_event_detail(&self, e: &Event, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_event_detail(&self, e: &Event, cx: &mut Context<Self>) -> Div {
         let p = *cx.palette();
         let (fill, edge) = self.event_colors(e, &p);
         let calendar = self.calendar_of(e);
@@ -1618,11 +1655,10 @@ impl MailWindow {
                         }))),
                 )
         });
-        v_flex()
-            .id("event-detail")
-            .size_full()
+        let body = v_flex()
+            .flex_none()
+            .w_full()
             .p(px(20.))
-            .children(scope_card)
             .gap(px(14.))
             .child(
                 h_flex()
@@ -1630,10 +1666,7 @@ impl MailWindow {
                     .gap(px(10.))
                     .child(div().mt(px(5.)).size(px(12.)).rounded(px(3.)).bg(fill.opacity(1.0)).border_1().border_color(edge))
                     .child(div().flex_1().text_size(px(20.)).line_height(px(26.)).font_weight(FontWeight::SEMIBOLD).child(e.display_title()))
-                    .child(Button::new("close-detail").ghost().xsmall().icon(icon("x").size(px(14.))).on_click(cx.listener(|this, _, _w, cx| {
-                        this.cal_selected = None;
-                        cx.notify();
-                    }))),
+                    .child(Button::new("close-detail").ghost().xsmall().icon(icon("x").size(px(14.))).on_click(cx.listener(|this, _, window, cx| this.close_event_details(window, cx)))),
             )
             .child(v_flex().gap(px(6.)).text_size(px(13.))
                 .child(h_flex().gap(px(8.)).items_center().child(icon("clock").size(px(15.)).text_color(p.muted)).child(when))
@@ -1669,11 +1702,15 @@ impl MailWindow {
                 )
             })
             .when(!e.attendees.is_empty(), |d| {
+                let total = e.attendees.len();
+                let expanded = self.cal_guests_expanded.as_ref() == Some(&e.id);
+                let shown = visible_guests(total, expanded);
+                let event_id = e.id.clone();
                 d.child(
                     v_flex()
                         .gap(px(6.))
-                        .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child(format!("{} guests", e.attendees.len())))
-                        .children(e.attendees.iter().take(12).map(|a| {
+                        .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child(format!("{total} guests")))
+                        .children(e.attendees.iter().take(shown).map(|a| {
                             let (ic, color) = match a.response {
                                 ResponseStatus::Accepted => ("circle-check", p.success),
                                 ResponseStatus::Declined => ("circle-x", p.error),
@@ -1687,11 +1724,21 @@ impl MailWindow {
                                 .child(icon(ic).size(px(14.)).text_color(color))
                                 .child(div().flex_1().truncate().child(format!("{}{}", a.display_name(), if a.is_organizer { " · Organizer" } else if a.optional { " · Optional" } else { "" })))
                         }))
-                        .when(e.attendees.len() > 12, |d| d.child(div().text_size(px(11.)).text_color(p.muted).child(format!("and {} more", e.attendees.len() - 12)))),
+                        .when(total > GUESTS_SHOWN + 1, |d| {
+                            let text = if expanded { "show fewer".to_owned() } else { format!("+{} more", total - shown) };
+                            d.child(div().id("guests-more").w_full().cursor_pointer().text_size(px(12.)).text_color(p.accent).child(text).on_click(cx.listener(move |this, _, _w, cx| {
+                                this.cal_guests_expanded = (!expanded).then(|| event_id.clone());
+                                cx.notify();
+                            })))
+                        }),
                 )
             })
-            .children(description_html.map(|html| div().text_size(px(13.)).line_height(px(20.)).child(TextView::html(SharedString::from(format!("evdesc-{}", e.id)), html).selectable(true))))
-            .child(div().flex_1())
+            .children(description_html.map(|html| div().text_size(px(13.)).line_height(px(20.)).child(TextView::html(SharedString::from(format!("evdesc-{}", e.id)), html).selectable(true))));
+        // The scope question stays above the scrolling details, so it is seen from any scroll
+        // position. The scroller's id is per event, so opening another event starts at its top.
+        v_flex()
+            .children(scope_card.map(|card| div().flex_none().px(px(20.)).pt(px(20.)).child(card)))
+            .child(v_flex().flex_1().min_h_0().child(body).overflow_y_scrollbar().id(SharedString::from(format!("event-detail-{}", e.id))))
     }
 
     fn render_new_event(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1833,6 +1880,73 @@ impl MailWindow {
             )
             .into_any_element()
     }
+
+    /// An event's details as a modal, opened by double-clicking it. It covers the toolbar, so it
+    /// carries the event's actions itself. Nothing can be lost here, so a click outside closes it.
+    pub(crate) fn render_event_details_modal(&self, cx: &mut Context<Self>) -> AnyElement {
+        let p = *cx.palette();
+        let Some(e) = self.event_in_modal() else { return div().into_any_element() };
+        let can_edit = self.can_edit_calendar_event(e);
+        let action = |name: &'static str, label: &'static str, run: fn(&mut MailWindow, EventId, &mut Window, &mut Context<MailWindow>), cx: &mut Context<Self>| {
+            let id = e.id.clone();
+            Button::new(name).small().ghost().label(label).on_click(cx.listener(move |this, _, window, cx| run(this, id.clone(), window, cx)))
+        };
+        let footer = h_flex()
+            .flex_none()
+            .justify_end()
+            .gap(px(6.))
+            .px(px(20.))
+            .py(px(12.))
+            .border_t_1()
+            .border_color(p.divider)
+            .when(can_edit, |d| d.child(action("modal-delete-event", "Delete", Self::request_delete_event, cx)))
+            .child(action("modal-duplicate-event", "Duplicate…", Self::duplicate_event, cx))
+            .when(can_edit, |d| d.child(action("modal-edit-event", "Edit…", Self::request_edit_event, cx)));
+        div()
+            .id("event-details-overlay")
+            .track_focus(&self.cal_modal_focus)
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(gpui_kit::black().opacity(if p.is_dark() { 0.55 } else { 0.3 }))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_click(cx.listener(|this, _, window, cx| this.close_event_details(window, cx)))
+            .child(
+                v_flex()
+                    .id("event-details-modal")
+                    .w(px(480.))
+                    .max_w(relative(0.94))
+                    .max_h(relative(0.88))
+                    .rounded(px(12.))
+                    .overflow_hidden()
+                    .occlude()
+                    .bg(p.surface)
+                    .border_1()
+                    .border_color(p.divider)
+                    .shadow_lg()
+                    .child(self.render_event_detail(e, cx).flex_1().overflow_hidden())
+                    .child(footer),
+            )
+            .into_any_element()
+    }
+}
+
+/// How long a first click holds the side panel back. Linux counts a second press within 400 ms of
+/// the first as a double click, and this runs from the release of the first.
+const PANEL_WAIT: std::time::Duration = std::time::Duration::from_millis(350);
+
+/// A second click in place. Pressing a second time and dragging is a move, not a double click.
+fn is_double_click(click: &ClickEvent) -> bool {
+    let in_place = match click {
+        ClickEvent::Mouse(m) => {
+            let moved = m.up.position - m.down.position;
+            f32::from(moved.x).abs() <= 4. && f32::from(moved.y).abs() <= 4.
+        }
+        _ => true,
+    };
+    click.click_count() >= 2 && in_place
 }
 
 /// What to ask before deleting an event that has guests.
@@ -1847,6 +1961,19 @@ fn delete_question(title: &str, scope: RecurrenceScope, guests: usize) -> (Strin
 }
 
 /// An event's guests as the form's guest field shows them, without you.
+/// How many guests the event details list before "+N more".
+const GUESTS_SHOWN: usize = 12;
+
+/// How many of `total` guests to list. One more than the limit is listed rather than replaced
+/// by "+1 more", which would take the same room.
+fn visible_guests(total: usize, expanded: bool) -> usize {
+    if expanded || total <= GUESTS_SHOWN + 1 {
+        total
+    } else {
+        GUESTS_SHOWN
+    }
+}
+
 fn guest_text(attendees: &[Attendee]) -> String {
     attendees.iter().filter(|a| !a.is_self).map(|a| a.email.clone()).collect::<Vec<_>>().join(", ")
 }
@@ -1910,8 +2037,33 @@ fn merge_guests(existing: &[Attendee], guests: &[Address], owner: &Address) -> V
 
 #[cfg(test)]
 mod calendar_drag_tests {
-    use super::{delete_question, guest_text, CalDrag, CalRangeDrag, DragMode, HOUR_PX};
+    use super::{delete_question, guest_text, is_double_click, visible_guests, CalDrag, CalRangeDrag, DragMode, HOUR_PX};
+    use gpui_kit::{point, px, ClickEvent, MouseClickEvent, MouseDownEvent, MouseUpEvent};
     use overlook_core::{tz, Attendee, EventId, RecurrenceScope, ResponseStatus};
+
+    fn click(count: usize, moved: f32) -> ClickEvent {
+        ClickEvent::Mouse(MouseClickEvent {
+            down: MouseDownEvent { position: point(px(100.), px(100.)), click_count: count, ..Default::default() },
+            up: MouseUpEvent { position: point(px(100.), px(100. + moved)), click_count: count, ..Default::default() },
+        })
+    }
+
+    #[test]
+    fn only_a_second_click_in_place_is_a_double_click() {
+        assert!(!is_double_click(&click(1, 0.)));
+        assert!(is_double_click(&click(2, 0.)));
+        assert!(is_double_click(&click(2, 3.)), "a hand isn't perfectly still");
+        assert!(!is_double_click(&click(2, 30.)), "a second press that drags moves the event");
+    }
+
+    #[test]
+    fn long_guest_lists_stop_at_twelve_unless_expanded() {
+        assert_eq!(visible_guests(5, false), 5);
+        assert_eq!(visible_guests(13, false), 13, "one more is listed rather than '+1 more'");
+        assert_eq!(visible_guests(14, false), 12);
+        assert_eq!(visible_guests(20, false), 12);
+        assert_eq!(visible_guests(20, true), 20);
+    }
 
     #[test]
     fn deleting_with_guests_says_what_will_happen() {
