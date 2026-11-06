@@ -286,6 +286,9 @@ impl MailWindow {
     fn click_event(&mut self, id: EventId, click: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         let second_click = is_double_click(click) && self.cal_selected.as_ref() == Some(&id);
         let panel_open = self.new_event.is_some() || (self.selected_event().is_some() && self.cal_panel_wait.is_none() && self.event_in_modal().is_none());
+        if second_click || self.cal_selected.as_ref() != Some(&id) {
+            self.reset_detail_scroll();
+        }
         self.new_event = None;
         self.cal_selected = Some(id.clone());
         if second_click {
@@ -306,6 +309,11 @@ impl MailWindow {
             }
         }
         cx.notify();
+    }
+
+    /// Another event's details start at their top.
+    pub(super) fn reset_detail_scroll(&self) {
+        self.cal_detail_scroll.set_offset(point(px(0.), px(0.)));
     }
 
     /// The event whose details are showing in a modal.
@@ -349,6 +357,7 @@ impl MailWindow {
         self.reload_calendar();
         self.ensure_caldav_range(cx);
         self.cal_event_modal = None;
+        self.reset_detail_scroll();
         self.cal_selected = Some(id);
         cx.notify();
     }
@@ -1735,10 +1744,12 @@ impl MailWindow {
             })
             .children(description_html.map(|html| div().text_size(px(13.)).line_height(px(20.)).child(TextView::html(SharedString::from(format!("evdesc-{}", e.id)), html).selectable(true))));
         // The scope question stays above the scrolling details, so it is seen from any scroll
-        // position. The scroller's id is per event, so opening another event starts at its top.
+        // position. This is a plain scroll area because `overflow_y_scrollbar` collapses to no
+        // height in the modal, whose height comes from its content.
+        let scroll = &self.cal_detail_scroll;
         v_flex()
             .children(scope_card.map(|card| div().flex_none().px(px(20.)).pt(px(20.)).child(card)))
-            .child(v_flex().flex_1().min_h_0().child(body).overflow_y_scrollbar().id(SharedString::from(format!("event-detail-{}", e.id))))
+            .child(v_flex().id("event-detail").min_h_0().child(body).overflow_y_scroll().track_scroll(scroll).vertical_scrollbar(scroll))
     }
 
     fn render_new_event(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1926,7 +1937,7 @@ impl MailWindow {
                     .border_1()
                     .border_color(p.divider)
                     .shadow_lg()
-                    .child(self.render_event_detail(e, cx).flex_1().overflow_hidden())
+                    .child(self.render_event_detail(e, cx).min_h_0().overflow_hidden())
                     .child(footer),
             )
             .into_any_element()
