@@ -670,6 +670,10 @@ pub struct MailWindow {
     pub(crate) cal_event_modal: Option<EventId>,
     /// Holds the modal's keyboard focus, which keeps the calendar's keys from acting behind it.
     pub(crate) cal_modal_focus: FocusHandle,
+    /// The modal's size. A size dragged for one event carries over to the next.
+    pub(crate) cal_modal_size: calendar::EventModalSize,
+    /// The drag resizing the modal.
+    pub(crate) cal_modal_resize: Option<calendar::EventModalResize>,
     /// The event details' scroll position, in the side panel or the modal.
     pub(crate) cal_detail_scroll: ScrollHandle,
     /// Running while a first click holds the side panel back, in case a second click follows.
@@ -931,6 +935,8 @@ impl MailWindow {
             cal_guests_expanded: None,
             cal_event_modal: None,
             cal_modal_focus: cx.focus_handle(),
+            cal_modal_size: calendar::EventModalSize::default(),
+            cal_modal_resize: None,
             cal_detail_scroll: ScrollHandle::new(),
             cal_panel_wait: None,
             cal_status: SyncState::Offline,

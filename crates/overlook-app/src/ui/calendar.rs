@@ -124,6 +124,44 @@ impl CalDrag {
     }
 }
 
+/// The event modal's size. Until a height is dragged, the modal fits the event it shows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EventModalSize {
+    pub width: Pixels,
+    pub height: Option<Pixels>,
+}
+
+impl Default for EventModalSize {
+    fn default() -> Self {
+        Self { width: px(480.), height: None }
+    }
+}
+
+impl EventModalSize {
+    /// The size that puts the dragged edge under the pointer. The modal stays centered, so both
+    /// of its sides move and it can't be dragged off the window.
+    fn dragged_to(self, resize: EventModalResize, pointer: Point<Pixels>, window: Size<Pixels>) -> Self {
+        let span = |at: Pixels, whole: Pixels, least: f32, most: f32| {
+            let whole = f32::from(whole);
+            // In this order, because a window smaller than the minimum still has to contain it.
+            px((2. * (f32::from(at) - whole / 2.).abs()).max(least).min(whole * most))
+        };
+        Self {
+            width: if resize.width { span(pointer.x, window.width, MODAL_MIN_WIDTH, MODAL_MAX_WIDTH) } else { self.width },
+            height: if resize.height { Some(span(pointer.y, window.height, MODAL_MIN_HEIGHT, MODAL_MAX_HEIGHT)) } else { self.height },
+        }
+    }
+}
+
+/// A drag on one of the event modal's edges or corners: which axes it changes, and the cursor to
+/// hold while it runs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EventModalResize {
+    pub width: bool,
+    pub height: bool,
+    pub cursor: CursorStyle,
+}
+
 /// Empty time being dragged out in the day or week grid, to become a new event. Positions are
 /// from the top of the day, so scrolling during the drag doesn't move the anchor.
 #[derive(Clone, Copy, Debug)]
@@ -294,6 +332,7 @@ impl MailWindow {
         if second_click {
             self.cal_panel_wait = None;
             self.cal_event_modal = Some(id);
+            self.cal_modal_resize = None;
             self.cal_modal_focus.focus(window, cx);
         } else {
             self.cal_event_modal = None;
@@ -1914,6 +1953,19 @@ impl MailWindow {
             .when(can_edit, |d| d.child(action("modal-delete-event", "Delete", Self::request_delete_event, cx)))
             .child(action("modal-duplicate-event", "Duplicate…", Self::duplicate_event, cx))
             .when(can_edit, |d| d.child(action("modal-edit-event", "Edit…", Self::request_edit_event, cx)));
+        let size = self.cal_modal_size;
+        // A press here is not a press on the overlay, so letting go outside the modal doesn't
+        // count as a click outside it.
+        let handle = |name: &'static str, width: bool, height: bool, cursor: CursorStyle, cx: &mut Context<Self>| {
+            div().id(name).absolute().occlude().cursor(cursor).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.cal_modal_resize = Some(EventModalResize { width, height, cursor });
+                    cx.notify();
+                }),
+            )
+        };
+        let (out, thick, corner) = (px(-4.), px(6.), px(12.));
         div()
             .id("event-details-overlay")
             .track_focus(&self.cal_modal_focus)
@@ -1928,22 +1980,65 @@ impl MailWindow {
             .child(
                 v_flex()
                     .id("event-details-modal")
-                    .w(px(480.))
-                    .max_w(relative(0.94))
-                    .max_h(relative(0.88))
+                    .relative()
+                    .w(size.width)
+                    .max_w(relative(MODAL_MAX_WIDTH))
+                    .when_some(size.height, |d, height| d.h(height))
+                    .max_h(relative(MODAL_MAX_HEIGHT))
                     .rounded(px(12.))
-                    .overflow_hidden()
                     .occlude()
                     .bg(p.surface)
                     .border_1()
                     .border_color(p.divider)
                     .shadow_lg()
-                    .child(self.render_event_detail(e, cx).min_h_0().overflow_hidden())
-                    .child(footer),
+                    .child(self.render_event_detail(e, cx).when(size.height.is_some(), |d| d.flex_1()).min_h_0().overflow_hidden())
+                    .child(footer)
+                    // The handles reach past the modal's edge, so it can't clip its overflow, and
+                    // they barely overlap the scrollbar. Corners come last, to sit above the edges.
+                    .child(handle("modal-resize-top", false, true, CursorStyle::ResizeUpDown, cx).top(out).left_0().right_0().h(thick))
+                    .child(handle("modal-resize-bottom", false, true, CursorStyle::ResizeUpDown, cx).bottom(out).left_0().right_0().h(thick))
+                    .child(handle("modal-resize-left", true, false, CursorStyle::ResizeLeftRight, cx).left(out).top_0().bottom_0().w(thick))
+                    .child(handle("modal-resize-right", true, false, CursorStyle::ResizeLeftRight, cx).right(out).top_0().bottom_0().w(thick))
+                    .child(handle("modal-resize-top-left", true, true, CursorStyle::ResizeUpLeftDownRight, cx).top(out).left(out).size(corner))
+                    .child(handle("modal-resize-top-right", true, true, CursorStyle::ResizeUpRightDownLeft, cx).top(out).right(out).size(corner))
+                    .child(handle("modal-resize-bottom-left", true, true, CursorStyle::ResizeUpRightDownLeft, cx).bottom(out).left(out).size(corner))
+                    .child(handle("modal-resize-bottom-right", true, true, CursorStyle::ResizeUpLeftDownRight, cx).bottom(out).right(out).size(corner)),
             )
+            // Moves only reach what's under the pointer, and shrinking brings it inside the modal.
+            // This covers the window for the length of the drag, and holds the resize cursor.
+            .when_some(self.cal_modal_resize, |d, resize| {
+                d.child(
+                    div()
+                        .id("event-modal-resizing")
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .cursor(resize.cursor)
+                        .on_mouse_move(cx.listener(move |this, e: &MouseMoveEvent, window, cx| {
+                            if e.dragging() {
+                                this.cal_modal_size = this.cal_modal_size.dragged_to(resize, e.position, window.viewport_size());
+                            } else {
+                                // The button came up outside the window: the drag is over.
+                                this.cal_modal_resize = None;
+                            }
+                            cx.notify();
+                        }))
+                        .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                            this.cal_modal_resize = None;
+                            cx.notify();
+                        })),
+                )
+            })
             .into_any_element()
     }
 }
+
+/// The event modal's limits. Its details scroll, so the minimums only need to keep the title, the
+/// close button and the footer in view. The maximums are fractions of the window.
+const MODAL_MIN_WIDTH: f32 = 360.;
+const MODAL_MIN_HEIGHT: f32 = 240.;
+const MODAL_MAX_WIDTH: f32 = 0.94;
+const MODAL_MAX_HEIGHT: f32 = 0.88;
 
 /// How long a first click holds the side panel back. Linux counts a second press within 400 ms of
 /// the first as a double click, and this runs from the release of the first.
@@ -2049,8 +2144,8 @@ fn merge_guests(existing: &[Attendee], guests: &[Address], owner: &Address) -> V
 
 #[cfg(test)]
 mod calendar_drag_tests {
-    use super::{delete_question, guest_text, is_double_click, visible_guests, CalDrag, CalRangeDrag, DragMode, HOUR_PX};
-    use gpui_kit::{point, px, ClickEvent, MouseClickEvent, MouseDownEvent, MouseUpEvent};
+    use super::{delete_question, guest_text, is_double_click, visible_guests, CalDrag, CalRangeDrag, DragMode, EventModalResize, EventModalSize, HOUR_PX};
+    use gpui_kit::{point, px, size, ClickEvent, CursorStyle, MouseClickEvent, MouseDownEvent, MouseUpEvent};
     use overlook_core::{tz, Attendee, EventId, RecurrenceScope, ResponseStatus};
 
     fn click(count: usize, moved: f32) -> ClickEvent {
@@ -2058,6 +2153,29 @@ mod calendar_drag_tests {
             down: MouseDownEvent { position: point(px(100.), px(100.)), click_count: count, ..Default::default() },
             up: MouseUpEvent { position: point(px(100.), px(100. + moved)), click_count: count, ..Default::default() },
         })
+    }
+
+    #[test]
+    fn a_dragged_modal_edge_follows_the_pointer_within_limits() {
+        let window = size(px(1000.), px(800.));
+        let sides = EventModalResize { width: true, height: false, cursor: CursorStyle::ResizeLeftRight };
+        let corner = EventModalResize { width: true, height: true, cursor: CursorStyle::ResizeUpLeftDownRight };
+        let start = EventModalSize::default();
+
+        let wider = start.dragged_to(sides, point(px(850.), px(1.)), window);
+        assert_eq!(wider, EventModalSize { width: px(700.), height: None }, "the height keeps fitting the event");
+        assert_eq!(start.dragged_to(sides, point(px(150.), px(1.)), window).width, px(700.), "the left edge works the same");
+
+        let both = start.dragged_to(corner, point(px(800.), px(600.)), window);
+        assert_eq!(both, EventModalSize { width: px(600.), height: Some(px(400.)) });
+
+        let smallest = start.dragged_to(corner, point(px(500.), px(400.)), window);
+        assert_eq!(smallest, EventModalSize { width: px(360.), height: Some(px(240.)) });
+        let largest = start.dragged_to(corner, point(px(5000.), px(5000.)), window);
+        assert_eq!(largest, EventModalSize { width: px(940.), height: Some(px(704.)) });
+
+        let tiny = start.dragged_to(corner, point(px(100.), px(100.)), size(px(200.), px(200.)));
+        assert_eq!(tiny, EventModalSize { width: px(188.), height: Some(px(176.)) }, "it still fits a tiny window");
     }
 
     #[test]
