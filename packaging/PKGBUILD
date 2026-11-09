@@ -6,7 +6,7 @@ pkgrel=1
 pkgdesc="A clear view of what matters. A native mail and calendar client for Linux by Last Refuge."
 arch=('x86_64' 'aarch64')
 url="https://github.com/last-refuge/overlook"
-license=('LicenseRef-Proprietary')
+license=('MIT')
 depends=('vulkan-icd-loader' 'libxkbcommon' 'libxkbcommon-x11' 'libxcb' 'wayland' 'fontconfig' 'freetype2' 'xdg-desktop-portal' 'chromium')
 makedepends=('git' 'rust')
 optdepends=('gnome-keyring: stores Gmail sign-in tokens' 'kwallet: alternative keyring' 'xdg-desktop-portal-gtk: Follow system theme and file dialogs on Hyprland' 'poppler: PDF previews inside Overlook')
@@ -51,6 +51,7 @@ package() {
   for s in 16 24 32 48 64 128 256 512; do
     install -Dm644 "branding/assets/overlook-icon-$s.png" "$pkgdir/usr/share/icons/hicolor/${s}x${s}/apps/ai.lastrefuge.Overlook.png"
   done
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 branding/fonts/Inter-LICENSE.txt "$pkgdir/usr/share/licenses/$pkgname/Inter-LICENSE.txt"
   install -Dm644 branding/fonts/SourceSerif-LICENSE.md "$pkgdir/usr/share/licenses/$pkgname/SourceSerif-LICENSE.md"
 }

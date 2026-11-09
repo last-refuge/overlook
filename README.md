@@ -233,5 +233,7 @@ SIL Open Font License. Icons: [Lucide](https://lucide.dev) (ISC). Overlook is a 
 
 ## License
 
-Copyright © 2026 Last Refuge. All rights reserved. Source is published for transparency and review; a
-license for redistribution has not been chosen yet.
+Overlook is released under the [MIT License](LICENSE). Copyright © 2026 Last Refuge.
+
+The vendored [`vendor/gpui-base`](vendor/gpui-base) keeps its own Apache-2.0 license, and the bundled fonts and icons keep
+the licenses listed above.

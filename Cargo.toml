@@ -10,7 +10,7 @@ members = [
 [workspace.package]
 version = "1.6.21"
 edition = "2021"
-license = "Proprietary"
+license = "MIT"
 authors = ["Last Refuge"]
 repository = "https://github.com/lastrefuge/overlook"
 
