@@ -86,6 +86,7 @@ actions!(
         NewEventAction,
         SaveCalendarEvent,
         OpenSettings,
+        QuitOverlook,
         ArchiveSelected,
         TrashSelected,
         ToggleStar,
@@ -198,6 +199,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-shift-a", NewEventAction, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-s", SaveCalendarEvent, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-,", OpenSettings, Some(WINDOW_CONTEXT)),
+        KeyBinding::new("ctrl-q", QuitOverlook, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-b", FormatBold, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-i", FormatItalic, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-shift-x", FormatStrike, Some(WINDOW_CONTEXT)),
@@ -504,6 +506,12 @@ pub struct UpdateState {
     pub dismissed: Option<String>,
 }
 
+/// Set once the first main window has opened; a later one is the window coming back.
+static MAIN_WINDOW_OPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Reminder state handed from a closing main window to the next one.
+type ReminderMemory = (HashSet<(EventId, i32)>, HashMap<EventId, i64>);
+static REMINDER_MEMORY: std::sync::Mutex<Option<ReminderMemory>> = std::sync::Mutex::new(None);
+
 pub struct MailWindow {
     focus_handle: FocusHandle,
     list_focus: FocusHandle,
@@ -733,6 +741,17 @@ pub struct MailWindow {
     next_retry: HashMap<AccountId, i64>,
     retry_attempts: HashMap<AccountId, u32>,
     _subscriptions: Vec<Subscription>,
+}
+
+impl Drop for MailWindow {
+    fn drop(&mut self) {
+        // Only the main window checks reminders; its state outlives it (see `new`).
+        if self.composer_owner.is_none() && self.folder_owner.is_none() {
+            let memory = (std::mem::take(&mut self.notified), std::mem::take(&mut self.snoozed_reminders));
+            *REMINDER_MEMORY.lock().unwrap() = Some(memory);
+            tracing::info!("main window state released");
+        }
+    }
 }
 
 impl MailWindow {
@@ -1014,6 +1033,15 @@ impl MailWindow {
                 me.update(cx, |this, cx| this.close_folder_windows(cx)).ok();
             }
         }));
+        // The main window opens again after running in the background (`lifecycle`); what
+        // follows only a process start happens once.
+        let first_start = !MAIN_WINDOW_OPENED.swap(true, std::sync::atomic::Ordering::Relaxed);
+        let hidden = cx.graphical_environment().is_none();
+        // Reminders already shown stay shown, and snoozes run on, across a reopened window.
+        if let Some((notified, snoozed)) = REMINDER_MEMORY.lock().unwrap().take() {
+            this.notified = notified;
+            this.snoozed_reminders = snoozed;
+        }
         // The watchdog reports any stall of this thread (see `watchdog.rs`).
         crate::watchdog::start();
         cx.spawn(async move |_, cx| loop {
@@ -1021,10 +1049,11 @@ impl MailWindow {
             crate::watchdog::beat();
         })
         .detach();
-        // Keep a Chromium started so the first message opens without its launch.
+        // Keep a Chromium started so the first message opens without its launch (paused while
+        // hidden: see `browser_engine::set_prewarm`).
         crate::browser_engine::prewarm();
         // A fresh process has not reached any provider yet: say so until a probe succeeds.
-        for a in this.accounts.clone() {
+        for a in this.accounts.clone().into_iter().filter(|_| first_start) {
             if this.provider_issues.contains_key(&a.id) {
                 let _ = this.store.set_sync_state(&a.id, &SyncState::SignInRequired, None);
             } else if !this.connected(&a.id) {
@@ -1042,19 +1071,23 @@ impl MailWindow {
         // Synchronize on startup for every reachable account; queued work from a previous
         // session is replayed before anything else happens.
         // A fresh start checks every account's folders and messages against the server once.
-        this.verify_pending = this.accounts.iter().map(|a| a.id.clone()).collect();
+        if first_start {
+            this.verify_pending = this.accounts.iter().map(|a| a.id.clone()).collect();
+        }
         this.sync_all(window, cx);
         // IMAP IDLE: one thread per account asks for a sync the moment the Inbox changes.
         this.watch_idle_events(idle_rx, window, cx);
         this.refresh_idle_watchers();
         this.watch_system_time_zone(window, cx);
         // `OVERLOOK_SIGN_IN=gmail` opens the Google sign-in immediately (first-run helper).
-        match std::env::var("OVERLOOK_SIGN_IN").as_deref() {
+        // Neither it nor the sample offer belongs in a window nobody can see.
+        let launch_helper = if first_start && !hidden { std::env::var("OVERLOOK_SIGN_IN") } else { Err(std::env::VarError::NotPresent) };
+        match launch_helper.as_deref() {
             Ok("gmail") => this.start_google_sign_in(None, window, cx),
             Ok("imap") => this.open_account_setup(ProviderKind::Imap, SetupMode::New, window, cx),
             Ok("pop3") => this.open_account_setup(ProviderKind::Pop3, SetupMode::New, window, cx),
             // Asked only here, at launch: removing the last account later leaves the window empty.
-            _ if !this.has_account() => {
+            _ if !this.has_account() && first_start && !hidden => {
                 cx.spawn_in(window, async move |this, cx| {
                     let _ = this.update_in(cx, |this, window, cx| this.offer_sample_mailbox(window, cx));
                 })
@@ -1071,26 +1104,6 @@ impl MailWindow {
                     this.check_for_updates(false, window, cx);
                 }
             });
-        })
-        .detach();
-
-        // mailto: links handed over by later launches (or this one) open the composer;
-        // Omarchy's theme-set hook asks for the desktop theme to be read again.
-        cx.spawn_in(window, async move |this, cx| loop {
-            cx.background_executor().timer(Duration::from_millis(700)).await;
-            let alive = this.update_in(cx, |this, window, cx| {
-                for link in crate::single_instance::take() {
-                    if link == crate::single_instance::RELOAD_THEME {
-                        theme::apply_preference(this.appearance, theme::system_appearance(window.appearance()), cx);
-                    } else if let Some(m) = overlook_core::mailto::parse(&link) {
-                        this.compose_mailto(m, window, cx);
-                        window.activate_window();
-                    }
-                }
-            });
-            if alive.is_err() {
-                break;
-            }
         })
         .detach();
 
@@ -1116,6 +1129,44 @@ impl MailWindow {
         })
         .detach();
         this
+    }
+
+    /// Carries out a request from a later launch that needs the main window
+    /// (`lifecycle::serve`): open a mailto link, or re-read the desktop theme.
+    pub(crate) fn serve_launch(&mut self, request: crate::single_instance::Request, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::single_instance::Request;
+        match request {
+            Request::Show(_) => window.activate_window(),
+            Request::Quit => {}
+            // Omarchy's theme-set hook asks for the desktop theme to be read again.
+            Request::ReloadTheme => {
+                theme::apply_preference(self.appearance, theme::system_appearance(window.appearance()), cx);
+            }
+            Request::Mailto(link) => {
+                if let Some(m) = overlook_core::mailto::parse(&link) {
+                    self.compose_mailto(m, window, cx);
+                    window.activate_window();
+                }
+            }
+        }
+    }
+
+    /// A package upgrade installed `version` while this one kept running: the update banner
+    /// offers the restart into it.
+    pub(crate) fn offer_restart_into(&mut self, version: String, cx: &mut Context<Self>) {
+        if matches!(self.update.phase, UpdatePhase::Downloading | UpdatePhase::ReadyToRestart) {
+            return;
+        }
+        let tag = format!("v{version}");
+        self.update.latest = Some(ReleaseInfo {
+            html_url: format!("https://github.com/{}/releases/tag/{tag}", updater::REPO),
+            version,
+            tag,
+            notes: String::new(),
+            assets: Vec::new(),
+        });
+        self.update.phase = UpdatePhase::ReadyToRestart;
+        cx.notify();
     }
 
     /// False when the device has no accounts and the window shows "Add an account".
@@ -4028,6 +4079,8 @@ impl Render for MailWindow {
             .on_action(cx.listener(Self::on_cal_select_previous))
             .on_action(cx.listener(Self::on_save_calendar_event))
             .on_action(cx.listener(Self::on_open_settings))
+            // Deferred: Quit asks each composer (perhaps this one) to save its draft first.
+            .on_action(cx.listener(|_, _: &QuitOverlook, _window, cx| cx.defer(crate::lifecycle::quit)))
             .on_action(cx.listener(|this, _: &UndoLast, window, cx| this.undo_last(window, cx)))
             .on_action(cx.listener(|this, _: &ShowHistory, window, cx| this.open_history(window, cx)))
             .size_full()

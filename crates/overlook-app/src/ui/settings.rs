@@ -156,6 +156,7 @@ impl MailWindow {
         });
         overlook_core::tz::set_clock_24h(self.prefs.clock_24h);
         crate::notify::set_mirror(self.prefs.omarchy_notifications);
+        crate::lifecycle::set_keep_running(self.prefs.keep_running);
         self.reminders_enabled = self.prefs.event_reminders;
         self.reload(cx);
         self.share_prefs(cx);
@@ -956,6 +957,25 @@ impl MailWindow {
                     this.save_prefs(cx);
                 }),
             ))
+            .child(section("Running in the background", None))
+            .child(setting_row(
+                "Keep running when the window is closed",
+                "Overlook keeps checking mail and calendars, with notifications and reminders, after you close its window. Open it again from the app launcher or a notification; Ctrl+Q quits.",
+                Switch::new("pref-keep-running").checked(prefs.keep_running).on_click(cx.listener(|this, checked: &bool, _w, cx| {
+                    this.prefs.keep_running = *checked;
+                    this.save_prefs(cx);
+                })).into_any_element(),
+            ))
+            .child(setting_row(
+                "Start Overlook when you log in",
+                if prefs.keep_running { "Starts without a window, ready with notifications and reminders." } else { "Opens the Overlook window when you log in." },
+                Switch::new("pref-start-at-login").checked(crate::autostart::enabled()).on_click(cx.listener(|_this, checked: &bool, window, cx| {
+                    if let Err(e) = crate::autostart::set_enabled(*checked) {
+                        crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t change starting at login: {e}"));
+                    }
+                    cx.notify();
+                })).into_any_element(),
+            ))
             .child(section("Notifications", None))
             .when(crate::notify::omarchy_available(), |d| {
                 d.child(setting_row(
@@ -1191,7 +1211,7 @@ impl MailWindow {
             .child(setting_row("Sign-in tokens", "Stored in the system keyring (Secret Service), never in files.", div().into_any_element()))
             .child(section("Keyboard", None))
             .child(div().text_size(px(12.)).text_color(p.muted).line_height(px(20.)).child(
-                "Ctrl N new message · Ctrl E search · Ctrl R reply · Ctrl Shift R reply all · Ctrl F forward · Ctrl Enter send · Ctrl U toggle read · J/K move · E archive or move to Inbox · Delete · S star · Ctrl 1 Mail · Ctrl 2 Calendar · Ctrl Shift A new event · Ctrl , settings · in settings: Ctrl F or F3 search · in the calendar: ← → T D W M A",
+                "Ctrl N new message · Ctrl E search · Ctrl R reply · Ctrl Shift R reply all · Ctrl F forward · Ctrl Enter send · Ctrl U toggle read · J/K move · E archive or move to Inbox · Delete · S star · Ctrl 1 Mail · Ctrl 2 Calendar · Ctrl Shift A new event · Ctrl , settings · Ctrl Q quit · in settings: Ctrl F or F3 search · in the calendar: ← → T D W M A",
             ))
     }
 }
@@ -1448,6 +1468,8 @@ pub(crate) static SETTINGS_INDEX: &[SettingEntry] = &[
     entry(GE, "Start-up and time", "Open Overlook in", "Mail, Calendar, or the last used module.", "startup launch start"),
     entry(GE, "Start-up and time", "Time format", "12-hour or 24-hour clock.", "clock 24h 12h am pm"),
     entry(GE, "Start-up and time", "Week starts on", "Monday or Sunday.", "first day week"),
+    entry(GE, "Running in the background", "Keep running when the window is closed", "Keep checking mail and calendars, with notifications and reminders, after the window closes.", "background tray minimize close daemon quit"),
+    entry(GE, "Running in the background", "Start Overlook when you log in", "Start at login, without a window when Overlook keeps running.", "autostart startup login boot launch"),
     entry(GE, "Notifications", "Show in Omarchy notifications", "Messages also appear in Omarchy’s notification center.", "omarchy notification center"),
     entry(GE, "Notifications", "New mail", "Desktop notification when new mail arrives.", "notifications alert focused"),
     entry(GE, "Notifications", "Event reminders", "Desktop notification before events start.", "notifications alert reminder"),

@@ -81,15 +81,22 @@ struct Warm {
 static POOL: Mutex<Option<Warm>> = Mutex::new(None);
 static POOL_WAKE: std::sync::Condvar = std::sync::Condvar::new();
 static POOL_STARTED: std::sync::Once = std::sync::Once::new();
-/// Tests that count live processes empty the pool and stop it refilling.
-#[cfg(test)]
+/// Stops the pool refilling: while Overlook runs without a window (nothing is shown, so a
+/// spare Chromium is only memory), and in tests that count live processes.
 static POOL_PAUSED: AtomicBool = AtomicBool::new(false);
 
 fn pool_paused() -> bool {
-    #[cfg(test)]
-    return POOL_PAUSED.load(Ordering::Acquire);
-    #[cfg(not(test))]
-    false
+    POOL_PAUSED.load(Ordering::Acquire)
+}
+
+/// Keeps a spare Chromium ready, or lets the spare go and stops keeping one.
+pub fn set_prewarm(on: bool) {
+    POOL_PAUSED.store(!on, Ordering::Release);
+    if on {
+        POOL_WAKE.notify_all();
+    } else {
+        drop(take_warm());
+    }
 }
 
 /// Starts keeping one spare Chromium ready. The launcher thread lives as long as the

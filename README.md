@@ -80,6 +80,12 @@ and you can read, search, write, and file mail with no connection at all.
   control takes effect immediately.
   Mail and calendar use date-aware daylight-saving rules. Overlook checks for system time-zone changes
   every minute and asks before switching; keeping the current zone saves an override.
+- **Runs in the background if you want it to.** Settings → General → *Keep running when the window is
+  closed* keeps mail and calendars syncing, with new-mail notifications and event reminders, after you close
+  the window. Open it again from the app launcher or a notification; <kbd>Ctrl</kbd>+<kbd>Q</kbd> or
+  `overlook --quit` quits. *Start Overlook when you log in* adds an autostart entry, which starts it
+  without a window when it keeps running in the background. Launching Overlook again always brings the
+  running one forward rather than starting a second copy.
 
 <p align="center">
   <img src="docs/screenshots/calendar-week-light.png" alt="Overlook calendar week view" width="920">
@@ -137,7 +143,8 @@ make install PREFIX=~/.local
 `--source` forces a build from source even when a release exists.
 
 **Remove it:** `sudo pacman -Rns overlook` on Arch, or `./install.sh --uninstall`. Your mail and settings in
-`~/.local/share/overlook` stay until you delete them.
+`~/.local/share/overlook` stay until you delete them. If Overlook starts at login, switch that off in
+Settings first (`./install.sh --uninstall` does it for you).
 
 ### Updates
 
@@ -189,6 +196,7 @@ The [secrets access policy](docs/secrets-policy.md) lists every stored secret, w
 | <kbd>←</kbd> <kbd>→</kbd> <kbd>T</kbd> <kbd>D</kbd> <kbd>W</kbd> <kbd>M</kbd> <kbd>A</kbd> | Calendar: move, today, day, week, month, agenda |
 | <kbd>Enter</kbd> / <kbd>Delete</kbd> | Calendar: edit / delete the selected event |
 | <kbd>Ctrl</kbd>+<kbd>,</kbd> | Settings |
+| <kbd>Ctrl</kbd>+<kbd>Q</kbd> | Quit Overlook (closing the window keeps it running when that's on) |
 | <kbd>Esc</kbd> | Close composer or settings, clear search |
 
 Drag a conversation onto Inbox, Archive, Trash, Starred, or a label in the sidebar to move it. Every move

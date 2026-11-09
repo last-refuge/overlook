@@ -168,6 +168,7 @@ impl MailWindow {
                             .ok();
                     }
                 });
+                crate::lifecycle::add_composer(handle, editor.downgrade(), cx);
                 self.detached_composers.insert(
                     id,
                     DetachedComposer {
@@ -191,7 +192,7 @@ impl MailWindow {
     }
 
     /// Veto native close on a failed save. The input entities and edit guard stay alive.
-    pub(super) fn prepare_composer_window_close(
+    pub(crate) fn prepare_composer_window_close(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
