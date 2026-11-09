@@ -27,6 +27,8 @@ pub const RELOAD_THEME: &str = "overlook:reload-theme";
 pub const SHOW: &str = "overlook:show";
 /// The line `overlook --quit` sends.
 pub const QUIT: &str = "overlook:quit";
+/// Check for new mail now (the tray icon's menu).
+pub const SYNC: &str = "overlook:sync";
 
 /// The variables that name a launch's desktop, passed along with a show request.
 const LAUNCH_VARIABLES: [&str; 4] = ["WAYLAND_DISPLAY", "DISPLAY", "XDG_RUNTIME_DIR", "XDG_ACTIVATION_TOKEN"];
@@ -80,6 +82,7 @@ impl LaunchEnv {
 pub enum Request {
     Show(LaunchEnv),
     Quit,
+    SyncNow,
     ReloadTheme,
     Mailto(String),
 }
@@ -92,6 +95,7 @@ impl Request {
         match head.trim() {
             SHOW => Some(Self::Show(LaunchEnv::parse(fields))),
             QUIT => Some(Self::Quit),
+            SYNC => Some(Self::SyncNow),
             RELOAD_THEME => Some(Self::ReloadTheme),
             head if head.to_ascii_lowercase().starts_with("mailto:") => Some(Self::Mailto(line.trim().to_owned())),
             _ => None,
@@ -103,6 +107,7 @@ impl Request {
         match self {
             Self::Show(_) => "show",
             Self::Quit => "quit",
+            Self::SyncNow => "check for new mail",
             Self::ReloadTheme => "reload theme",
             Self::Mailto(_) => "mailto",
         }
@@ -232,6 +237,7 @@ mod tests {
     fn launch_lines_parse_into_requests() {
         assert_eq!(Request::parse("overlook:show"), Some(Request::Show(LaunchEnv::default())));
         assert_eq!(Request::parse("overlook:quit"), Some(Request::Quit));
+        assert_eq!(Request::parse("overlook:sync"), Some(Request::SyncNow));
         assert_eq!(Request::parse("overlook:reload-theme\r"), Some(Request::ReloadTheme));
         assert_eq!(Request::parse("MAILTO:maya@example.com"), Some(Request::Mailto("MAILTO:maya@example.com".into())));
         assert_eq!(Request::parse("overlook:something-newer"), None);

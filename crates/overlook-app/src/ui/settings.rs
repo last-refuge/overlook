@@ -960,7 +960,7 @@ impl MailWindow {
             .child(section("Running in the background", None))
             .child(setting_row(
                 "Keep running when the window is closed",
-                "Overlook keeps checking mail and calendars, with notifications and reminders, after you close its window. Open it again from the app launcher or a notification; Ctrl+Q quits.",
+                "Overlook keeps checking mail and calendars, with notifications and reminders, after you close its window, and shows an icon in the system tray. Open it again from the tray, the app launcher or a notification; Ctrl+Q quits.",
                 Switch::new("pref-keep-running").checked(prefs.keep_running).on_click(cx.listener(|this, checked: &bool, _w, cx| {
                     this.prefs.keep_running = *checked;
                     this.save_prefs(cx);
@@ -1468,7 +1468,7 @@ pub(crate) static SETTINGS_INDEX: &[SettingEntry] = &[
     entry(GE, "Start-up and time", "Open Overlook in", "Mail, Calendar, or the last used module.", "startup launch start"),
     entry(GE, "Start-up and time", "Time format", "12-hour or 24-hour clock.", "clock 24h 12h am pm"),
     entry(GE, "Start-up and time", "Week starts on", "Monday or Sunday.", "first day week"),
-    entry(GE, "Running in the background", "Keep running when the window is closed", "Keep checking mail and calendars, with notifications and reminders, after the window closes.", "background tray minimize close daemon quit"),
+    entry(GE, "Running in the background", "Keep running when the window is closed", "Keep checking mail and calendars, with notifications, reminders and a tray icon, after the window closes.", "background tray icon system tray minimize close daemon quit"),
     entry(GE, "Running in the background", "Start Overlook when you log in", "Start at login, without a window when Overlook keeps running.", "autostart startup login boot launch"),
     entry(GE, "Notifications", "Show in Omarchy notifications", "Messages also appear in Omarchy’s notification center.", "omarchy notification center"),
     entry(GE, "Notifications", "New mail", "Desktop notification when new mail arrives.", "notifications alert focused"),

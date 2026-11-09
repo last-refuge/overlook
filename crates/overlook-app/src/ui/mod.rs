@@ -1138,6 +1138,7 @@ impl MailWindow {
         match request {
             Request::Show(_) => window.activate_window(),
             Request::Quit => {}
+            Request::SyncNow => self.sync_now(window, cx),
             // Omarchy's theme-set hook asks for the desktop theme to be read again.
             Request::ReloadTheme => {
                 theme::apply_preference(self.appearance, theme::system_appearance(window.appearance()), cx);
@@ -1149,6 +1150,20 @@ impl MailWindow {
                 }
             }
         }
+    }
+
+    /// Unread Inbox mail across accounts, as the sidebar's Inbox badges count it: for the
+    /// tray icon.
+    pub(crate) fn unread_inbox_total(&self) -> usize {
+        let inbox = MailboxView::Kind(LabelKind::Inbox);
+        let active = self.counts.get(&inbox).copied().unwrap_or(0);
+        let others: usize = self
+            .account_counts
+            .iter()
+            .filter(|(id, _)| **id != self.account.id)
+            .filter_map(|(_, counts)| counts.get(&inbox))
+            .sum();
+        active + others
     }
 
     /// A package upgrade installed `version` while this one kept running: the update banner

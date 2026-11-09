@@ -9,7 +9,8 @@
 //! the command palette, `overlook --quit`) ends the process.
 //!
 //! Every request from a later launch arrives here too (`serve_launches`), so one is served even
-//! while the window is hidden, or when only a composer window is open.
+//! while the window is hidden, or when only a composer window is open. So do the tray icon's,
+//! which this module shows while keep-running is on (`tray.rs`).
 
 use crate::single_instance::{LaunchEnv, Request};
 use crate::ui::{MailWindow, WindowSetup};
@@ -53,6 +54,10 @@ struct Lifecycle {
     /// Composer windows, which save their draft before Quit ends the process.
     composers: Vec<(AnyWindowHandle, WeakEntity<MailWindow>)>,
     replaced_noticed: bool,
+    tray: Option<crate::tray::TrayIcon>,
+    /// The tray icon couldn't start (no session bus): not tried again until keep-running is
+    /// switched off and on.
+    tray_failed: bool,
 }
 
 impl Global for Lifecycle {}
@@ -70,6 +75,8 @@ pub fn start(store: Arc<Store>, sample: SampleProvider, hidden: bool, cx: &mut A
         after_show: Vec::new(),
         composers: Vec::new(),
         replaced_noticed: false,
+        tray: None,
+        tray_failed: false,
     });
     cx.on_window_closed(window_closed).detach();
     if hidden {
@@ -82,6 +89,7 @@ pub fn start(store: Arc<Store>, sample: SampleProvider, hidden: bool, cx: &mut A
     }
     serve_launches(cx);
     watch_for_upgrades(cx);
+    keep_tray(cx);
 }
 
 /// A composer window to give the chance to save before Quit.
@@ -285,6 +293,7 @@ fn serve(request: Request, cx: &mut App) {
         Request::Quit => quit(cx),
         // While hidden there's nothing to repaint; the window reads the theme when it opens.
         Request::ReloadTheme if l.hidden || l.switching => {}
+        Request::SyncNow if l.switching => {}
         Request::Mailto(_) if l.hidden || l.switching || l.main.is_none() => {
             l.after_show.push(request);
             show(LaunchEnv::default(), cx);
@@ -331,4 +340,37 @@ fn serve_in_main_with(cx: &mut App, f: impl FnOnce(&mut MailWindow, &mut Context
     if let Some(view) = cx.global::<Lifecycle>().main.as_ref().and_then(|m| m.view.upgrade()) {
         view.update(cx, f);
     }
+}
+
+/// Shows the tray icon while keep-running is on, with the unread count, and takes it away
+/// when it's switched off. Checked every two seconds: cheap, and the count needs no hook into
+/// every change that moves it.
+fn keep_tray(cx: &mut App) {
+    cx.spawn(async move |cx| loop {
+        cx.update(|cx| {
+            let unread = cx
+                .global::<Lifecycle>()
+                .main
+                .as_ref()
+                .and_then(|m| m.view.upgrade())
+                .map(|view| view.read(cx).unread_inbox_total());
+            let l = cx.global_mut::<Lifecycle>();
+            match (&mut l.tray, keep_running()) {
+                (None, true) if !l.tray_failed => {
+                    l.tray = crate::tray::TrayIcon::start(unread.unwrap_or(0));
+                    l.tray_failed = l.tray.is_none();
+                }
+                (None, true) => {}
+                (Some(_), false) => l.tray = None,
+                (Some(tray), true) => {
+                    if let Some(unread) = unread {
+                        tray.set_unread(unread);
+                    }
+                }
+                (None, false) => l.tray_failed = false,
+            }
+        });
+        cx.background_executor().timer(Duration::from_secs(2)).await;
+    })
+    .detach();
 }

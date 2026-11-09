@@ -20,6 +20,7 @@ mod providers;
 mod sync;
 mod draft_sync;
 mod theme;
+mod tray;
 mod ui;
 
 use gpui_kit::*;

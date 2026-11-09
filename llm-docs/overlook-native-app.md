@@ -271,6 +271,19 @@ colour choices (by design), and underline, which Markdown has no mark for.
   command palette, `overlook --quit`) gives each detached composer `prepare_composer_window_close` first;
   one that can't close yet keeps Overlook open and comes forward. Headless, Overlook isn't tied to the
   compositor connection; at logout systemd stops the autostart unit or the launcher's app scope.
+- **Tray icon** (`tray.rs`, `ksni`). While keep-running is on, `lifecycle::keep_tray` keeps a
+  StatusNotifierItem registered (both visible and hidden), and takes it away when the setting is switched
+  off. It checks every two seconds and pushes the unread count (`MailWindow::unread_inbox_total`, the
+  sidebar's Inbox badges summed over accounts) only when it changes. The icon is the symbolic mark, or
+  `…-unread-symbolic` with a dot (the ring opens around it, since symbolic icons are one color). Both are
+  written to `$XDG_RUNTIME_DIR/overlook-tray-icons`, flat and as `hicolor/scalable/apps`, and named by
+  `IconThemePath`, so no install step is needed. Omarchy's bar tints `-symbolic` names. The 32 and 64 px
+  app-icon PNGs are the pixmap fallback, and the tooltip carries the count. A left click (`Activate`) and
+  the menu (Open Overlook, Check for new mail, Quit Overlook) push `overlook:show`, `overlook:sync` or
+  `overlook:quit` into the `single_instance` queue, so they're served like a later launch.
+  `assume_sni_available` lets the icon appear when a bar starts after Overlook at login, and
+  `watcher_offline` keeps the service when the bar restarts. If the tray can't start (no session bus), it
+  isn't retried until the setting changes. Tested on a private bus (`dbus-run-session`, gdbus).
 - **Start at login** (`autostart.rs`). The setting is the presence of
   `$XDG_CONFIG_HOME/autostart/ai.lastrefuge.Overlook.desktop`; an entry with `Hidden=true` or
   `X-GNOME-Autostart-enabled=false` counts as off. It runs `<installed path> --background`: headless from

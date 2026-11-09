@@ -31,6 +31,7 @@ base64 = "0.22"
 libc = "0.2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+ksni = { version = "0.3.7", features = ["blocking"] }
 
 [dev-dependencies]
 tempfile = "3"

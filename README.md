@@ -82,8 +82,9 @@ and you can read, search, write, and file mail with no connection at all.
   every minute and asks before switching; keeping the current zone saves an override.
 - **Runs in the background if you want it to.** Settings → General → *Keep running when the window is
   closed* keeps mail and calendars syncing, with new-mail notifications and event reminders, after you close
-  the window. Open it again from the app launcher or a notification; <kbd>Ctrl</kbd>+<kbd>Q</kbd> or
-  `overlook --quit` quits. *Start Overlook when you log in* adds an autostart entry, which starts it
+  the window, and puts the Overlook mark in the system tray (with a dot while the Inbox has unread mail).
+  Open it again from the tray, the app launcher or a notification; <kbd>Ctrl</kbd>+<kbd>Q</kbd>, the tray
+  menu or `overlook --quit` quits. *Start Overlook when you log in* adds an autostart entry, which starts it
   without a window when it keeps running in the background. Launching Overlook again always brings the
   running one forward rather than starting a second copy.
 
