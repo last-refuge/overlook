@@ -28,9 +28,13 @@ const STALL: Duration = Duration::from_millis(1000);
 
 /// Called on the UI thread: records it and starts the watcher.
 pub fn start() {
-    UI_TID.store(unsafe { libc::gettid() }, Ordering::Relaxed);
-    beat();
-    let _ = std::thread::Builder::new().name("overlook-watchdog".into()).spawn(watch);
+    // The main window can open again (after running in the background); one watcher is enough.
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        UI_TID.store(unsafe { libc::gettid() }, Ordering::Relaxed);
+        beat();
+        let _ = std::thread::Builder::new().name("overlook-watchdog".into()).spawn(watch);
+    });
 }
 
 /// The UI thread is alive.

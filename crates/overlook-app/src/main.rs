@@ -1,12 +1,14 @@
 //! Overlook — a clear view of what matters.
 
 mod assets;
+mod autostart;
 mod backup;
 mod browser_engine;
 mod browser_body;
 mod credentials;
 mod caldav_sync;
 mod google_signin;
+mod lifecycle;
 mod notify;
 mod persist;
 mod watchdog;
@@ -18,9 +20,9 @@ mod providers;
 mod sync;
 mod draft_sync;
 mod theme;
+mod tray;
 mod ui;
 
-use gpui_kit::component::TitleBar;
 use gpui_kit::*;
 use overlook_core::time::now;
 use overlook_core::*;
@@ -274,13 +276,45 @@ fn main() {
         return;
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("Overlook {} — a clear view of what matters.\n\nUsage: overlook [mailto:…] [--reload-theme] [--version] [--help]\n\nEnvironment:\n  OVERLOOK_DATA_DIR      profile directory (default ~/.local/share/overlook)\n  OVERLOOK_CONFIG_DIR    directory holding google-oauth-client.json (default ~/.config/overlook)\n  OVERLOOK_SIGN_IN=gmail start the Google sign-in at launch (imap / pop3: open that account setup)\n  OVERLOOK_BROWSER_BIN  compatible Chromium executable (default PATH discovery){}", env!("CARGO_PKG_VERSION"), if cfg!(debug_assertions) { "\n  RUST_LOG=overlook=debug tracing output (development builds only)" } else { "" });
+        println!("Overlook {} — a clear view of what matters.\n\nUsage: overlook [mailto:…] [--background] [--quit] [--reload-theme] [--version] [--help]\n\n  --background  start without a window when \"Keep running when the window is closed\" is on\n                (otherwise open it); does nothing if Overlook is already running\n  --quit        quit the running Overlook\n\nEnvironment:\n  OVERLOOK_DATA_DIR      profile directory (default ~/.local/share/overlook)\n  OVERLOOK_CONFIG_DIR    directory holding google-oauth-client.json (default ~/.config/overlook)\n  OVERLOOK_SIGN_IN=gmail start the Google sign-in at launch (imap / pop3: open that account setup)\n  OVERLOOK_BROWSER_BIN  compatible Chromium executable (default PATH discovery){}", env!("CARGO_PKG_VERSION"), if cfg!(debug_assertions) { "\n  RUST_LOG=overlook=debug tracing output (development builds only)" } else { "" });
         return;
+    }
+    if args.iter().any(|a| a == "--quit") {
+        if !single_instance::send(single_instance::QUIT) {
+            eprintln!("Overlook isn't running.");
+        }
+        return;
+    }
+    // Start at login: an Overlook already running is left as it is.
+    let background = args.iter().any(|a| a == "--background");
+    if background && single_instance::running() {
+        return;
+    }
+    // Any other launch brings the running Overlook forward rather than starting a second
+    // copy against the same database. It passes its desktop along, so a window hidden in the
+    // background opens there, focused with this launch's activation token.
+    if !background && single_instance::send(&single_instance::LaunchEnv::current().show_line()) {
+        return;
+    }
+    match single_instance::listen() {
+        Ok(true) => {}
+        Ok(false) => {
+            // A concurrent launch claimed the profile after the first handoff attempt.
+            if !background {
+                let line = mailto.clone().unwrap_or_else(|| single_instance::LaunchEnv::current().show_line());
+                single_instance::send(&line);
+            }
+            return;
+        }
+        Err(error) => {
+            eprintln!("Overlook could not claim its profile: {error}");
+            std::process::exit(1);
+        }
     }
     init_logging();
     install_panic_hook();
 
-    let (store, accounts) = match open_store() {
+    let (store, _accounts) = match open_store() {
         Ok(v) => v,
         Err(e) => {
             eprintln!("Overlook could not open its local database: {e}");
@@ -288,7 +322,6 @@ fn main() {
         }
     };
     tracing::debug!("startup: store open after {} ms", since_start_ms());
-    single_instance::listen();
     theme::install_omarchy_hook();
     if let Some(link) = mailto {
         single_instance::push(link);
@@ -300,7 +333,16 @@ fn main() {
         provider.set_online(true);
     }
 
-    gpui_kit::application().with_assets(assets::Assets).run(move |cx| {
+    let prefs = store.setting::<overlook_core::Prefs>("prefs").ok().flatten();
+    lifecycle::set_keep_running(prefs.as_ref().is_some_and(|p| p.keep_running));
+    // Started at login with "Keep running when the window is closed" on: no window until asked.
+    let start_hidden = background && prefs.as_ref().is_some_and(|p| p.keep_running);
+    // `lifecycle` decides when the app ends; closing the last window may leave it running.
+    let mut application = gpui_kit::application().with_assets(assets::Assets).with_quit_mode(QuitMode::Explicit);
+    if start_hidden {
+        application = application.with_windowing(WindowingRequest::Headless);
+    }
+    application.run(move |cx| {
         tracing::debug!("startup: app running after {} ms", since_start_ms());
         gpui_kit::init(cx);
         let mut fonts: Vec<Cow<'static, [u8]>> = assets::INTER_FACES.iter().map(|f| Cow::Borrowed(*f)).collect();
@@ -310,7 +352,7 @@ fn main() {
         }
         tracing::debug!("startup: fonts loaded after {} ms", since_start_ms());
 
-        if let Ok(Some(prefs)) = store.setting::<overlook_core::Prefs>("prefs") {
+        if let Some(prefs) = &prefs {
             set_inbox_limit(prefs.inbox_messages as usize);
             overlook_core::tz::set_clock_24h(prefs.clock_24h);
         }
@@ -322,27 +364,6 @@ fn main() {
         theme::apply_preference(preference, theme::system_appearance(cx.window_appearance()), cx);
         ui::init(cx);
         tracing::debug!("startup: theme and keys ready after {} ms", since_start_ms());
-
-        let bounds = Bounds::centered(None, size(px(1320.), px(920.)), cx);
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            app_id: Some(APP_ID.into()),
-            window_min_size: Some(size(px(880.), px(560.))),
-            ..TitleBar::window_options()
-        };
-        let active: Option<AccountId> = store
-            .setting::<AccountId>("active_account")
-            .ok()
-            .flatten()
-            .filter(|id| accounts.iter().any(|a| &a.id == id))
-            .or_else(|| accounts.first().map(|a| a.id.clone()));
-        let store = store.clone();
-        let accounts = accounts.clone();
-        let provider = provider.clone();
-        gpui_kit::open_window(options, cx, move |window, cx| {
-            cx.new(|cx| ui::MailWindow::new(store, provider, accounts, active, ui::WindowSetup::Mail(preference), window, cx))
-        })
-        .expect("failed to open the Overlook window");
-        cx.activate(true);
+        lifecycle::start(store.clone(), provider.clone(), start_hidden, cx);
     });
 }

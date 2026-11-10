@@ -15,7 +15,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -349,10 +349,58 @@ pub enum PacmanOutcome {
     TerminalOpened,
 }
 
-/// Starts a fresh copy of the current executable and exits this one.
-pub fn restart() -> ! {
+/// Where this program is installed. After a package upgrade replaces the file, Linux reports
+/// the running image as `… (deleted)`; the new copy is at the same path.
+pub fn installed_exe() -> PathBuf {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("overlook"));
-    let _ = Command::new(exe).spawn();
+    strip_deleted(exe)
+}
+
+fn strip_deleted(exe: PathBuf) -> PathBuf {
+    match exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        Some(path) => PathBuf::from(path),
+        None => exe,
+    }
+}
+
+/// The version now installed on disk, when it differs from this running one: a package
+/// upgrade replaced the program while Overlook kept running. Checked from the running image,
+/// so nothing is read while the file is untouched.
+pub fn replaced_on_disk() -> Option<String> {
+    let running = std::fs::read_link("/proc/self/exe").ok()?;
+    if !running.to_string_lossy().ends_with(" (deleted)") {
+        return None;
+    }
+    let exe = strip_deleted(running);
+    // Ask the new file its version once, not every minute: again only if it changes again.
+    static SEEN: std::sync::Mutex<Option<(u64, i64)>> = std::sync::Mutex::new(None);
+    let meta = std::fs::metadata(&exe).ok()?;
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        (meta.ino(), meta.mtime())
+    };
+    if SEEN.lock().unwrap().replace(identity) == Some(identity) {
+        return None;
+    }
+    let out = Command::new(&exe).arg("--version").stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    let version = String::from_utf8_lossy(&out.stdout).trim().strip_prefix("overlook ")?.to_owned();
+    (out.status.success() && version != env!("CARGO_PKG_VERSION")).then_some(version)
+}
+
+/// Starts a fresh copy of the installed program and exits this one.
+pub fn restart() -> ! {
+    restart_with(&[])
+}
+
+/// Like `restart`, for an Overlook running without a window: the new copy starts the same way.
+pub fn restart_in_background() -> ! {
+    restart_with(&["--background"])
+}
+
+fn restart_with(args: &[&str]) -> ! {
+    // The new copy must not find this one and hand its launch back to it.
+    crate::single_instance::release();
+    let _ = Command::new(installed_exe()).args(args).spawn();
     std::process::exit(0)
 }
 
@@ -365,6 +413,12 @@ pub fn cache_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_replaced_program_restarts_from_its_installed_path() {
+        assert_eq!(strip_deleted(PathBuf::from("/usr/bin/overlook (deleted)")), PathBuf::from("/usr/bin/overlook"));
+        assert_eq!(strip_deleted(PathBuf::from("/usr/bin/overlook")), PathBuf::from("/usr/bin/overlook"));
+    }
 
     #[test]
     fn version_comparison() {

@@ -32,7 +32,7 @@ use overlook_core::*;
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Weak};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -178,6 +178,8 @@ pub struct Store {
     editing_drafts: Mutex<HashMap<DraftId, usize>>,
     /// Serializes finding and claiming history entries, so two quick undos take two entries.
     history_claim: Mutex<()>,
+    /// A sync may outlive its window while another controller opens from the same store.
+    mail_syncs: Mutex<HashMap<AccountId, Weak<()>>>,
 }
 
 impl Store {
@@ -203,7 +205,19 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         schema::migrate(&conn)?;
-        Ok(Self { conn: Mutex::new(conn), reader: None, editing_drafts: Mutex::new(HashMap::new()), history_claim: Mutex::new(()) })
+        Ok(Self { conn: Mutex::new(conn), reader: None, editing_drafts: Mutex::new(HashMap::new()), history_claim: Mutex::new(()), mail_syncs: Mutex::new(HashMap::new()) })
+    }
+
+    /// Claims the account's mail sync until the returned lease is dropped. A new window
+    /// must skip replay while a previous controller is still finishing its provider calls.
+    pub fn try_mail_sync(&self, account: &AccountId) -> Option<Arc<()>> {
+        let mut syncs = self.mail_syncs.lock().expect("mail sync mutex poisoned");
+        if syncs.get(account).and_then(Weak::upgrade).is_some() {
+            return None;
+        }
+        let lease = Arc::new(());
+        syncs.insert(account.clone(), Arc::downgrade(&lease));
+        Some(lease)
     }
 
     fn with_tx<T>(&self, f: impl FnOnce(&Transaction) -> Result<T>) -> Result<T> {

@@ -241,10 +241,63 @@ colour choices (by design), and underline, which Markdown has no mark for.
 - **Automatic replies.** `MailProvider::fetch_vacation` / `set_vacation` (Gmail `settings/vacation`, scope
   `gmail.settings.basic`). Settings → Accounts loads them when the page opens and saves with one button; the
   end date is stored exclusive, so the last day runs through midnight.
-- **mailto:.** `overlook mailto:…` parses the link (`overlook_core::mailto`) and opens the composer. A second
-  launch hands the link to the running instance over a Unix socket (`single_instance.rs`, one socket per
-  profile under `$XDG_RUNTIME_DIR`) and exits, so the desktop entry's `mailto` handler never opens a second
-  window.
+- **mailto:.** `overlook mailto:…` parses the link (`overlook_core::mailto`) and opens the composer.
+- **One instance per profile.** A later launch hands its request to the running instance over a Unix socket
+  (`single_instance.rs`, one socket per profile under `$XDG_RUNTIME_DIR`) and exits: a `mailto:` link opens
+  the composer, `overlook --quit` quits, `overlook --background` does nothing when one is running, and any
+  other launch (the app launcher, a notification click with no window open) sends `overlook:show` with its
+  `WAYLAND_DISPLAY`, `DISPLAY`, `XDG_RUNTIME_DIR` and `XDG_ACTIVATION_TOKEN` (tab-separated). The listener
+  thread wakes `lifecycle::serve_launches`, an app-level task, so nothing polls and a launch is served while
+  the window is hidden or only a composer is open. Raising a visible window relies on the compositor
+  honouring GPUI's own activation request (Omarchy sets Hyprland's `focus_on_activate`); GPUI has no call to
+  activate an existing window with another process's token, so the passed token is used only when a hidden
+  Overlook reconnects. A crashed instance's stale socket is replaced on the next start. Restarts and Quit
+  call `single_instance::release()` first, so a launch never hands itself to the copy that is ending. Each
+  request is logged by kind only (`later launch: show`), never the link.
+- **Running in the background** (`lifecycle.rs`, issue #15). The app runs with `QuitMode::Explicit`, and
+  `lifecycle` decides when it ends. Closing the last window quits unless Settings → General → *Keep running
+  when the window is closed* (`Prefs::keep_running`, mirrored in `lifecycle::set_keep_running`) is on. Then
+  GPUI switches to headless mode (`request_windowing`, no display connection at all) and the main window
+  opens again there. It draws nothing, but sync, IDLE, reminders, new-mail notifications and update checks
+  all live in the main `MailWindow`, so they carry on unchanged. A show request closes the headless window,
+  switches back to windowed mode with the launch's environment, and opens a fresh main window from the
+  store, re-applying the theme. A failed switch (no display named) stays headless and logs the error.
+  Switching needs every window closed, so the switch happens only when the last one (main, folder or
+  composer) closes. Only the first main window does start-up-only work (`MAIN_WINDOW_OPENED`): the
+  offline/sign-in sync states, the full verification sync, `OVERLOOK_SIGN_IN` and the sample-mailbox
+  offer. The last two are also skipped while headless. Shown reminders and snoozes pass from one main
+  window to the next (`REMINDER_MEMORY`, saved in `Drop`), so a reopened window doesn't repeat them. The
+  spare Chromium is let go and not refilled while hidden (`browser_engine::set_prewarm`). Quit (Ctrl+Q, the
+  command palette, `overlook --quit`) gives every mail window `prepare_composer_window_close` first;
+  one that can't close yet keeps Overlook open and comes forward.
+  A per-account lease in the shared `Store` keeps a reopened window from replaying sends while an old
+  controller's sync is still finishing. Native close also saves drafts in main and folder windows.
+  Headless, Overlook runs independently of the compositor connection. At logout systemd stops the
+  autostart unit or the launcher's app scope.
+- **Tray icon** (`tray.rs`, `ksni`). While keep-running is on, `lifecycle::keep_tray` keeps a
+  StatusNotifierItem registered (both visible and hidden), and takes it away when the setting is switched
+  off. It checks every two seconds and pushes the unread count (`MailWindow::unread_inbox_total`, the
+  sidebar's Inbox badges summed over accounts) only when it changes. The icon is the symbolic mark, or
+  `…-unread-symbolic` with a dot (the ring opens around it, since symbolic icons are one color). Both are
+  written to `$XDG_RUNTIME_DIR/overlook-tray-icons`, flat and as `hicolor/scalable/apps`, and named by
+  `IconThemePath`, so no install step is needed. Omarchy's bar tints `-symbolic` names. The 32 and 64 px
+  app-icon PNGs are the pixmap fallback, and the tooltip carries the count. A left click (`Activate`) and
+  the menu (Open Overlook, Check for new mail, Quit Overlook) push `overlook:show`, `overlook:sync` or
+  `overlook:quit` into the `single_instance` queue, so they're served like a later launch.
+  `assume_sni_available` lets the icon appear when a bar starts after Overlook at login, and
+  `watcher_offline` keeps the service when the bar restarts. If the tray can't start (no session bus), it
+  isn't retried until the setting changes. Tested on a private bus (`dbus-run-session`, gdbus).
+- **Start at login** (`autostart.rs`). The setting is the presence of
+  `$XDG_CONFIG_HOME/autostart/ai.lastrefuge.Overlook.desktop`; an entry with `Hidden=true` or
+  `X-GNOME-Autostart-enabled=false` counts as off. It runs `<installed path> --background`: headless from
+  the start (`Application::with_windowing(Headless)`) when keep-running is on, otherwise a normal window.
+  Omarchy runs XDG autostart entries through uwsm and systemd's autostart generator.
+  `install.sh --uninstall` quits a running Overlook (when it knows `--quit`) and removes the entry.
+- **Upgrades under a running Overlook.** Every minute `lifecycle` checks whether `/proc/self/exe` reads
+  `… (deleted)` (a package upgrade replaced the file). If so, it asks the new file its `--version`, once
+  per file identity. Hidden, Overlook restarts into it with `--background`; with a window, the update
+  banner shows "Overlook X is installed. Restart to start using it." `updater::installed_exe()` strips
+  the ` (deleted)` suffix, which `current_exe()` keeps, so Restart works after a pacman upgrade.
 - **Reminders** have Snooze 5 min on the in-app toast; a snoozed reminder returns once.
 - **Gmail batch endpoint.** `GmailClient::batch_get` sends up to 20 `messages.get` calls in one
   multipart request to `batch/gmail/v1`; `fetch_messages` uses it for every multi-message download (first

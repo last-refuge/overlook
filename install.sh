@@ -139,6 +139,13 @@ confirm() {
 # ---------------------------------------------------------------------------------------------
 if (( UNINSTALL )); then
   banner
+  # One kept running in the background (or started at login) would outlive its program.
+  # Only a version that knows --quit is asked: an older one would start instead.
+  if command -v overlook >/dev/null 2>&1 && overlook --help 2>/dev/null | grep -q -- '--quit'; then
+    step "Quit the running Overlook" overlook --quit
+  fi
+  AUTOSTART="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/ai.lastrefuge.Overlook.desktop"
+  if [[ -e $AUTOSTART ]]; then step "Stop starting Overlook at login" rm -f "$AUTOSTART"; fi
   if (( IS_ARCH )) && pacman -Qi "$PKGNAME" >/dev/null 2>&1; then
     note "Removing the package needs administrator access."
     step "Remove the overlook package" sudo pacman -Rns --noconfirm "$PKGNAME"

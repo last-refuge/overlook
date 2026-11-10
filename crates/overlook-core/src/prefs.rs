@@ -54,6 +54,9 @@ pub struct Prefs {
     pub omarchy_notifications: bool,
     pub event_reminders: bool,
     pub sync_interval_secs: u32,
+    /// Closing the last window leaves Overlook running without one, so sync, reminders and
+    /// notifications carry on; Quit ends it.
+    pub keep_running: bool,
     // Mail
     pub show_avatars: bool,
     pub show_previews: bool,
@@ -94,6 +97,7 @@ impl Default for Prefs {
             omarchy_notifications: true,
             event_reminders: true,
             sync_interval_secs: 30,
+            keep_running: false,
             show_avatars: true,
             show_previews: true,
             mark_as_read: MarkAsRead::WhenSelected,

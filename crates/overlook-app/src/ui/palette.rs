@@ -95,6 +95,7 @@ impl MailWindow {
             entry("Go to Mail", Some("Ctrl+1"), PaletteCommand::Module(Module::Mail)),
             entry("Go to Calendar", Some("Ctrl+2"), PaletteCommand::Module(Module::Calendar)),
             entry("Go to Contacts", Some("Ctrl+3"), PaletteCommand::Module(Module::Contacts)),
+            entry("Quit Overlook", Some("Ctrl+Q"), action(Box::new(QuitOverlook))),
         ];
         if self.renamable_open_folder().is_some() {
             out.push(entry("Rename folder", Some("F2"), action(Box::new(RenameFolder))));
