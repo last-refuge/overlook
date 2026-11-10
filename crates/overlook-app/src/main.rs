@@ -296,6 +296,21 @@ fn main() {
     if !background && single_instance::send(&single_instance::LaunchEnv::current().show_line()) {
         return;
     }
+    match single_instance::listen() {
+        Ok(true) => {}
+        Ok(false) => {
+            // A concurrent launch claimed the profile after the first handoff attempt.
+            if !background {
+                let line = mailto.clone().unwrap_or_else(|| single_instance::LaunchEnv::current().show_line());
+                single_instance::send(&line);
+            }
+            return;
+        }
+        Err(error) => {
+            eprintln!("Overlook could not claim its profile: {error}");
+            std::process::exit(1);
+        }
+    }
     init_logging();
     install_panic_hook();
 
@@ -307,7 +322,6 @@ fn main() {
         }
     };
     tracing::debug!("startup: store open after {} ms", since_start_ms());
-    single_instance::listen();
     theme::install_omarchy_hook();
     if let Some(link) = mailto {
         single_instance::push(link);

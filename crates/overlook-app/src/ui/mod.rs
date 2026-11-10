@@ -1010,6 +1010,13 @@ impl MailWindow {
             _subscriptions: subs,
         };
         this.load_recent_moves();
+        // Main and folder windows can own composers too. Native close and explicit Quit
+        // must both finish their saves before the editor and its debounce timer go away.
+        let editor = cx.weak_entity();
+        crate::lifecycle::add_editor(window.window_handle(), editor.clone(), cx);
+        window.on_window_should_close(cx, move |window, cx| {
+            editor.update(cx, |this, cx| this.prepare_composer_window_close(window, cx)).unwrap_or(true)
+        });
         // Every window starts with every other account's badges to count: the first
         // `reload` recounts them, in the main window and in a folder window alike.
         this.mark_all_counts_stale();
@@ -1044,8 +1051,11 @@ impl MailWindow {
         }
         // The watchdog reports any stall of this thread (see `watchdog.rs`).
         crate::watchdog::start();
-        cx.spawn(async move |_, cx| loop {
+        cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_millis(200)).await;
+            if this.upgrade().is_none() {
+                break;
+            }
             crate::watchdog::beat();
         })
         .detach();
@@ -4134,6 +4144,7 @@ impl MailWindow {
             .id("mail-window")
             .key_context(WINDOW_CONTEXT)
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|_, _: &QuitOverlook, _window, cx| cx.defer(crate::lifecycle::quit)))
             .on_action(cx.listener(Self::on_escape))
             .size_full()
             .bg(p.background)

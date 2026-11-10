@@ -142,7 +142,7 @@ if (( UNINSTALL )); then
   # One kept running in the background (or started at login) would outlive its program.
   # Only a version that knows --quit is asked: an older one would start instead.
   if command -v overlook >/dev/null 2>&1 && overlook --help 2>/dev/null | grep -q -- '--quit'; then
-    overlook --quit >/dev/null 2>&1 || true
+    step "Quit the running Overlook" overlook --quit
   fi
   AUTOSTART="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/ai.lastrefuge.Overlook.desktop"
   if [[ -e $AUTOSTART ]]; then step "Stop starting Overlook at login" rm -f "$AUTOSTART"; fi

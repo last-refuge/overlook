@@ -8,7 +8,10 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::path::Path;
@@ -177,22 +180,32 @@ pub fn take() -> Vec<String> {
     std::mem::take(&mut *PENDING.lock().unwrap())
 }
 
-/// Starts listening for lines from later launches. A stale socket from a crashed instance
-/// is replaced.
-pub fn listen() {
-    listen_at(socket_path());
+/// Claims the profile and starts listening. `false` means another instance already owns
+/// it. Called before opening the store, so concurrent launches cannot start two controllers.
+pub fn listen() -> std::io::Result<bool> {
+    listen_at(socket_path())
 }
 
-fn listen_at(path: PathBuf) {
+fn listen_at(path: PathBuf) -> std::io::Result<bool> {
+    // Serialize the stale-socket check, removal and bind. Keep this lock file in place:
+    // unlinking it would let another launch lock a different inode for the same profile.
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path.with_extension("lock"))?;
+    // SAFETY: `lock` owns a valid descriptor for this call and until it is dropped on
+    // return. Closing the descriptor releases the startup lock after the socket is bound.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     if UnixStream::connect(&path).is_ok() {
-        return;
+        return Ok(false);
     }
     let _ = std::fs::remove_file(&path);
-    let Ok(listener) = UnixListener::bind(&path) else {
-        tracing::warn!("could not listen on {}", path.display());
-        return;
-    };
-    *BOUND.lock().unwrap() = Some(path);
+    let listener = UnixListener::bind(&path)?;
     std::thread::Builder::new()
         .name("overlook-instance".into())
         .spawn(move || {
@@ -204,8 +217,9 @@ fn listen_at(path: PathBuf) {
                     }
                 }
             }
-        })
-        .ok();
+        })?;
+    *BOUND.lock().unwrap() = Some(path);
+    Ok(true)
 }
 
 /// Stops later launches from finding this instance, so the copy that replaces it (after an
@@ -225,7 +239,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("overlook-si-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("overlook-test.sock");
-        listen_at(path.clone());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let attempts: Vec<_> = (0..4).map(|_| {
+            let (path, barrier) = (path.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                listen_at(path).unwrap()
+            })
+        }).collect();
+        let owners = attempts.into_iter().map(|attempt| attempt.join().unwrap()).filter(|owned| *owned).count();
+        assert_eq!(owners, 1, "concurrent launches must share one listener");
         assert!(send_to(&path, SHOW), "the listening instance takes the launch");
         assert!(UnixStream::connect(&path).is_ok());
         release();

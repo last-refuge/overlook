@@ -272,6 +272,10 @@ impl MailWindow {
     }
 
     pub(crate) fn focus_current_module(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.has_account() {
+            self.focus_handle.focus(window, cx);
+            return;
+        }
         match self.module {
             Module::Calendar => self.cal_focus.focus(window, cx),
             Module::Contacts => self.contact_search.update(cx, |s, cx| s.focus(window, cx)),

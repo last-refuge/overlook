@@ -268,9 +268,12 @@ colour choices (by design), and underline, which Markdown has no mark for.
   offer. The last two are also skipped while headless. Shown reminders and snoozes pass from one main
   window to the next (`REMINDER_MEMORY`, saved in `Drop`), so a reopened window doesn't repeat them. The
   spare Chromium is let go and not refilled while hidden (`browser_engine::set_prewarm`). Quit (Ctrl+Q, the
-  command palette, `overlook --quit`) gives each detached composer `prepare_composer_window_close` first;
-  one that can't close yet keeps Overlook open and comes forward. Headless, Overlook isn't tied to the
-  compositor connection; at logout systemd stops the autostart unit or the launcher's app scope.
+  command palette, `overlook --quit`) gives every mail window `prepare_composer_window_close` first;
+  one that can't close yet keeps Overlook open and comes forward.
+  A per-account lease in the shared `Store` keeps a reopened window from replaying sends while an old
+  controller's sync is still finishing. Native close also saves drafts in main and folder windows.
+  Headless, Overlook runs independently of the compositor connection. At logout systemd stops the
+  autostart unit or the launcher's app scope.
 - **Tray icon** (`tray.rs`, `ksni`). While keep-running is on, `lifecycle::keep_tray` keeps a
   StatusNotifierItem registered (both visible and hidden), and takes it away when the setting is switched
   off. It checks every two seconds and pushes the unread count (`MailWindow::unread_inbox_total`, the

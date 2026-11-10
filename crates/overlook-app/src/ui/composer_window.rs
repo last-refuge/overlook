@@ -146,13 +146,6 @@ impl MailWindow {
                 editor.restore_composer_transfer(transfer, window, cx);
                 editor
             });
-            let weak = editor.downgrade();
-            window.on_window_should_close(cx, move |window, cx| {
-                weak.update(cx, |this, cx| {
-                    this.prepare_composer_window_close(window, cx)
-                })
-                .unwrap_or(true)
-            });
             editor
         }) {
             Ok((handle, editor)) => {
@@ -168,7 +161,6 @@ impl MailWindow {
                             .ok();
                     }
                 });
-                crate::lifecycle::add_composer(handle, editor.downgrade(), cx);
                 self.detached_composers.insert(
                     id,
                     DetachedComposer {
@@ -321,6 +313,7 @@ impl MailWindow {
             .id("composer-window")
             .key_context(WINDOW_CONTEXT)
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|_, _: &QuitOverlook, _window, cx| cx.defer(crate::lifecycle::quit)))
             .on_action(cx.listener(Self::on_escape))
             .on_action(cx.listener(Self::on_send))
             .on_action(cx.listener(Self::on_command_palette))

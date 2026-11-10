@@ -772,6 +772,9 @@ async fn replay_operations(
 /// One sync of an account. `verify` checks everything against the provider and repairs
 /// drift (see [`MailProvider::verify_changes`]); otherwise only changes are fetched.
 pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calendar: Option<Arc<dyn CalendarProvider>>, account: Account, verify: bool) -> SyncOutcome {
+    let Some(_lease) = store.try_mail_sync(&account.id) else {
+        return SyncOutcome::default();
+    };
     let mut outcome = SyncOutcome::default();
     let acct = account.id.clone();
 
@@ -921,6 +924,24 @@ mod tests {
 
     fn arc(p: &SampleProvider) -> Arc<dyn MailProvider> {
         Arc::new(p.clone())
+    }
+
+    #[test]
+    fn a_reopened_window_waits_for_the_previous_accounts_sync() {
+        let (store, account, provider) = seeded();
+        provider.set_online(true);
+        let draft = queued_draft(&store, &account);
+        let previous_sync = store.try_mail_sync(&account.id).unwrap();
+
+        let skipped = block_on(run_sync(store.clone(), arc(&provider), None, account.clone(), false));
+        assert!(skipped.state.is_none());
+        assert!(skipped.sent.is_empty());
+        assert_eq!(store.draft(&draft.id).unwrap().unwrap().state, DraftState::Queued);
+
+        drop(previous_sync);
+        let resumed = block_on(run_sync(store.clone(), arc(&provider), None, account.clone(), false));
+        assert_eq!(resumed.sent, vec!["Agenda"]);
+        assert_eq!(store.pending_count(&account.id).unwrap(), 0);
     }
 
     #[test]

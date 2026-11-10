@@ -51,8 +51,8 @@ struct Lifecycle {
     show_after: Option<LaunchEnv>,
     /// Requests waiting for the window to be shown: a mailto link while hidden.
     after_show: Vec<Request>,
-    /// Composer windows, which save their draft before Quit ends the process.
-    composers: Vec<(AnyWindowHandle, WeakEntity<MailWindow>)>,
+    /// Every mail window can own a draft that must be saved before Quit.
+    editors: Vec<(AnyWindowHandle, WeakEntity<MailWindow>)>,
     replaced_noticed: bool,
     tray: Option<crate::tray::TrayIcon>,
     /// The tray icon couldn't start (no session bus): not tried again until keep-running is
@@ -73,7 +73,7 @@ pub fn start(store: Arc<Store>, sample: SampleProvider, hidden: bool, cx: &mut A
         switching: false,
         show_after: None,
         after_show: Vec::new(),
-        composers: Vec::new(),
+        editors: Vec::new(),
         replaced_noticed: false,
         tray: None,
         tray_failed: false,
@@ -92,10 +92,10 @@ pub fn start(store: Arc<Store>, sample: SampleProvider, hidden: bool, cx: &mut A
     keep_tray(cx);
 }
 
-/// A composer window to give the chance to save before Quit.
-pub fn add_composer(window: AnyWindowHandle, editor: WeakEntity<MailWindow>, cx: &mut App) {
+/// Registers a mail window so its draft gets a chance to save before Quit.
+pub fn add_editor(window: AnyWindowHandle, editor: WeakEntity<MailWindow>, cx: &mut App) {
     if cx.has_global::<Lifecycle>() {
-        cx.global_mut::<Lifecycle>().composers.push((window, editor));
+        cx.global_mut::<Lifecycle>().editors.push((window, editor));
     }
 }
 
@@ -136,7 +136,7 @@ fn window_closed(cx: &mut App, closed: WindowId) {
         return;
     }
     let l = cx.global_mut::<Lifecycle>();
-    l.composers.retain(|(w, _)| w.window_id() != closed);
+    l.editors.retain(|(w, _)| w.window_id() != closed);
     if l.main.as_ref().is_some_and(|m| m.window.window_id() == closed) {
         l.main = None;
     }
@@ -245,8 +245,8 @@ pub fn show(env: LaunchEnv, cx: &mut App) {
 /// Quit: each open composer saves its draft as closing its window would, and one that can't
 /// close yet (an attachment still loading, a save that failed) keeps Overlook open.
 pub fn quit(cx: &mut App) {
-    let composers = cx.try_global::<Lifecycle>().map(|l| l.composers.clone()).unwrap_or_default();
-    for (window, editor) in composers {
+    let editors = cx.try_global::<Lifecycle>().map(|l| l.editors.clone()).unwrap_or_default();
+    for (window, editor) in editors {
         let ready = window
             .update(cx, |_, window, cx| editor.update(cx, |e, cx| e.prepare_composer_window_close(window, cx)).unwrap_or(true))
             .unwrap_or(true);
