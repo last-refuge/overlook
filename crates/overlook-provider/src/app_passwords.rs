@@ -3,16 +3,19 @@
 //! where to create one, what it looks like, what a refused sign-in usually means, and the
 //! service's server settings.
 //!
-//! iCloud Mail is the first. Yahoo, AOL, Fastmail and Zoho follow the same pattern (roadmap
-//! priorities 3, 4 and 6), so each is one more [`AppPasswordGuide`] in [`GUIDES`].
+//! iCloud Mail, Yahoo Mail and AOL Mail are guided. Fastmail and Zoho follow the same pattern
+//! (roadmap priorities 4 and 6), so each is one more [`AppPasswordGuide`] in [`GUIDES`]; the
+//! app builds its "Add … account" entries from that list.
 
-use overlook_core::{MailServers, Security, ServerEndpoint};
+use overlook_core::{MailServers, Security, ServerEndpoint, ServerProtocol};
 
 /// How to set up one service that signs in with an app-specific password.
 #[derive(Debug)]
 pub struct AppPasswordGuide {
     /// The service's name: "iCloud Mail".
     pub provider: &'static str,
+    /// Its short name, for "Add iCloud account…" and `OVERLOOK_SIGN_IN=icloud`.
+    pub short_name: &'static str,
     /// Address domains that belong to the service.
     pub domains: &'static [&'static str],
     /// Server host names that belong to it, matched with their subdomains, for accounts at
@@ -36,10 +39,14 @@ pub struct AppPasswordGuide {
     /// Whether the incoming user name may be the address's name part or the whole address:
     /// the connection test tries the other form when the first is refused.
     pub alternate_user_names: bool,
+    /// Whether spaces are taken out of a typed password: the service shows its app passwords
+    /// in groups, but the spaces are not part of them.
+    pub strip_spaces: bool,
     /// Whether a password has the shape the service's app passwords have.
     pub looks_like_app_password: fn(&str) -> bool,
-    /// The service's server settings for an address, its own or a custom domain's.
-    pub servers: fn(&str) -> MailServers,
+    /// The service's server settings for an address (its own or a custom domain's), reading
+    /// mail over IMAP or, where offered, POP3.
+    pub servers: fn(ServerProtocol, &str) -> MailServers,
 }
 
 /// iCloud Mail, from Apple's "iCloud Mail server settings for other email client apps"
@@ -47,6 +54,7 @@ pub struct AppPasswordGuide {
 /// using app-specific passwords" (support.apple.com/102654).
 pub static ICLOUD: AppPasswordGuide = AppPasswordGuide {
     provider: "iCloud Mail",
+    short_name: "iCloud",
     domains: &["icloud.com", "me.com", "mac.com"],
     hosts: &["mail.me.com"],
     explanation: "iCloud Mail needs an app-specific password for mail apps outside Apple’s own, not your Apple Account password. Create one in your Apple Account under Sign-In and Security → App-Specific Passwords (it needs two-factor authentication), then paste it here. Overlook keeps it in the system keyring.",
@@ -58,12 +66,62 @@ pub static ICLOUD: AppPasswordGuide = AppPasswordGuide {
     custom_domain: "For an address at your own domain, iCloud signs you in with your iCloud Mail address: use its name (before the @) as the incoming user name and the whole @icloud.com address as the outgoing one.",
     offers_pop3: false,
     alternate_user_names: true,
+    strip_spaces: false,
     looks_like_app_password: looks_like_apple_app_password,
     servers: icloud_servers,
 };
 
+/// Yahoo Mail, from Yahoo's "IMAP server settings for Yahoo Mail" (help.yahoo.com SLN4075)
+/// and "Generate and manage 3rd-party app passwords" (SLN15241), November 2026. Yahoo! JAPAN
+/// (yahoo.co.jp) is a separate service and is not included.
+pub static YAHOO: AppPasswordGuide = AppPasswordGuide {
+    provider: "Yahoo Mail",
+    short_name: "Yahoo",
+    domains: &[
+        "yahoo.com", "ymail.com", "rocketmail.com", "yahoo.co.uk", "yahoo.ca", "yahoo.de", "yahoo.fr", "yahoo.es", "yahoo.it",
+        "yahoo.com.au", "yahoo.co.nz", "yahoo.co.in", "yahoo.in", "yahoo.ie", "yahoo.com.br", "yahoo.com.mx", "yahoo.com.ar",
+        "yahoo.com.sg", "yahoo.com.ph", "yahoo.co.id",
+    ],
+    hosts: &["mail.yahoo.com"],
+    explanation: "Yahoo Mail needs an app password for mail apps, not your Yahoo account password. Create one in your Yahoo account under Account Security → External connections → Create app password, then paste it here. Yahoo offers app passwords only in a browser you’ve used to sign in to Yahoo for several days (not a private window). Overlook keeps it in the system keyring.",
+    password_label: "App password",
+    password_placeholder: "The app password Yahoo generated",
+    create_label: "Create an app password",
+    create_url: "https://login.yahoo.com/account/security",
+    refused: "Yahoo accepts only an app password here, not your Yahoo account password. Create one at login.yahoo.com/account/security under External connections; one you deleted there no longer works.",
+    custom_domain: "This address isn’t at a Yahoo Mail domain. These are Yahoo Mail’s own servers; check them against the settings your mail provider gives you.",
+    offers_pop3: true,
+    alternate_user_names: false,
+    strip_spaces: true,
+    looks_like_app_password: looks_like_yahoo_app_password,
+    servers: yahoo_servers,
+};
+
+/// AOL Mail, which runs on Yahoo's platform. AOL's help pages do not render without a
+/// browser; the settings and steps here agree across the third-party guides checked in
+/// November 2026, which also say AOL wants two-step verification before it offers app
+/// passwords. Verizon addresses, also on AOL's servers, are left to separate qualification.
+pub static AOL: AppPasswordGuide = AppPasswordGuide {
+    provider: "AOL Mail",
+    short_name: "AOL",
+    domains: &["aol.com", "aim.com", "aol.co.uk", "aol.fr", "aol.de", "love.com", "ygm.com", "games.com", "wow.com"],
+    hosts: &["aol.com"],
+    explanation: "AOL Mail needs an app password for mail apps, not your AOL account password. Create one in your AOL account under Account Security → Generate app password (AOL asks you to turn on two-step verification first), then paste it here. Overlook keeps it in the system keyring.",
+    password_label: "App password",
+    password_placeholder: "The app password AOL generated",
+    create_label: "Create an app password",
+    create_url: "https://login.aol.com/account/security",
+    refused: "AOL accepts only an app password here, not your AOL account password. Create one at login.aol.com/account/security; one you deleted there no longer works.",
+    custom_domain: "This address isn’t at an AOL Mail domain. These are AOL Mail’s own servers; check them against the settings your mail provider gives you.",
+    offers_pop3: true,
+    alternate_user_names: false,
+    strip_spaces: true,
+    looks_like_app_password: looks_like_yahoo_app_password,
+    servers: aol_servers,
+};
+
 /// Every guided service.
-pub static GUIDES: &[&AppPasswordGuide] = &[&ICLOUD];
+pub static GUIDES: &[&AppPasswordGuide] = &[&ICLOUD, &YAHOO, &AOL];
 
 /// The guide for an address's service, or, for an address at another domain, for the
 /// service its incoming server belongs to.
@@ -126,6 +184,12 @@ impl AppPasswordGuide {
     }
 }
 
+/// Yahoo's and AOL's app passwords are 16 letters, sometimes shown in groups with spaces.
+fn looks_like_yahoo_app_password(password: &str) -> bool {
+    let letters: Vec<char> = password.chars().filter(|c| !c.is_whitespace()).collect();
+    letters.len() == 16 && letters.iter().all(char::is_ascii_alphabetic)
+}
+
 /// Apple's app-specific passwords are 16 letters, shown in four groups of four with hyphens.
 fn looks_like_apple_app_password(password: &str) -> bool {
     let password = password.trim();
@@ -148,7 +212,7 @@ fn looks_like_apple_app_password(password: &str) -> bool {
 /// johnappleseed, not johnappleseed@icloud.com)"; the outgoing one is the full address. For
 /// an address at a custom domain the iCloud name is unknown here, so both start as the
 /// address and [`AppPasswordGuide::custom_domain`] explains what to enter.
-fn icloud_servers(email: &str) -> MailServers {
+fn icloud_servers(_incoming: ServerProtocol, email: &str) -> MailServers {
     let email = email.trim().to_lowercase();
     let incoming = if ICLOUD.owns_address(&email) {
         email.split('@').next().unwrap_or(&email).to_owned()
@@ -164,13 +228,60 @@ fn icloud_servers(email: &str) -> MailServers {
     }
 }
 
+/// The full address signs in everywhere, with implicit TLS: IMAP 993 or POP3 995, SMTP 465.
+fn full_address_servers(
+    incoming: ServerProtocol,
+    email: &str,
+    imap: &str,
+    pop3: &str,
+    smtp: &str,
+) -> MailServers {
+    let email = email.trim().to_lowercase();
+    let (host, port) = if incoming == ServerProtocol::Pop3 {
+        (pop3, 995)
+    } else {
+        (imap, 993)
+    };
+    MailServers {
+        incoming: ServerEndpoint::new(host, port, Security::Tls, email.clone()),
+        outgoing: ServerEndpoint::new(smtp, 465, Security::Tls, email),
+        pop3: None,
+        imap: None,
+        oauth: None,
+    }
+}
+
+/// Yahoo: `imap.mail.yahoo.com` 993 or `pop.mail.yahoo.com` 995, `smtp.mail.yahoo.com` 465,
+/// all with SSL, the full address as user name.
+fn yahoo_servers(incoming: ServerProtocol, email: &str) -> MailServers {
+    full_address_servers(
+        incoming,
+        email,
+        "imap.mail.yahoo.com",
+        "pop.mail.yahoo.com",
+        "smtp.mail.yahoo.com",
+    )
+}
+
+/// AOL: `imap.aol.com` 993 or `pop.aol.com` 995, `smtp.aol.com` 465, all with SSL, the full
+/// address as user name.
+fn aol_servers(incoming: ServerProtocol, email: &str) -> MailServers {
+    full_address_servers(
+        incoming,
+        email,
+        "imap.aol.com",
+        "pop.aol.com",
+        "smtp.aol.com",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn icloud_servers_follow_apple() {
-        let s = (ICLOUD.servers)(" Jane.Doe@iCloud.com ");
+        let s = (ICLOUD.servers)(ServerProtocol::Imap, " Jane.Doe@iCloud.com ");
         assert_eq!(
             (
                 s.incoming.address(),
@@ -191,7 +302,7 @@ mod tests {
                 "jane.doe@icloud.com"
             )
         );
-        let custom = (ICLOUD.servers)("jane@family.example");
+        let custom = (ICLOUD.servers)(ServerProtocol::Imap, "jane@family.example");
         assert_eq!(
             (
                 custom.incoming.username.as_str(),
@@ -232,7 +343,97 @@ mod tests {
     }
 
     #[test]
+    fn yahoo_and_aol_servers_take_the_full_address_and_offer_pop3() {
+        let imap = (YAHOO.servers)(ServerProtocol::Imap, "Jane@Yahoo.co.uk");
+        assert_eq!(
+            (
+                imap.incoming.address(),
+                imap.incoming.security,
+                imap.incoming.username.as_str()
+            ),
+            (
+                "imap.mail.yahoo.com:993".to_owned(),
+                Security::Tls,
+                "jane@yahoo.co.uk"
+            )
+        );
+        assert_eq!(
+            (
+                imap.outgoing.address(),
+                imap.outgoing.security,
+                imap.outgoing.username.as_str()
+            ),
+            (
+                "smtp.mail.yahoo.com:465".to_owned(),
+                Security::Tls,
+                "jane@yahoo.co.uk"
+            )
+        );
+        assert_eq!(
+            (YAHOO.servers)(ServerProtocol::Pop3, "jane@yahoo.com")
+                .incoming
+                .address(),
+            "pop.mail.yahoo.com:995"
+        );
+        let aol = (AOL.servers)(ServerProtocol::Pop3, "jane@aol.com");
+        assert_eq!(
+            (
+                aol.incoming.address(),
+                aol.outgoing.address(),
+                aol.incoming.username.as_str()
+            ),
+            (
+                "pop.aol.com:995".to_owned(),
+                "smtp.aol.com:465".to_owned(),
+                "jane@aol.com"
+            )
+        );
+        assert_eq!(
+            (AOL.servers)(ServerProtocol::Imap, "jane@aim.com")
+                .incoming
+                .address(),
+            "imap.aol.com:993"
+        );
+        assert!(YAHOO.offers_pop3 && AOL.offers_pop3 && !ICLOUD.offers_pop3);
+    }
+
+    #[test]
+    fn yahoo_and_aol_are_found_by_address_or_server_but_not_yahoo_japan() {
+        assert!(guide_for("x@ymail.com", None).is_some_and(|g| std::ptr::eq(g, &YAHOO)));
+        assert!(guide_for("x@love.com", None).is_some_and(|g| std::ptr::eq(g, &AOL)));
+        assert!(
+            guide_for("x@yahoo.co.jp", None).is_none(),
+            "Yahoo! JAPAN is a separate service"
+        );
+        assert!(
+            guide_for("x@verizon.net", None).is_none(),
+            "Verizon is qualified separately"
+        );
+        assert!(guide_for("me@family.example", Some("imap.mail.yahoo.com"))
+            .is_some_and(|g| std::ptr::eq(g, &YAHOO)));
+        assert!(guide_for("me@family.example", Some("imap.aol.com"))
+            .is_some_and(|g| std::ptr::eq(g, &AOL)));
+        assert_eq!(
+            GUIDES.iter().map(|g| g.short_name).collect::<Vec<_>>(),
+            ["iCloud", "Yahoo", "AOL"]
+        );
+        assert_eq!(
+            YAHOO.user_names("jane@yahoo.com", "jane@yahoo.com"),
+            ["jane@yahoo.com"],
+            "Yahoo has one user name form"
+        );
+    }
+
+    #[test]
     fn app_password_shape() {
+        let yahoo = YAHOO.looks_like_app_password;
+        assert!(
+            yahoo("abcdefghijklmnop")
+                && yahoo("abcd efgh ijkl mnop")
+                && !yahoo("hunter2")
+                && !yahoo("abcd-efgh-ijkl-mnop")
+        );
+        assert!(YAHOO.strip_spaces && AOL.strip_spaces && !ICLOUD.strip_spaces);
         let looks = ICLOUD.looks_like_app_password;
         assert!(
             looks("abcd-efgh-ijkl-mnop")

@@ -425,14 +425,14 @@ impl MailWindow {
         cx.notify();
     }
 
-    /// "Add iCloud account…": the setup dialog with iCloud Mail's guidance, for an IMAP
-    /// account at an iCloud address or a custom domain.
-    pub(crate) fn open_icloud_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.in_main_window(cx, move |this, window, cx| this.open_icloud_setup(window, cx)) {
+    /// "Add iCloud account…", "Add Yahoo account…" and the like: the setup dialog with that
+    /// service's guidance, for an IMAP account at its address or a custom domain.
+    pub(crate) fn open_guided_setup(&mut self, guide: &'static AppPasswordGuide, window: &mut Window, cx: &mut Context<Self>) {
+        if self.in_main_window(cx, move |this, window, cx| this.open_guided_setup(guide, window, cx)) {
             return;
         }
         self.open_account_setup(ProviderKind::Imap, SetupMode::New, window, cx);
-        self.setup_use_guide(&app_passwords::ICLOUD, window, cx);
+        self.setup_use_guide(guide, window, cx);
     }
 
     /// Follows `guide` from here on: its words in the dialog, and IMAP for a service without
@@ -455,7 +455,8 @@ impl MailWindow {
     /// A guided service's own server settings, for its own domains and custom ones alike;
     /// the lookup is not needed.
     fn setup_guided_servers(&mut self, guide: &'static AppPasswordGuide, email: &str, to_imap: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let suggestion = Suggestion { servers: (guide.servers)(email), source: Source::Preset, provider: Some(guide.provider.to_owned()) };
+        let protocol = self.account_setup.as_ref().map(|s| s.incoming_protocol()).unwrap_or(ServerProtocol::Imap);
+        let suggestion = Suggestion { servers: (guide.servers)(protocol, email), source: Source::Preset, provider: Some(guide.provider.to_owned()) };
         self.apply_suggestion(suggestion, window, cx);
         let Some(setup) = self.account_setup.as_mut() else { return };
         let base = if guide.owns_address(email) { format!("{}’s published settings. Check them, then save.", guide.provider) } else { guide.custom_domain.to_owned() };
@@ -876,7 +877,12 @@ impl MailWindow {
             // The sign-in replaces both passwords.
             return Ok((servers.with_oauth(issuer), None, None));
         }
-        let password = value(&setup.password);
+        // Some services show app passwords in groups; the spaces are not part of them.
+        let secret = |e: &Entity<InputState>| {
+            let typed = value(e);
+            if setup.guide.is_some_and(|g| g.strip_spaces) { typed.split_whitespace().collect::<String>() } else { typed }
+        };
+        let password = secret(&setup.password);
         let password = if password.is_empty() {
             match setup.mode {
                 SetupMode::Edit(_) => None,
@@ -885,7 +891,7 @@ impl MailWindow {
         } else {
             Some(password)
         };
-        let out_password = if setup.same_password { None } else { Some(value(&setup.out_password)).filter(|p| !p.is_empty()) };
+        let out_password = if setup.same_password { None } else { Some(secret(&setup.out_password)).filter(|p| !p.is_empty()) };
         if !setup.same_password && out_password.is_none() && !matches!(setup.mode, SetupMode::Edit(_)) {
             return Err("Enter the outgoing server’s password, or use the same password for both.".into());
         }

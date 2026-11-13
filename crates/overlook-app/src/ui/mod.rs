@@ -1102,10 +1102,12 @@ impl MailWindow {
         // `OVERLOOK_SIGN_IN=gmail` opens the Google sign-in immediately (first-run helper).
         // Neither it nor the sample offer belongs in a window nobody can see.
         let launch_helper = if first_start && !hidden { std::env::var("OVERLOOK_SIGN_IN") } else { Err(std::env::VarError::NotPresent) };
+        // `icloud`, `yahoo`, `aol`: a guided app-password service, by its short name.
+        let guided = launch_helper.as_deref().ok().and_then(|name| overlook_provider::app_passwords::GUIDES.iter().copied().find(|g| g.short_name.eq_ignore_ascii_case(name)));
         match launch_helper.as_deref() {
             Ok("gmail") => this.start_google_sign_in(None, window, cx),
             Ok("microsoft") => this.open_microsoft_setup(window, cx),
-            Ok("icloud") => this.open_icloud_setup(window, cx),
+            Ok(_) if guided.is_some() => this.open_guided_setup(guided.expect("checked"), window, cx),
             Ok("imap") => this.open_account_setup(ProviderKind::Imap, SetupMode::New, window, cx),
             Ok("pop3") => this.open_account_setup(ProviderKind::Pop3, SetupMode::New, window, cx),
             // Asked only here, at launch: removing the last account later leaves the window empty.
@@ -4232,7 +4234,9 @@ impl MailWindow {
                             .pt(px(10.))
                             .child(Button::new("empty-add-gmail").primary().small().label("Add Gmail account").on_click(cx.listener(|this, _, window, cx| this.start_google_sign_in(None, window, cx))))
                             .child(Button::new("empty-add-microsoft").small().label("Add Microsoft account").on_click(cx.listener(|this, _, window, cx| this.open_microsoft_setup(window, cx))))
-                            .child(Button::new("empty-add-icloud").small().label("Add iCloud account").on_click(cx.listener(|this, _, window, cx| this.open_icloud_setup(window, cx))))
+                            .children(overlook_provider::app_passwords::GUIDES.iter().map(|&guide| {
+                                Button::new(SharedString::from(format!("empty-add-{}", guide.short_name.to_ascii_lowercase()))).small().label(format!("Add {} account", guide.short_name)).on_click(cx.listener(move |this, _, window, cx| this.open_guided_setup(guide, window, cx)))
+                            }))
                             .child(Button::new("empty-add-imap").small().label("Add IMAP account").on_click(cx.listener(|this, _, window, cx| this.open_account_setup(ProviderKind::Imap, SetupMode::New, window, cx))))
                             .child(Button::new("empty-add-pop3").small().label("Add POP3 account").on_click(cx.listener(|this, _, window, cx| this.open_account_setup(ProviderKind::Pop3, SetupMode::New, window, cx)))),
                     ),

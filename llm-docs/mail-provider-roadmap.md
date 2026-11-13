@@ -57,6 +57,8 @@ Apple documents IMAP and SMTP access with an app-specific password. iCloud does 
 
 ### 3. Yahoo and AOL
 
+**Status (13 November 2026):** step 1, guided app-password setup for both, is built: Yahoo and AOL guides with POP3, "Add Yahoo account…" and "Add AOL account…", and spaces taken out of pasted app passwords. A real Yahoo account works; AOL is checked by build and tests only. Step 2, OAuth, is not started. See [yahoo-aol-mail.md](yahoo-aol-mail.md).
+
 Group the implementation effort while maintaining separate compatibility results. Improve the current password setup first, then implement browser-based OAuth where provider registration and access permit it. Do not assume that Yahoo, AOL, AT&T, Verizon, or every Yahoo-hosted ISP address share identical onboarding requirements.
 
 Thunderbird explicitly documents OAuth for Yahoo, AOL, and AT&T, establishing a precedent for provider-specific sign-in support. It does not automatically grant Overlook access to the same registrations. [Thunderbird authentication documentation](https://support.mozilla.org/en-US/kb/thunderbird-and-yahoo)

@@ -885,10 +885,12 @@ impl MailWindow {
                                 menu = menu.item(PopupMenuItem::new("Add Microsoft account…").on_click(move |_, window, cx| {
                                     let _ = t.update(cx, |this, cx| this.open_microsoft_setup(window, cx));
                                 }));
-                                let t = this.clone();
-                                menu = menu.item(PopupMenuItem::new("Add iCloud account…").on_click(move |_, window, cx| {
-                                    let _ = t.update(cx, |this, cx| this.open_icloud_setup(window, cx));
-                                }));
+                                for &guide in overlook_provider::app_passwords::GUIDES {
+                                    let t = this.clone();
+                                    menu = menu.item(PopupMenuItem::new(format!("Add {} account…", guide.short_name)).on_click(move |_, window, cx| {
+                                        let _ = t.update(cx, |this, cx| this.open_guided_setup(guide, window, cx));
+                                    }));
+                                }
                                 let t = this.clone();
                                 menu = menu.item(PopupMenuItem::new("Add IMAP account…").on_click(move |_, window, cx| {
                                     let _ = t.update(cx, |this, cx| this.open_account_setup(ProviderKind::Imap, super::SetupMode::New, window, cx));

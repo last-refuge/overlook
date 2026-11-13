@@ -207,6 +207,15 @@ account needs two-factor authentication), then paste it into Overlook, which kee
 Overlook fills in Apple's server settings and finds which user name iCloud wants. For an iCloud+ address at your
 own domain, use your iCloud Mail address as the user name. iCloud doesn't offer POP, so it's always IMAP.
 
+## Connect Yahoo or AOL
+
+Open the account menu → **Add Yahoo account…** or **Add AOL account…**. Both want an **app password**, not your
+account password: create one in your account's Account Security settings
+([Yahoo](https://login.yahoo.com/account/security): External connections → Create app password;
+[AOL](https://login.aol.com/account/security): Generate app password, after turning on two-step verification),
+then paste it into Overlook. Spaces in it don't matter. Yahoo only offers app passwords in a browser you've used to
+sign in to Yahoo for several days. Overlook fills in the server settings; both work over IMAP or POP3.
+
 ## Keyboard
 
 | Key | Action |
