@@ -268,9 +268,8 @@ native subset; see [rendering policy and limits](docs/message-formatting.md).
 ## Status
 
 Early daily use by its author on Omarchy (Hyprland, Wayland). Gmail accounts work end to end. IMAP/SMTP and
-POP3 are built and tested against scripted servers and public servers' login exchanges, but no real account
-has been synced yet, so treat them as beta. Outlook.com and Microsoft 365 sign in with Microsoft (OAuth), tested so
-far against scripted servers only. A Flatpak build,
+POP3 are tested against scripted servers, and real Outlook.com (Microsoft sign-in), iCloud and Yahoo accounts have
+been tried by hand. Treat other services, and Microsoft 365 work accounts, as beta. A Flatpak build,
 GNOME, KDE, and screen-reader testing are still to be done. Open an issue with what you did, what you saw, and what you
 expected.
 
