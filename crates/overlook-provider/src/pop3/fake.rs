@@ -39,7 +39,12 @@ impl FakeMessage {
 #[derive(Debug)]
 pub struct FakeState {
     pub user: String,
+    /// What `PASS` must present, and the bearer token `AUTH XOAUTH2` must present.
     pub password: String,
+    /// Answer a refused `XOAUTH2` token with a JSON error challenge before the `-ERR`.
+    pub xoauth2_error_challenge: bool,
+    /// Every bearer token presented with `AUTH XOAUTH2`, accepted or not.
+    pub tokens_seen: Vec<String>,
     pub login: Login,
     /// The maildrop in message-number order (1-based on the wire).
     pub messages: Vec<FakeMessage>,
@@ -60,7 +65,7 @@ pub struct FakeState {
 
 impl Default for FakeState {
     fn default() -> Self {
-        Self { user: "jason@example.com".into(), password: "hunter2".into(), login: Login::Ok, messages: Vec::new(), deleted: Vec::new(), log: Vec::new(), connections: 0, quits: 0, drop_after_next: None, fail_next: None, no_top: false }
+        Self { user: "jason@example.com".into(), password: "hunter2".into(), xoauth2_error_challenge: false, tokens_seen: Vec::new(), login: Login::Ok, messages: Vec::new(), deleted: Vec::new(), log: Vec::new(), connections: 0, quits: 0, drop_after_next: None, fail_next: None, no_top: false }
     }
 }
 
@@ -177,14 +182,50 @@ impl Session {
                     }
                 }
             }
-            if !self.authed && !matches!(cmd.as_str(), "USER" | "PASS" | "CAPA" | "QUIT" | "STLS") {
+            if !self.authed && !matches!(cmd.as_str(), "USER" | "PASS" | "AUTH" | "CAPA" | "QUIT" | "STLS") {
                 self.say("-ERR [AUTH] Unauthenticated")?;
                 continue;
             }
             match cmd.as_str() {
                 "CAPA" => {
                     self.say("+OK")?;
-                    self.body(b"TOP\r\nUIDL\r\nUSER\r\nPIPELINING\r\n")?;
+                    self.body(b"TOP\r\nUIDL\r\nUSER\r\nSASL XOAUTH2\r\nPIPELINING\r\n")?;
+                }
+                "AUTH" if args.eq_ignore_ascii_case("XOAUTH2") => {
+                    use base64::Engine;
+                    self.say("+ ")?;
+                    let mut response = String::new();
+                    if self.reader.read_line(&mut response)? == 0 {
+                        return Ok(());
+                    }
+                    let raw = base64::engine::general_purpose::STANDARD.decode(response.trim()).unwrap_or_default();
+                    let text = String::from_utf8_lossy(&raw).into_owned();
+                    let mut fields = text.split('\x01');
+                    let u = fields.next().and_then(|f| f.strip_prefix("user=")).unwrap_or_default().to_owned();
+                    let token = fields.next().and_then(|f| f.strip_prefix("auth=Bearer ")).unwrap_or_default().to_owned();
+                    let (login, accepted, challenge) = {
+                        let mut s = self.state.lock().unwrap();
+                        s.log.push("XOAUTH2 ****".into());
+                        s.tokens_seen.push(token.clone());
+                        (s.login, u == s.user && token == s.password, s.xoauth2_error_challenge)
+                    };
+                    match login {
+                        Login::InUse => self.say("-ERR [IN-USE] Do you have another POP session running?")?,
+                        Login::Ok if accepted => {
+                            self.authed = true;
+                            self.say("+OK User successfully authenticated.")?;
+                        }
+                        _ => {
+                            if challenge {
+                                let error = base64::engine::general_purpose::STANDARD.encode(r#"{"status":"401","schemes":"bearer"}"#);
+                                self.say(&format!("+ {error}"))?;
+                                let mut cancel = String::new();
+                                self.reader.read_line(&mut cancel)?;
+                                self.state.lock().unwrap().log.push(cancel.trim().to_owned());
+                            }
+                            self.say("-ERR [AUTH] Authentication failure: unknown user name or bad password.")?;
+                        }
+                    }
                 }
                 "STLS" => self.say("-ERR STLS is not offered by the fake server")?,
                 "USER" => {

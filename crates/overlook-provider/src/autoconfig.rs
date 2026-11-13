@@ -1,5 +1,6 @@
-//! Server settings for an email address: Thunderbird's ISPDB, then a small preset table,
-//! then the common `mail.<domain>` guess.
+//! Server settings for an email address: Microsoft's own domains, then a small preset table,
+//! then Thunderbird's ISPDB, then the common `mail.<domain>` guess. Services that offer no
+//! IMAP, POP3 or SMTP access at all are named by [`unsupported`] instead.
 
 use overlook_core::{MailServers, Security, ServerEndpoint, ServerProtocol};
 use std::time::Duration;
@@ -31,10 +32,15 @@ pub fn lookup(email: &str) -> Suggestion {
     lookup_for(ServerProtocol::Imap, email)
 }
 
-/// [`lookup`] for the given incoming protocol (IMAP or POP3).
+/// [`lookup`] for the given incoming protocol (IMAP or POP3). Outlook.com, Hotmail, Live and
+/// MSN addresses get Microsoft's settings with [`MailServers::oauth`] set: Microsoft accepts
+/// only its own sign-in from mail apps.
 pub fn lookup_for(protocol: ServerProtocol, email: &str) -> Suggestion {
     let email = email.trim();
     let domain = email.rsplit('@').next().unwrap_or("").trim().to_ascii_lowercase();
+    if crate::microsoft::is_consumer_address(email) {
+        return Suggestion { servers: crate::microsoft::servers(protocol, email, true), source: Source::Preset, provider: Some("Outlook.com".into()) };
+    }
     let preset = match protocol {
         ServerProtocol::Pop3 => preset_pop3(&domain, email),
         _ => preset(&domain, email),
@@ -81,12 +87,21 @@ pub fn preset(domain: &str, email: &str) -> Option<Suggestion> {
         (&["gmx.de", "gmx.net", "gmx.at", "gmx.ch", "gmx.com", "gmx.us"], "GMX", "imap.gmx.net", 993, Security::Tls, "mail.gmx.net", 465, Security::Tls),
         (&["web.de"], "WEB.DE", "imap.web.de", 993, Security::Tls, "smtp.web.de", 465, Security::Tls),
         (&["gmail.com", "googlemail.com"], "Gmail over IMAP (needs an app password)", "imap.gmail.com", 993, Security::Tls, "smtp.gmail.com", 465, Security::Tls),
-        (&["hey.com"], "HEY", "imap.hey.com", 993, Security::Tls, "smtp.hey.com", 465, Security::Tls),
-        (&["tutanota.com", "tuta.io", "tuta.com"], "Tuta (no IMAP without the paid bridge)", "imap.tuta.com", 993, Security::Tls, "smtp.tuta.com", 465, Security::Tls),
     ];
     let row = TABLE.iter().find(|(domains, ..)| domains.iter().any(|d| *d == domain))?;
     let (_, provider, ih, ip, isec, sh, sp, ssec) = *row;
     Some(Suggestion { servers: servers(ih, ip, isec, sh, sp, ssec, email), source: Source::Preset, provider: Some(provider.to_owned()) })
+}
+
+/// Why an address's service cannot be added as an IMAP or POP3 account, for services that
+/// do not let other mail apps in at all. Checked before any lookup.
+pub fn unsupported(email: &str) -> Option<&'static str> {
+    let domain = email.trim().rsplit('@').next().unwrap_or("").trim().trim_end_matches('.').to_ascii_lowercase();
+    match domain.as_str() {
+        "hey.com" => Some("HEY doesn’t let other mail apps read or send its mail, so it can’t be added to Overlook. Use HEY’s own apps."),
+        "tuta.com" | "tuta.io" | "tutanota.com" | "tutanota.de" | "tutamail.com" | "keemail.me" => Some("Tuta doesn’t offer IMAP, POP3 or SMTP, so other mail apps can’t connect to it. Use Tuta’s own apps."),
+        _ => None,
+    }
 }
 
 pub fn guess(domain: &str, email: &str) -> Suggestion {
@@ -101,7 +116,7 @@ pub fn guess_for(protocol: ServerProtocol, domain: &str, email: &str) -> Suggest
 }
 
 fn servers(ih: &str, ip: u16, isec: Security, sh: &str, sp: u16, ssec: Security, email: &str) -> MailServers {
-    MailServers { incoming: ServerEndpoint::new(ih, ip, isec, email), outgoing: ServerEndpoint::new(sh, sp, ssec, email), pop3: None, imap: None }
+    MailServers { incoming: ServerEndpoint::new(ih, ip, isec, email), outgoing: ServerEndpoint::new(sh, sp, ssec, email), pop3: None, imap: None, oauth: None }
 }
 
 fn ispdb(protocol: ServerProtocol, domain: &str, email: &str) -> Option<Suggestion> {
@@ -151,7 +166,7 @@ pub fn parse_ispdb_for(protocol: ServerProtocol, xml: &str, email: &str) -> Opti
     if incoming.is_insecure_remote() || outgoing.is_insecure_remote() {
         return None;
     }
-    Some(Suggestion { servers: MailServers { incoming, outgoing, pop3: None, imap: None }, source: Source::Ispdb, provider })
+    Some(Suggestion { servers: MailServers { incoming, outgoing, pop3: None, imap: None, oauth: None }, source: Source::Ispdb, provider })
 }
 
 /// `(attributes, inner text)` of every `<tag …>…</tag>` element, in document order.
@@ -196,6 +211,22 @@ mod tests {
         let g = guess("example.com", "x@example.com");
         assert_eq!((g.source, g.servers.incoming.host.as_str(), g.servers.outgoing.port), (Source::Guess, "mail.example.com", 587));
         assert_eq!(preset("proton.me", "x@proton.me").unwrap().servers.incoming.host, "127.0.0.1");
+    }
+
+    #[test]
+    fn microsoft_addresses_sign_in_with_microsoft() {
+        let s = lookup_for(ServerProtocol::Imap, "Jason@Hotmail.co.uk");
+        assert_eq!((s.source, s.provider.as_deref(), s.servers.oauth), (Source::Preset, Some("Outlook.com"), Some(overlook_core::OAuthIssuer::Microsoft)));
+        assert_eq!((s.servers.incoming.address(), s.servers.outgoing.address()), ("outlook.office365.com:993".to_owned(), "smtp-mail.outlook.com:587".to_owned()));
+        assert_eq!(lookup_for(ServerProtocol::Pop3, "x@outlook.com").servers.incoming.port, 995);
+    }
+
+    #[test]
+    fn services_without_mail_app_access_are_explained_not_guessed() {
+        assert!(unsupported("x@hey.com").unwrap().contains("HEY"));
+        assert!(unsupported("x@Tuta.io").unwrap().contains("Tuta"));
+        assert!(unsupported("x@fastmail.com").is_none());
+        assert!(preset("hey.com", "x@hey.com").is_none() && preset("tuta.com", "x@tuta.com").is_none(), "no invented endpoints");
     }
 
     #[test]

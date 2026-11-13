@@ -3010,6 +3010,7 @@ mod tests {
             outgoing: ServerEndpoint::new("smtp.example.com", 587, Security::StartTls, "jason@example.com"),
             pop3: None,
             imap: Some(ImapPolicy::default()),
+            oauth: None,
         };
         store.set_servers(&acct, &servers).unwrap();
         assert_eq!(store.servers(&acct).unwrap(), Some(servers.clone()));

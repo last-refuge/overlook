@@ -41,7 +41,7 @@ pub mod fake;
 mod tests;
 
 use crate::mime::{headers_from_rfc822, message_from_rfc822, MessageFlags};
-use crate::{build_raw, draft_message_id, smtp, AppliedChanges, BoxFuture, MailProvider, MailboxSnapshot, ProviderError, RemoteChanges, SendContext, SendOutcome, SentReceipt};
+use crate::{build_raw, draft_message_id, smtp, AppliedChanges, BoxFuture, Credential, MailProvider, MailboxSnapshot, ProviderError, RemoteChanges, SendContext, SendOutcome, SentReceipt};
 use client::Client;
 use overlook_core::time::now;
 use overlook_core::*;
@@ -165,7 +165,8 @@ struct Ledger {
 
 pub struct Pop3Provider {
     servers: MailServers,
-    password: String,
+    /// The password, or the OAuth session's token source.
+    credential: Credential,
     outgoing_password: Option<String>,
     /// Where this account's `.eml` files live.
     raw_dir: PathBuf,
@@ -183,8 +184,9 @@ impl std::fmt::Debug for Pop3Provider {
 
 impl Pop3Provider {
     /// `raw_dir` is the account's own directory for `.eml` files (`<data dir>/raw/<account>`).
-    pub fn new(servers: MailServers, password: impl Into<String>, raw_dir: impl Into<PathBuf>) -> Self {
-        Self { servers, password: password.into(), outgoing_password: None, raw_dir: raw_dir.into(), timeout: DEFAULT_TIMEOUT, top_above: DEFAULT_TOP_ABOVE, ledger: Mutex::new(Ledger::default()) }
+    /// `credential` is the account's password, or its OAuth token source.
+    pub fn new(servers: MailServers, credential: impl Into<Credential>, raw_dir: impl Into<PathBuf>) -> Self {
+        Self { servers, credential: credential.into(), outgoing_password: None, raw_dir: raw_dir.into(), timeout: DEFAULT_TIMEOUT, top_above: DEFAULT_TOP_ABOVE, ledger: Mutex::new(Ledger::default()) }
     }
 
     /// The SMTP password, when "use the same password" was not chosen at setup.
@@ -221,12 +223,16 @@ impl Pop3Provider {
         self.servers.pop3.clone().unwrap_or_default()
     }
 
-    fn outgoing_password(&self) -> &str {
-        self.outgoing_password.as_deref().unwrap_or(&self.password)
+    /// What SMTP signs in with: the separate outgoing password, or the incoming credential.
+    fn outgoing_credential(&self) -> Credential {
+        match &self.outgoing_password {
+            Some(password) => Credential::Password(password.clone()),
+            None => self.credential.clone(),
+        }
     }
 
     fn connect(&self) -> Result<Client, ProviderError> {
-        Client::connect(&self.servers.incoming, &self.password, self.timeout)
+        Client::connect(&self.servers.incoming, &self.credential, self.timeout)
     }
 
     fn local_id(account: &Account) -> MessageId {
@@ -427,7 +433,7 @@ impl Pop3Provider {
         let rfc_id = draft_message_id(draft);
         let raw = build_raw(account, draft, context.in_reply_to.as_ref(), &rfc_id).map_err(ProviderError::Rejected)?;
         let recipients: Vec<String> = draft.to.iter().chain(&draft.cc).chain(&draft.bcc).map(|a| a.email.trim().to_owned()).filter(|e| !e.is_empty()).collect();
-        let transport = smtp::Transport::new(self.servers.outgoing.clone(), self.outgoing_password()).with_timeout(self.timeout);
+        let transport = smtp::Transport::new(self.servers.outgoing.clone(), self.outgoing_credential()).with_timeout(self.timeout);
         let reply = transport.send(&account.email, &recipients, &raw)?;
         info!("smtp: {} accepted {:?}: {reply}", self.servers.outgoing.host, draft.display_subject());
 
@@ -581,7 +587,7 @@ mod unit {
         let account = AccountId::from("pop3:jason@example.com");
         let labels = labels_for(&account);
         assert_eq!(labels.iter().map(|l| (l.id.as_str(), l.kind, l.provider_id.is_none())).collect::<Vec<_>>(), vec![("pop3:jason@example.com:inbox", LabelKind::Inbox, true), ("pop3:jason@example.com:sent", LabelKind::Sent, true), ("pop3:jason@example.com:archive", LabelKind::Archive, true), ("pop3:jason@example.com:trash", LabelKind::Trash, true)]);
-        let servers = MailServers { incoming: ServerEndpoint::new("localhost", 110, Security::None, "j"), outgoing: ServerEndpoint::new("localhost", 25, Security::None, "j"), pop3: None, imap: None };
+        let servers = MailServers { incoming: ServerEndpoint::new("localhost", 110, Security::None, "j"), outgoing: ServerEndpoint::new("localhost", 25, Security::None, "j"), pop3: None, imap: None, oauth: None };
         let p = Pop3Provider::new(servers, "pw", "/tmp/raw");
         assert_eq!(p.raw_path(&MessageId::from("pop3:jason@example.com:abc")), PathBuf::from("/tmp/raw/pop3_jason@example.com_abc.eml"));
         assert!(!format!("{p:?}").contains("pw"));

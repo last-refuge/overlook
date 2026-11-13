@@ -236,6 +236,7 @@ fn servers() -> MailServers {
         ),
         pop3: None,
         imap: None,
+        oauth: None,
     }
 }
 fn seed(uid: &str, title: &str, location: &str) -> String {

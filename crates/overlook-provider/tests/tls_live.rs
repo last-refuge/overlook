@@ -79,8 +79,8 @@ fn mail_clients_refuse_bad_servers() {
     diag_logging();
     let mut failures = Vec::new();
     for (stack, connect) in [
-        ("IMAP (rustls)", (|ep: &ServerEndpoint| imap::connect(ep, "unused", TIMEOUT).map(|_| ())) as fn(&ServerEndpoint) -> Result<(), overlook_provider::ProviderError>),
-        ("POP3 (rustls)", |ep| Pop3::connect(ep, "unused", TIMEOUT).map(|_| ())),
+        ("IMAP (rustls)", (|ep: &ServerEndpoint| imap::connect(ep, &"unused".into(), TIMEOUT).map(|_| ())) as fn(&ServerEndpoint) -> Result<(), overlook_provider::ProviderError>),
+        ("POP3 (rustls)", |ep| Pop3::connect(ep, &"unused".into(), TIMEOUT).map(|_| ())),
         ("SMTP (lettre + rustls)", |ep| Transport::new(ep.clone(), "unused").with_timeout(TIMEOUT).probe()),
     ] {
         println!("\n{stack}, implicit TLS");

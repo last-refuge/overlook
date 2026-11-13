@@ -431,9 +431,16 @@ const SESSION_IDLE_WORDING: &str = "Signed out after 90 days without use. Sign i
 const SESSION_AGE_WORDING: &str = "Signed out because this sign-in is 180 days old. Sign in again to continue syncing.";
 
 /// Ends an account's session everywhere it exists: revokes the Google grant (through the
-/// shared client, so cloned providers stop too) and deletes every stored credential.
-/// Shared by Sign out and Remove account. Blocking; run in the background.
-fn end_session(account: &Account, id: &AccountId, gmail: Option<Arc<overlook_provider::gmail::GmailClient>>) -> Result<(), String> {
+/// shared client, so cloned providers stop too), ends a Microsoft session (Microsoft offers
+/// no revocation of a single sign-in, so its tokens are only forgotten here), and deletes
+/// every stored credential. Shared by Sign out and Remove account. Blocking; run in the
+/// background.
+fn end_session(account: &Account, id: &AccountId, gmail: Option<Arc<overlook_provider::gmail::GmailClient>>, microsoft: Option<Arc<overlook_provider::microsoft::MicrosoftSession>>) -> Result<(), String> {
+    // No session of the account may write its sign-in back once it is deleted below.
+    providers::end_microsoft_sign_ins(id);
+    if let Some(session) = microsoft {
+        session.disconnect();
+    }
     if account.provider == ProviderKind::Gmail {
         if let Some(client) = gmail {
             client.disconnect().map_err(|e| e.to_string())?;
@@ -454,19 +461,22 @@ fn no_account() -> Account {
     Account { id: AccountId::from(""), provider: ProviderKind::Sample, display_name: String::new(), email: String::new(), created_at: 0 }
 }
 
-/// "Sign in again" for Google accounts, "Update password" for password accounts.
-pub(crate) fn sign_in_label_for(provider: ProviderKind) -> &'static str {
+/// "Sign in again" for Google and Microsoft accounts, "Update password" for password
+/// accounts. `oauth` says whether an IMAP or POP3 account signs in through an OAuth issuer.
+pub(crate) fn sign_in_label_for(provider: ProviderKind, oauth: bool) -> &'static str {
     match provider {
-        ProviderKind::Imap | ProviderKind::Pop3 => "Update password",
+        ProviderKind::Imap | ProviderKind::Pop3 if !oauth => "Update password",
         _ => "Sign in again",
     }
 }
 
-/// A Google sign-in in progress (the browser has been opened).
+/// A browser sign-in in progress (the browser has been opened).
 pub struct SignIn {
     cancel: Arc<AtomicBool>,
     /// The address this sign-in was started for ("Sign in again"), if any.
     expected: Option<String>,
+    /// Who the browser is signing in to: "Google" or "Microsoft".
+    issuer: &'static str,
 }
 
 /// The warning shown when Google returns a different account than the one being signed in
@@ -1094,6 +1104,7 @@ impl MailWindow {
         let launch_helper = if first_start && !hidden { std::env::var("OVERLOOK_SIGN_IN") } else { Err(std::env::VarError::NotPresent) };
         match launch_helper.as_deref() {
             Ok("gmail") => this.start_google_sign_in(None, window, cx),
+            Ok("microsoft") => this.open_microsoft_setup(window, cx),
             Ok("imap") => this.open_account_setup(ProviderKind::Imap, SetupMode::New, window, cx),
             Ok("pop3") => this.open_account_setup(ProviderKind::Pop3, SetupMode::New, window, cx),
             // Asked only here, at launch: removing the last account later leaves the window empty.
@@ -1247,9 +1258,28 @@ impl MailWindow {
         self.provider_issues.get(&self.account.id)
     }
 
-    /// What the "fix the credentials" action is called for the active account.
+    /// What the "fix the credentials" action is called for the active account. Reads its
+    /// server settings, so call it only when the action is shown.
     pub(crate) fn sign_in_again_label(&self) -> &'static str {
-        sign_in_label_for(self.account.provider)
+        sign_in_label_for(self.account.provider, self.oauth_issuer(&self.account.id).is_some())
+    }
+
+    /// Who an IMAP or POP3 account signs in through, when not with a password. Reads the
+    /// account's server settings; keep it out of per-row render paths.
+    pub(crate) fn oauth_issuer(&self, account: &AccountId) -> Option<OAuthIssuer> {
+        self.store.servers(account).ok().flatten().and_then(|s| s.oauth)
+    }
+
+    /// What kind of account this is, for account lists: "Microsoft" for an IMAP or POP3
+    /// account that signs in with Microsoft, otherwise the provider's name. Its live sign-in
+    /// answers; only a signed-out IMAP or POP3 account costs a settings read.
+    pub(crate) fn account_kind_label(&self, account: &Account) -> &'static str {
+        match self.providers.get(&account.id) {
+            Some(p) if p.microsoft.is_some() => OAuthIssuer::Microsoft.label(),
+            Some(_) => account.provider.label(),
+            None if matches!(account.provider, ProviderKind::Imap | ProviderKind::Pop3) => self.oauth_issuer(&account.id).map(OAuthIssuer::label).unwrap_or(account.provider.label()),
+            None => account.provider.label(),
+        }
     }
 
     /// Reopens the credentials flow for the active account: the Google sign-in, or the
@@ -1261,6 +1291,9 @@ impl MailWindow {
 
     pub(crate) fn sign_in_again_for(&mut self, account: &AccountId, hint: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         match self.accounts.iter().find(|a| &a.id == account).map(|a| a.provider) {
+            Some(ProviderKind::Imap) | Some(ProviderKind::Pop3) if self.oauth_issuer(account) == Some(OAuthIssuer::Microsoft) => {
+                self.start_microsoft_sign_in_again(account.clone(), window, cx);
+            }
             Some(ProviderKind::Imap) | Some(ProviderKind::Pop3) => {
                 let kind = self.accounts.iter().find(|a| &a.id == account).map(|a| a.provider).unwrap_or(ProviderKind::Imap);
                 self.open_account_setup(kind, SetupMode::UpdatePassword(account.clone()), window, cx);
@@ -1329,10 +1362,11 @@ impl MailWindow {
             return;
         }
         let gmail = self.providers.get(&id).and_then(|p| p.gmail.clone());
+        let microsoft = self.providers.get(&id).and_then(|p| p.microsoft.clone());
         let background_id = id.clone();
         crate::ui::toast(window, cx, crate::notify::Level::Info, "Removing account and disconnecting access…");
         cx.spawn_in(window, async move |this, cx| {
-            let result = cx.background_spawn(async move { end_session(&account, &background_id, gmail) }).await;
+            let result = cx.background_spawn(async move { end_session(&account, &background_id, gmail, microsoft) }).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.removing_accounts.remove(&id);
                 match result {
@@ -1353,6 +1387,7 @@ impl MailWindow {
         let Some(account) = self.accounts.iter().find(|a| a.id == id).cloned() else { return };
         if account.provider == ProviderKind::Sample || !self.removing_accounts.insert(id.clone()) { return; }
         let gmail = self.providers.get(&id).and_then(|p| p.gmail.clone());
+        let microsoft = self.providers.get(&id).and_then(|p| p.microsoft.clone());
         let background_id = id.clone();
         if !expired {
             crate::ui::toast(window, cx, crate::notify::Level::Info, "Signing out…");
@@ -1364,12 +1399,12 @@ impl MailWindow {
         };
         tracing::info!(target: "overlook::signin", account = %id.0, reason, "sign-out started");
         cx.spawn_in(window, async move |this, cx| {
-            let result = cx.background_spawn(async move { end_session(&account, &background_id, gmail) }).await;
+            let result = cx.background_spawn(async move { end_session(&account, &background_id, gmail, microsoft) }).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.removing_accounts.remove(&id);
                 match result {
                     Ok(()) => {
-                        tracing::info!(target: "overlook::signin", account = %id.0, "sign-out complete: grant revoked, stored credentials deleted");
+                        tracing::info!(target: "overlook::signin", account = %id.0, "sign-out complete: grant revoked where the issuer allows, stored credentials deleted");
                         this.providers.remove(&id);
                         this.syncing.remove(&id);
                         this.next_retry.remove(&id);
@@ -1401,11 +1436,22 @@ impl MailWindow {
         }).detach();
     }
 
-    /// Signs out connected Gmail sessions that are idle past the limit or past their maximum
-    /// age.
+    /// Signs out connected Gmail and Microsoft sessions that are idle past the limit or past
+    /// their maximum age.
     fn expire_idle_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let now_ms = now();
-        let expired: Vec<(AccountId, SessionExpiry)> = self.providers.iter().filter_map(|(id, p)| Some((id.clone(), p.gmail.as_ref()?.session_expiry(now_ms)?))).collect();
+        let expired: Vec<(AccountId, SessionExpiry)> = self
+            .providers
+            .iter()
+            .filter_map(|(id, p)| {
+                let expiry = match (&p.gmail, &p.microsoft) {
+                    (Some(gmail), _) => gmail.session_expiry(now_ms),
+                    (None, Some(microsoft)) => microsoft.session_expiry(now_ms),
+                    (None, None) => None,
+                }?;
+                Some((id.clone(), expiry))
+            })
+            .collect();
         for (id, expiry) in expired {
             self.sign_out_account(id, Some(expiry), window, cx);
         }
@@ -1627,7 +1673,7 @@ impl MailWindow {
             }
         };
         let url = pending.url.clone();
-        self.signin = Some(SignIn { cancel: pending.cancel_handle(), expected: hint });
+        self.signin = Some(SignIn { cancel: pending.cancel_handle(), expected: hint, issuer: "Google" });
         cx.open_url(&url);
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
@@ -3258,6 +3304,7 @@ impl MailWindow {
                 }
                 if matches!(outcome.state, Some(SyncState::SignInRequired)) {
                     let wording = match account.provider {
+                        ProviderKind::Imap | ProviderKind::Pop3 if this.oauth_issuer(&account.id).is_some() => providers::MICROSOFT_SIGN_IN_WORDING,
                         ProviderKind::Imap | ProviderKind::Pop3 => providers::PASSWORD_NEEDED_WORDING,
                         _ => "Sign in again to continue syncing. Your local drafts are safe.",
                     };
@@ -3438,7 +3485,14 @@ impl MailWindow {
         crate::set_inbox_limit(self.prefs.inbox_messages as usize);
         let accounts = self.accounts.clone();
         for a in accounts.iter().filter(|a| matches!(a.provider, ProviderKind::Gmail | ProviderKind::Imap)) {
-            if let Ok(bundle) = providers::providers_for(a, &self.sample, &self.store) {
+            // A Microsoft account keeps its running sign-in: a second session of the same
+            // account would refresh and store on its own.
+            let live = self.providers.get(&a.id).and_then(|p| p.microsoft.clone()).zip(self.store.servers(&a.id).ok().flatten());
+            let rebuilt = match live {
+                Some((session, servers)) => Ok(providers::microsoft_providers(a, servers, session)),
+                None => providers::providers_for(a, &self.sample, &self.store),
+            };
+            if let Ok(bundle) = rebuilt {
                 self.providers.insert(a.id.clone(), bundle);
             }
             // Drop the coverage marker so the next sync lists the mailboxes again.
@@ -3883,8 +3937,8 @@ impl MailWindow {
     /// Banner under the header for a sign-in in progress or an account that needs sign-in.
     fn render_banner(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let p = *cx.palette();
-        let (icon_name, text, action, color): (&str, String, Option<(&str, bool)>, Hsla) = if self.signin.is_some() {
-            ("globe", "Finish signing in to Google in your browser. Overlook is waiting for the sign-in to complete.".into(), Some(("Cancel", false)), p.accent)
+        let (icon_name, text, action, color): (&str, String, Option<(&str, bool)>, Hsla) = if let Some(signin) = &self.signin {
+            ("globe", format!("Finish signing in to {} in your browser. Overlook is waiting for the sign-in to complete.", signin.issuer), Some(("Cancel", false)), p.accent)
         } else if let Some(reason) = self.active_issue() {
             ("key-round", reason.clone(), Some((self.sign_in_again_label(), true)), p.warning)
         } else {
@@ -4174,6 +4228,7 @@ impl MailWindow {
                             .gap(px(8.))
                             .pt(px(10.))
                             .child(Button::new("empty-add-gmail").primary().small().label("Add Gmail account").on_click(cx.listener(|this, _, window, cx| this.start_google_sign_in(None, window, cx))))
+                            .child(Button::new("empty-add-microsoft").small().label("Add Microsoft account").on_click(cx.listener(|this, _, window, cx| this.open_microsoft_setup(window, cx))))
                             .child(Button::new("empty-add-imap").small().label("Add IMAP account").on_click(cx.listener(|this, _, window, cx| this.open_account_setup(ProviderKind::Imap, SetupMode::New, window, cx))))
                             .child(Button::new("empty-add-pop3").small().label("Add POP3 account").on_click(cx.listener(|this, _, window, cx| this.open_account_setup(ProviderKind::Pop3, SetupMode::New, window, cx)))),
                     ),

@@ -57,7 +57,7 @@ pub mod fake;
 mod tests;
 
 use crate::mime::{headers_from_rfc822, message_from_rfc822, MessageFlags};
-use crate::{build_raw, draft_message_id, folder_name_problem, smtp, AppliedChanges, BoxFuture, MailProvider, MailboxSnapshot, ProviderError, RemoteChanges, RemoteState, RenamedFolder, SendContext, SendOutcome, SentReceipt};
+use crate::{build_raw, draft_message_id, folder_name_problem, smtp, AppliedChanges, BoxFuture, Credential, MailProvider, MailboxSnapshot, ProviderError, RemoteChanges, RemoteState, RenamedFolder, SendContext, SendOutcome, SentReceipt};
 mod drafts;
 use connection::{map_error, Session};
 use folders::FolderInfo;
@@ -86,6 +86,11 @@ const FLAG_REFRESH_EVERY: u64 = 10;
 const FETCH_CHUNK: usize = 400;
 
 const SEP: char = '\u{1f}';
+
+/// How long to wait for the Sent copy a server files by itself (Microsoft) before appending
+/// one, and how often to look.
+const SERVER_COPY_WAIT: Duration = Duration::from_secs(8);
+const SERVER_COPY_POLL: Duration = Duration::from_secs(1);
 
 /// Prefix of the provider id given to a Sent copy that exists only locally (the `APPEND`
 /// failed after SMTP accepted the message). The sync engine adopts such a row for the
@@ -552,13 +557,18 @@ enum SendPhase {
 
 pub struct ImapProvider {
     servers: MailServers,
-    password: String,
+    /// The password, or the OAuth session's token source.
+    credential: Credential,
     /// SMTP password when it differs from the incoming one.
     outgoing_password: Option<String>,
     inbox_limit: usize,
     timeout: Duration,
     conn: Mutex<Conn>,
     send_phases: Mutex<HashMap<String, SendPhase>>,
+    /// See [`ImapProvider::server_files_sent`].
+    server_files_sent: bool,
+    /// See [`SERVER_COPY_WAIT`]; shorter in tests.
+    server_copy_wait: Duration,
 }
 
 impl std::fmt::Debug for ImapProvider {
@@ -569,16 +579,41 @@ impl std::fmt::Debug for ImapProvider {
 }
 
 impl ImapProvider {
-    pub fn new(servers: MailServers, password: impl Into<String>) -> Self {
+    /// `credential` is the account's password, or its OAuth token source.
+    pub fn new(servers: MailServers, credential: impl Into<Credential>) -> Self {
+        // Microsoft files what its SMTP server accepts in the Sent folder this account reads,
+        // a moment after accepting it, but only when it serves both sides: as a relay for
+        // another provider's mailbox it files nothing there.
+        let server_files_sent = crate::microsoft::is_microsoft_host(&servers.incoming.host) && crate::microsoft::is_microsoft_host(&servers.outgoing.host);
         Self {
+            server_files_sent,
             servers,
-            password: password.into(),
+            credential: credential.into(),
             outgoing_password: None,
             inbox_limit: 100,
             timeout: DEFAULT_TIMEOUT,
             conn: Mutex::new(Conn { session: None, selected: None, caps: Capabilities::default(), relist_pending: false, renamed: Vec::new(), sent_path: None, folders: Vec::new(), unopenable: HashSet::new() }),
             send_phases: Mutex::new(HashMap::new()),
+            server_copy_wait: SERVER_COPY_WAIT,
         }
+    }
+
+    /// How long a send waits for the server's own Sent copy (see [`Self::server_files_sent`]).
+    pub fn with_server_copy_wait(mut self, wait: Duration) -> Self {
+        self.server_copy_wait = wait;
+        self
+    }
+
+    /// Whether the SMTP server files what it accepts in the Sent folder this account reads, as
+    /// Outlook.com and Microsoft 365 do: appending a copy of our own there would leave two.
+    pub fn server_files_sent(&self) -> bool {
+        self.server_files_sent
+    }
+
+    /// Overrides [`Self::server_files_sent`], which follows the server host names.
+    pub fn with_server_files_sent(mut self, files: bool) -> Self {
+        self.server_files_sent = files;
+        self
     }
 
     /// The SMTP password, when "use the same password" was not chosen at setup.
@@ -587,8 +622,12 @@ impl ImapProvider {
         self
     }
 
-    fn outgoing_password(&self) -> &str {
-        self.outgoing_password.as_deref().unwrap_or(&self.password)
+    /// What SMTP signs in with: the separate outgoing password, or the incoming credential.
+    fn outgoing_credential(&self) -> Credential {
+        match &self.outgoing_password {
+            Some(password) => Credential::Password(password.clone()),
+            None => self.credential.clone(),
+        }
     }
 
     /// Newest Inbox messages to list on first download; other folders scale with it, with
@@ -610,7 +649,7 @@ impl ImapProvider {
     /// Starts the account's `IDLE` thread on its own connection (see [`idle`]). The
     /// callback runs on that thread; the app turns it into a sync request.
     pub fn idle_watcher(&self, on_event: impl Fn(idle::IdleEvent) + Send + 'static) -> idle::IdleWatcher {
-        idle::watch(self.servers.incoming.clone(), self.password.clone(), self.timeout, on_event)
+        idle::watch(self.servers.incoming.clone(), self.credential.clone(), self.timeout, on_event)
     }
 
     /// Server extensions seen at login, once connected.
@@ -634,7 +673,7 @@ impl ImapProvider {
         if conn.session.is_some() {
             return Ok(());
         }
-        let mut session = connection::connect(&self.servers.incoming, &self.password, self.timeout)?;
+        let mut session = connection::connect(&self.servers.incoming, &self.credential, self.timeout)?;
         let caps = session.capabilities().map_err(|e| map_error(&e))?;
         let mut capabilities = Capabilities {
             special_use: caps.has_str("SPECIAL-USE"),
@@ -1725,7 +1764,7 @@ impl ImapProvider {
         let rfc_id = draft_message_id(draft);
         let raw = build_raw(account, draft, context.in_reply_to.as_ref(), &rfc_id).map_err(ProviderError::Rejected)?;
         let recipients: Vec<String> = draft.to.iter().chain(&draft.cc).chain(&draft.bcc).map(|a| a.email.trim().to_owned()).filter(|e| !e.is_empty()).collect();
-        let transport = smtp::Transport::new(self.servers.outgoing.clone(), self.outgoing_password()).with_timeout(self.timeout);
+        let transport = smtp::Transport::new(self.servers.outgoing.clone(), self.outgoing_credential()).with_timeout(self.timeout);
         self.set_phase(draft, SendPhase::BeforeData);
         match transport.send(&account.email, &recipients, &raw) {
             Ok(reply) => info!("smtp: {} accepted {:?}: {reply}", self.servers.outgoing.host, draft.display_subject()),
@@ -1737,8 +1776,10 @@ impl ImapProvider {
         }
         self.set_phase(draft, SendPhase::Accepted);
 
-        // The Sent copy: APPEND the same bytes; APPENDUID names the server copy.
+        // The Sent copy: APPEND the same bytes; APPENDUID names the server copy. A server
+        // that files its own copy gets a few seconds to do so first.
         let from_labels = Self::kind_path(&context.labels, LabelKind::Sent).map(str::to_owned);
+        let server_files_sent = self.server_files_sent();
         let appended = self.with_session(|conn| {
             let path = match from_labels.clone() {
                 Some(p) => Some(p),
@@ -1747,9 +1788,22 @@ impl ImapProvider {
             let Some(path) = path else { return Ok(None) };
             // This closure may run twice (a dropped connection is reopened once): an APPEND
             // whose reply was lost must not be repeated.
-            let validity = conn.select(&path)?.uid_validity.unwrap_or(0);
+            let mut validity = conn.select(&path)?.uid_validity.unwrap_or(0);
             if let Some(uid) = conn.find_by_message_id(&rfc_id)? {
                 return Ok(Some(MessageRef::provider_id(&path, validity, uid)));
+            }
+            if server_files_sent {
+                let deadline = std::time::Instant::now() + self.server_copy_wait;
+                while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()).filter(|d| !d.is_zero()) {
+                    std::thread::sleep(left.min(SERVER_COPY_POLL));
+                    // A fresh SELECT shows what arrived since.
+                    validity = conn.select(&path)?.uid_validity.unwrap_or(0);
+                    if let Some(uid) = conn.find_by_message_id(&rfc_id)? {
+                        debug!("imap: {} filed its own Sent copy", self.servers.outgoing.host);
+                        return Ok(Some(MessageRef::provider_id(&path, validity, uid)));
+                    }
+                }
+                info!("imap: no Sent copy from {} after {:?}; appending one", self.servers.outgoing.host, self.server_copy_wait);
             }
             let result = conn.session().append(&path, &raw).flag(Flag::Seen).finish();
             match result {
@@ -2101,7 +2155,7 @@ mod unit {
 
     #[test]
     fn folder_limits_scale_with_the_inbox_preference() {
-        let servers = MailServers { incoming: ServerEndpoint::new("localhost", 143, Security::None, "j"), outgoing: ServerEndpoint::new("localhost", 25, Security::None, "j"), pop3: None, imap: None };
+        let servers = MailServers { incoming: ServerEndpoint::new("localhost", 143, Security::None, "j"), outgoing: ServerEndpoint::new("localhost", 25, Security::None, "j"), pop3: None, imap: None, oauth: None };
         let p = ImapProvider::new(servers.clone(), "pw");
         assert_eq!((p.folder_limit(LabelKind::Inbox), p.folder_limit(LabelKind::Sent), p.folder_limit(LabelKind::Trash), p.folder_limit(LabelKind::Spam), p.folder_limit(LabelKind::User)), (100, 40, 20, 10, 20));
         let p = ImapProvider::new(servers, "pw").with_inbox_limit(300);

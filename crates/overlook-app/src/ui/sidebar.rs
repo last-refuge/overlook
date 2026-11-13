@@ -668,13 +668,13 @@ impl MailWindow {
         };
 
         let owner = self.owner();
-        let accounts: Vec<(Account, String)> = ordered_accounts.iter().map(|a| (a.clone(), self.account_name(&a.id))).collect();
+        let accounts: Vec<(Account, String, &'static str)> = ordered_accounts.iter().map(|a| (a.clone(), self.account_name(&a.id), self.account_kind_label(a))).collect();
         let sidebar_mode = self.prefs.sidebar_mode;
         let active_id = self.account.id.clone();
         let active_email = self.account.email.clone();
         let needs_sign_in = self.active_issue().is_some();
         let can_sign_out = self.account.provider != ProviderKind::Sample;
-        let sign_in_label = self.sign_in_again_label();
+        let sign_in_label = if needs_sign_in { self.sign_in_again_label() } else { "Sign in again" };
         let this = cx.entity().downgrade();
         let state_color = match status.state {
             SyncState::UpToDate => p.success,
@@ -859,10 +859,10 @@ impl MailWindow {
                             .tooltip("Accounts")
                             .dropdown_menu(move |mut menu, _window, _cx| {
                                 menu = menu.label("Accounts");
-                                for (a, name) in &accounts {
+                                for (a, name, kind) in &accounts {
                                     let id = a.id.clone();
                                     let t = this.clone();
-                                    let text = if name == &a.email { format!("{} · {}", a.email, a.provider.label()) } else { format!("{name} · {}", a.email) };
+                                    let text = if name == &a.email { format!("{} · {kind}", a.email) } else { format!("{name} · {}", a.email) };
                                     menu = menu.item(PopupMenuItem::new(text).checked(a.id == active_id).on_click(
                                         move |_, window, cx| {
                                             let _ = t.update(cx, |this, cx| this.switch_account(id.clone(), window, cx));
@@ -880,6 +880,10 @@ impl MailWindow {
                                 let t = this.clone();
                                 menu = menu.item(PopupMenuItem::new("Add Gmail account…").on_click(move |_, window, cx| {
                                     let _ = t.update(cx, |this, cx| this.start_google_sign_in(None, window, cx));
+                                }));
+                                let t = this.clone();
+                                menu = menu.item(PopupMenuItem::new("Add Microsoft account…").on_click(move |_, window, cx| {
+                                    let _ = t.update(cx, |this, cx| this.open_microsoft_setup(window, cx));
                                 }));
                                 let t = this.clone();
                                 menu = menu.item(PopupMenuItem::new("Add IMAP account…").on_click(move |_, window, cx| {

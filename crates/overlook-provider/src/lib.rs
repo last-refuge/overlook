@@ -8,9 +8,12 @@
 pub mod autoconfig;
 pub mod calendar;
 pub mod caldav;
+pub mod credential;
 pub mod gmail;
 pub mod imap;
+pub mod microsoft;
 pub mod mime;
+pub mod oauth;
 pub mod outgoing;
 pub mod drafts;
 pub mod pop3;
@@ -19,6 +22,7 @@ pub mod secure_error;
 pub mod smtp;
 
 pub use calendar::{CalendarProvider, EventChanges};
+pub use credential::{AccessTokenSource, Credential};
 pub use outgoing::{build_raw, message_to_raw};
 
 use overlook_core::*;

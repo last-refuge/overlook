@@ -315,6 +315,7 @@ fn export_caldav_native_fixture() {
                 ),
                 imap: None,
                 pop3: None,
+                oauth: None,
             },
         )
         .unwrap();

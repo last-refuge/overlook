@@ -1,14 +1,16 @@
-//! A hand-written RFC 1939 client: `STLS` (RFC 2595), `USER`/`PASS`, `STAT`, `LIST`, `UIDL`,
+//! A hand-written RFC 1939 client: `STLS` (RFC 2595), `USER`/`PASS` or `AUTH XOAUTH2`
+//! (RFC 5034 with an OAuth access token), `STAT`, `LIST`, `UIDL`,
 //! `TOP`, `RETR`, `DELE`, `NOOP`, `QUIT`, over the same TLS / STARTTLS / plaintext-to-localhost
 //! stream handling the IMAP provider uses. One session is one maildrop lock: callers open a
 //! session per unit of work and `QUIT`, which is also what commits deletions.
 //!
 //! Error mapping, in the IMAP provider's spirit: a refused connection, a lost connection or
-//! a timeout is [`ProviderError::Offline`]; `-ERR` to `USER`/`PASS` is
+//! a timeout is [`ProviderError::Offline`]; `-ERR` to `USER`/`PASS` or `AUTH` is
 //! [`ProviderError::SignInRequired`] unless the RFC 2449 code says `[IN-USE]`,
 //! `[LOGIN-DELAY]` or `[SYS/TEMP]` ([`ProviderError::Temporary`]); any other `-ERR` is
 //! [`ProviderError::Rejected`] with the server's words, except the temporary codes.
 
+use crate::credential::{Credential, Secret};
 use crate::imap::connection::{tcp_connect, wrap_tls, Stream};
 use crate::ProviderError;
 use overlook_core::{Security, ServerEndpoint};
@@ -27,8 +29,13 @@ pub struct Client {
 pub type OkText = String;
 
 impl Client {
-    /// Connects, secures the connection as the endpoint asks, and logs in.
-    pub fn connect(endpoint: &ServerEndpoint, password: &str, timeout: Duration) -> Result<Self, ProviderError> {
+    /// Connects, secures the connection as the endpoint asks, and signs in. A refused access
+    /// token is retried once on a new connection with a refreshed token.
+    pub fn connect(endpoint: &ServerEndpoint, credential: &Credential, timeout: Duration) -> Result<Self, ProviderError> {
+        credential.sign_in(|secret| Self::open(endpoint, secret, timeout))
+    }
+
+    fn open(endpoint: &ServerEndpoint, secret: Secret<'_>, timeout: Duration) -> Result<Self, ProviderError> {
         if endpoint.is_insecure_remote() {
             return Err(ProviderError::Rejected(format!("refusing to connect to {} without encryption", endpoint.host)));
         }
@@ -60,7 +67,10 @@ impl Client {
         if endpoint.username.trim().is_empty() {
             return Err(ProviderError::SignInRequired);
         }
-        client.login(endpoint.username.trim(), password)?;
+        match secret {
+            Secret::Password(password) => client.login(endpoint.username.trim(), password)?,
+            Secret::AccessToken(token) => client.xoauth2(endpoint.username.trim(), token)?,
+        }
         Ok(client)
     }
 
@@ -74,17 +84,50 @@ impl Client {
     }
 
     fn login(&mut self, user: &str, password: &str) -> Result<(), ProviderError> {
-        let sign_in = |e: ProviderError| match e {
-            ProviderError::Rejected(words) => match code_of(&words).as_deref() {
-                Some("IN-USE") | Some("LOGIN-DELAY") | Some("SYS/TEMP") => ProviderError::Temporary(strip_code(&words)),
-                _ => ProviderError::SignInRequired,
-            },
-            other => other,
-        };
         tracing::info!(target: "overlook::signin", host = %self.host, mechanism = "USER/PASS", username = "[account]", password = "[REDACTED]", "POP3 sign-in");
         self.send(&format!("USER {user}"), "USER ****").and_then(|_| self.ok()).map_err(sign_in)?;
         self.send(&format!("PASS {password}"), "PASS ****").and_then(|_| self.ok()).map_err(sign_in)?;
         Ok(())
+    }
+
+    /// `AUTH XOAUTH2`, then the base64 response at the server's `+`, as Microsoft documents.
+    /// A second `+` carries the server's JSON error; the exchange is cancelled with `*`
+    /// (RFC 5034 §4) and the refusal reported.
+    fn xoauth2(&mut self, user: &str, token: &str) -> Result<(), ProviderError> {
+        use base64::Engine;
+        tracing::info!(target: "overlook::signin", host = %self.host, mechanism = "XOAUTH2", username = "[account]", access_token = "[REDACTED]", "POP3 sign-in");
+        self.send("AUTH XOAUTH2", "AUTH XOAUTH2")?;
+        if self.sasl_reply().map_err(sign_in)? != SaslReply::Continue {
+            return Err(ProviderError::Rejected(format!("{} answered AUTH XOAUTH2 without asking for the token", self.host)));
+        }
+        let response = base64::engine::general_purpose::STANDARD.encode(crate::oauth::xoauth2_response(user, token));
+        self.send(&response, "****")?;
+        match self.sasl_reply().map_err(sign_in)? {
+            SaslReply::Done => Ok(()),
+            SaslReply::Continue => {
+                self.send("*", "*")?;
+                let _ = self.ok();
+                Err(ProviderError::SignInRequired)
+            }
+        }
+    }
+
+    /// Reads the server's answer during a SASL exchange: `+ …` asks for more, `+OK` ends it,
+    /// `-ERR` maps as any status line does.
+    fn sasl_reply(&mut self) -> Result<SaslReply, ProviderError> {
+        let line = self.read_line()?;
+        let line = line.trim_end();
+        if line.starts_with("+OK") {
+            return Ok(SaslReply::Done);
+        }
+        if line == "+" || line.starts_with("+ ") {
+            return Ok(SaslReply::Continue);
+        }
+        let words = line.strip_prefix("-ERR").map(str::trim).unwrap_or(line).to_owned();
+        Err(match code_of(&words).as_deref() {
+            Some("IN-USE") | Some("LOGIN-DELAY") | Some("SYS/TEMP") => ProviderError::Temporary(strip_code(&words)),
+            _ => ProviderError::Rejected(strip_code(&words)),
+        })
     }
 
     fn read_line(&mut self) -> Result<String, ProviderError> {
@@ -210,6 +253,27 @@ impl Client {
 }
 
 /// The RFC 2449 response code at the start of an `-ERR` text, upper-cased.
+/// A step of a SASL exchange.
+#[derive(Debug, PartialEq, Eq)]
+enum SaslReply {
+    /// `+ …`: the server wants the next response.
+    Continue,
+    /// `+OK`: signed in.
+    Done,
+}
+
+/// A refused sign-in is [`ProviderError::SignInRequired`] unless the RFC 2449 code says it is
+/// temporary.
+fn sign_in(e: ProviderError) -> ProviderError {
+    match e {
+        ProviderError::Rejected(words) => match code_of(&words).as_deref() {
+            Some("IN-USE") | Some("LOGIN-DELAY") | Some("SYS/TEMP") => ProviderError::Temporary(strip_code(&words)),
+            _ => ProviderError::SignInRequired,
+        },
+        other => other,
+    }
+}
+
 fn code_of(words: &str) -> Option<String> {
     let rest = words.trim_start().strip_prefix('[')?;
     let end = rest.find(']')?;
@@ -240,10 +304,10 @@ mod tests {
 
     #[test]
     fn refuses_plaintext_to_remote_hosts_and_maps_refused_connections() {
-        let e = Client::connect(&ServerEndpoint::new("pop.example.com", 110, Security::None, "j"), "pw", Duration::from_secs(1)).err();
+        let e = Client::connect(&ServerEndpoint::new("pop.example.com", 110, Security::None, "j"), &"pw".into(), Duration::from_secs(1)).err();
         assert!(matches!(e, Some(ProviderError::Rejected(_))), "{e:?}");
         let unreachable = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
-        assert_eq!(Client::connect(&ServerEndpoint::new("127.0.0.1", unreachable.port(), Security::None, "j"), "pw", Duration::from_secs(1)).err(), Some(ProviderError::Offline));
+        assert_eq!(Client::connect(&ServerEndpoint::new("127.0.0.1", unreachable.port(), Security::None, "j"), &"pw".into(), Duration::from_secs(1)).err(), Some(ProviderError::Offline));
     }
 
     /// A one-shot server that plays a script: reads a line, answers with the next reply.
@@ -268,7 +332,7 @@ mod tests {
     #[test]
     fn unstuffs_multiline_replies_and_maps_errors() {
         let addr = scripted(vec!["+OK hello\r\n", "+OK\r\n", "+OK\r\n", "+OK 2 messages:\r\n1 a\r\n2 b\r\n.\r\n", "+OK 12 octets\r\nSubject: x\r\n\r\n..dot line\r\n.\r\n", "-ERR no such message\r\n", "-ERR [SYS/TEMP] try later\r\n", "+OK bye\r\n"]);
-        let mut c = Client::connect(&ServerEndpoint::new("127.0.0.1", addr.port(), Security::None, "j"), "pw", Duration::from_secs(2)).unwrap();
+        let mut c = Client::connect(&ServerEndpoint::new("127.0.0.1", addr.port(), Security::None, "j"), &"pw".into(), Duration::from_secs(2)).unwrap();
         assert_eq!(c.uidl().unwrap(), vec![(1, "a".to_owned()), (2, "b".to_owned())]);
         assert_eq!(c.retr(1).unwrap(), b"Subject: x\r\n\r\n.dot line\r\n");
         assert_eq!(c.retr(9).err(), Some(ProviderError::Rejected("no such message".into())));
@@ -280,10 +344,10 @@ mod tests {
     #[test]
     fn login_failures_are_sign_in_required_unless_temporary() {
         let addr = scripted(vec!["+OK\r\n", "+OK\r\n", "-ERR [AUTH] bad password\r\n"]);
-        assert_eq!(Client::connect(&ServerEndpoint::new("127.0.0.1", addr.port(), Security::None, "j"), "pw", Duration::from_secs(2)).err(), Some(ProviderError::SignInRequired));
+        assert_eq!(Client::connect(&ServerEndpoint::new("127.0.0.1", addr.port(), Security::None, "j"), &"pw".into(), Duration::from_secs(2)).err(), Some(ProviderError::SignInRequired));
         let addr = scripted(vec!["+OK\r\n", "+OK\r\n", "-ERR [IN-USE] maildrop locked\r\n"]);
-        assert_eq!(Client::connect(&ServerEndpoint::new("127.0.0.1", addr.port(), Security::None, "j"), "pw", Duration::from_secs(2)).err(), Some(ProviderError::Temporary("maildrop locked".into())));
+        assert_eq!(Client::connect(&ServerEndpoint::new("127.0.0.1", addr.port(), Security::None, "j"), &"pw".into(), Duration::from_secs(2)).err(), Some(ProviderError::Temporary("maildrop locked".into())));
         let addr = scripted(vec!["* OK I am IMAP\r\n"]);
-        assert!(matches!(Client::connect(&ServerEndpoint::new("127.0.0.1", addr.port(), Security::None, "j"), "pw", Duration::from_secs(2)).err(), Some(ProviderError::Rejected(_))));
+        assert!(matches!(Client::connect(&ServerEndpoint::new("127.0.0.1", addr.port(), Security::None, "j"), &"pw".into(), Duration::from_secs(2)).err(), Some(ProviderError::Rejected(_))));
     }
 }

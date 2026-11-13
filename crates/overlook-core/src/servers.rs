@@ -1,8 +1,8 @@
 //! Server settings for IMAP, POP3 and SMTP accounts.
 //!
-//! These are not secrets and live in the store next to the account. Passwords never appear
-//! here: they are kept in the system keyring under the account id, so a `ServerEndpoint`
-//! can be logged or shown in the settings dialog without leaking anything.
+//! These are not secrets and live in the store next to the account. Passwords and OAuth
+//! tokens never appear here: they are kept in the system keyring under the account id, so a
+//! `ServerEndpoint` can be logged or shown in the settings dialog without leaking anything.
 
 use serde::{Deserialize, Serialize};
 
@@ -53,8 +53,28 @@ pub enum AuthMethod {
     /// `LOGIN` / `AUTH PLAIN` with the password from the keyring.
     #[default]
     Password,
-    /// XOAUTH2. Reserved in the model; no provider implements it yet.
+    /// SASL `XOAUTH2` with an access token from the account's OAuth sign-in. Set on both
+    /// endpoints of an account whose [`MailServers::oauth`] names the issuer.
     OAuth2,
+}
+
+/// Who issues the OAuth tokens of an account that signs in with [`AuthMethod::OAuth2`]
+/// rather than a password.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OAuthIssuer {
+    /// The Microsoft identity platform: Outlook.com, Hotmail, Live and MSN addresses, and
+    /// Microsoft 365 (Exchange Online) work or school accounts.
+    Microsoft,
+}
+
+impl OAuthIssuer {
+    /// The name people know the sign-in by ("Sign in with Microsoft").
+    pub fn label(self) -> &'static str {
+        match self {
+            OAuthIssuer::Microsoft => "Microsoft",
+        }
+    }
 }
 
 /// The protocol an endpoint speaks. Determines the default port for a security mode.
@@ -178,7 +198,8 @@ pub struct Pop3Seen {
     pub deleted_on_server: bool,
 }
 
-/// Everything needed to reach an IMAP or POP3 account and its SMTP server, except passwords.
+/// Everything needed to reach an IMAP or POP3 account and its SMTP server, except passwords
+/// and tokens.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MailServers {
     /// IMAP or POP3, depending on the account's provider kind.
@@ -189,6 +210,21 @@ pub struct MailServers {
     pub pop3: Option<Pop3Policy>,
     #[serde(default)]
     pub imap: Option<ImapPolicy>,
+    /// Set when the account signs in through this OAuth issuer instead of with a password.
+    /// This decides which credential the keyring holds for the account; password accounts
+    /// leave it out, so their stored rows are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<OAuthIssuer>,
+}
+
+impl MailServers {
+    /// These servers, signing in through `issuer`: both endpoints use [`AuthMethod::OAuth2`].
+    pub fn with_oauth(mut self, issuer: OAuthIssuer) -> Self {
+        self.oauth = Some(issuer);
+        self.incoming.auth = AuthMethod::OAuth2;
+        self.outgoing.auth = AuthMethod::OAuth2;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -202,9 +238,11 @@ mod tests {
             outgoing: ServerEndpoint::new("smtp.example.com", 587, Security::StartTls, "jason@example.com"),
             pop3: None,
             imap: Some(ImapPolicy { archive_folder: Some("Archive".into()), ..Default::default() }),
+            oauth: None,
         };
         let json = serde_json::to_string(&servers).unwrap();
         assert!(json.contains("\"security\":\"start-tls\""), "{json}");
+        assert!(!json.contains("oauth"), "password accounts store the same JSON as before: {json}");
         assert_eq!(serde_json::from_str::<MailServers>(&json).unwrap(), servers);
 
         // Older rows without the optional fields still load.
@@ -212,8 +250,25 @@ mod tests {
         let loaded: MailServers = serde_json::from_str(minimal).unwrap();
         assert_eq!(loaded.incoming.security, Security::Tls);
         assert_eq!(loaded.incoming.auth, AuthMethod::Password);
-        assert!(loaded.pop3.is_none() && loaded.imap.is_none());
+        assert!(loaded.pop3.is_none() && loaded.imap.is_none() && loaded.oauth.is_none());
         assert_eq!(Pop3Policy::default().leave_on_server, true);
+    }
+
+    #[test]
+    fn oauth_accounts_round_trip() {
+        let servers = MailServers {
+            incoming: ServerEndpoint::new("outlook.office365.com", 993, Security::Tls, "jason@outlook.com"),
+            outgoing: ServerEndpoint::new("smtp-mail.outlook.com", 587, Security::StartTls, "jason@outlook.com"),
+            pop3: None,
+            imap: None,
+            oauth: None,
+        }
+        .with_oauth(OAuthIssuer::Microsoft);
+        assert_eq!((servers.incoming.auth, servers.outgoing.auth), (AuthMethod::OAuth2, AuthMethod::OAuth2));
+        let json = serde_json::to_string(&servers).unwrap();
+        assert!(json.contains("\"oauth\":\"microsoft\"") && json.contains("\"auth\":\"o-auth2\""), "{json}");
+        assert_eq!(serde_json::from_str::<MailServers>(&json).unwrap(), servers);
+        assert_eq!(OAuthIssuer::Microsoft.label(), "Microsoft");
     }
 
     #[test]

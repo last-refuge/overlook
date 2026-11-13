@@ -14,7 +14,7 @@
 //! unblocks the read in progress, so stopping is immediate.
 
 use super::connection::{self, map_error};
-use crate::{backoff_seconds, ProviderError};
+use crate::{backoff_seconds, Credential, ProviderError};
 use imap::extensions::idle::WaitOutcome;
 use imap::types::UnsolicitedResponse;
 use overlook_core::ServerEndpoint;
@@ -105,14 +105,14 @@ enum Ended {
 
 /// Starts the IDLE thread for `endpoint`'s Inbox. `on_event` runs on that thread; keep it
 /// quick (send on a channel) and never block in it.
-pub fn watch(endpoint: ServerEndpoint, password: String, timeout: Duration, on_event: impl Fn(IdleEvent) + Send + 'static) -> IdleWatcher {
+pub fn watch(endpoint: ServerEndpoint, credential: Credential, timeout: Duration, on_event: impl Fn(IdleEvent) + Send + 'static) -> IdleWatcher {
     let stop = Arc::new(AtomicBool::new(false));
     let socket: Arc<Mutex<Option<TcpStream>>> = Arc::new(Mutex::new(None));
     let (stop_flag, socket_slot) = (stop.clone(), socket.clone());
     let host = endpoint.host.clone();
     let thread = std::thread::Builder::new()
         .name(format!("imap-idle {host}"))
-        .spawn(move || run(endpoint, password, timeout, stop_flag, socket_slot, on_event))
+        .spawn(move || run(endpoint, credential, timeout, stop_flag, socket_slot, on_event))
         .ok();
     if thread.is_none() {
         warn!("imap idle: could not start a thread for {host}; polling only");
@@ -120,14 +120,14 @@ pub fn watch(endpoint: ServerEndpoint, password: String, timeout: Duration, on_e
     IdleWatcher { stop, socket, thread, tag: 0 }
 }
 
-fn run(endpoint: ServerEndpoint, password: String, timeout: Duration, stop: Arc<AtomicBool>, socket: Arc<Mutex<Option<TcpStream>>>, on_event: impl Fn(IdleEvent)) {
+fn run(endpoint: ServerEndpoint, credential: Credential, timeout: Duration, stop: Arc<AtomicBool>, socket: Arc<Mutex<Option<TcpStream>>>, on_event: impl Fn(IdleEvent)) {
     let host = endpoint.host.clone();
     let mut attempt: u32 = 0;
     while !stop.load(Ordering::SeqCst) && attempt < MAX_ATTEMPTS {
-        let (mut session, sock) = match connection::connect_with_socket(&endpoint, &password, timeout) {
+        let (mut session, sock) = match connection::connect_with_socket(&endpoint, &credential, timeout) {
             Ok(connected) => connected,
             Err(ProviderError::SignInRequired) => {
-                warn!("imap idle: {host} refused the credentials; stopping until the password is updated");
+                warn!("imap idle: {host} refused the credentials; stopping until the account signs in again");
                 on_event(IdleEvent::SignInRequired);
                 return;
             }
