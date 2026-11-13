@@ -61,7 +61,6 @@ pub fn preset_pop3(domain: &str, email: &str) -> Option<Suggestion> {
         return guide.offers_pop3.then(|| Suggestion { servers: (guide.servers)(ServerProtocol::Pop3, email), source: Source::Preset, provider: Some(guide.provider.to_owned()) });
     }
     const TABLE: &[(&[&str], &str, &str, u16, &str, u16, Security)] = &[
-        (&["fastmail.com", "fastmail.fm", "messagingengine.com", "fastmail.us", "fastmail.uk", "fastmail.de"], "Fastmail", "pop.fastmail.com", 995, "smtp.fastmail.com", 465, Security::Tls),
         (&["zoho.com", "zohomail.com", "zoho.eu", "zohomail.eu"], "Zoho Mail", "poppro.zoho.com", 995, "smtp.zoho.com", 465, Security::Tls),
         (&["posteo.de", "posteo.net", "posteo.eu", "posteo.org", "posteo.ch", "posteo.at"], "Posteo", "posteo.de", 995, "posteo.de", 465, Security::Tls),
         (&["mailbox.org"], "mailbox.org", "pop3.mailbox.org", 995, "smtp.mailbox.org", 465, Security::Tls),
@@ -81,7 +80,6 @@ pub fn preset(domain: &str, email: &str) -> Option<Suggestion> {
     }
     // (domains, provider, imap host, imap port, imap security, smtp host, smtp port, smtp security)
     const TABLE: &[(&[&str], &str, &str, u16, Security, &str, u16, Security)] = &[
-        (&["fastmail.com", "fastmail.fm", "messagingengine.com", "fastmail.us", "fastmail.uk", "fastmail.de"], "Fastmail", "imap.fastmail.com", 993, Security::Tls, "smtp.fastmail.com", 465, Security::Tls),
         (&["zoho.com", "zohomail.com", "zoho.eu", "zohomail.eu"], "Zoho Mail", "imap.zoho.com", 993, Security::Tls, "smtp.zoho.com", 465, Security::Tls),
         (&["proton.me", "protonmail.com", "protonmail.ch", "pm.me"], "Proton Mail Bridge", "127.0.0.1", 1143, Security::StartTls, "127.0.0.1", 1025, Security::StartTls),
         (&["posteo.de", "posteo.net", "posteo.eu", "posteo.org", "posteo.ch", "posteo.at"], "Posteo", "posteo.de", 993, Security::Tls, "posteo.de", 465, Security::Tls),

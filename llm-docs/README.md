@@ -8,6 +8,7 @@ Overlook is a native Linux mail client in Rust, with an Outlook-inspired workflo
 - [Draft synchronization](draft-sync.md): two-way Gmail/IMAP drafts, conflicts, durable uploads/deletions, MIME attachments, and retry recovery.
 - [Mail protocol capabilities](mail-protocol-capabilities.md): feature and data-field support across IMAP, POP3, Gmail, Exchange, JMAP and ActiveSync; what to gate per provider and what to QA per server.
 - [Mail service provider roadmap](mail-provider-roadmap.md): prioritized provider support, existing presets and qualification gaps, Microsoft verification and administrator consent requirements, and services named by competing clients.
+- [Fastmail mail setup](fastmail-mail.md): guided app-password setup, Fastmail's documented servers, plans and data residency, how guidance is found for its many domains, tests, and what remains to qualify.
 - [Yahoo Mail and AOL Mail](yahoo-aol-mail.md): guided app-password setup with POP3, the services' documented settings, what the OAuth step depends on, tests, and what remains to qualify.
 - [iCloud Mail](icloud-mail.md): guided app-specific password setup, Apple's documented settings and user names, custom domains, iCloud's reported IMAP quirks, tests, and what remains to qualify.
 - [Microsoft accounts](microsoft-mail.md): Outlook.com and Microsoft 365 over IMAP/POP3/SMTP with Microsoft sign-in (XOAUTH2): design, sessions, Sent copies, the Entra app registration, tests, and what remains to qualify.

@@ -536,14 +536,21 @@ impl MailWindow {
         let identity = setup.email.entity_id();
         cx.notify();
         let protocol = setup.incoming_protocol();
+        let lookup_email = email.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let suggestion = cx.background_spawn(async move { autoconfig::lookup_for(protocol, &email) }).await;
+            let suggestion = cx.background_spawn(async move { autoconfig::lookup_for(protocol, &lookup_email) }).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 let Some(setup) = this.account_setup.as_mut() else { return };
                 if setup.generation != generation || setup.email.entity_id() != identity {
                     return;
                 }
                 setup.busy = None;
+                // A domain no guide lists whose settings turn out to be a guided service's
+                // (one of Fastmail's many domains, say) gets that service's guidance too.
+                let found = app_passwords::guide_for(&email, Some(&suggestion.servers.incoming.host)).filter(|g| g.offers_pop3 || protocol == ServerProtocol::Imap);
+                if let Some(guide) = found {
+                    this.setup_use_guide(guide, window, cx);
+                }
                 this.apply_suggestion(suggestion, window, cx);
             });
         })
@@ -1299,7 +1306,7 @@ impl MailWindow {
                         .child(Button::new("setup-microsoft-signin").small().label(if setup.microsoft.is_some() { "Sign in again" } else { "Sign in with Microsoft" }).disabled(busy.is_some() && !in_browser).on_click(cx.listener(|this, _, window, cx| this.setup_microsoft_sign_in(window, cx)))))
                 } else {
                     d.child(field(setup.guide.map(|g| g.password_label).unwrap_or("Password"), Input::new(&setup.password).into_any_element()))
-                        .when_some(setup.guide.filter(|_| !matches!(setup.mode, SetupMode::New)), |d, guide| {
+                        .when_some(setup.guide, |d, guide| {
                             let url = guide.create_url;
                             d.child(h_flex().child(Button::new("setup-create-app-password").ghost().xsmall().icon(icon("external-link").size(px(13.))).label(guide.create_label).on_click(move |_, _, cx| cx.open_url(url))))
                         })
