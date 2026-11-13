@@ -1,6 +1,7 @@
-//! Server settings for an email address: Microsoft's own domains, then a small preset table,
-//! then Thunderbird's ISPDB, then the common `mail.<domain>` guess. Services that offer no
-//! IMAP, POP3 or SMTP access at all are named by [`unsupported`] instead.
+//! Server settings for an email address: Microsoft's own domains, then a small preset table
+//! (with the guided app-password services of [`crate::app_passwords`]), then Thunderbird's
+//! ISPDB, then the common `mail.<domain>` guess. Services that offer no IMAP, POP3 or SMTP
+//! access at all are named by [`unsupported`] instead.
 
 use overlook_core::{MailServers, Security, ServerEndpoint, ServerProtocol};
 use std::time::Duration;
@@ -74,10 +75,12 @@ pub fn preset_pop3(domain: &str, email: &str) -> Option<Suggestion> {
 
 /// The built-in table alone (no network), for tests and the offline path.
 pub fn preset(domain: &str, email: &str) -> Option<Suggestion> {
+    if let Some(guide) = crate::app_passwords::GUIDES.iter().find(|g| g.domains.contains(&domain)) {
+        return Some(Suggestion { servers: (guide.servers)(email), source: Source::Preset, provider: Some(guide.provider.to_owned()) });
+    }
     // (domains, provider, imap host, imap port, imap security, smtp host, smtp port, smtp security)
     const TABLE: &[(&[&str], &str, &str, u16, Security, &str, u16, Security)] = &[
         (&["fastmail.com", "fastmail.fm", "messagingengine.com", "fastmail.us", "fastmail.uk", "fastmail.de"], "Fastmail", "imap.fastmail.com", 993, Security::Tls, "smtp.fastmail.com", 465, Security::Tls),
-        (&["icloud.com", "me.com", "mac.com"], "iCloud Mail", "imap.mail.me.com", 993, Security::Tls, "smtp.mail.me.com", 587, Security::StartTls),
         (&["yahoo.com", "ymail.com", "rocketmail.com", "yahoo.co.uk", "yahoo.ca", "yahoo.de", "yahoo.fr"], "Yahoo Mail", "imap.mail.yahoo.com", 993, Security::Tls, "smtp.mail.yahoo.com", 465, Security::Tls),
         (&["aol.com"], "AOL Mail", "imap.aol.com", 993, Security::Tls, "smtp.aol.com", 465, Security::Tls),
         (&["zoho.com", "zohomail.com", "zoho.eu", "zohomail.eu"], "Zoho Mail", "imap.zoho.com", 993, Security::Tls, "smtp.zoho.com", 465, Security::Tls),
@@ -263,6 +266,8 @@ mod tests {
         assert!(parse_ispdb_for(ServerProtocol::Pop3, &xml.replace("type=\"pop3\"", "type=\"exchange\""), "j@example.com").is_none());
         assert_eq!(preset_pop3("gmx.net", "x@gmx.net").unwrap().servers.incoming.host, "pop.gmx.net");
         assert!(preset_pop3("icloud.com", "x@icloud.com").is_none(), "iCloud has no POP3");
+        let icloud = preset("icloud.com", "jane@icloud.com").unwrap();
+        assert_eq!((icloud.provider.as_deref(), icloud.servers.incoming.username.as_str(), icloud.servers.outgoing.username.as_str()), (Some("iCloud Mail"), "jane", "jane@icloud.com"), "Apple's user names: the name for IMAP, the address for SMTP");
         assert_eq!(guess_for(ServerProtocol::Pop3, "example.com", "x@example.com").servers.incoming.port, 995);
         assert!(parse_ispdb("<clientConfig/>", "x@y.z").is_none());
         let plain = xml.replace("<socketType>STARTTLS</socketType>", "<socketType>plain</socketType>");

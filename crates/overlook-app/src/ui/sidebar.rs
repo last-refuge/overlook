@@ -886,6 +886,10 @@ impl MailWindow {
                                     let _ = t.update(cx, |this, cx| this.open_microsoft_setup(window, cx));
                                 }));
                                 let t = this.clone();
+                                menu = menu.item(PopupMenuItem::new("Add iCloud account…").on_click(move |_, window, cx| {
+                                    let _ = t.update(cx, |this, cx| this.open_icloud_setup(window, cx));
+                                }));
+                                let t = this.clone();
                                 menu = menu.item(PopupMenuItem::new("Add IMAP account…").on_click(move |_, window, cx| {
                                     let _ = t.update(cx, |this, cx| this.open_account_setup(ProviderKind::Imap, super::SetupMode::New, window, cx));
                                 }));

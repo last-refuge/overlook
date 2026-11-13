@@ -1105,6 +1105,7 @@ impl MailWindow {
         match launch_helper.as_deref() {
             Ok("gmail") => this.start_google_sign_in(None, window, cx),
             Ok("microsoft") => this.open_microsoft_setup(window, cx),
+            Ok("icloud") => this.open_icloud_setup(window, cx),
             Ok("imap") => this.open_account_setup(ProviderKind::Imap, SetupMode::New, window, cx),
             Ok("pop3") => this.open_account_setup(ProviderKind::Pop3, SetupMode::New, window, cx),
             // Asked only here, at launch: removing the last account later leaves the window empty.
@@ -4225,10 +4226,13 @@ impl MailWindow {
                     .child(div().text_size(px(12.)).child("Add an account to start reading and sending mail."))
                     .child(
                         h_flex()
+                            .flex_wrap()
+                            .justify_center()
                             .gap(px(8.))
                             .pt(px(10.))
                             .child(Button::new("empty-add-gmail").primary().small().label("Add Gmail account").on_click(cx.listener(|this, _, window, cx| this.start_google_sign_in(None, window, cx))))
                             .child(Button::new("empty-add-microsoft").small().label("Add Microsoft account").on_click(cx.listener(|this, _, window, cx| this.open_microsoft_setup(window, cx))))
+                            .child(Button::new("empty-add-icloud").small().label("Add iCloud account").on_click(cx.listener(|this, _, window, cx| this.open_icloud_setup(window, cx))))
                             .child(Button::new("empty-add-imap").small().label("Add IMAP account").on_click(cx.listener(|this, _, window, cx| this.open_account_setup(ProviderKind::Imap, SetupMode::New, window, cx))))
                             .child(Button::new("empty-add-pop3").small().label("Add POP3 account").on_click(cx.listener(|this, _, window, cx| this.open_account_setup(ProviderKind::Pop3, SetupMode::New, window, cx)))),
                     ),

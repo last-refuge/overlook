@@ -5,6 +5,7 @@
 //! touch the store directly, which keeps "what we asked for" and "what the server has"
 //! separate.
 
+pub mod app_passwords;
 pub mod autoconfig;
 pub mod calendar;
 pub mod caldav;

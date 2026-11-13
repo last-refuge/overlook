@@ -32,6 +32,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use overlook_core::time::now;
 use overlook_core::*;
+use overlook_provider::app_passwords::{self, AppPasswordGuide};
 use overlook_provider::autoconfig::{self, Source, Suggestion};
 use overlook_provider::caldav::fastmail_preset_for_login;
 use overlook_provider::imap::ImapProvider;
@@ -114,6 +115,9 @@ pub struct AccountSetup {
     /// A password account being switched to Microsoft sign-in: its sign-in also brings
     /// Microsoft's server settings.
     pub converting: bool,
+    /// The app-password service this account belongs to (iCloud Mail), from its menu entry,
+    /// its address or its server: the dialog uses its words, settings and checks.
+    pub guide: Option<&'static AppPasswordGuide>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -170,6 +174,12 @@ impl AccountSetup {
     }
 }
 
+/// "a Yahoo Mail", "an iCloud Mail".
+fn with_article(name: &str) -> String {
+    let vowel = name.chars().next().is_some_and(|c| "aeiouAEIOU".contains(c));
+    format!("{} {name}", if vowel { "an" } else { "a" })
+}
+
 /// What the dialog says about an Outlook.com address entered as an IMAP or POP3 account.
 const MICROSOFT_SWITCH_NOTE: &str = "Outlook.com, Hotmail, Live and MSN addresses sign in with Microsoft: Microsoft no longer accepts passwords from mail apps.";
 
@@ -198,7 +208,10 @@ fn connection_key(servers: &MailServers, credential: &SetupCredential) -> u64 {
 /// Signs in to both servers (blocking; run it off the UI thread). One line per server.
 /// The two probes run at the same time, so a server that times out does not hold up the
 /// other's answer.
-fn probe_servers(kind: ProviderKind, servers: &MailServers, credential: SetupCredential) -> Vec<(bool, String)> {
+/// With `alternates`, other forms of the incoming user name are tried when the first is
+/// refused (see [`AppPasswordGuide::user_names`]); the one accepted comes back beside the
+/// lines. `hint` is added to a refused password.
+fn probe_servers(kind: ProviderKind, servers: &MailServers, credential: SetupCredential, alternates: Vec<String>, hint: Option<String>) -> (Vec<(bool, String)>, Option<String>) {
     let oauth = matches!(credential, SetupCredential::Microsoft(_));
     let (incoming_credential, outgoing_credential): (Credential, Credential) = match credential {
         SetupCredential::Password { incoming, outgoing } => {
@@ -207,21 +220,41 @@ fn probe_servers(kind: ProviderKind, servers: &MailServers, credential: SetupCre
         }
         SetupCredential::Microsoft(session) => (Credential::OAuth(session.clone()), Credential::OAuth(session)),
     };
-    let (incoming_line, outgoing) = std::thread::scope(|scope| {
+    let (incoming_line, outgoing, accepted) = std::thread::scope(|scope| {
         let outgoing = scope.spawn(|| smtp::Transport::new(servers.outgoing.clone(), outgoing_credential).with_timeout(PROBE_TIMEOUT).probe());
         let (what, incoming) = if kind == ProviderKind::Pop3 {
-            let pop3 = Pop3Provider::new(servers.clone(), incoming_credential, std::env::temp_dir()).with_timeout(PROBE_TIMEOUT);
+            let pop3 = Pop3Provider::new(servers.clone(), incoming_credential.clone(), std::env::temp_dir()).with_timeout(PROBE_TIMEOUT);
             ("Incoming (POP3)", pollster_block(pop3.probe()))
         } else {
-            let imap = ImapProvider::new(servers.clone(), incoming_credential).with_timeout(PROBE_TIMEOUT);
+            let imap = ImapProvider::new(servers.clone(), incoming_credential.clone()).with_timeout(PROBE_TIMEOUT);
             let result = pollster_block(imap.probe());
             imap.disconnect();
             ("Incoming (IMAP)", result)
         };
+        let mut accepted = None;
+        let mut incoming_hint = hint.clone();
+        let incoming = match incoming {
+            Err(ProviderError::SignInRequired) if !alternates.is_empty() => match ImapProvider::probe_user_names(servers, &incoming_credential, &alternates, PROBE_TIMEOUT) {
+                Ok(name) => {
+                    accepted = Some(name);
+                    Ok(())
+                }
+                Err(_) => {
+                    let tried = std::iter::once(&servers.incoming.username).chain(&alternates).map(|n| format!("“{n}”")).collect::<Vec<_>>().join(" and ");
+                    incoming_hint = Some(format!("Tried the user names {tried}. {}", hint.clone().unwrap_or_default()).trim_end().to_owned());
+                    Err(ProviderError::SignInRequired)
+                }
+            },
+            other => other,
+        };
         let outgoing = outgoing.join().unwrap_or_else(|_| Err(ProviderError::Offline));
-        (probe_line(what, &servers.incoming, incoming, oauth), outgoing)
+        let line = match (&accepted, incoming) {
+            (Some(name), Ok(())) => (true, format!("{what}: connected to {} and signed in as “{name}”.", servers.incoming.address())),
+            (_, result) => probe_line(what, &servers.incoming, result, oauth, incoming_hint.as_deref()),
+        };
+        (line, outgoing, accepted)
     });
-    vec![incoming_line, probe_line("Outgoing (SMTP)", &servers.outgoing, outgoing, oauth)]
+    (vec![incoming_line, probe_line("Outgoing (SMTP)", &servers.outgoing, outgoing, oauth, hint.as_deref())], accepted)
 }
 
 /// Signs in to the incoming server once (blocking; run it off the UI thread).
@@ -236,13 +269,17 @@ fn open_mailbox(kind: ProviderKind, servers: &MailServers, credential: Credentia
     }
 }
 
-/// One line of "Test connection" output. `oauth` words a refusal for a Microsoft sign-in.
-fn probe_line(what: &str, endpoint: &ServerEndpoint, result: Result<(), ProviderError>, oauth: bool) -> (bool, String) {
+/// One line of "Test connection" output. `oauth` words a refusal for a Microsoft sign-in;
+/// `hint` follows a refused password (an app-password service's advice).
+fn probe_line(what: &str, endpoint: &ServerEndpoint, result: Result<(), ProviderError>, oauth: bool, hint: Option<&str>) -> (bool, String) {
     match result {
         Ok(()) => (true, format!("{what}: connected to {} and signed in.", endpoint.address())),
         Err(ProviderError::SignInRequired) if oauth && endpoint.port == 995 => (false, format!("{what}: {} did not accept the Microsoft sign-in. Outlook.com accounts need POP turned on first (Outlook.com settings → Mail → Forwarding and IMAP); an organization may have turned POP off.", endpoint.host)),
         Err(ProviderError::SignInRequired) if oauth => (false, format!("{what}: {} did not accept the Microsoft sign-in. Check the user name; if an organization manages this account, it may have turned this protocol off.", endpoint.host)),
-        Err(ProviderError::SignInRequired) => (false, format!("{what}: {} did not accept the user name or password.", endpoint.host)),
+        Err(ProviderError::SignInRequired) => match hint {
+            Some(hint) => (false, format!("{what}: {} did not accept the user name or password. {hint}", endpoint.host)),
+            None => (false, format!("{what}: {} did not accept the user name or password.", endpoint.host)),
+        },
         // Microsoft's settings are filled in for the account, so silence is the network or the
         // service, not a typo.
         Err(ProviderError::Offline) if oauth => (false, format!("{what}: {} didn’t answer. Microsoft’s settings are filled in for you, so this is usually your network or Microsoft’s service: check that Outlook on the web loads, then test again.", endpoint.address())),
@@ -269,7 +306,15 @@ impl MailWindow {
         let saved_account_name = account.as_ref().map(|a| self.account_prefs_for(&a.id).name).unwrap_or_default();
         let account_name = cx.new(|cx| InputState::new(window, cx).placeholder("Work, Personal… (optional)").default_value(saved_account_name));
         let email = cx.new(|cx| InputState::new(window, cx).placeholder("you@example.com").default_value(email_value.clone()));
-        let password = cx.new(|cx| InputState::new(window, cx).placeholder(if matches!(existing, SetupMode::Edit(_)) { "Leave empty to keep the saved password" } else { "Password or app password" }).masked(true));
+        // An account on a guided service's servers (iCloud, including a custom domain) keeps
+        // its guidance when reopened.
+        let guide = servers.as_ref().filter(|s| s.oauth.is_none()).and_then(|s| app_passwords::guide_for(&email_value, Some(&s.incoming.host)));
+        let placeholder = match (&existing, guide) {
+            (SetupMode::Edit(_), _) => "Leave empty to keep the saved password",
+            (_, Some(guide)) => guide.password_placeholder,
+            (_, None) => "Password or app password",
+        };
+        let password = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder).masked(true));
         let mut field = |cx: &mut Context<Self>, placeholder: &str, value: String| cx.new(|cx| InputState::new(window, cx).placeholder(placeholder.to_owned()).default_value(value));
         let incoming = servers.as_ref().map(|s| s.incoming.clone());
         let outgoing = servers.as_ref().map(|s| s.outgoing.clone());
@@ -357,6 +402,7 @@ impl MailWindow {
             microsoft: None,
             signin_cancel: None,
             converting: false,
+            guide,
             _subscriptions: subscriptions,
         });
         // A password account at an Outlook.com address on Microsoft's servers can no longer
@@ -377,6 +423,43 @@ impl MailWindow {
         }
         focus.update(cx, |s, cx| s.focus(window, cx));
         cx.notify();
+    }
+
+    /// "Add iCloud account…": the setup dialog with iCloud Mail's guidance, for an IMAP
+    /// account at an iCloud address or a custom domain.
+    pub(crate) fn open_icloud_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.in_main_window(cx, move |this, window, cx| this.open_icloud_setup(window, cx)) {
+            return;
+        }
+        self.open_account_setup(ProviderKind::Imap, SetupMode::New, window, cx);
+        self.setup_use_guide(&app_passwords::ICLOUD, window, cx);
+    }
+
+    /// Follows `guide` from here on: its words in the dialog, and IMAP for a service without
+    /// POP3. Returns whether the account changed from POP3 to IMAP.
+    fn setup_use_guide(&mut self, guide: &'static AppPasswordGuide, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(setup) = self.account_setup.as_mut() else { return false };
+        setup.guide = Some(guide);
+        let to_imap = setup.kind == ProviderKind::Pop3 && !guide.offers_pop3 && matches!(setup.mode, SetupMode::New);
+        if to_imap {
+            setup.kind = ProviderKind::Imap;
+        }
+        if !matches!(setup.mode, SetupMode::Edit(_)) {
+            let password = setup.password.clone();
+            password.update(cx, |i, cx| i.set_placeholder(guide.password_placeholder, window, cx));
+        }
+        cx.notify();
+        to_imap
+    }
+
+    /// A guided service's own server settings, for its own domains and custom ones alike;
+    /// the lookup is not needed.
+    fn setup_guided_servers(&mut self, guide: &'static AppPasswordGuide, email: &str, to_imap: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let suggestion = Suggestion { servers: (guide.servers)(email), source: Source::Preset, provider: Some(guide.provider.to_owned()) };
+        self.apply_suggestion(suggestion, window, cx);
+        let Some(setup) = self.account_setup.as_mut() else { return };
+        let base = if guide.owns_address(email) { format!("{}’s published settings. Check them, then save.", guide.provider) } else { guide.custom_domain.to_owned() };
+        setup.note = Some(if to_imap { format!("{} doesn’t offer POP, so this account uses IMAP. {base}", guide.provider) } else { base });
     }
 
     /// "Add Microsoft account…": the setup dialog in Microsoft mode, for an IMAP account.
@@ -430,12 +513,22 @@ impl MailWindow {
             cx.notify();
             return;
         }
+        let guide = setup.guide.or_else(|| app_passwords::guide_for(&email, None));
+        let to_imap = guide.is_some_and(|g| self.setup_use_guide(g, window, cx));
+        let Some(setup) = self.account_setup.as_mut() else { return };
         if password.is_empty() {
-            setup.error = Some("Enter the account’s password. Many providers want an app password here.".into());
+            setup.error = Some(match guide {
+                Some(guide) => format!("Enter the {}. {}", guide.password_label.to_lowercase(), guide.explanation),
+                None => "Enter the account’s password. Many providers want an app password here.".into(),
+            });
             cx.notify();
             return;
         }
         setup.error = None;
+        if let Some(guide) = guide {
+            self.setup_guided_servers(guide, &email, to_imap, window, cx);
+            return;
+        }
         setup.busy = Some("Looking up the server settings…");
         setup.generation += 1;
         let generation = setup.generation;
@@ -642,6 +735,11 @@ impl MailWindow {
             setup.note = Some(MICROSOFT_SWITCH_NOTE.into());
             setup.error = None;
             cx.notify();
+            return;
+        }
+        if let Some(guide) = self.account_setup.as_ref().and_then(|s| s.guide).or_else(|| app_passwords::guide_for(&email, None)) {
+            let to_imap = self.setup_use_guide(guide, window, cx);
+            self.setup_guided_servers(guide, &email, to_imap, window, cx);
             return;
         }
         let domain = email.rsplit('@').next().unwrap_or("").to_owned();
@@ -901,9 +999,25 @@ impl MailWindow {
         let generation = setup.generation;
         let identity = setup.email.entity_id();
         let kind = setup.kind;
+        // A guided service: the other user name form is tried, and a refusal says what the
+        // service wants (and whether the password even looks like one).
+        let email = setup.email.read(cx).value().trim().to_lowercase();
+        let password_guide = setup.guide.filter(|_| matches!(credential, SetupCredential::Password { .. }));
+        let alternates = match password_guide {
+            Some(guide) if kind == ProviderKind::Imap => guide.user_names(&servers.incoming.username, &email).split_off(1),
+            _ => Vec::new(),
+        };
+        let hint = password_guide.map(|guide| {
+            let typed = match &credential {
+                SetupCredential::Password { incoming, .. } => incoming.as_str(),
+                SetupCredential::Microsoft(_) => "",
+            };
+            let shape = if (guide.looks_like_app_password)(typed) { String::new() } else { format!("That doesn’t look like an {}. ", guide.password_label.to_lowercase()) };
+            format!("{shape}{}", guide.refused)
+        });
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let lines = cx.background_spawn(async move { probe_servers(kind, &servers, credential) }).await;
+            let (lines, accepted_user) = cx.background_spawn(async move { probe_servers(kind, &servers, credential, alternates, hint) }).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 if !this.account_setup.as_ref().is_some_and(|s| s.generation == generation && s.email.entity_id() == identity) {
                     return;
@@ -911,14 +1025,26 @@ impl MailWindow {
                 // Inputs remain editable during the probe. Never save settings that
                 // differ from the ones tested, or apply a result to a reopened dialog.
                 let still_current = this.setup_prepared(cx).is_ok_and(|(.., current_key)| current_key == key);
-                let setup = this.account_setup.as_mut().expect("the checked dialog is still open");
-                setup.busy = None;
                 if !still_current {
+                    let setup = this.account_setup.as_mut().expect("the checked dialog is still open");
+                    setup.busy = None;
                     setup.checked = None;
                     setup.error = Some("Settings changed during the connection check. Check them again before saving.".into());
                     cx.notify();
                     return;
                 }
+                // The other user name form worked: it replaces the one typed, and the check
+                // counts for the settings as they now read.
+                let key = match accepted_user {
+                    Some(name) => {
+                        let input = this.account_setup.as_ref().map(|s| s.in_user.clone()).expect("the checked dialog is still open");
+                        input.update(cx, |i, cx| i.set_value(name, window, cx));
+                        this.setup_prepared(cx).map(|(.., k)| k).unwrap_or(key)
+                    }
+                    None => key,
+                };
+                let setup = this.account_setup.as_mut().expect("the checked dialog is still open");
+                setup.busy = None;
                 let ok = lines.iter().all(|(ok, _)| *ok);
                 setup.test_result = lines;
                 setup.checked = Some((key, ok));
@@ -1100,6 +1226,7 @@ impl MailWindow {
             && fastmail_preset_for_login(setup.in_host.read(cx).value().trim(), setup.in_user.read(cx).value().trim()).is_some();
         let title = match (&setup.mode, setup.step) {
             (SetupMode::New, SetupStep::Basics) if is_microsoft => "Add a Microsoft account".to_owned(),
+            (SetupMode::New, SetupStep::Basics) if setup.guide.is_some() => format!("Add {} account", with_article(setup.guide.map(|g| g.provider).unwrap_or_default())),
             (SetupMode::UpdatePassword(_), _) if is_microsoft => "Sign in with Microsoft".to_owned(),
             (SetupMode::New, SetupStep::Basics) => format!("Add {} account", if is_pop3 { "a POP3" } else { "an IMAP" }),
             (SetupMode::New, SetupStep::Servers) => "Server settings".to_owned(),
@@ -1120,6 +1247,20 @@ impl MailWindow {
                 .child(field("Your name", Input::new(&setup.name).into_any_element()))
                 .child(field("Email address", Input::new(&setup.email).into_any_element()))
                 .into_any_element(),
+            SetupStep::Basics if setup.guide.is_some() => {
+                let guide = setup.guide.expect("checked above");
+                let url = guide.create_url;
+                v_flex()
+                    .gap(px(12.))
+                    .child(div().text_size(px(13.)).text_color(p.muted).child(guide.explanation))
+                    .child(h_flex().child(Button::new("setup-create-app-password").small().icon(icon("external-link").size(px(14.))).label(guide.create_label).on_click(move |_, _, cx| cx.open_url(url))))
+                    .children(setup.note.clone().map(|n| div().text_size(px(12.)).text_color(p.muted).child(n)))
+                    .child(field("Account name", Input::new(&setup.account_name).into_any_element()))
+                    .child(field("Your name", Input::new(&setup.name).into_any_element()))
+                    .child(field("Email address", Input::new(&setup.email).into_any_element()))
+                    .child(field(guide.password_label, Input::new(&setup.password).into_any_element()))
+                    .into_any_element()
+            }
             SetupStep::Basics => v_flex()
                 .gap(px(12.))
                 .child(div().text_size(px(13.)).text_color(p.muted).child(if is_pop3 {
@@ -1151,7 +1292,11 @@ impl MailWindow {
                         .child(div().flex_1().text_size(px(13.)).child(signed_in))
                         .child(Button::new("setup-microsoft-signin").small().label(if setup.microsoft.is_some() { "Sign in again" } else { "Sign in with Microsoft" }).disabled(busy.is_some() && !in_browser).on_click(cx.listener(|this, _, window, cx| this.setup_microsoft_sign_in(window, cx)))))
                 } else {
-                    d.child(field("Password", Input::new(&setup.password).into_any_element()))
+                    d.child(field(setup.guide.map(|g| g.password_label).unwrap_or("Password"), Input::new(&setup.password).into_any_element()))
+                        .when_some(setup.guide.filter(|_| !matches!(setup.mode, SetupMode::New)), |d, guide| {
+                            let url = guide.create_url;
+                            d.child(h_flex().child(Button::new("setup-create-app-password").ghost().xsmall().icon(icon("external-link").size(px(13.))).label(guide.create_label).on_click(move |_, _, cx| cx.open_url(url))))
+                        })
                 })
                 .child(divider(&p))
                 .children(setup.note.clone().map(|n| div().text_size(px(12.)).text_color(p.muted).child(n)))

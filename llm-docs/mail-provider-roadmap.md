@@ -49,6 +49,8 @@ Include expired/revoked tokens, account removal, administrator approval messages
 
 ### 2. iCloud
 
+**Status (13 November 2026):** milestone 1 is built and a real account works: guided app-specific password setup, Apple's user names with a fallback, an "Add iCloud account…" entry that covers custom domains, and POP3 setups switching to IMAP. A reusable `AppPasswordGuide` is meant to serve Yahoo, AOL, Fastmail and Zoho next. Real-account qualification is listed in [icloud-mail.md](icloud-mail.md).
+
 iCloud is a relatively small extension of the existing infrastructure and useful for people using Linux alongside Apple devices. Provide a clear app-specific password setup path and verify username handling, aliases, custom domains, Sent/Trash mapping, and sending identity.
 
 Apple documents IMAP and SMTP access with an app-specific password. iCloud does not support POP. [Apple server settings](https://support.apple.com/en-us/102525)

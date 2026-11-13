@@ -1774,3 +1774,20 @@ fn microsoft_servers_file_their_own_sent_copy_so_none_is_appended() {
     assert!(!is_local_placeholder(&receipt.provider_id));
     assert_eq!(server.lock().commands("APPEND"), 1);
 }
+
+#[test]
+fn the_accepted_user_name_form_is_found() {
+    let mut state = mailbox();
+    state.user = "jane".into();
+    state.password = "abcd-efgh-ijkl-mnop".into();
+    let server = serve(state);
+    let servers = MailServers { incoming: ServerEndpoint::new("127.0.0.1", server.addr.port(), Security::None, "jane@icloud.com"), ..provider(&server).servers().clone() };
+    let credential = Credential::from("abcd-efgh-ijkl-mnop");
+    let names = crate::app_passwords::ICLOUD.user_names("jane@icloud.com", "jane@icloud.com");
+    assert_eq!(ImapProvider::probe_user_names(&servers, &credential, &names, Duration::from_secs(5)), Ok("jane".to_owned()));
+    assert_eq!(server.lock().commands(" LOGIN "), 2, "the whole address was refused, then the name was accepted");
+    assert_eq!(ImapProvider::probe_user_names(&servers, &Credential::from("wrong"), &names, Duration::from_secs(5)), Err(ProviderError::SignInRequired));
+    server.lock().login = Login::Unavailable;
+    assert!(matches!(ImapProvider::probe_user_names(&servers, &credential, &names, Duration::from_secs(5)), Err(ProviderError::Temporary(_))), "a temporary failure is not a reason to try another name");
+    assert_eq!(server.lock().commands(" LOGIN "), 5);
+}

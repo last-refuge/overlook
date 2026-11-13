@@ -646,6 +646,25 @@ impl ImapProvider {
         &self.servers
     }
 
+    /// Signs in with each of `names` as the incoming user name in turn and returns the first
+    /// the server accepts, for services whose user name may be the address's name part or
+    /// the whole address (see [`crate::app_passwords`]). Every name refused is
+    /// [`ProviderError::SignInRequired`]; any other failure stops at once.
+    pub fn probe_user_names(servers: &MailServers, credential: &Credential, names: &[String], timeout: Duration) -> Result<String, ProviderError> {
+        for name in names {
+            let endpoint = ServerEndpoint { username: name.clone(), ..servers.incoming.clone() };
+            match connection::connect(&endpoint, credential, timeout) {
+                Ok(mut session) => {
+                    let _ = session.logout();
+                    return Ok(name.clone());
+                }
+                Err(ProviderError::SignInRequired) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(ProviderError::SignInRequired)
+    }
+
     /// Starts the account's `IDLE` thread on its own connection (see [`idle`]). The
     /// callback runs on that thread; the app turns it into a sync request.
     pub fn idle_watcher(&self, on_event: impl Fn(idle::IdleEvent) + Send + 'static) -> idle::IdleWatcher {
