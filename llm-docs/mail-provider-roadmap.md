@@ -78,6 +78,8 @@ Existing CalDAV implementation and live observations remain governed by the cale
 
 ### 5. Proton Mail via Bridge
 
+**Status (13 November 2026):** milestone 1 is built. It adds a Proton guide ("Add Proton account…") with Bridge's settings and wording for the Bridge password, and trust for Bridge's own certificate. That trust is pinned by SHA-256 fingerprint, for servers on this computer only, after the person accepts the certificate in the setup dialog; for IMAP, POP3 and SMTP, a changed certificate is refused before any password is sent. Archive is now preferred over an All Mail view. It is tested against loopback TLS servers, and a real Proton account works through Bridge on Linux. See [proton-bridge.md](proton-bridge.md).
+
 Present this service as **Proton Mail via Bridge**, not a direct Proton server integration. The current preset is only a starting point: users need Bridge-generated credentials, its actual local endpoints, and an appropriate certificate trust path.
 
 The current [IMAP TLS configuration](../crates/overlook-provider/src/imap/connection.rs) trusts public WebPKI roots. Bridge uses a locally generated self-signed certificate, so the trust flow needs explicit implementation and validation for both receiving and sending. Do not solve this by globally disabling certificate verification. [Proton certificate guidance](https://proton.me/support/bridge-ssl-connection-issue)

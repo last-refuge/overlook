@@ -112,18 +112,39 @@ impl Transport {
             return Err(ProviderError::Rejected(format!("refusing to send to {} without encryption", endpoint.host)));
         }
         let client_id = ClientId::default();
-        let tls = match endpoint.security {
-            Security::None => None,
-            Security::Tls | Security::StartTls => Some(TlsParameters::new(endpoint.host.clone()).map_err(connect_error)?),
+        // A server on this computer whose certificate the person trusted is held to exactly
+        // that certificate (`crate::pinning`); every other server is verified as always.
+        let pin = crate::pinning::pin_for(endpoint);
+        let tls = match (endpoint.security, pin) {
+            (Security::None, _) => None,
+            (_, Some(_)) => Some(local_tls(&endpoint.host)?),
+            (_, None) => Some(TlsParameters::new(endpoint.host.clone()).map_err(connect_error)?),
         };
         let wrapper = match endpoint.security {
             Security::Tls => tls.as_ref(),
             _ => None,
         };
-        let mut conn = SmtpConnection::connect((endpoint.host.as_str(), endpoint.port), Some(self.timeout), &client_id, wrapper, None).map_err(connect_error)?;
+        // A pinned or unencrypted connection goes only to this computer's loopback addresses.
+        let local = match (pin, endpoint.security) {
+            (Some(_), _) => Some(crate::pinning::loopback_addresses(endpoint)?),
+            (None, Security::None) => Some(crate::pinning::loopback_addresses(endpoint).map_err(|e| crate::imap::connection::unencrypted_refusal(endpoint, e))?),
+            (None, _) => None,
+        };
+        let mut conn = match &local {
+            Some(addrs) => SmtpConnection::connect(&addrs[..], Some(self.timeout), &client_id, wrapper, None),
+            None => SmtpConnection::connect((endpoint.host.as_str(), endpoint.port), Some(self.timeout), &client_id, wrapper, None),
+        }
+        .map_err(connect_error)?;
         if endpoint.security == Security::StartTls {
             if let Some(params) = tls.as_ref() {
                 conn.starttls(params, &client_id).map_err(connect_error)?;
+            }
+        }
+        if let Some(pin) = pin {
+            // Before any credentials: the certificate must be the one the person trusted.
+            if !conn.peer_certificate().is_ok_and(|der| crate::pinning::matches(&der, pin)) {
+                conn.abort();
+                return Err(ProviderError::Rejected(crate::secure_error::CERTIFICATE_CHANGED.into()));
             }
         }
         if !endpoint.username.is_empty() {
@@ -155,6 +176,33 @@ impl Transport {
         }
         Ok(conn)
     }
+}
+
+/// TLS for a server on this computer whose certificate is compared with a pin after the
+/// handshake, or read so the person can decide whether to trust it. lettre takes no custom
+/// verifier, so it is told not to check the chain or the name; it still verifies the
+/// handshake signature with the certificate's key. Never used for any other server.
+fn local_tls(host: &str) -> Result<TlsParameters, ProviderError> {
+    TlsParameters::builder(host.trim().to_owned()).dangerous_accept_invalid_certs(true).dangerous_accept_invalid_hostnames(true).build_rustls().map_err(connect_error)
+}
+
+/// Reads the certificate an SMTP server on this computer presents and returns its
+/// fingerprint, without signing in. Callers check that the endpoint is local.
+pub(crate) fn fetch_certificate(endpoint: &ServerEndpoint, timeout: Duration) -> Result<String, ProviderError> {
+    let client_id = ClientId::default();
+    let tls = local_tls(&endpoint.host)?;
+    let wrapper = (endpoint.security == Security::Tls).then_some(&tls);
+    let addrs = crate::pinning::loopback_addresses(endpoint)?;
+    let mut conn = SmtpConnection::connect(&addrs[..], Some(timeout), &client_id, wrapper, None).map_err(connect_error)?;
+    if endpoint.security == Security::StartTls {
+        conn.starttls(&tls, &client_id).map_err(connect_error)?;
+    }
+    let der = conn.peer_certificate().map_err(|e| {
+        crate::secure_error::log_detail("SMTP certificate", &e);
+        ProviderError::Rejected(crate::secure_error::SECURE_CONNECTION_FAILED.into())
+    });
+    let _ = conn.quit();
+    Ok(crate::pinning::fingerprint(&der?))
 }
 
 /// The server's words from a reply error, without lettre's "permanent error (550): " prefix.

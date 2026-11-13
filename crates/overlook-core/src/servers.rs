@@ -112,11 +112,17 @@ pub struct ServerEndpoint {
     pub username: String,
     #[serde(default)]
     pub auth: AuthMethod,
+    /// SHA-256 fingerprint (`AB:CD:…`) of the certificate a server on this computer uses,
+    /// which the person chose to trust: Proton Mail Bridge encrypts its local connections
+    /// with a certificate it made itself, which no public authority vouches for. Honoured
+    /// only for [`Self::is_local`] hosts; elsewhere certificates are verified as always.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_certificate: Option<String>,
 }
 
 impl ServerEndpoint {
     pub fn new(host: impl Into<String>, port: u16, security: Security, username: impl Into<String>) -> Self {
-        Self { host: host.into(), port, security, username: username.into(), auth: AuthMethod::Password }
+        Self { host: host.into(), port, security, username: username.into(), auth: AuthMethod::Password, pinned_certificate: None }
     }
 
     /// `host:port` for connecting and for messages.
@@ -127,6 +133,11 @@ impl ServerEndpoint {
     /// Whether unencrypted connections are being asked for somewhere other than this machine.
     pub fn is_insecure_remote(&self) -> bool {
         self.security == Security::None && !is_local_host(&self.host)
+    }
+
+    /// Whether the server is on this computer (a loopback name or address).
+    pub fn is_local(&self) -> bool {
+        is_local_host(&self.host)
     }
 }
 
@@ -278,6 +289,11 @@ mod tests {
         assert_eq!(ServerProtocol::Pop3.default_port(Security::None), 110);
         assert!(!ServerEndpoint::new("localhost", 1025, Security::None, "x").is_insecure_remote());
         assert!(ServerEndpoint::new("mail.example.com", 25, Security::None, "x").is_insecure_remote());
+        assert!(ServerEndpoint::new("127.0.0.1", 1143, Security::StartTls, "x").is_local() && !ServerEndpoint::new("imap.example.com", 993, Security::Tls, "x").is_local());
+        let pinned = ServerEndpoint { pinned_certificate: Some("AB:CD".into()), ..ServerEndpoint::new("127.0.0.1", 1143, Security::StartTls, "x") };
+        let json = serde_json::to_string(&pinned).unwrap();
+        assert!(json.contains("\"pinned_certificate\":\"AB:CD\""), "{json}");
+        assert!(!serde_json::to_string(&ServerEndpoint::new("h", 1, Security::Tls, "x")).unwrap().contains("pinned"), "unpinned endpoints store what they always did");
         assert_eq!(Security::from_key("ssl"), Some(Security::Tls));
     }
 }

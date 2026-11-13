@@ -1,8 +1,9 @@
 //! IMAP folders as [`Label`] rows, per the plan's "Folders as labels" table.
 //!
 //! `INBOX` is always the Inbox. Sent, Trash, Spam and Archive are found by the account's
-//! `ImapPolicy` overrides first, then RFC 6154 SPECIAL-USE attributes, then common names;
-//! the first candidate wins. `\Drafts`, `\Flagged`, `\All`-less `\Important` and other
+//! `ImapPolicy` overrides first, then RFC 6154 SPECIAL-USE attributes (`\Archive` before an
+//! `\All` view), then common names; the first candidate wins. `\Drafts`, `\Flagged`,
+//! `\All`-less `\Important` and other
 //! virtual folders are not mapped as mail (Drafts has its own synchronization). Everything else is a user
 //! label whose name is the path with the delimiter shown as " / ".
 
@@ -238,6 +239,9 @@ pub fn classify(folders: &[FolderInfo], policy: Option<&ImapPolicy>) -> Vec<(Fol
             None
         }
     };
+    // An `\Archive` folder is the Archive even when an `\All` view is listed first, as
+    // Proton Mail Bridge lists All Mail beside its Archive.
+    let archive_marked = folders.iter().any(|f| f.selectable() && f.special_use().as_deref() == Some("\\Archive"));
     // Three passes so an override beats SPECIAL-USE, which beats a name.
     for pass in 0..3 {
         for f in folders {
@@ -256,7 +260,8 @@ pub fn classify(folders: &[FolderInfo], policy: Option<&ImapPolicy>) -> Vec<(Fol
                     Some("\\Sent") => Some(LabelKind::Sent),
                     Some("\\Trash") => Some(LabelKind::Trash),
                     Some("\\Junk") => Some(LabelKind::Spam),
-                    Some("\\Archive") | Some("\\All") => Some(LabelKind::Archive),
+                    Some("\\Archive") => Some(LabelKind::Archive),
+                    Some("\\All") if !archive_marked => Some(LabelKind::Archive),
                     _ => None,
                 },
                 _ => match f.near_top().then(|| f.leaf()).as_deref() {
@@ -483,6 +488,43 @@ mod tests {
         assert_eq!(
             kinds,
             vec![("INBOX", LabelKind::Inbox), ("[Gmail]/All Mail", LabelKind::Archive), ("[Gmail]/Sent Mail", LabelKind::Sent), ("[Gmail]/Spam", LabelKind::Spam), ("[Gmail]/Trash", LabelKind::Trash)]
+        );
+    }
+
+    #[test]
+    fn proton_bridge_layout() {
+        // Bridge lists All Mail and Starred views beside the real folders, and puts the
+        // person's folders and labels under two containers.
+        let folders = vec![
+            f("All Mail", &["\\All"]),
+            f("Archive", &["\\Archive"]),
+            f("Drafts", &["\\Drafts"]),
+            f("Folders", &["\\Noselect", "\\HasChildren"]),
+            f("Folders/Work", &[]),
+            f("INBOX", &[]),
+            f("Labels", &["\\Noselect", "\\HasChildren"]),
+            f("Labels/Receipts", &[]),
+            f("Sent", &["\\Sent"]),
+            f("Spam", &["\\Junk"]),
+            f("Starred", &["\\Flagged"]),
+            f("Trash", &["\\Trash"]),
+        ];
+        let classified = classify(&folders, None);
+        let kinds: Vec<(&str, LabelKind)> = classified.iter().map(|(f, k)| (f.path.as_str(), *k)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("INBOX", LabelKind::Inbox),
+                ("Archive", LabelKind::Archive),
+                ("Sent", LabelKind::Sent),
+                ("Spam", LabelKind::Spam),
+                ("Trash", LabelKind::Trash),
+                ("Folders/Work", LabelKind::User),
+                ("Labels/Receipts", LabelKind::User),
+                ("Folders", LabelKind::Container),
+                ("Labels", LabelKind::Container),
+            ],
+            "the Archive, not All Mail, is the Archive; the views are left out"
         );
     }
 

@@ -756,6 +756,8 @@ impl MailWindow {
         let is_password_account = matches!(account.provider, ProviderKind::Imap | ProviderKind::Pop3);
         let servers = if is_password_account { self.store.servers(&account.id).ok().flatten() } else { None };
         let oauth = servers.as_ref().and_then(|s| s.oauth);
+        // A server on this computer (Proton Mail Bridge) is trusted by its certificate.
+        let trusted = servers.as_ref().and_then(|s| s.incoming.pinned_certificate.as_deref().or(s.outgoing.pinned_certificate.as_deref())).map(|fp| format!(" Overlook accepts only the certificate you trusted for the server on this computer (SHA-256 {}…).", fp.get(..11).unwrap_or(fp))).unwrap_or_default();
         let connection_line = match (account.provider, &servers) {
             (ProviderKind::Gmail, _) => "Connected through the Gmail and Google Calendar APIs.".to_owned(),
             (ProviderKind::Sample, _) => "Sample account with fictional mail; nothing leaves this device.".to_owned(),
@@ -763,10 +765,10 @@ impl MailWindow {
             (ProviderKind::Imap, Some(s)) => {
                 // An app-password service names what is stored ("App-specific password").
                 let secret = overlook_provider::app_passwords::guide_for(&account.email, Some(&s.incoming.host)).map(|g| g.password_label).unwrap_or("Password");
-                format!("Mail is read over IMAP from {} and sent through {}. {secret} kept in the system keyring.", s.incoming.address(), s.outgoing.address())
+                format!("Mail is read over IMAP from {} and sent through {}. {secret} kept in the system keyring.{trusted}", s.incoming.address(), s.outgoing.address())
             }
             (ProviderKind::Pop3, Some(s)) if s.oauth.is_some() => format!("Mail is downloaded over POP3 from {} and sent through {}. Signed in with Microsoft. This device holds the only copy.", s.incoming.address(), s.outgoing.address()),
-            (ProviderKind::Pop3, Some(s)) => format!("Mail is downloaded over POP3 from {} and sent through {}. This device holds the only copy.", s.incoming.address(), s.outgoing.address()),
+            (ProviderKind::Pop3, Some(s)) => format!("Mail is downloaded over POP3 from {} and sent through {}. This device holds the only copy.{trusted}", s.incoming.address(), s.outgoing.address()),
             (_, None) => "Server settings are not set up yet.".to_owned(),
         };
         let sign_in_label = super::sign_in_label_for(account.provider, oauth.is_some());

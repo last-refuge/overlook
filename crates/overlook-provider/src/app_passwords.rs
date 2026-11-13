@@ -143,8 +143,33 @@ pub static FASTMAIL: AppPasswordGuide = AppPasswordGuide {
     servers: fastmail_servers,
 };
 
+/// Proton Mail through Proton Mail Bridge, from Proton's Bridge help: Bridge runs on this
+/// computer for paid plans, serves IMAP on 127.0.0.1:1143 and SMTP on 127.0.0.1:1025 with
+/// STARTTLS unless changed in its settings, offers no POP3, and shows a password of its own
+/// in each account's mailbox details. It encrypts with a certificate it made itself, which
+/// the setup dialog asks the person to trust ([`crate::pinning`]). No server host is listed:
+/// 127.0.0.1 could be any local bridge.
+pub static PROTON: AppPasswordGuide = AppPasswordGuide {
+    provider: "Proton Mail",
+    short_name: "Proton",
+    domains: &["proton.me", "protonmail.com", "protonmail.ch", "pm.me"],
+    hosts: &[],
+    explanation: "Overlook reaches Proton Mail through Proton Mail Bridge, Proton’s app for paid plans that runs on this computer. Sign in to Bridge first, then use the password Bridge shows in this account’s mailbox details, not your Proton password. Bridge encrypts the connection with a certificate it made itself, so Overlook asks you to trust it once. Overlook keeps the password in the system keyring.",
+    password_label: "Bridge password",
+    password_placeholder: "The password Bridge shows",
+    create_label: "Get Proton Mail Bridge",
+    create_url: "https://proton.me/mail/bridge",
+    refused: "Bridge accepts only the password it shows in this account’s mailbox details, not your Proton password, and only while it is signed in to the account. The user name must be the one Bridge shows there too.",
+    custom_domain: "Bridge shows the user name to use in this account’s mailbox details. If it isn’t this address, enter it as both user names below.",
+    offers_pop3: false,
+    alternate_user_names: false,
+    strip_spaces: false,
+    looks_like_app_password: looks_like_bridge_password,
+    servers: proton_servers,
+};
+
 /// Every guided service, in the order the "Add … account" entries list them.
-pub static GUIDES: &[&AppPasswordGuide] = &[&ICLOUD, &YAHOO, &AOL, &FASTMAIL];
+pub static GUIDES: &[&AppPasswordGuide] = &[&ICLOUD, &YAHOO, &AOL, &FASTMAIL, &PROTON];
 
 /// The guide for an address's service, or, for an address at another domain, for the
 /// service its incoming server belongs to.
@@ -218,6 +243,11 @@ fn looks_like_yahoo_app_password(password: &str) -> bool {
 fn looks_like_fastmail_app_password(password: &str) -> bool {
     let characters: Vec<char> = password.chars().filter(|c| !c.is_whitespace()).collect();
     characters.len() == 16 && characters.iter().all(char::is_ascii_alphanumeric)
+}
+
+/// Bridge's passwords have no documented shape, so any password passes.
+fn looks_like_bridge_password(password: &str) -> bool {
+    !password.trim().is_empty()
 }
 
 /// Apple's app-specific passwords are 16 letters, shown in four groups of four with hyphens.
@@ -303,6 +333,19 @@ fn fastmail_servers(incoming: ServerProtocol, email: &str) -> MailServers {
         "pop.fastmail.com",
         "smtp.fastmail.com",
     )
+}
+
+/// Bridge's defaults: IMAP on 127.0.0.1:1143 and SMTP on 127.0.0.1:1025, both with STARTTLS,
+/// the address as user name. Bridge offers no POP3, so the incoming side is always IMAP.
+fn proton_servers(_incoming: ServerProtocol, email: &str) -> MailServers {
+    let email = email.trim().to_lowercase();
+    MailServers {
+        incoming: ServerEndpoint::new("127.0.0.1", 1143, Security::StartTls, email.clone()),
+        outgoing: ServerEndpoint::new("127.0.0.1", 1025, Security::StartTls, email),
+        pop3: None,
+        imap: None,
+        oauth: None,
+    }
 }
 
 /// AOL: `imap.aol.com` 993 or `pop.aol.com` 995, `smtp.aol.com` 465, all with SSL, the full
@@ -457,7 +500,7 @@ mod tests {
             .is_some_and(|g| std::ptr::eq(g, &AOL)));
         assert_eq!(
             GUIDES.iter().map(|g| g.short_name).collect::<Vec<_>>(),
-            ["iCloud", "Yahoo", "AOL", "Fastmail"]
+            ["iCloud", "Yahoo", "AOL", "Fastmail", "Proton"]
         );
         assert_eq!(
             YAHOO.user_names("jane@yahoo.com", "jane@yahoo.com"),
@@ -510,6 +553,33 @@ mod tests {
                 && !looks("abcd-2345-efgh-6789")
         );
         assert!(FASTMAIL.strip_spaces && FASTMAIL.offers_pop3);
+    }
+
+    #[test]
+    fn proton_uses_bridge_on_this_computer() {
+        for protocol in [ServerProtocol::Imap, ServerProtocol::Pop3] {
+            let s = (PROTON.servers)(protocol, " Jane@Proton.me ");
+            assert_eq!(
+                (s.incoming.address(), s.incoming.security, s.incoming.username.as_str()),
+                ("127.0.0.1:1143".to_owned(), Security::StartTls, "jane@proton.me"),
+                "Bridge offers no POP3"
+            );
+            assert_eq!(
+                (s.outgoing.address(), s.outgoing.security, s.outgoing.username.as_str()),
+                ("127.0.0.1:1025".to_owned(), Security::StartTls, "jane@proton.me")
+            );
+            assert!(s.incoming.is_local() && s.incoming.pinned_certificate.is_none());
+        }
+        for email in ["jane@proton.me", "jane@protonmail.com", "jane@protonmail.ch", "jane@pm.me"] {
+            assert!(guide_for(email, None).is_some_and(|g| std::ptr::eq(g, &PROTON)), "{email}");
+        }
+        assert!(
+            guide_for("me@own.example", Some("127.0.0.1")).is_none(),
+            "a local server could be any bridge, so it doesn't mean Proton"
+        );
+        let looks = PROTON.looks_like_app_password;
+        assert!(looks("aB3-any_shape") && !looks("  "));
+        assert!(!PROTON.offers_pop3 && !PROTON.strip_spaces && !PROTON.alternate_user_names);
     }
 
     #[test]
