@@ -216,6 +216,13 @@ account password: create one in your account's Account Security settings
 then paste it into Overlook. Spaces in it don't matter. Yahoo only offers app passwords in a browser you've used to
 sign in to Yahoo for several days. Overlook fills in the server settings; both work over IMAP or POP3.
 
+## Connect Fastmail
+
+Open the account menu → **Add Fastmail account…**. Fastmail wants its own **app password** for each mail app:
+create one in Fastmail under Settings → Privacy & Security → Manage app passwords and access → New app password,
+and keep its default access (Mail, Contacts & Calendars) if you'd like Overlook to connect your calendars too.
+Fastmail's Basic plan doesn't include mail apps. Overlook fills in the server settings, for IMAP or POP3.
+
 ## Keyboard
 
 | Key | Action |

@@ -68,6 +68,8 @@ Thunderbird explicitly documents OAuth for Yahoo, AOL, and AT&T, establishing a 
 
 ### 4. Fastmail
 
+**Status (13 November 2026):** guided app-password setup is built on the `fastmail-mail` branch: a Fastmail guide with POP3 and an "Add Fastmail account…" entry, the Basic-plan limit explained, and guidance found for any domain whose looked-up servers are Fastmail's. A real Fastmail account works. See [fastmail-mail.md](fastmail-mail.md).
+
 Fastmail is a good fit for the intended audience and a useful standard-protocol qualification target. Keep the initial mail work on IMAP/SMTP; a dedicated JMAP adapter can be evaluated after the existing experience is dependable.
 
 Every third-party client needs its own app password. Fastmail's documented Basic plans do not include third-party protocol access. Setup should explain the requirement rather than repeatedly reporting an invalid password. [Fastmail app passwords](https://www.fastmail.help/hc/en-us/articles/360058752854-App-passwords)

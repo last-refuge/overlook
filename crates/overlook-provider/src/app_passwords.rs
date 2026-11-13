@@ -3,9 +3,9 @@
 //! where to create one, what it looks like, what a refused sign-in usually means, and the
 //! service's server settings.
 //!
-//! iCloud Mail, Yahoo Mail and AOL Mail are guided. Fastmail and Zoho follow the same pattern
-//! (roadmap priorities 4 and 6), so each is one more [`AppPasswordGuide`] in [`GUIDES`]; the
-//! app builds its "Add … account" entries from that list.
+//! iCloud Mail, Yahoo Mail, AOL Mail and Fastmail are guided. Zoho and the providers of
+//! roadmap priority 7 follow the same pattern, so each is one more [`AppPasswordGuide`] in
+//! [`GUIDES`]; the app builds its "Add … account" entries from that list.
 
 use overlook_core::{MailServers, Security, ServerEndpoint, ServerProtocol};
 
@@ -120,8 +120,31 @@ pub static AOL: AppPasswordGuide = AppPasswordGuide {
     servers: aol_servers,
 };
 
-/// Every guided service.
-pub static GUIDES: &[&AppPasswordGuide] = &[&ICLOUD, &YAHOO, &AOL];
+/// Fastmail, from its help pages "App passwords" (fastmail.help 360058752854), "Server names
+/// and ports" (1500000278342) and "Choosing your data residency" (16796454162063), November
+/// 2026. US and EU accounts alike use the standard server names; the optional regional ones
+/// (`eu-imap.fastmail.com`, `us-imap.fastmail.com`) are recognised by host.
+pub static FASTMAIL: AppPasswordGuide = AppPasswordGuide {
+    provider: "Fastmail",
+    short_name: "Fastmail",
+    domains: &["fastmail.com", "fastmail.fm", "messagingengine.com", "fastmail.us", "fastmail.uk", "fastmail.de"],
+    hosts: &["fastmail.com", "messagingengine.com"],
+    explanation: "Fastmail needs its own app password for each mail app, not your Fastmail password. Create one under Settings → Privacy & Security → Manage app passwords and access → New app password; its default access, Mail, Contacts & Calendars, also lets Overlook connect your calendars. Fastmail’s Basic plan doesn’t include mail apps. Overlook keeps the password in the system keyring.",
+    password_label: "App password",
+    password_placeholder: "16 letters and digits from Fastmail",
+    create_label: "Create an app password",
+    create_url: "https://app.fastmail.com/settings/security",
+    refused: "Fastmail accepts only an app password here, not your Fastmail password, and its Basic plan doesn’t allow mail apps at all. Create one under Settings → Privacy & Security → Manage app passwords and access; one you removed or disabled there no longer works.",
+    custom_domain: "Fastmail signs you in with the address you log in to Fastmail with. If that isn’t this one, enter it as both user names below.",
+    offers_pop3: true,
+    alternate_user_names: false,
+    strip_spaces: true,
+    looks_like_app_password: looks_like_fastmail_app_password,
+    servers: fastmail_servers,
+};
+
+/// Every guided service, in the order the "Add … account" entries list them.
+pub static GUIDES: &[&AppPasswordGuide] = &[&ICLOUD, &YAHOO, &AOL, &FASTMAIL];
 
 /// The guide for an address's service, or, for an address at another domain, for the
 /// service its incoming server belongs to.
@@ -188,6 +211,13 @@ impl AppPasswordGuide {
 fn looks_like_yahoo_app_password(password: &str) -> bool {
     let letters: Vec<char> = password.chars().filter(|c| !c.is_whitespace()).collect();
     letters.len() == 16 && letters.iter().all(char::is_ascii_alphabetic)
+}
+
+/// Fastmail's app passwords are 16 letters and digits (without 0, 1, O or I); spaces and
+/// capitalisation don't matter to Fastmail.
+fn looks_like_fastmail_app_password(password: &str) -> bool {
+    let characters: Vec<char> = password.chars().filter(|c| !c.is_whitespace()).collect();
+    characters.len() == 16 && characters.iter().all(char::is_ascii_alphanumeric)
 }
 
 /// Apple's app-specific passwords are 16 letters, shown in four groups of four with hyphens.
@@ -263,6 +293,18 @@ fn yahoo_servers(incoming: ServerProtocol, email: &str) -> MailServers {
     )
 }
 
+/// Fastmail: `imap.fastmail.com` 993 or `pop.fastmail.com` 995, `smtp.fastmail.com` 465, all
+/// with SSL (not STARTTLS on 993 and 995), the sign-in address as user name.
+fn fastmail_servers(incoming: ServerProtocol, email: &str) -> MailServers {
+    full_address_servers(
+        incoming,
+        email,
+        "imap.fastmail.com",
+        "pop.fastmail.com",
+        "smtp.fastmail.com",
+    )
+}
+
 /// AOL: `imap.aol.com` 993 or `pop.aol.com` 995, `smtp.aol.com` 465, all with SSL, the full
 /// address as user name.
 fn aol_servers(incoming: ServerProtocol, email: &str) -> MailServers {
@@ -322,7 +364,7 @@ mod tests {
             "a custom domain on iCloud's servers"
         );
         assert!(guide_for("jane@family.example", Some("p42-imap.mail.me.com.")).is_some());
-        assert!(guide_for("jane@family.example", Some("imap.fastmail.com")).is_none());
+        assert!(guide_for("jane@family.example", Some("imap.example.net")).is_none());
         assert!(guide_for("x@notme.com", Some("mail.me.com.evil.example")).is_none());
     }
 
@@ -415,13 +457,59 @@ mod tests {
             .is_some_and(|g| std::ptr::eq(g, &AOL)));
         assert_eq!(
             GUIDES.iter().map(|g| g.short_name).collect::<Vec<_>>(),
-            ["iCloud", "Yahoo", "AOL"]
+            ["iCloud", "Yahoo", "AOL", "Fastmail"]
         );
         assert_eq!(
             YAHOO.user_names("jane@yahoo.com", "jane@yahoo.com"),
             ["jane@yahoo.com"],
             "Yahoo has one user name form"
         );
+    }
+
+    #[test]
+    fn fastmail_follows_its_help_pages() {
+        let imap = (FASTMAIL.servers)(ServerProtocol::Imap, "Jane@Fastmail.com");
+        assert_eq!(
+            (
+                imap.incoming.address(),
+                imap.incoming.security,
+                imap.incoming.username.as_str()
+            ),
+            (
+                "imap.fastmail.com:993".to_owned(),
+                Security::Tls,
+                "jane@fastmail.com"
+            )
+        );
+        assert_eq!(
+            (imap.outgoing.address(), imap.outgoing.security),
+            ("smtp.fastmail.com:465".to_owned(), Security::Tls)
+        );
+        assert_eq!(
+            (FASTMAIL.servers)(ServerProtocol::Pop3, "jane@fastmail.fm")
+                .incoming
+                .address(),
+            "pop.fastmail.com:995"
+        );
+        assert!(guide_for("jane@fastmail.fm", None).is_some_and(|g| std::ptr::eq(g, &FASTMAIL)));
+        for host in [
+            "imap.fastmail.com",
+            "eu-imap.fastmail.com",
+            "mail.messagingengine.com",
+        ] {
+            assert!(
+                guide_for("me@own.example", Some(host)).is_some_and(|g| std::ptr::eq(g, &FASTMAIL)),
+                "{host}"
+            );
+        }
+        let looks = FASTMAIL.looks_like_app_password;
+        assert!(
+            looks("abcd2345efgh6789")
+                && looks("ABCD 2345 efgh 6789")
+                && !looks("hunter2")
+                && !looks("abcd-2345-efgh-6789")
+        );
+        assert!(FASTMAIL.strip_spaces && FASTMAIL.offers_pop3);
     }
 
     #[test]
