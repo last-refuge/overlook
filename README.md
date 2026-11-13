@@ -198,6 +198,15 @@ Until then, register a public client in Microsoft Entra (redirect URI `http://lo
 accounts) and save `{"client_id": "<application id>"}` as `~/.config/overlook/microsoft-oauth-client.json`. The
 [Microsoft account notes](llm-docs/microsoft-mail.md#the-app-registration) walk through it.
 
+## Connect iCloud
+
+Open the account menu at the bottom of the sidebar → **Add iCloud account…** (or Settings → Accounts → Add
+account → iCloud Mail). iCloud wants an **app-specific password**, not your Apple Account password: create one
+at [account.apple.com](https://account.apple.com) under Sign-In and Security → App-Specific Passwords (your
+account needs two-factor authentication), then paste it into Overlook, which keeps it in your system keyring.
+Overlook fills in Apple's server settings and finds which user name iCloud wants. For an iCloud+ address at your
+own domain, use your iCloud Mail address as the user name. iCloud doesn't offer POP, so it's always IMAP.
+
 ## Keyboard
 
 | Key | Action |

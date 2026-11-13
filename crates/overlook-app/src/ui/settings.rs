@@ -760,7 +760,11 @@ impl MailWindow {
             (ProviderKind::Gmail, _) => "Connected through the Gmail and Google Calendar APIs.".to_owned(),
             (ProviderKind::Sample, _) => "Sample account with fictional mail; nothing leaves this device.".to_owned(),
             (ProviderKind::Imap, Some(s)) if s.oauth.is_some() => format!("Mail is read over IMAP from {} and sent through {}. Signed in with Microsoft; the sign-in is kept in the system keyring.", s.incoming.address(), s.outgoing.address()),
-            (ProviderKind::Imap, Some(s)) => format!("Mail is read over IMAP from {} and sent through {}. Password kept in the system keyring.", s.incoming.address(), s.outgoing.address()),
+            (ProviderKind::Imap, Some(s)) => {
+                // An app-password service names what is stored ("App-specific password").
+                let secret = overlook_provider::app_passwords::guide_for(&account.email, Some(&s.incoming.host)).map(|g| g.password_label).unwrap_or("Password");
+                format!("Mail is read over IMAP from {} and sent through {}. {secret} kept in the system keyring.", s.incoming.address(), s.outgoing.address())
+            }
             (ProviderKind::Pop3, Some(s)) if s.oauth.is_some() => format!("Mail is downloaded over POP3 from {} and sent through {}. Signed in with Microsoft. This device holds the only copy.", s.incoming.address(), s.outgoing.address()),
             (ProviderKind::Pop3, Some(s)) => format!("Mail is downloaded over POP3 from {} and sent through {}. This device holds the only copy.", s.incoming.address(), s.outgoing.address()),
             (_, None) => "Server settings are not set up yet.".to_owned(),
@@ -1281,6 +1285,10 @@ impl MailWindow {
                 let m = t.clone();
                 menu = menu.item(PopupMenuItem::new("Microsoft (Outlook.com, Microsoft 365)…").on_click(move |_, window, cx| {
                     let _ = m.update(cx, |this, cx| this.open_microsoft_setup(window, cx));
+                }));
+                let a = t.clone();
+                menu = menu.item(PopupMenuItem::new("iCloud Mail…").on_click(move |_, window, cx| {
+                    let _ = a.update(cx, |this, cx| this.open_icloud_setup(window, cx));
                 }));
                 let i = t.clone();
                 menu = menu.item(PopupMenuItem::new("IMAP…").on_click(move |_, window, cx| {
