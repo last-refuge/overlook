@@ -35,7 +35,8 @@ Ordinary verification refuses Bridge's certificate, because no public authority 
 1. **Add Proton account…** fills in Bridge's usual settings and asks for the Bridge password.
 2. **Add account** or **Test connection** fails on both servers before signing in. The test then reads each certificate again without signing in, and the dialog shows a panel: what the certificate is, the addresses and the SHA-256 fingerprint (one line when both servers share it, as Bridge's do), and **Trust certificate**.
 3. **Trust certificate** pins each certificate to its `host:port` and tests again. If the test was for saving, the account is saved when it passes.
-4. Changing a server's host or port drops its pin, because a pin stays with the address it was trusted for. A changed certificate is offered as a change, with a warning not to trust it unless the change was expected. Settings → Accounts shows the start of the trusted fingerprint.
+4. Settings can't be saved without a trusted certificate. Neither **Add anyway** nor **Save anyway** is offered while an encrypted server on this computer has none, and the button stays disabled. This covers adding an account, **Server settings…** and **Update password**. It applies to a refused certificate, including one that changed, and to a server that couldn't be reached to check one before any was trusted (Bridge not running). Only **Trust certificate**, or a test that passes, saves. A server whose certificate is trusted but which is only offline (Bridge quit) can still be saved anyway.
+5. Changing a server's host or port drops its pin, because a pin stays with the address it was trusted for. A changed certificate is offered as a change, with a warning not to trust it unless the change was expected. Settings → Accounts shows the start of the trusted fingerprint.
 
 The panel appears for any server on this computer whose certificate is refused, not only Bridge. A certificate whose handshake signature fails is never offered. Only Overlook's own fixed refusals count, so a local server's error text can't bring up the panel.
 
@@ -77,7 +78,12 @@ Overlook files its Sent copy as for any IMAP server: it first looks in Sent by M
   - A pin on 127.0.0.2, which isn't one of the local names, is ignored.
   - Certificates are read over IMAP, POP3 and SMTP, with STARTTLS and implicit TLS, without signing in.
   - Each protocol and security mode is checked four ways against loopback TLS servers: unpinned is refused before sign-in, pinned signs in, a changed certificate is refused before sign-in, and the pinned certificate with another key is refused.
-- `ui::account_setup::tests`: the dialog's probe offers a fake Bridge's certificate for both servers and passes once it's pinned. A changed certificate is offered as a change, a certificate with the wrong key is never offered, and a pin stays with its address.
+- `ui::account_setup::tests`:
+  - The dialog's probe offers a fake Bridge's certificate for both servers and passes once it's pinned.
+  - A changed certificate is offered as a change.
+  - A certificate with the wrong key is never offered.
+  - A pin stays with its address.
+  - Settings need a trusted certificate before they can be saved: when the certificate is refused, changed or unreadable, and when Bridge isn't running and nothing is trusted yet. They don't need one when the password is refused, when a trusted server is only offline, or for servers elsewhere.
 - `app_passwords::tests::proton_uses_bridge_on_this_computer` and `autoconfig::tests::presets_and_guesses`: Bridge's settings, the domains, and no match on `127.0.0.1` alone.
 - `imap::folders::tests::proton_bridge_layout`: the Archive and the views.
 

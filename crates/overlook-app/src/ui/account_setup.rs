@@ -18,7 +18,10 @@
 //! connection test before any password is sent. The test then reads the certificate again
 //! without signing in and offers it: **Trust certificate** pins that exact certificate to
 //! that address ([`overlook_provider::pinning`]) and tests again. A pinned certificate that
-//! changed is offered the same way, worded as a change.
+//! changed is offered the same way, worded as a change. Settings for such a server are
+//! saved only once its certificate is trusted: there is no "Add anyway" or "Save anyway"
+//! past a certificate, or past a server on this computer that couldn't be reached to check
+//! one before any was trusted.
 
 use super::widgets::*;
 use super::MailWindow;
@@ -134,6 +137,9 @@ pub struct AccountSetup {
     pub certificate_offers: Vec<CertificateOffer>,
     /// Whether that test was checking before saving, so trusting continues to the save.
     pub offers_resume_save: bool,
+    /// The last test left an encrypted server on this computer without a trusted
+    /// certificate (see [`lacks_trust`]): the settings can't be saved until one is.
+    pub needs_trust: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -222,6 +228,23 @@ impl AccountSetup {
     fn forget_check(&mut self) {
         self.checked = None;
         self.certificate_offers.clear();
+        self.needs_trust = false;
+    }
+
+    /// Why the account can't be added or its settings saved yet, when they can't: a
+    /// certificate to trust first. Every mode, so no path saves past one.
+    fn trust_required(&self) -> Option<String> {
+        if !self.needs_trust {
+            return None;
+        }
+        let new = matches!(self.mode, SetupMode::New);
+        let bridge = self.guide.is_some_and(|g| std::ptr::eq(g, &app_passwords::PROTON));
+        let then = if new { "the account can be added" } else { "these settings can be saved" };
+        Some(match (self.certificate_offers.is_empty(), bridge) {
+            (false, _) => format!("To {}, trust the certificate above.", if new { "add this account" } else { "save these settings" }),
+            (true, true) => format!("Overlook couldn’t check Bridge’s certificate. Make sure Proton Mail Bridge is running and signed in, then test again: {then} once you’ve trusted its certificate."),
+            (true, false) => format!("Overlook couldn’t check the certificate of the mail server on this computer. Make sure it’s running, then test again: {then} once you’ve trusted its certificate."),
+        })
     }
 
     /// Stops waiting for a browser sign-in, if one is open.
@@ -271,6 +294,9 @@ struct ProbeOutcome {
     accepted: Option<String>,
     /// Untrusted certificates of servers on this computer.
     offers: Vec<CertificateOffer>,
+    /// Whether either server is on this computer, encrypts, and failed without a trusted
+    /// certificate ([`lacks_trust`]).
+    needs_trust: bool,
 }
 
 /// Signs in to both servers (blocking; run it off the UI thread). One line per server.
@@ -290,7 +316,7 @@ fn probe_servers(kind: ProviderKind, servers: &MailServers, credential: SetupCre
         SetupCredential::Microsoft(session) => (Credential::OAuth(session.clone()), Credential::OAuth(session)),
     };
     let protocol = if kind == ProviderKind::Pop3 { ServerProtocol::Pop3 } else { ServerProtocol::Imap };
-    let (incoming_line, incoming_offer, outgoing, accepted) = std::thread::scope(|scope| {
+    let (incoming_line, incoming_offer, incoming_needs_trust, outgoing, accepted) = std::thread::scope(|scope| {
         let outgoing = scope.spawn(|| smtp::Transport::new(servers.outgoing.clone(), outgoing_credential).with_timeout(PROBE_TIMEOUT).probe());
         let (what, incoming) = if kind == ProviderKind::Pop3 {
             let pop3 = Pop3Provider::new(servers.clone(), incoming_credential.clone(), std::env::temp_dir()).with_timeout(PROBE_TIMEOUT);
@@ -319,19 +345,33 @@ fn probe_servers(kind: ProviderKind, servers: &MailServers, credential: SetupCre
         };
         let outgoing = outgoing.join().unwrap_or_else(|_| Err(ProviderError::Offline));
         let offer = certificate_offer(true, &servers.incoming, protocol, &incoming);
+        let needs_trust = lacks_trust(&servers.incoming, &incoming);
         let line = match (&accepted, incoming, &offer) {
             (_, _, Some(offer)) => offer_line(what, offer),
             (Some(name), Ok(()), _) => (true, format!("{what}: connected to {} and signed in as “{name}”.", servers.incoming.address())),
             (_, result, _) => probe_line(what, &servers.incoming, result, oauth, incoming_hint.as_deref()),
         };
-        (line, offer, outgoing, accepted)
+        (line, offer, needs_trust, outgoing, accepted)
     });
     let outgoing_offer = certificate_offer(false, &servers.outgoing, ServerProtocol::Smtp, &outgoing);
+    let needs_trust = incoming_needs_trust || lacks_trust(&servers.outgoing, &outgoing);
     let outgoing_line = match &outgoing_offer {
         Some(offer) => offer_line("Outgoing (SMTP)", offer),
         None => probe_line("Outgoing (SMTP)", &servers.outgoing, outgoing, oauth, hint.as_deref()),
     };
-    ProbeOutcome { lines: vec![incoming_line, outgoing_line], accepted, offers: incoming_offer.into_iter().chain(outgoing_offer).collect() }
+    ProbeOutcome { lines: vec![incoming_line, outgoing_line], accepted, offers: incoming_offer.into_iter().chain(outgoing_offer).collect(), needs_trust }
+}
+
+/// Whether a failed test leaves an encrypted server on this computer without a trusted
+/// certificate: its certificate was refused (not trusted yet, or not the one trusted), or
+/// none is trusted and the server couldn't be checked (Bridge not running). A refused
+/// password needs no trust: the handshake, certificate included, had passed.
+fn lacks_trust(endpoint: &ServerEndpoint, result: &Result<(), ProviderError>) -> bool {
+    let Err(error) = result else { return false };
+    if !endpoint.is_local() || endpoint.security == Security::None {
+        return false;
+    }
+    pinning::is_trust_question(endpoint, error) || (pinning::pin_for(endpoint).is_none() && !matches!(error, ProviderError::SignInRequired))
 }
 
 /// The certificate to offer when a server on this computer refused the connection over its
@@ -509,6 +549,7 @@ impl MailWindow {
             trusted_outgoing: outgoing.as_ref().and_then(TrustedCertificate::of),
             certificate_offers: Vec::new(),
             offers_resume_save: false,
+            needs_trust: false,
             _subscriptions: subscriptions,
         });
         // A password account at an Outlook.com address on Microsoft's servers can no longer
@@ -1139,7 +1180,7 @@ impl MailWindow {
         });
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let ProbeOutcome { lines, accepted: accepted_user, offers } = cx.background_spawn(async move { probe_servers(kind, &servers, credential, alternates, hint) }).await;
+            let ProbeOutcome { lines, accepted: accepted_user, offers, needs_trust } = cx.background_spawn(async move { probe_servers(kind, &servers, credential, alternates, hint) }).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 if !this.account_setup.as_ref().is_some_and(|s| s.generation == generation && s.email.entity_id() == identity) {
                     return;
@@ -1173,12 +1214,15 @@ impl MailWindow {
                 setup.offers_resume_save = then_save;
                 let offered = !offers.is_empty();
                 setup.certificate_offers = offers;
+                setup.needs_trust = needs_trust;
                 if then_save && ok {
                     this.setup_commit(window, cx);
                     return;
                 }
-                // The trust panel asks the question; the footer stays quiet.
-                if then_save && !offered {
+                if let Some(required) = setup.trust_required() {
+                    // No "anyway": the settings wait for a trusted certificate.
+                    setup.error = Some(required);
+                } else if then_save && !offered {
                     let anyway = if matches!(setup.mode, SetupMode::New) { "Add anyway" } else { "Save anyway" };
                     setup.error = Some(format!("These settings didn’t work (details above), so the account won’t sync. Fix them, or choose {anyway}."));
                 }
@@ -1251,6 +1295,15 @@ impl MailWindow {
 
     /// Saves the account: the same tail as finishing a Google sign-in.
     fn setup_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Settings for a server on this computer are saved only with a trusted certificate,
+        // whichever way the save was asked for.
+        if let Some(setup) = self.account_setup.as_mut() {
+            if let Some(required) = setup.trust_required() {
+                setup.error = Some(required);
+                cx.notify();
+                return;
+            }
+        }
         let prepared = self.setup_servers(cx).and_then(|(servers, pw, out_pw)| self.setup_credential(pw, out_pw).map(|c| (servers, c)));
         let name = self.setup_value(cx, |s| &s.name);
         let account_name = self.setup_value(cx, |s| &s.account_name);
@@ -1562,7 +1615,10 @@ impl MailWindow {
                     .child(Button::new("setup-continue").primary().small().label("Continue").loading(busy.is_some()).on_click(cx.listener(|this, _, window, cx| this.setup_continue(window, cx)))),
                 SetupStep::Servers => {
                     let is_new = matches!(setup.mode, SetupMode::New);
-                    let failed = matches!(setup.checked, Some((_, false)));
+                    // Past an untrusted certificate there is no "anyway": only trusting it,
+                    // or a test that passes, adds the account or saves the settings.
+                    let blocked = setup.trust_required().is_some();
+                    let failed = matches!(setup.checked, Some((_, false))) && !blocked;
                     let save_label = match (is_new, failed) {
                         (true, false) => "Add account",
                         (true, true) => "Add anyway",
@@ -1571,7 +1627,7 @@ impl MailWindow {
                     };
                     d.when(is_new, |d| d.child(Button::new("setup-back").ghost().small().label("Back").disabled(busy.is_some()).on_click(cx.listener(|this, _, window, cx| this.setup_back(window, cx)))))
                         .child(Button::new("setup-test").small().label("Test connection").disabled(busy.is_some()).on_click(cx.listener(|this, _, window, cx| this.setup_test(window, cx))))
-                        .child(Button::new("setup-save").small().map(|b| if failed { b.danger() } else { b.primary() }).label(save_label).loading(busy.is_some()).disabled(busy.is_some()).on_click(cx.listener(|this, _, window, cx| this.setup_save(window, cx))))
+                        .child(Button::new("setup-save").small().map(|b| if failed { b.danger() } else { b.primary() }).label(save_label).loading(busy.is_some()).disabled(busy.is_some() || blocked).on_click(cx.listener(|this, _, window, cx| this.setup_save(window, cx))))
                 }
             });
         let footer = v_flex()
@@ -1630,8 +1686,9 @@ impl MailWindow {
 #[cfg(test)]
 mod tests {
     // Named imports: the parent's glob imports bring in a `test` attribute of their own.
-    use super::{pin_at, probe_servers, CertificateOffer, ProbeOutcome, SetupCredential, TrustedCertificate};
+    use super::{lacks_trust, pin_at, probe_servers, CertificateOffer, ProbeOutcome, SetupCredential, TrustedCertificate};
     use overlook_core::{MailServers, ProviderKind, Security, ServerEndpoint};
+    use overlook_provider::ProviderError;
     use overlook_provider::pinning::{self, fake::{self, Speaks, LOOPBACK_CERT, LOOPBACK_KEY, OTHER_CERT, OTHER_KEY}};
 
     /// IMAP and SMTP on this computer with STARTTLS and a certificate of their own, as
@@ -1657,6 +1714,7 @@ mod tests {
         let mut servers = bridge(LOOPBACK_CERT, LOOPBACK_KEY);
         let first = probe(&servers);
         assert!(first.lines.iter().all(|(ok, line)| !ok && line.contains("doesn’t trust yet")), "{:?}", first.lines);
+        assert!(first.needs_trust, "no adding the account before its certificate is trusted");
         let fingerprint = pinning::fingerprint(LOOPBACK_CERT);
         assert_eq!(
             first.offers,
@@ -1672,7 +1730,7 @@ mod tests {
             endpoint.pinned_certificate = pin_at(endpoint, Some(&trusted));
         }
         let second = probe(&servers);
-        assert!(second.lines.iter().all(|(ok, _)| *ok) && second.offers.is_empty(), "{:?}", second.lines);
+        assert!(second.lines.iter().all(|(ok, _)| *ok) && second.offers.is_empty() && !second.needs_trust, "{:?}", second.lines);
     }
 
     #[test]
@@ -1684,12 +1742,48 @@ mod tests {
         assert_eq!(outcome.offers.len(), 2);
         assert!(outcome.offers.iter().all(|o| o.changed && o.fingerprint == pinning::fingerprint(OTHER_CERT)), "{:?}", outcome.offers);
         assert!(outcome.lines.iter().all(|(ok, line)| !ok && line.contains("has changed")), "{:?}", outcome.lines);
+        assert!(outcome.needs_trust);
     }
 
     #[test]
     fn a_server_whose_key_doesnt_match_its_certificate_is_not_offered() {
         let outcome = probe(&bridge(LOOPBACK_CERT, OTHER_KEY));
         assert!(outcome.offers.is_empty() && outcome.lines.iter().all(|(ok, _)| !ok), "{:?}", outcome.lines);
+        assert!(outcome.needs_trust, "nothing to trust, so nothing to add");
+    }
+
+    #[test]
+    fn a_local_server_that_isnt_running_needs_a_certificate_trusted_before() {
+        // Bridge not running: nothing answers on its ports.
+        let closed = || std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let mut servers = MailServers {
+            incoming: ServerEndpoint::new("127.0.0.1", closed(), Security::StartTls, "jane@proton.me"),
+            outgoing: ServerEndpoint::new("127.0.0.1", closed(), Security::StartTls, "jane@proton.me"),
+            pop3: None,
+            imap: None,
+            oauth: None,
+        };
+        let outcome = probe(&servers);
+        assert!(outcome.offers.is_empty() && outcome.needs_trust, "{:?}", outcome.lines);
+        // With its certificate trusted earlier, the account is only offline.
+        servers.incoming.pinned_certificate = Some(pinning::fingerprint(LOOPBACK_CERT));
+        servers.outgoing.pinned_certificate = Some(pinning::fingerprint(LOOPBACK_CERT));
+        assert!(!probe(&servers).needs_trust);
+    }
+
+    #[test]
+    fn only_encrypted_servers_on_this_computer_need_trust() {
+        let local = ServerEndpoint::new("127.0.0.1", 1143, Security::StartTls, "x");
+        let pinned = ServerEndpoint { pinned_certificate: Some(pinning::fingerprint(LOOPBACK_CERT)), ..local.clone() };
+        let untrusted = Err(ProviderError::Rejected(format!("The TLS handshake to 127.0.0.1 failed: {}", overlook_provider::secure_error::CERTIFICATE_NOT_TRUSTED)));
+        let changed = Err(ProviderError::Rejected(format!("The TLS handshake to 127.0.0.1 failed: {}", overlook_provider::secure_error::CERTIFICATE_CHANGED)));
+        assert!(lacks_trust(&local, &untrusted) && lacks_trust(&local, &Err(ProviderError::Offline)));
+        assert!(lacks_trust(&pinned, &changed), "a changed certificate needs trusting again");
+        assert!(!lacks_trust(&pinned, &Err(ProviderError::Offline)), "trusted, just not running");
+        assert!(!lacks_trust(&local, &Err(ProviderError::SignInRequired)), "a refused password means the certificate passed");
+        assert!(!lacks_trust(&local, &Ok(())));
+        assert!(!lacks_trust(&ServerEndpoint::new("127.0.0.1", 143, Security::None, "x"), &Err(ProviderError::Offline)), "no encryption, no certificate");
+        assert!(!lacks_trust(&ServerEndpoint::new("imap.example.com", 993, Security::Tls, "x"), &untrusted), "servers elsewhere are never trusted this way");
     }
 
     #[test]

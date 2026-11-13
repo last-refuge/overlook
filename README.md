@@ -226,12 +226,12 @@ Fastmail's Basic plan doesn't include mail apps. Overlook fills in the server se
 ## Connect Proton Mail
 
 Proton Mail works through [Proton Mail Bridge](https://proton.me/mail/bridge), Proton's desktop app for paid plans.
-Bridge must be running and signed in on the same computer. Open the account menu → **Add Proton account…**, and use the
-password Bridge shows in the account's mailbox details, not your Proton password. Bridge encrypts the connection with a
-certificate it made itself, so the first connection test asks you to trust it. Overlook then accepts that certificate,
-and no other, from Bridge on this computer. If Bridge's certificate ever changes, Overlook stops and asks again. The
-settings are filled in with Bridge's defaults (IMAP 127.0.0.1:1143 and SMTP 127.0.0.1:1025 with STARTTLS); change them
-if you changed them in Bridge.
+Bridge must be running and signed in on the same computer. Open the account menu → **Add Proton account…**, and use
+the password Bridge shows in the account's mailbox details, not your Proton password. Bridge encrypts the connection
+with a certificate it made itself, so the first connection test asks you to trust it, and the account can't be added
+until you do. Overlook then accepts that certificate, and no other, from Bridge on this computer. If Bridge's
+certificate ever changes, Overlook stops and asks again. The settings are filled in with Bridge's defaults (IMAP
+127.0.0.1:1143 and SMTP 127.0.0.1:1025 with STARTTLS); change them if you changed them in Bridge.
 
 ## Keyboard
 
