@@ -1286,10 +1286,12 @@ impl MailWindow {
                 menu = menu.item(PopupMenuItem::new("Microsoft (Outlook.com, Microsoft 365)…").on_click(move |_, window, cx| {
                     let _ = m.update(cx, |this, cx| this.open_microsoft_setup(window, cx));
                 }));
-                let a = t.clone();
-                menu = menu.item(PopupMenuItem::new("iCloud Mail…").on_click(move |_, window, cx| {
-                    let _ = a.update(cx, |this, cx| this.open_icloud_setup(window, cx));
-                }));
+                for &guide in overlook_provider::app_passwords::GUIDES {
+                    let a = t.clone();
+                    menu = menu.item(PopupMenuItem::new(format!("{}…", guide.provider)).on_click(move |_, window, cx| {
+                        let _ = a.update(cx, |this, cx| this.open_guided_setup(guide, window, cx));
+                    }));
+                }
                 let i = t.clone();
                 menu = menu.item(PopupMenuItem::new("IMAP…").on_click(move |_, window, cx| {
                     let _ = i.update(cx, |this, cx| this.open_account_setup(ProviderKind::Imap, super::SetupMode::New, window, cx));

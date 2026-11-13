@@ -57,10 +57,11 @@ pub fn lookup_for(protocol: ServerProtocol, email: &str) -> Suggestion {
 
 /// POP3 settings for the providers that still offer POP3; most of the IMAP table do not.
 pub fn preset_pop3(domain: &str, email: &str) -> Option<Suggestion> {
+    if let Some(guide) = crate::app_passwords::GUIDES.iter().find(|g| g.domains.contains(&domain)) {
+        return guide.offers_pop3.then(|| Suggestion { servers: (guide.servers)(ServerProtocol::Pop3, email), source: Source::Preset, provider: Some(guide.provider.to_owned()) });
+    }
     const TABLE: &[(&[&str], &str, &str, u16, &str, u16, Security)] = &[
         (&["fastmail.com", "fastmail.fm", "messagingengine.com", "fastmail.us", "fastmail.uk", "fastmail.de"], "Fastmail", "pop.fastmail.com", 995, "smtp.fastmail.com", 465, Security::Tls),
-        (&["yahoo.com", "ymail.com", "rocketmail.com", "yahoo.co.uk", "yahoo.ca", "yahoo.de", "yahoo.fr"], "Yahoo Mail", "pop.mail.yahoo.com", 995, "smtp.mail.yahoo.com", 465, Security::Tls),
-        (&["aol.com"], "AOL Mail", "pop.aol.com", 995, "smtp.aol.com", 465, Security::Tls),
         (&["zoho.com", "zohomail.com", "zoho.eu", "zohomail.eu"], "Zoho Mail", "poppro.zoho.com", 995, "smtp.zoho.com", 465, Security::Tls),
         (&["posteo.de", "posteo.net", "posteo.eu", "posteo.org", "posteo.ch", "posteo.at"], "Posteo", "posteo.de", 995, "posteo.de", 465, Security::Tls),
         (&["mailbox.org"], "mailbox.org", "pop3.mailbox.org", 995, "smtp.mailbox.org", 465, Security::Tls),
@@ -76,13 +77,11 @@ pub fn preset_pop3(domain: &str, email: &str) -> Option<Suggestion> {
 /// The built-in table alone (no network), for tests and the offline path.
 pub fn preset(domain: &str, email: &str) -> Option<Suggestion> {
     if let Some(guide) = crate::app_passwords::GUIDES.iter().find(|g| g.domains.contains(&domain)) {
-        return Some(Suggestion { servers: (guide.servers)(email), source: Source::Preset, provider: Some(guide.provider.to_owned()) });
+        return Some(Suggestion { servers: (guide.servers)(ServerProtocol::Imap, email), source: Source::Preset, provider: Some(guide.provider.to_owned()) });
     }
     // (domains, provider, imap host, imap port, imap security, smtp host, smtp port, smtp security)
     const TABLE: &[(&[&str], &str, &str, u16, Security, &str, u16, Security)] = &[
         (&["fastmail.com", "fastmail.fm", "messagingengine.com", "fastmail.us", "fastmail.uk", "fastmail.de"], "Fastmail", "imap.fastmail.com", 993, Security::Tls, "smtp.fastmail.com", 465, Security::Tls),
-        (&["yahoo.com", "ymail.com", "rocketmail.com", "yahoo.co.uk", "yahoo.ca", "yahoo.de", "yahoo.fr"], "Yahoo Mail", "imap.mail.yahoo.com", 993, Security::Tls, "smtp.mail.yahoo.com", 465, Security::Tls),
-        (&["aol.com"], "AOL Mail", "imap.aol.com", 993, Security::Tls, "smtp.aol.com", 465, Security::Tls),
         (&["zoho.com", "zohomail.com", "zoho.eu", "zohomail.eu"], "Zoho Mail", "imap.zoho.com", 993, Security::Tls, "smtp.zoho.com", 465, Security::Tls),
         (&["proton.me", "protonmail.com", "protonmail.ch", "pm.me"], "Proton Mail Bridge", "127.0.0.1", 1143, Security::StartTls, "127.0.0.1", 1025, Security::StartTls),
         (&["posteo.de", "posteo.net", "posteo.eu", "posteo.org", "posteo.ch", "posteo.at"], "Posteo", "posteo.de", 993, Security::Tls, "posteo.de", 465, Security::Tls),
@@ -266,6 +265,8 @@ mod tests {
         assert!(parse_ispdb_for(ServerProtocol::Pop3, &xml.replace("type=\"pop3\"", "type=\"exchange\""), "j@example.com").is_none());
         assert_eq!(preset_pop3("gmx.net", "x@gmx.net").unwrap().servers.incoming.host, "pop.gmx.net");
         assert!(preset_pop3("icloud.com", "x@icloud.com").is_none(), "iCloud has no POP3");
+        assert_eq!(preset_pop3("yahoo.com", "x@yahoo.com").unwrap().servers.incoming.address(), "pop.mail.yahoo.com:995");
+        assert_eq!(preset("aol.com", "x@aol.com").unwrap().servers.incoming.address(), "imap.aol.com:993");
         let icloud = preset("icloud.com", "jane@icloud.com").unwrap();
         assert_eq!((icloud.provider.as_deref(), icloud.servers.incoming.username.as_str(), icloud.servers.outgoing.username.as_str()), (Some("iCloud Mail"), "jane", "jane@icloud.com"), "Apple's user names: the name for IMAP, the address for SMTP");
         assert_eq!(guess_for(ServerProtocol::Pop3, "example.com", "x@example.com").servers.incoming.port, 995);
