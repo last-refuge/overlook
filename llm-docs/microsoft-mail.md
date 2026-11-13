@@ -112,13 +112,13 @@ Automated coverage, all offline (synthetic tokens, fake servers on loopback):
 - App: `loopback::tests` (Google and Microsoft redirect shapes, forgery, pollution, wrong origin, and a redirect answered on `::1`), `microsoft_signin::tests`, and `credentials::tests::microsoft_sign_ins_keep_their_registration_beside_the_tokens`.
 - An independent review on 12 November 2026 covered secrets, loopback validation, session concurrency, the protocol exchanges and the dialog. It found no high-severity defects; its nine medium and low findings are fixed above.
 
-Not verified: a real Microsoft sign-in, consent screen, token exchange, mailbox sync or send. The registration does not exist yet, and no Microsoft account was used. The native dialog has been checked by build only.
+Live, 13 November 2026: the user tested a real personal Microsoft account through the setup dialog and marked it done. They used a test app registration supplied through `microsoft-oauth-client.json`; the Last Refuge registration is not compiled in yet. An earlier attempt the same day got through sign-in, consent and the token exchange, but couldn't reach the mail servers during an Outlook outage that affected everyone. Microsoft 365 work or school accounts have not been tested.
 
 ## Qualification still to do
 
 Per the roadmap's "What earns explicit support", in the order the roadmap gives:
 
-1. Personal Outlook.com: sign-in, consent, IMAP sync, IDLE, drafts, Sent copies (one copy, the server's, and how long it takes to appear), Archive/Junk/Deleted Items mapping, an access token expiring during IDLE, and POP3 with POP turned on.
+1. Personal Outlook.com: **done 13 November 2026**, tested by hand with a real account. Its finer points weren't recorded separately: IDLE across an access-token expiry, how quickly the server's own Sent copy appears, and POP3 with POP turned on.
 2. Microsoft 365: user consent where allowed, the administrator-approval path, a tenant with SMTP AUTH turned off, IMAP disabled for a mailbox, and conditional access or MFA prompts on refresh.
 3. Accounts whose sign-in name differs from the address (aliases, UPN), and shared mailboxes (user name set to the shared address).
 

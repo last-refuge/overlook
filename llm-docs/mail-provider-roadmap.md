@@ -11,7 +11,7 @@ Mail support does not imply calendar, contacts, or meeting support. Those capabi
 - **Gmail:** a dedicated Gmail API provider and Google sign-in already exist. Validate Google Workspace accounts and organization policies through this integration rather than introducing a second Google provider. Google verification and CASA work are tracked separately in the [CASA assessment handoff](casa/README.md) and [remediation plan](casa-remediation-plan.md).
 - **IMAP and SMTP:** receiving and sending implementations exist, with TLS/STARTTLS, password authentication, account setup, and stored credentials. Protocol availability is not proof of compatibility with a particular hosted service.
 - **POP3:** implemented, including local message storage, UIDL tracking, retention policies, and SMTP sending. It is available in account setup.
-- **Microsoft:** milestone 1 is implemented: IMAP or POP3 and SMTP accounts that sign in with Microsoft (OAuth 2.0, SASL `XOAUTH2`) instead of a password. See [Microsoft accounts over IMAP, POP3 and SMTP](microsoft-mail.md). It is tested against scripted servers only. The Last Refuge app registration does not exist yet, and no real Microsoft account has signed in.
+- **Microsoft:** milestone 1 is implemented: IMAP or POP3 and SMTP accounts that sign in with Microsoft (OAuth 2.0, SASL `XOAUTH2`) instead of a password. See [Microsoft accounts over IMAP, POP3 and SMTP](microsoft-mail.md). A real personal Microsoft account was tested on 13 November 2026, using a registration supplied through `microsoft-oauth-client.json`. The permanent Last Refuge registration is not compiled in yet, and Microsoft 365 work accounts are untested.
 - **Discovery:** built-in presets are tried first, then Thunderbird's ISPDB, then an unverified server-name guess. An automatically discovered endpoint does not establish compatible authentication or account eligibility.
 
 The built-in IMAP presets name Fastmail, iCloud, Yahoo, AOL, Zoho, Proton Mail Bridge, Posteo, mailbox.org, GMX, WEB.DE, and Gmail. Outlook.com, Hotmail, Live and MSN addresses now resolve to Microsoft sign-in. The misleading HEY and Tuta entries were replaced with explanations that the services cannot be added. POP3 presets cover Fastmail, Yahoo, AOL, Zoho, Posteo, mailbox.org, GMX, WEB.DE, and Gmail. These are configuration entries, not a verified service-support list.
@@ -39,7 +39,10 @@ The ignored tests require real-server configuration and were not run. These resu
 
 ### 1. Microsoft
 
-**Status (12 November 2026):** milestone 1 is built: IMAP/SMTP with OAuth, chosen over a Graph adapter, and a built-in client id with a file override. Next steps are the Entra registration, then the qualification list in [microsoft-mail.md](microsoft-mail.md).
+**Status (13 November 2026):** milestone 1 is done: IMAP/SMTP with OAuth, chosen over a Graph adapter, and a built-in client id with a file override. It is merged and was tested with a real personal Microsoft account. Remaining:
+- Compile in the permanent client id once its tenant is decided.
+- Publisher verification.
+- Microsoft 365 work-account qualification (administrator consent, SMTP AUTH settings), from the list in [microsoft-mail.md](microsoft-mail.md).
 
 Microsoft is the most consequential missing integration in this roadmap. Cover personal Outlook.com/Hotmail/Live accounts first, then qualify Microsoft 365 organizations, including their consent and access policies.
 
