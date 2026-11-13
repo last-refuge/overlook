@@ -11,6 +11,9 @@ use std::fmt::Display;
 pub const SECURE_CONNECTION_FAILED: &str = "couldn't make a secure connection to the server";
 /// The server's certificate chain, validity, or hostname was rejected.
 pub const CERTIFICATE_NOT_TRUSTED: &str = "the server's security certificate isn't trusted";
+/// A server on this computer presented a different certificate from the one the person
+/// trusted for it.
+pub const CERTIFICATE_CHANGED: &str = "the server's security certificate has changed since you trusted it";
 /// The server could not be reached at all (DNS, refused, timeout, dropped).
 pub const NETWORK_FAILED: &str = "couldn't reach the server";
 /// The host name cannot be used for TLS server-name verification.
@@ -98,7 +101,7 @@ mod tests {
 
     #[test]
     fn constants_carry_no_library_detail() {
-        for message in [SECURE_CONNECTION_FAILED, CERTIFICATE_NOT_TRUSTED, NETWORK_FAILED, INVALID_SERVER_NAME, UNREADABLE_RESPONSE] {
+        for message in [SECURE_CONNECTION_FAILED, CERTIFICATE_NOT_TRUSTED, CERTIFICATE_CHANGED, NETWORK_FAILED, INVALID_SERVER_NAME, UNREADABLE_RESPONSE] {
             for word in ["rustls", "ureq", "lettre", "webpki", "alert", "{"] {
                 assert!(!message.contains(word), "{message}");
             }

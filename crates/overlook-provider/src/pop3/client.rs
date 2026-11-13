@@ -11,7 +11,7 @@
 //! [`ProviderError::Rejected`] with the server's words, except the temporary codes.
 
 use crate::credential::{Credential, Secret};
-use crate::imap::connection::{tcp_connect, wrap_tls, Stream};
+use crate::imap::connection::{tcp_connect, unencrypted_refusal, wrap_tls, Stream};
 use crate::ProviderError;
 use overlook_core::{Security, ServerEndpoint};
 use std::collections::BTreeMap;
@@ -41,9 +41,13 @@ impl Client {
         }
         let host = endpoint.host.trim().to_owned();
         let tcp = tcp_connect(endpoint, timeout)?;
+        if endpoint.security == Security::None {
+            // Plain text only ever goes to this computer, whatever the name resolved to.
+            crate::pinning::require_loopback(&tcp).map_err(|e| unencrypted_refusal(endpoint, e))?;
+        }
         let mut client = match endpoint.security {
             Security::Tls => {
-                let mut c = Self { stream: BufReader::new(wrap_tls(&host, tcp)?), host: host.clone(), commands: Vec::new() };
+                let mut c = Self { stream: BufReader::new(wrap_tls(endpoint, tcp)?), host: host.clone(), commands: Vec::new() };
                 c.greeting()?;
                 c
             }
@@ -61,7 +65,7 @@ impl Client {
                     Err(e) => return Err(e),
                 }
                 let Stream::Plain(tcp) = plain.stream.into_inner() else { unreachable!("plaintext before STLS") };
-                Self { stream: BufReader::new(wrap_tls(&host, tcp)?), host: host.clone(), commands: plain.commands }
+                Self { stream: BufReader::new(wrap_tls(endpoint, tcp)?), host: host.clone(), commands: plain.commands }
             }
         };
         if endpoint.username.trim().is_empty() {

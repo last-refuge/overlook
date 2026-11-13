@@ -81,7 +81,6 @@ pub fn preset(domain: &str, email: &str) -> Option<Suggestion> {
     // (domains, provider, imap host, imap port, imap security, smtp host, smtp port, smtp security)
     const TABLE: &[(&[&str], &str, &str, u16, Security, &str, u16, Security)] = &[
         (&["zoho.com", "zohomail.com", "zoho.eu", "zohomail.eu"], "Zoho Mail", "imap.zoho.com", 993, Security::Tls, "smtp.zoho.com", 465, Security::Tls),
-        (&["proton.me", "protonmail.com", "protonmail.ch", "pm.me"], "Proton Mail Bridge", "127.0.0.1", 1143, Security::StartTls, "127.0.0.1", 1025, Security::StartTls),
         (&["posteo.de", "posteo.net", "posteo.eu", "posteo.org", "posteo.ch", "posteo.at"], "Posteo", "posteo.de", 993, Security::Tls, "posteo.de", 465, Security::Tls),
         (&["mailbox.org"], "mailbox.org", "imap.mailbox.org", 993, Security::Tls, "smtp.mailbox.org", 465, Security::Tls),
         (&["gmx.de", "gmx.net", "gmx.at", "gmx.ch", "gmx.com", "gmx.us"], "GMX", "imap.gmx.net", 993, Security::Tls, "mail.gmx.net", 465, Security::Tls),
@@ -210,7 +209,8 @@ mod tests {
         assert!(preset("example.com", "x@example.com").is_none());
         let g = guess("example.com", "x@example.com");
         assert_eq!((g.source, g.servers.incoming.host.as_str(), g.servers.outgoing.port), (Source::Guess, "mail.example.com", 587));
-        assert_eq!(preset("proton.me", "x@proton.me").unwrap().servers.incoming.host, "127.0.0.1");
+        let proton = preset("proton.me", "x@proton.me").unwrap();
+        assert_eq!((proton.provider.as_deref(), proton.servers.incoming.address(), proton.servers.outgoing.address()), (Some("Proton Mail"), "127.0.0.1:1143".to_owned(), "127.0.0.1:1025".to_owned()));
     }
 
     #[test]

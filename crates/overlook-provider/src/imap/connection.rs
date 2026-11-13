@@ -72,9 +72,17 @@ fn io_error(host: &str, what: &str, e: &std::io::Error) -> ProviderError {
     use std::io::ErrorKind::*;
     match e.kind() {
         // rustls reports certificate and protocol failures as InvalidData.
+        InvalidData if what == HANDSHAKE => ProviderError::Rejected(handshake_failed(host, crate::secure_error::io(what, e))),
         InvalidData => ProviderError::Rejected(format!("{what} to {host} failed: {}", crate::secure_error::io(what, e))),
         _ => ProviderError::Offline,
     }
+}
+
+const HANDSHAKE: &str = "The TLS handshake";
+
+/// "The TLS handshake to 127.0.0.1 failed: …", with one of the fixed messages.
+pub(crate) fn handshake_failed(host: &str, message: &str) -> String {
+    format!("{HANDSHAKE} to {host} failed: {message}")
 }
 
 pub(crate) fn tcp_connect(endpoint: &ServerEndpoint, timeout: Duration) -> Result<TcpStream, ProviderError> {
@@ -82,9 +90,10 @@ pub(crate) fn tcp_connect(endpoint: &ServerEndpoint, timeout: Duration) -> Resul
     if host.is_empty() {
         return Err(ProviderError::Rejected("no incoming server is set for this account".into()));
     }
-    let mut addrs = (host, endpoint.port).to_socket_addrs().map_err(|_| ProviderError::Offline)?;
-    let addr = addrs.next().ok_or(ProviderError::Offline)?;
-    let tcp = TcpStream::connect_timeout(&addr, timeout).map_err(|_| ProviderError::Offline)?;
+    // Each address in turn, as a name like `localhost` may list `::1` before the 127.0.0.1
+    // a server listens on.
+    let addrs = (host, endpoint.port).to_socket_addrs().map_err(|_| ProviderError::Offline)?;
+    let tcp = addrs.into_iter().find_map(|addr| TcpStream::connect_timeout(&addr, timeout).ok()).ok_or(ProviderError::Offline)?;
     tcp.set_read_timeout(Some(timeout)).map_err(|_| ProviderError::Offline)?;
     tcp.set_write_timeout(Some(timeout)).map_err(|_| ProviderError::Offline)?;
     let _ = tcp.set_nodelay(true);
@@ -92,18 +101,44 @@ pub(crate) fn tcp_connect(endpoint: &ServerEndpoint, timeout: Duration) -> Resul
 }
 
 /// Completes the TLS handshake before the stream is handed to the IMAP client, so a
-/// certificate problem is reported as such rather than as a lost connection.
-pub(crate) fn wrap_tls(host: &str, mut tcp: TcpStream) -> Result<Stream, ProviderError> {
+/// certificate problem is reported as such rather than as a lost connection. A server on this
+/// computer whose certificate the person chose to trust is held to exactly that certificate
+/// ([`crate::pinning`]); every other server is verified against the public roots.
+pub(crate) fn wrap_tls(endpoint: &ServerEndpoint, mut tcp: TcpStream) -> Result<Stream, ProviderError> {
+    let host = endpoint.host.trim();
+    let pin = crate::pinning::pin_for(endpoint);
+    let config = match pin {
+        Some(pin) => {
+            crate::pinning::require_loopback(&tcp)?;
+            crate::pinning::client_config(pin)?
+        }
+        None => tls_config(),
+    };
     let name = rustls::pki_types::ServerName::try_from(host.to_owned()).map_err(|e| { crate::secure_error::log_detail("TLS server name", e); ProviderError::Rejected(format!("“{host}”: {}", crate::secure_error::INVALID_SERVER_NAME)) })?;
-    let mut conn = rustls::ClientConnection::new(tls_config(), name).map_err(|e| { crate::secure_error::log_detail("TLS setup", &e); ProviderError::Rejected(crate::secure_error::rustls_message(&e).into()) })?;
+    let mut conn = rustls::ClientConnection::new(config, name).map_err(|e| { crate::secure_error::log_detail("TLS setup", &e); ProviderError::Rejected(crate::secure_error::rustls_message(&e).into()) })?;
     while conn.is_handshaking() {
-        conn.complete_io(&mut tcp).map_err(|e| io_error(host, "The TLS handshake", &e))?;
+        conn.complete_io(&mut tcp).map_err(|e| {
+            if pin.is_some() && crate::pinning::is_mismatch_io(&e) {
+                crate::secure_error::log_detail("The TLS handshake", &e);
+                return ProviderError::Rejected(handshake_failed(host, crate::secure_error::CERTIFICATE_CHANGED));
+            }
+            io_error(host, HANDSHAKE, &e)
+        })?;
     }
     Ok(Stream::Tls(Box::new(rustls::StreamOwned::new(conn, tcp))))
 }
 
+/// The refusal for an unencrypted connection whose name led somewhere other than this
+/// computer.
+pub(crate) fn unencrypted_refusal(endpoint: &ServerEndpoint, e: ProviderError) -> ProviderError {
+    match e {
+        ProviderError::Rejected(_) => ProviderError::Rejected(format!("refusing to connect to {} without encryption", endpoint.host)),
+        other => other,
+    }
+}
+
 /// Reads the greeting, sends `STARTTLS`, and returns the socket once the server says OK.
-fn starttls_by_hand(host: &str, tcp: TcpStream) -> Result<TcpStream, ProviderError> {
+pub(crate) fn starttls_by_hand(host: &str, tcp: TcpStream) -> Result<TcpStream, ProviderError> {
     let mut reader = BufReader::new(tcp.try_clone().map_err(|_| ProviderError::Offline)?);
     let mut writer = tcp;
     let mut line = String::new();
@@ -178,10 +213,14 @@ fn open(endpoint: &ServerEndpoint, secret: Secret<'_>, timeout: Duration) -> Res
     }
     let host = endpoint.host.trim();
     let tcp = tcp_connect(endpoint, timeout)?;
+    if endpoint.security == Security::None {
+        // Plain text only ever goes to this computer, whatever the name resolved to.
+        crate::pinning::require_loopback(&tcp).map_err(|e| unencrypted_refusal(endpoint, e))?;
+    }
     let socket = tcp.try_clone().map_err(|_| ProviderError::Offline)?;
     let mut client = match endpoint.security {
         Security::Tls => {
-            let mut c = imap::Client::new(wrap_tls(host, tcp)?);
+            let mut c = imap::Client::new(wrap_tls(endpoint, tcp)?);
             c.read_greeting().map_err(|e| map_error(&e))?;
             c
         }
@@ -192,7 +231,7 @@ fn open(endpoint: &ServerEndpoint, secret: Secret<'_>, timeout: Duration) -> Res
         }
         Security::StartTls => {
             let tcp = starttls_by_hand(host, tcp)?;
-            let mut c = imap::Client::new(wrap_tls(host, tcp)?);
+            let mut c = imap::Client::new(wrap_tls(endpoint, tcp)?);
             // No new greeting after STARTTLS; mark it read so LOGIN does not wait for one.
             c.greeting_read = true;
             c

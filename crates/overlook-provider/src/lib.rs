@@ -16,6 +16,7 @@ pub mod microsoft;
 pub mod mime;
 pub mod oauth;
 pub mod outgoing;
+pub mod pinning;
 pub mod drafts;
 pub mod pop3;
 pub mod sample;

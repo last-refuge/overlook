@@ -223,6 +223,16 @@ create one in Fastmail under Settings → Privacy & Security → Manage app pass
 and keep its default access (Mail, Contacts & Calendars) if you'd like Overlook to connect your calendars too.
 Fastmail's Basic plan doesn't include mail apps. Overlook fills in the server settings, for IMAP or POP3.
 
+## Connect Proton Mail
+
+Proton Mail works through [Proton Mail Bridge](https://proton.me/mail/bridge), Proton's desktop app for paid plans.
+Bridge must be running and signed in on the same computer. Open the account menu → **Add Proton account…**, and use the
+password Bridge shows in the account's mailbox details, not your Proton password. Bridge encrypts the connection with a
+certificate it made itself, so the first connection test asks you to trust it. Overlook then accepts that certificate,
+and no other, from Bridge on this computer. If Bridge's certificate ever changes, Overlook stops and asks again. The
+settings are filled in with Bridge's defaults (IMAP 127.0.0.1:1143 and SMTP 127.0.0.1:1025 with STARTTLS); change them
+if you changed them in Bridge.
+
 ## Keyboard
 
 | Key | Action |
@@ -275,8 +285,8 @@ native subset; see [rendering policy and limits](docs/message-formatting.md).
 ## Status
 
 Early daily use by its author on Omarchy (Hyprland, Wayland). Gmail accounts work end to end. IMAP/SMTP and
-POP3 are tested against scripted servers, and real Outlook.com (Microsoft sign-in), iCloud and Yahoo accounts have
-been tried by hand. Treat other services, and Microsoft 365 work accounts, as beta. A Flatpak build,
+POP3 are tested against scripted servers, and real Outlook.com (Microsoft sign-in), iCloud, Yahoo, Fastmail and Proton
+Mail (through Bridge) accounts have been tried by hand. Treat other services, and Microsoft 365 work accounts, as beta. A Flatpak build,
 GNOME, KDE, and screen-reader testing are still to be done. Open an issue with what you did, what you saw, and what you
 expected.
 
