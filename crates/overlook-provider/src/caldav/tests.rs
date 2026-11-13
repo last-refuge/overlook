@@ -397,6 +397,7 @@ fn fastmail_preset_uses_incoming_host_and_requires_explicit_credential_choice() 
         ),
         pop3: None,
         imap: None,
+        oauth: None,
     };
     let preset = fastmail_preset(&servers).unwrap();
     assert_eq!(preset.username, "owner@custom.example");

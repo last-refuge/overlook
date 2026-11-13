@@ -177,6 +177,27 @@ files. In Google's *Testing* mode you will be asked to sign in again every seven
 in Google Cloud lifts that. The [native app guide](llm-docs/overlook-native-app.md#gmail) has the details.
 The [secrets access policy](docs/secrets-policy.md) lists every stored secret, who can reach it, and how access is logged.
 
+## Connect Microsoft
+
+Outlook.com, Hotmail, Live and MSN addresses and Microsoft 365 work or school accounts are read over IMAP (or
+POP3) and sent over SMTP. You sign in with Microsoft in your browser. Overlook never sees your password, and it
+keeps the sign-in Microsoft issues in your system keyring.
+
+1. Open the account menu at the bottom of the sidebar → **Add Microsoft account…** (or Settings → Accounts →
+   Add account → Microsoft).
+2. Enter your address and choose **Sign in with Microsoft**, then approve Overlook in the browser.
+3. Overlook fills in Microsoft's server settings, checks both servers, and adds the account.
+
+An Outlook.com address entered as an IMAP or POP3 account switches to this sign-in by itself, because Microsoft
+no longer accepts passwords from mail apps. Microsoft 365 organizations may need an administrator to approve
+Overlook first, and some turn off IMAP, POP or SMTP sign-in for mail apps; Overlook tells you which. Outlook.com
+accounts set up as POP3 need POP turned on in Outlook.com's settings.
+
+Overlook will ship with Last Refuge's Microsoft app registration built in, but current builds don't have one yet.
+Until then, register a public client in Microsoft Entra (redirect URI `http://localhost`, personal and work
+accounts) and save `{"client_id": "<application id>"}` as `~/.config/overlook/microsoft-oauth-client.json`. The
+[Microsoft account notes](llm-docs/microsoft-mail.md#the-app-registration) walk through it.
+
 ## Keyboard
 
 | Key | Action |
@@ -230,7 +251,8 @@ native subset; see [rendering policy and limits](docs/message-formatting.md).
 
 Early daily use by its author on Omarchy (Hyprland, Wayland). Gmail accounts work end to end. IMAP/SMTP and
 POP3 are built and tested against scripted servers and public servers' login exchanges, but no real account
-has been synced yet, so treat them as beta; Microsoft 365 needs OAuth, which is not there yet. A Flatpak build,
+has been synced yet, so treat them as beta. Outlook.com and Microsoft 365 sign in with Microsoft (OAuth), tested so
+far against scripted servers only. A Flatpak build,
 GNOME, KDE, and screen-reader testing are still to be done. Open an issue with what you did, what you saw, and what you
 expected.
 

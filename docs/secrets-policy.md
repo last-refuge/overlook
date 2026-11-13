@@ -1,8 +1,10 @@
 # Secrets access policy
 
-This policy covers Overlook 1.6.1. It lists every secret Overlook keeps, which parts of Overlook may read,
-write or delete it, which users and processes the operating system lets reach it, and how that access
-is logged. All statements are checked against the source; paths are relative to the repository root.
+This policy covers Overlook 1.6.1, plus the Microsoft sign-in added for 1.6.22. Line references in the
+Microsoft rows and paragraphs are to 1.6.22; the rest are to 1.6.1. It lists every secret Overlook
+keeps, which parts of Overlook may read, write or delete it, which users and processes the operating
+system lets reach it, and how that access is logged. All statements are checked against the source;
+paths are relative to the repository root.
 
 ## Where secrets live
 
@@ -16,7 +18,7 @@ Every secret is one keyring item with exactly three attributes (`credentials.rs:
 | Attribute     | Value                                                                     |
 |---------------|---------------------------------------------------------------------------|
 | `application` | `ai.lastrefuge.Overlook` (`credentials.rs:22`)                            |
-| `account`     | the Overlook account id: `gmail:<address>`, `imap:<address>` or `pop3:<address>` |
+| `account`     | the Overlook account id: `gmail:<address>`, `imap:<address>` or `pop3:<address>` (Microsoft accounts are `imap:` or `pop3:` accounts) |
 | `kind`        | one of the values in the table below                                      |
 
 The item label shown in keyring managers is `Overlook <what> (<account id>)` (`credentials.rs:113-121`).
@@ -30,6 +32,7 @@ attribute. The secret value never does.
 | Google OAuth tokens | `oauth-tokens` | JSON of `OAuthTokens`: `access_token`, `refresh_token`, `expires_at`, `scope`, `signed_in_at` (`crates/overlook-provider/src/gmail/oauth.rs:35-46`) | Google sign-in completing (`crates/overlook-app/src/ui/mod.rs:1227`); each access-token refresh, through the client's token sink (`crates/overlook-app/src/providers.rs:49`) | Provider creation when an account loads (`providers.rs:110`); sign-out or removal when no live client exists, to revoke the grant first (`ui/mod.rs:314`) | Google rejecting the refresh token with `invalid_grant` (`providers.rs:56`); sign-out, removal, and automatic sign-out after 90 days idle or 180 days since sign-in (`ui/mod.rs:310-322`, `ui/mod.rs:981-986`) |
 | IMAP or POP3 password | `password:incoming` | UTF-8 password | Account setup and "Update password" (`crates/overlook-app/src/ui/account_setup.rs:528`) | Provider creation (`providers.rs:90`); setup's connection test and form (`account_setup.rs:420`); CalDAV sync when the calendar reuses the mail password (`crates/overlook-app/src/caldav_sync.rs:113-118`) | Sign-out and removal (`ui/mod.rs:319`) |
 | SMTP password | `password:outgoing` | UTF-8 password; absent when "same as incoming" is chosen | Account setup (`account_setup.rs:533`) | Provider creation (`providers.rs:92`); setup form (`account_setup.rs:166`, `:428`) | Setup when "same as incoming" is chosen (`account_setup.rs:534`); sign-out and removal (`ui/mod.rs:319`) |
+| Microsoft OAuth tokens (1.6.22) | `oauth-tokens:microsoft` (`crates/overlook-app/src/credentials.rs:29`) | JSON of `OAuthTokens` (`crates/overlook-provider/src/oauth.rs:13-23`) with the public `client_id` and `tenant` of the app registration that issued them, so refreshes keep using it (`credentials.rs:202-228`). No client secret exists. | A Microsoft sign-in completing in the setup dialog or with Sign in again, through `providers::adopt_microsoft_sign_in` (`crates/overlook-app/src/providers.rs:130-140`, called at `crates/overlook-app/src/ui/account_setup.rs:614` and `:1018`); each access-token refresh, through the session's token sink, and only while that session is the account's newest sign-in (`providers.rs:157-172`) | Provider creation when an account loads (`providers.rs:200-201`); the setup dialog's connection test for an account with no session running (`account_setup.rs:829`) | Microsoft rejecting the refresh token with `invalid_grant`, again only from the newest session (`providers.rs:174-183`); sign-out, removal, and automatic sign-out after 90 days idle or 180 days since sign-in (`crates/overlook-app/src/ui/mod.rs:438-456`) |
 | CalDAV app password (for example Fastmail) | `password:calendar:<connection id>` (`crates/overlook-core/src/calendar_connection.rs:76-78`) | UTF-8 password; only when the connection uses a separate credential | Calendar connection setup and password change (`crates/overlook-app/src/ui/calendar_setup.rs:286`, `:336`) | CalDAV sync (`caldav_sync.rs:118`) | Setup failure or superseded setup (`calendar_setup.rs:288`, `:339`); replacing the connection (`:295`); disconnecting calendars (`:381`); sign-out and removal (`ui/mod.rs:319`) |
 
 Lifetime: each item exists from the write until one of the deletions listed. Google OAuth tokens also
@@ -37,6 +40,24 @@ end at Google's side: sign-out and removal revoke the grant before the local del
 signed out automatically after 90 days without a refresh (`SESSION_IDLE_LIMIT_MS`) or 180 days after
 sign-in (`SESSION_MAX_AGE_MS`), see `crates/overlook-provider/src/gmail/api.rs:45-51` and `:448-456`.
 Passwords have no expiry inside Overlook; they last until sign-out, removal or replacement.
+
+Microsoft OAuth tokens end only on this device: Microsoft offers no endpoint for revoking a single
+refresh token. Sign-out and removal first stop every running session of the account from storing
+tokens again (`providers::end_microsoft_sign_ins`, `providers.rs:151-153`). They then end the live
+session (`MicrosoftSession::disconnect`, `crates/overlook-provider/src/microsoft/session.rs:104-109`)
+and delete the item. Settings → Accounts tells the user to remove Overlook's access in their Microsoft
+account. The 90- and 180-day limits apply as for Google (`crates/overlook-provider/src/oauth.rs`,
+`SESSION_IDLE_LIMIT_MS` and `SESSION_MAX_AGE_MS`). Converting an Outlook.com password account to
+Microsoft sign-in deletes its stored passwords (`account_setup.rs:1028-1030`).
+
+### The Microsoft app registration
+
+Overlook signs in to Microsoft as a public client. Its application (client) id is public, as in every
+desktop mail client, and no client secret exists; PKCE protects the authorization code. The id is
+compiled in (`crates/overlook-provider/src/microsoft/oauth.rs`, `BUILT_IN_CLIENT_ID`). An optional
+`microsoft-oauth-client.json` in `~/.config/overlook/` (or `$OVERLOOK_CONFIG_DIR`) can name another:
+`{"client_id": "…", "tenant": "…"}`. Overlook only reads that file, at sign-in
+(`crates/overlook-app/src/microsoft_signin.rs:25-48`). It holds nothing secret.
 
 ### The Google OAuth client file
 
@@ -56,7 +77,7 @@ the secret (`oauth.rs:48-52`). File permissions are whatever the user saved it w
 | The desktop user who owns the session, while the keyring is unlocked | All items, through Overlook or any keyring manager (Seahorse, KWalletManager, `secret-tool`). |
 | Other processes in that user's session | Can query the Secret Service over the session D-Bus. This is the documented Secret Service model: the keyring trusts the unlocked user session, not individual programs. |
 | Other local users, and the user's processes when the keyring is locked | No access. Items are encrypted at rest by the keyring daemon and the session bus is per user. |
-| Last Refuge or any remote server | No access. Overlook has no server of its own; tokens go only to Google, passwords only to the user's configured mail and CalDAV servers. |
+| Last Refuge or any remote server | No access. Overlook has no server of its own. Google tokens go only to Google; Microsoft tokens go only to Microsoft's sign-in service (`login.microsoftonline.com`) and the account's mail servers (`outlook.office365.com` and Microsoft's SMTP hosts by default); passwords go only to the user's configured mail and CalDAV servers. |
 
 Released builds (Arch package and tarball) run unsandboxed and use the Secret Service as above.
 A Flatpak manifest exists as a draft (`packaging/ai.lastrefuge.Overlook.yml`) but is not built or
@@ -78,6 +99,7 @@ module reaches the keyring through it. Its public functions:
 | `delete_all_secrets(account)` | 162 | every item of one account: `application` and `account`, any `kind` |
 | `save_tokens` / `load_tokens` / `delete_tokens` | 175, 181, 189 | wrappers over the above with `kind = oauth-tokens` |
 | `save_password` / `load_password` | 195, 201 | wrappers with a password `kind` |
+| `save_microsoft_tokens` / `load_microsoft_tokens` (1.6.22) | 211, 219 | wrappers with `kind = oauth-tokens:microsoft` |
 
 There is no wildcard search across accounts or applications. The only broader query is
 `delete_all_secrets`, used by sign-out and account removal (`ui/mod.rs:319`): it matches on
@@ -89,7 +111,7 @@ passwords, and nothing else.
 | Place | Mechanism |
 |---|---|
 | Configuration and SQLite | Server settings types exclude passwords by design (`crates/overlook-core/src/servers.rs:84`, `:181`); the store notes passwords are kept in the keyring only (`crates/overlook-store/src/lib.rs:1030`). No code path writes tokens or passwords to a file. |
-| `Debug` output | Redacting `Debug` impls: `OAuthTokens` and `ClientConfig` (`oauth.rs:48-58`), PKCE (`oauth.rs:257`), `ImapProvider` (`crates/overlook-provider/src/imap/mod.rs:425`), `Pop3Provider` (`crates/overlook-provider/src/pop3/mod.rs:177`), SMTP `Transport` (`crates/overlook-provider/src/smtp.rs:36`), `CalDavClient` (`crates/overlook-provider/src/caldav/mod.rs:113-119`). |
+| `Debug` output | Redacting `Debug` impls: `OAuthTokens` and `ClientConfig` (`oauth.rs:48-58`), PKCE (`oauth.rs:257`); from 1.6.22 `OAuthTokens` and PKCE live in `crates/overlook-provider/src/oauth.rs` (`:25`, `:86`), with `MicrosoftSession` (`microsoft/session.rs:40`) and `Credential` (`credential.rs:31`) beside them; `ImapProvider` (`crates/overlook-provider/src/imap/mod.rs:425`), `Pop3Provider` (`crates/overlook-provider/src/pop3/mod.rs:177`), SMTP `Transport` (`crates/overlook-provider/src/smtp.rs:36`), `CalDavClient` (`crates/overlook-provider/src/caldav/mod.rs:113-119`). |
 | Logs | Release builds use the fixed filter `overlook=info` and ignore `RUST_LOG` (`crates/overlook-app/src/main.rs:138-146`). Library targets that can carry wire bytes or secrets (`ureq`, `rustls`, `lettre`, `imap`, `oo7`, `zbus`, `zvariant`) are dropped in every build (`main.rs:166-168`). Keyring library errors go only to `overlook::diag` at debug level, which release builds do not record, and users see constant messages (`credentials.rs:77-85`). The log file is mode 0600 in a 0700 data folder (`main.rs:118-132`). |
 | Crash output | Release builds replace the panic output with the fixed line `PANIC_NOTICE` on stderr and send the location and message only to the private log (`main.rs:150-162`). |
 

@@ -10,8 +10,10 @@
 //! - the connection drops after the message body was written → [`ProviderError::Uncertain`]:
 //!   the server may have queued it, so the Outbox must reconcile before any retry.
 //!
-//! Passwords are passed in at construction and never logged.
+//! Sign-in is `AUTH PLAIN`/`LOGIN` with a password, or `AUTH XOAUTH2` with an access token
+//! for OAuth accounts. Credentials are passed in at construction and never logged.
 
+use crate::credential::{Credential, Secret};
 use crate::ProviderError;
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::transport::smtp::client::{SmtpConnection, TlsParameters};
@@ -26,23 +28,28 @@ use std::time::Duration;
 /// Socket connect/read/write timeout. A hung server must not stall the sync thread.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// What Microsoft 365 means by `535 5.7.139 … SmtpClientAuthentication is disabled`: signing
+/// in again cannot help.
+pub const SMTP_AUTH_DISABLED: &str = "the organization has turned off sending from mail apps (SMTP AUTH) for this mailbox. An administrator can turn it on for the mailbox in Microsoft 365";
+
 /// One SMTP server with the credentials to use it.
 pub struct Transport {
     endpoint: ServerEndpoint,
-    password: String,
+    credential: Credential,
     timeout: Duration,
 }
 
 impl std::fmt::Debug for Transport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The password is deliberately absent.
+        // The credential is deliberately absent.
         f.debug_struct("Transport").field("endpoint", &self.endpoint).field("timeout", &self.timeout).finish()
     }
 }
 
 impl Transport {
-    pub fn new(endpoint: ServerEndpoint, password: impl Into<String>) -> Self {
-        Self { endpoint, password: password.into(), timeout: DEFAULT_TIMEOUT }
+    /// `credential` is a password, or an OAuth account's token source.
+    pub fn new(endpoint: ServerEndpoint, credential: impl Into<Credential>) -> Self {
+        Self { endpoint, credential: credential.into(), timeout: DEFAULT_TIMEOUT }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -93,7 +100,13 @@ impl Transport {
         Ok(accepted.message().collect::<Vec<_>>().join(" "))
     }
 
+    /// Connects and signs in. A refused access token is retried once on a new connection
+    /// with a refreshed token.
     fn connect(&self) -> Result<SmtpConnection, ProviderError> {
+        self.credential.sign_in(|secret| self.open(secret))
+    }
+
+    fn open(&self, secret: Secret<'_>) -> Result<SmtpConnection, ProviderError> {
         let endpoint = &self.endpoint;
         if endpoint.is_insecure_remote() {
             return Err(ProviderError::Rejected(format!("refusing to send to {} without encryption", endpoint.host)));
@@ -114,9 +127,28 @@ impl Transport {
             }
         }
         if !endpoint.username.is_empty() {
-            tracing::info!(target: "overlook::signin", host = %endpoint.host, port = endpoint.port, mechanisms = "PLAIN LOGIN", username = "[account]", password = "[REDACTED]", "SMTP sign-in");
-            conn.auth(&[Mechanism::Plain, Mechanism::Login], &Credentials::new(endpoint.username.clone(), self.password.clone())).map_err(|e| {
+            let (mechanisms, credentials): (&[Mechanism], Credentials) = match secret {
+                Secret::Password(password) => {
+                    tracing::info!(target: "overlook::signin", host = %endpoint.host, port = endpoint.port, mechanisms = "PLAIN LOGIN", username = "[account]", password = "[REDACTED]", "SMTP sign-in");
+                    (&[Mechanism::Plain, Mechanism::Login], Credentials::new(endpoint.username.clone(), password.to_owned()))
+                }
+                Secret::AccessToken(token) => {
+                    if !conn.server_info().supports_auth_mechanism(Mechanism::Xoauth2) {
+                        return Err(ProviderError::Rejected(NO_SHARED_MECHANISM.into()));
+                    }
+                    tracing::info!(target: "overlook::signin", host = %endpoint.host, port = endpoint.port, mechanisms = "XOAUTH2", username = "[account]", access_token = "[REDACTED]", "SMTP sign-in");
+                    (&[Mechanism::Xoauth2], Credentials::new(endpoint.username.clone(), token.to_owned()))
+                }
+            };
+            let oauth = matches!(secret, Secret::AccessToken(_));
+            conn.auth(mechanisms, &credentials).map_err(|e| {
                 tracing::info!(target: "overlook::signin", host = %endpoint.host, outcome = "rejected or failed", "SMTP sign-in result");
+                // A `334` error challenge to XOAUTH2 (RFC 7628 §3.2.2, as Gmail sends) is a
+                // refused token; lettre cannot answer it and reports a client error.
+                if oauth && e.status().is_none() && e.is_client() {
+                    crate::secure_error::log_detail("SMTP XOAUTH2", &e);
+                    return ProviderError::SignInRequired;
+                }
                 auth_error(e)
             })?;
             tracing::info!(target: "overlook::signin", host = %endpoint.host, outcome = "accepted", "SMTP sign-in result");
@@ -193,17 +225,30 @@ fn tls_message(e: &SmtpError) -> &'static str {
     crate::secure_error::SECURE_CONNECTION_FAILED
 }
 
+/// The outgoing server and Overlook have no sign-in method in common.
+const NO_SHARED_MECHANISM: &str = "the outgoing server offers no sign-in method Overlook supports";
+
 fn auth_error(e: SmtpError) -> ProviderError {
     match e.status() {
+        // Microsoft 365 refuses every sign-in this way while the organization has SMTP AUTH
+        // turned off; asking for a new sign-in would only repeat the refusal. Its other
+        // `5.7.139` replies (basic authentication disabled, security defaults) are ordinary
+        // refusals that a new sign-in can fix.
+        Some(code) if code.severity == Severity::PermanentNegativeCompletion && is_smtp_auth_disabled(&reply_text(&e)) => ProviderError::Rejected(SMTP_AUTH_DISABLED.into()),
         Some(code) if code.severity == Severity::PermanentNegativeCompletion => ProviderError::SignInRequired,
         Some(_) => ProviderError::Temporary(reply_text(&e)),
         // No shared mechanism is a settings problem, not a network one.
         None if e.is_client() => {
             crate::secure_error::log_detail("SMTP authentication", &e);
-            ProviderError::Rejected("the outgoing server offers no sign-in method Overlook supports".into())
+            ProviderError::Rejected(NO_SHARED_MECHANISM.into())
         }
         None => connect_error(e),
     }
+}
+
+/// Microsoft's wording for SMTP AUTH turned off for the organization or the mailbox.
+fn is_smtp_auth_disabled(reply: &str) -> bool {
+    reply.contains("5.7.139") && reply.to_ascii_lowercase().contains("smtpclientauthentication is disabled")
 }
 
 /// Before `DATA` is accepted nothing has left this machine, so a dropped connection is
@@ -231,6 +276,12 @@ pub mod fake {
     pub enum Behaviour {
         Normal,
         RejectAuth,
+        /// Refuses every sign-in as Microsoft 365 does with SMTP AUTH turned off (`5.7.139`).
+        AuthDisabled,
+        /// Refuses password sign-ins as Microsoft does for basic authentication (`5.7.139`).
+        BasicAuthDisabled,
+        /// Answers `AUTH XOAUTH2` with Gmail's JSON error challenge (`334`) and then `535`.
+        XoauthChallenge,
         TemporaryMail,
         RejectRecipient,
         DropAfterData,
@@ -240,7 +291,10 @@ pub mod fake {
     /// What the server saw.
     #[derive(Default, Debug, Clone)]
     pub struct Seen {
+        /// User name and password, or user name and access token for `XOAUTH2`.
         pub auth: Option<(String, String)>,
+        /// `PLAIN` or `XOAUTH2`.
+        pub mechanism: Option<String>,
         pub mail_from: Option<String>,
         pub rcpt: Vec<String>,
         pub data: Option<Vec<u8>>,
@@ -338,17 +392,37 @@ pub mod fake {
             let upper = cmd.to_ascii_uppercase();
             if upper.starts_with("EHLO") {
                 say("250-fake.example");
-                say("250-AUTH PLAIN LOGIN");
+                say("250-AUTH PLAIN LOGIN XOAUTH2");
                 say("250 8BITMIME");
-            } else if upper.starts_with("AUTH PLAIN") {
+            } else if upper.starts_with("AUTH PLAIN") || upper.starts_with("AUTH XOAUTH2") {
                 let b64 = cmd.split_whitespace().nth(2).unwrap_or("");
                 let raw = base64::engine::general_purpose::STANDARD.decode(b64).unwrap_or_default();
-                let mut parts = raw.split(|b| *b == 0).skip(1).map(|p| String::from_utf8_lossy(p).into_owned());
-                seen.auth = Some((parts.next().unwrap_or_default(), parts.next().unwrap_or_default()));
-                if behaviour == Behaviour::RejectAuth {
-                    say("535 5.7.8 Authentication credentials invalid");
+                if upper.starts_with("AUTH XOAUTH2") {
+                    // `user=…^Aauth=Bearer …^A^A`
+                    let text = String::from_utf8_lossy(&raw).into_owned();
+                    let mut fields = text.split('\x01');
+                    let user = fields.next().and_then(|f| f.strip_prefix("user=")).unwrap_or_default().to_owned();
+                    let token = fields.next().and_then(|f| f.strip_prefix("auth=Bearer ")).unwrap_or_default().to_owned();
+                    seen.auth = Some((user, token));
+                    seen.mechanism = Some("XOAUTH2".into());
                 } else {
-                    say("235 2.7.0 Authentication successful");
+                    let mut parts = raw.split(|b| *b == 0).skip(1).map(|p| String::from_utf8_lossy(p).into_owned());
+                    seen.auth = Some((parts.next().unwrap_or_default(), parts.next().unwrap_or_default()));
+                    seen.mechanism = Some("PLAIN".into());
+                }
+                match behaviour {
+                    Behaviour::RejectAuth => say("535 5.7.8 Authentication credentials invalid"),
+                    Behaviour::AuthDisabled => say("535 5.7.139 Authentication unsuccessful, SmtpClientAuthentication is disabled for the Tenant. Visit https://aka.ms/smtp_auth_disabled for more information."),
+                    Behaviour::BasicAuthDisabled => say("535 5.7.139 Authentication unsuccessful, basic authentication is disabled. [SN4PR0601CA0015.namprd06.prod.outlook.com]"),
+                    Behaviour::XoauthChallenge if upper.starts_with("AUTH XOAUTH2") => {
+                        say("334 eyJzdGF0dXMiOiI0MDAiLCJzY2hlbWVzIjoiQmVhcmVyIiwic2NvcGUiOiJodHRwczovL21haWwuZ29vZ2xlLmNvbS8ifQ==");
+                        line.clear();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                            break;
+                        }
+                        say("535 5.7.8 Username and Password not accepted");
+                    }
+                    _ => say("235 2.7.0 Authentication successful"),
                 }
             } else if upper.starts_with("MAIL FROM") {
                 seen.mail_from = Some(cmd.to_owned());
@@ -404,6 +478,45 @@ mod tests {
 
     fn transport(addr: SocketAddr) -> Transport {
         Transport::new(ServerEndpoint::new("127.0.0.1", addr.port(), Security::None, "jason@example.com"), "hunter2").with_timeout(Duration::from_secs(5))
+    }
+
+    /// An OAuth token source that hands out one fixed token.
+    struct FixedToken(&'static str);
+    impl crate::AccessTokenSource for FixedToken {
+        fn access_token(&self, _rejected: Option<&str>) -> Result<String, ProviderError> {
+            Ok(self.0.to_owned())
+        }
+    }
+
+    #[test]
+    fn oauth_accounts_send_with_xoauth2() {
+        let (addr, rx) = serve(Behaviour::Normal);
+        let oauth = Transport::new(ServerEndpoint::new("127.0.0.1", addr.port(), Security::None, "jason@outlook.com"), crate::Credential::OAuth(std::sync::Arc::new(FixedToken("synthetic-token")))).with_timeout(Duration::from_secs(5));
+        oauth.send("jason@outlook.com", &["maya@northstar.example".into()], MESSAGE).unwrap();
+        let seen = rx.recv().unwrap();
+        assert_eq!(seen.mechanism.as_deref(), Some("XOAUTH2"));
+        assert_eq!(seen.auth, Some(("jason@outlook.com".to_owned(), "synthetic-token".to_owned())));
+        assert!(!format!("{oauth:?}").contains("synthetic-token"));
+    }
+
+    #[test]
+    fn smtp_auth_turned_off_by_the_organization_is_not_a_password_problem() {
+        let server = serve_many(Behaviour::AuthDisabled);
+        let oauth = Transport::new(ServerEndpoint::new("127.0.0.1", server.addr.port(), Security::None, "jason@contoso.com"), crate::Credential::OAuth(std::sync::Arc::new(FixedToken("synthetic-token")))).with_timeout(Duration::from_secs(5));
+        assert_eq!(oauth.probe(), Err(ProviderError::Rejected(SMTP_AUTH_DISABLED.into())));
+        assert_eq!(server.wait_for_connections(1).len(), 1, "no second sign-in with a refreshed token");
+        // Microsoft's other 5.7.139 replies stay sign-in problems: basic authentication being
+        // off is what sends an Outlook.com password account to Microsoft sign-in.
+        server.set(Behaviour::BasicAuthDisabled);
+        assert_eq!(transport(server.addr).probe(), Err(ProviderError::SignInRequired));
+    }
+
+    #[test]
+    fn an_xoauth2_error_challenge_is_a_refused_token() {
+        let server = serve_many(Behaviour::XoauthChallenge);
+        let oauth = Transport::new(ServerEndpoint::new("127.0.0.1", server.addr.port(), Security::None, "jason@example.com"), crate::Credential::OAuth(std::sync::Arc::new(FixedToken("synthetic-token")))).with_timeout(Duration::from_secs(5));
+        assert_eq!(oauth.probe(), Err(ProviderError::SignInRequired));
+        assert_eq!(server.wait_for_connections(2).len(), 2, "refused once, retried once with a refreshed token");
     }
 
     const MESSAGE: &[u8] = b"From: Jason <jason@example.com>\r\nTo: maya@northstar.example\r\nSubject: Agenda\r\nMessage-ID: <d1@overlook.lastrefuge.ai>\r\n\r\nA few things to cover.\r\n.leading dot line\r\n";

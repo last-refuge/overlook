@@ -41,23 +41,8 @@ pub type TokenSink = Box<dyn Fn(&OAuthTokens) + Send + Sync>;
 /// Called once when Google rejects the refresh token, so the stored copy can be deleted.
 pub type InvalidationSink = Box<dyn Fn() + Send + Sync>;
 
-/// A Gmail session that has not refreshed its access token for this long is signed out:
-/// the refresh token is revoked at Google and deleted locally. Shorter than Google's own
-/// six-month expiry for unused refresh tokens.
-pub const SESSION_IDLE_LIMIT_MS: i64 = 90 * 24 * 60 * 60 * 1000;
-
-/// However active, a Gmail session ends this long after its sign-in: the refresh token is
-/// revoked and deleted, and the user signs in again.
-pub const SESSION_MAX_AGE_MS: i64 = 180 * 24 * 60 * 60 * 1000;
-
-/// Why a session has ended on its own.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SessionExpiry {
-    /// Unused for [`SESSION_IDLE_LIMIT_MS`].
-    Idle,
-    /// Older than [`SESSION_MAX_AGE_MS`].
-    MaxAge,
-}
+// Session limits are shared with Microsoft sign-ins; see `crate::oauth`.
+pub use crate::oauth::{session_expiry, session_idle_expired, SessionExpiry, SESSION_IDLE_LIMIT_MS, SESSION_MAX_AGE_MS};
 
 /// Minimum spacing between requests. Gmail meters usage in quota units per user per minute;
 /// a `messages.get` costs 5 units, so 6 requests per second stays well inside the default
@@ -451,22 +436,6 @@ fn api_message(text: &str) -> String {
         .ok()
         .and_then(|v| v.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()).map(str::to_owned))
         .unwrap_or_else(|| text.chars().take(200).collect())
-}
-
-/// See [`SESSION_IDLE_LIMIT_MS`]. A zero `expires_at` means no session at all.
-pub fn session_idle_expired(expires_at: i64, now: i64) -> bool {
-    expires_at > 0 && now - expires_at > SESSION_IDLE_LIMIT_MS
-}
-
-/// See [`SessionExpiry`]. The absolute limit is checked first.
-pub fn session_expiry(tokens: &OAuthTokens, now: i64) -> Option<SessionExpiry> {
-    if tokens.signed_in_at > 0 && now - tokens.signed_in_at > SESSION_MAX_AGE_MS {
-        Some(SessionExpiry::MaxAge)
-    } else if session_idle_expired(tokens.expires_at, now) {
-        Some(SessionExpiry::Idle)
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]

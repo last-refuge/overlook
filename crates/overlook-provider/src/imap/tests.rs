@@ -55,6 +55,7 @@ fn provider(server: &FakeServer) -> ImapProvider {
         outgoing: ServerEndpoint::new("127.0.0.1", 1, Security::None, "jason@example.com"),
         pop3: None,
         imap: None,
+        oauth: None,
     };
     ImapProvider::new(servers, "hunter2").with_timeout(Duration::from_secs(5)).with_inbox_limit(20)
 }
@@ -414,7 +415,7 @@ fn server_failures_map_to_provider_errors() {
     assert_eq!(block(provider(&server).probe()), Err(ProviderError::Offline), "a fresh connection that dies is Offline");
 
     let unreachable = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
-    let servers = MailServers { incoming: ServerEndpoint::new("127.0.0.1", unreachable.port(), Security::None, "j"), outgoing: ServerEndpoint::new("127.0.0.1", 1, Security::None, "j"), pop3: None, imap: None };
+    let servers = MailServers { incoming: ServerEndpoint::new("127.0.0.1", unreachable.port(), Security::None, "j"), outgoing: ServerEndpoint::new("127.0.0.1", 1, Security::None, "j"), pop3: None, imap: None, oauth: None };
     assert_eq!(block(ImapProvider::new(servers, "pw").with_timeout(Duration::from_secs(2)).probe()), Err(ProviderError::Offline));
 
     // A folder the server reports as in use is a temporary failure, not a sign-in problem.
@@ -875,7 +876,7 @@ fn real_imap_server_round_trip() {
     };
     let security = var("OVERLOOK_IMAP_TEST_SECURITY").and_then(|s| Security::from_key(&s)).unwrap_or(Security::Tls);
     let port = var("OVERLOOK_IMAP_TEST_PORT").and_then(|p| p.parse().ok()).unwrap_or(ServerProtocol::Imap.default_port(security));
-    let servers = MailServers { incoming: ServerEndpoint::new(host, port, security, user.clone()), outgoing: ServerEndpoint::new("", 0, security, user.clone()), pop3: None, imap: None };
+    let servers = MailServers { incoming: ServerEndpoint::new(host, port, security, user.clone()), outgoing: ServerEndpoint::new("", 0, security, user.clone()), pop3: None, imap: None, oauth: None };
     let p = ImapProvider::new(servers, password).with_inbox_limit(20);
     let acct = Account { id: AccountId(format!("imap:{user}")), provider: ProviderKind::Imap, display_name: user.clone(), email: user, created_at: 0 };
     block(p.probe()).unwrap();
@@ -1120,14 +1121,14 @@ fn real_imap_server_write_round_trip() {
     let security = var("OVERLOOK_IMAP_TEST_SECURITY").and_then(|s| Security::from_key(&s)).unwrap_or(Security::Tls);
     let port = var("OVERLOOK_IMAP_TEST_PORT").and_then(|p| p.parse().ok()).unwrap_or(ServerProtocol::Imap.default_port(security));
     let endpoint = ServerEndpoint::new(host.clone(), port, security, user.clone());
-    let servers = MailServers { incoming: endpoint.clone(), outgoing: ServerEndpoint::new("", 0, security, user.clone()), pop3: None, imap: None };
+    let servers = MailServers { incoming: endpoint.clone(), outgoing: ServerEndpoint::new("", 0, security, user.clone()), pop3: None, imap: None, oauth: None };
     let p = ImapProvider::new(servers, password.clone()).with_inbox_limit(20);
     let acct = Account { id: AccountId(format!("imap:{user}")), provider: ProviderKind::Imap, display_name: user.clone(), email: user, created_at: 0 };
     let pid = std::process::id();
     let rfc_id = format!("<write-test-{pid}@overlook.lastrefuge.ai>");
 
     // A raw session plays "another client": it makes the scratch folder and a message in it.
-    let mut other = connection::connect(&endpoint, &password, Duration::from_secs(30)).unwrap();
+    let mut other = connection::connect(&endpoint, &password.clone().into(), Duration::from_secs(30)).unwrap();
     let delimiter = other.list(Some(""), Some("")).ok().and_then(|names| names.iter().next().and_then(|n| n.delimiter().map(str::to_owned))).unwrap_or_else(|| "/".into());
     let prefix = if other.list(Some(""), Some("*")).map(|names| names.iter().all(|n| n.name() == "INBOX" || n.name().starts_with(&format!("INBOX{delimiter}")))).unwrap_or(false) { format!("INBOX{delimiter}") } else { String::new() };
     let scratch = format!("{prefix}Overlook-Test-{pid}");
@@ -1166,7 +1167,7 @@ fn real_imap_server_write_round_trip() {
         let moved = MessageRef::parse(new_pid).ok_or("bad provider id after the move")?;
         eprintln!("moved to {:?} (uid {}, label {}){}", moved.folder, moved.uid, trash_label.0, if applied.labels.is_empty() { "" } else { ", Trash folder created on demand" });
         // Clean up the server copy: flag \Deleted and expunge just that UID.
-        let mut session = connection::connect(&endpoint, &password, Duration::from_secs(30)).unwrap();
+        let mut session = connection::connect(&endpoint, &password.clone().into(), Duration::from_secs(30)).unwrap();
         session.select(&moved.folder).map_err(|e| e.to_string())?;
         let found = session.uid_search(format!("HEADER Message-ID \"{rfc_id}\"")).map_err(|e| e.to_string())?;
         if !found.contains(&moved.uid) {
@@ -1636,4 +1637,140 @@ fn a_listed_folder_the_server_refuses_to_open_becomes_folder_only_until_verified
     let labels = verified.labels.expect("a verifying cycle always reports labels");
     assert!(labels.iter().any(|l| l.name == "Ghost" && l.kind == LabelKind::User), "{labels:?}");
     assert!(Checkpoint::parse(verified.checkpoint.as_deref().unwrap()).unwrap().folders.contains_key("Ghost"));
+}
+
+/// A Microsoft session whose stored access token the server refuses although it has not
+/// expired (revoked early). Every refresh hands out `fresh-token` with a rotated refresh token.
+fn oauth_session(saved: std::sync::Arc<std::sync::Mutex<Vec<crate::oauth::OAuthTokens>>>, refresh: impl Fn(&str) -> Result<crate::oauth::OAuthTokens, crate::microsoft::oauth::AuthError> + Send + Sync + 'static) -> std::sync::Arc<crate::microsoft::MicrosoftSession> {
+    use crate::microsoft::{ClientConfig, MicrosoftSession};
+    let stale = crate::oauth::OAuthTokens { access_token: "revoked-token".into(), refresh_token: Some("refresh-1".into()), expires_at: now() + 3_600_000, scope: None, signed_in_at: 1 };
+    std::sync::Arc::new(MicrosoftSession::new(ClientConfig::new("synthetic-client", "common").unwrap(), "scopes", stale, Box::new(move |t| saved.lock().unwrap().push(t.clone()))).with_refresher(Box::new(move |_, token, _| refresh(token))))
+}
+
+fn fresh_tokens(_: &str) -> Result<crate::oauth::OAuthTokens, crate::microsoft::oauth::AuthError> {
+    Ok(crate::oauth::OAuthTokens { access_token: "fresh-token".into(), refresh_token: Some("refresh-2".into()), expires_at: now() + 3_600_000, scope: None, signed_in_at: now() })
+}
+
+fn oauth_provider(server: &FakeServer, session: std::sync::Arc<crate::microsoft::MicrosoftSession>) -> ImapProvider {
+    let servers = MailServers {
+        incoming: ServerEndpoint::new("127.0.0.1", server.addr.port(), Security::None, "jason@example.com"),
+        outgoing: ServerEndpoint::new("127.0.0.1", 1, Security::None, "jason@example.com"),
+        pop3: None,
+        imap: None,
+        oauth: None,
+    }
+    .with_oauth(OAuthIssuer::Microsoft);
+    ImapProvider::new(servers, Credential::OAuth(session)).with_timeout(Duration::from_secs(5)).with_inbox_limit(20)
+}
+
+#[test]
+fn oauth_accounts_sign_in_with_xoauth2_and_refresh_a_refused_token() {
+    // Microsoft answers a refused token with a plain NO; Gmail sends a JSON error challenge first.
+    for error_challenge in [false, true] {
+        let mut state = mailbox();
+        state.password = "fresh-token".into();
+        state.xoauth2_error_challenge = error_challenge;
+        let server = serve(state);
+        let saved = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let p = oauth_provider(&server, oauth_session(saved.clone(), |refresh| {
+            assert_eq!(refresh, "refresh-1");
+            fresh_tokens(refresh)
+        }));
+        let snap = block(p.fetch_snapshot(&account())).unwrap();
+        assert_eq!(snap.labels[0].name, "Inbox", "an OAuth account syncs like any IMAP account");
+        let state = server.lock();
+        assert_eq!(state.tokens_seen, ["revoked-token", "fresh-token"], "one refresh after the refusal (error challenge: {error_challenge})");
+        assert_eq!(state.commands(" LOGIN "), 0, "no password is ever sent");
+        assert!(state.log.iter().all(|l| !l.contains("fresh-token") && !l.contains("refresh-")), "{:?}", state.log);
+        let saved = saved.lock().unwrap();
+        assert_eq!(saved.iter().map(|t| t.refresh_token.as_deref()).collect::<Vec<_>>(), [Some("refresh-2")], "the rotated refresh token is persisted");
+    }
+}
+
+#[test]
+fn oauth_sign_in_stops_when_the_refresh_token_is_dead() {
+    let mut state = mailbox();
+    state.password = "fresh-token".into();
+    let server = serve(state);
+    let saved = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let session = oauth_session(saved.clone(), |_| Err(crate::microsoft::oauth::AuthError::Denied("invalid_grant: AADSTS50173: the grant was revoked".into())));
+    let p = oauth_provider(&server, session.clone());
+    assert_eq!(block(p.probe()), Err(ProviderError::SignInRequired));
+    assert_eq!(server.lock().tokens_seen, ["revoked-token"], "nothing more is tried without a working refresh token");
+    assert!(!session.is_active() && saved.lock().unwrap().is_empty());
+    assert_eq!(block(p.probe()), Err(ProviderError::SignInRequired));
+    assert_eq!(server.lock().connections, 1, "an ended session does not connect again");
+}
+
+#[test]
+fn idle_signs_in_with_the_session_token() {
+    let mut state = mailbox();
+    state.password = "fresh-token".into();
+    let server = serve(state);
+    let session = oauth_session(Default::default(), fresh_tokens);
+    let p = oauth_provider(&server, session);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut watcher = p.idle_watcher(move |event| {
+        let _ = tx.send(event);
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while server.lock().commands("IDLE") == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(server.lock().commands("IDLE"), 1, "the IDLE thread signed in with XOAUTH2");
+    assert_eq!(server.lock().tokens_seen, ["revoked-token", "fresh-token"]);
+    watcher.stop();
+    assert!(rx.try_recv().is_err(), "no sign-in problem reported");
+}
+
+#[test]
+fn microsoft_servers_file_their_own_sent_copy_so_none_is_appended() {
+    use crate::smtp::fake::{serve_many, Behaviour};
+    let smtp = serve_many(Behaviour::Normal);
+    let mut state = mailbox();
+    state.password = "fresh-token".into();
+    let server = serve(state);
+    let mut servers = oauth_provider(&server, oauth_session(Default::default(), fresh_tokens)).servers().clone();
+    servers.outgoing = ServerEndpoint { auth: AuthMethod::OAuth2, ..ServerEndpoint::new("127.0.0.1", smtp.addr.port(), Security::None, "jason@example.com") };
+    assert!(!ImapProvider::new(servers.clone(), "x").server_files_sent(), "only Microsoft's own hosts file sent mail");
+    let relay = MailServers { outgoing: ServerEndpoint::new("smtp.office365.com", 587, Security::StartTls, "j"), ..servers.clone() };
+    assert!(!ImapProvider::new(relay.clone(), "x").server_files_sent(), "Microsoft 365 relaying for another mailbox files nothing there");
+    let both = MailServers { incoming: ServerEndpoint::new("outlook.office365.com", 993, Security::Tls, "j"), ..relay };
+    assert!(ImapProvider::new(both, "x").server_files_sent());
+    let p = ImapProvider::new(servers, Credential::OAuth(oauth_session(Default::default(), fresh_tokens))).with_timeout(Duration::from_secs(5)).with_server_copy_wait(Duration::from_secs(4)).with_server_files_sent(true);
+    let acct = account();
+    let (labels, _, _) = synced(&server, &p);
+    let d = draft(&acct, "Filed by the server");
+    let rfc_id = crate::draft_message_id(&d);
+
+    // The fake files the copy a moment after SMTP accepts the message, as Exchange does.
+    let (state, filed) = (server.state.clone(), smtp.seen.clone());
+    let filer = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let raw = filed.lock().unwrap().iter().find_map(|s| s.data.clone());
+            if let Some(raw) = raw {
+                std::thread::sleep(Duration::from_millis(700));
+                let body = raw.strip_suffix(b".\r\n").unwrap_or(&raw).to_vec();
+                return state.lock().unwrap().folder_mut("Sent").add(FakeMessage::new(&["\\Seen"], "12-Nov-2026 10:00:00 +0000", body));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("SMTP never accepted the message");
+    });
+    let context = SendContext { sent_label: None, in_reply_to: None, labels: labels.clone() };
+    let receipt = block(p.send(&acct, &d, context)).unwrap();
+    let uid = filer.join().unwrap();
+    assert_eq!(receipt.provider_id, pid("Sent", 1760400001, uid), "the server's copy is adopted");
+    let s = server.lock();
+    assert_eq!(s.commands("APPEND"), 0, "no second copy");
+    assert_eq!(s.folder("Sent").find_header("Message-ID", &rfc_id).len(), 1);
+    drop(s);
+
+    // A server that files nothing within the wait still gets one copy.
+    let quiet = p.with_server_copy_wait(Duration::from_millis(300));
+    let d = draft(&acct, "Not filed");
+    let receipt = block(quiet.send(&acct, &d, SendContext { sent_label: None, in_reply_to: None, labels })).unwrap();
+    assert!(!is_local_placeholder(&receipt.provider_id));
+    assert_eq!(server.lock().commands("APPEND"), 1);
 }

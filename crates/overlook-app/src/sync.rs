@@ -1279,7 +1279,7 @@ mod tests {
         };
         let security = var("OVERLOOK_IMAP_TEST_SECURITY").and_then(|s| Security::from_key(&s)).unwrap_or(Security::Tls);
         let port = var("OVERLOOK_IMAP_TEST_PORT").and_then(|p| p.parse().ok()).unwrap_or(ServerProtocol::Imap.default_port(security));
-        let servers = MailServers { incoming: ServerEndpoint::new(host, port, security, user.clone()), outgoing: ServerEndpoint::new("", 0, security, user.clone()), pop3: None, imap: None };
+        let servers = MailServers { incoming: ServerEndpoint::new(host, port, security, user.clone()), outgoing: ServerEndpoint::new("", 0, security, user.clone()), pop3: None, imap: None, oauth: None };
         let account = Account { id: AccountId(format!("imap:{user}")), provider: ProviderKind::Imap, display_name: user.clone(), email: user, created_at: 0 };
         let dir = std::env::temp_dir().join(format!("overlook-imap-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1397,6 +1397,7 @@ mod tests {
             outgoing: ServerEndpoint::new("127.0.0.1", smtp.addr.port(), Security::None, "jason@example.com"),
             pop3: None,
             imap: None,
+            oauth: None,
         };
         let account = Account { id: AccountId::from("imap:jason@example.com"), provider: ProviderKind::Imap, display_name: "Jason".into(), email: "jason@example.com".into(), created_at: 0 };
         let dir = std::env::temp_dir().join(format!("overlook-{name}-{}", std::process::id()));
@@ -1695,7 +1696,7 @@ mod tests {
     fn imap_idle_delivers_new_mail_against_the_spike_servers() {
         use overlook_provider::imap::idle::IdleEvent;
         let imap_port: u16 = std::env::var("OVERLOOK_SPIKE_IMAP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(1143);
-        let servers = MailServers { incoming: ServerEndpoint::new("127.0.0.1", imap_port, Security::None, "spike"), outgoing: ServerEndpoint::new("127.0.0.1", 2525, Security::None, "spike"), pop3: None, imap: None };
+        let servers = MailServers { incoming: ServerEndpoint::new("127.0.0.1", imap_port, Security::None, "spike"), outgoing: ServerEndpoint::new("127.0.0.1", 2525, Security::None, "spike"), pop3: None, imap: None, oauth: None };
         let account = Account { id: AccountId::from("imap:spike@example.com"), provider: ProviderKind::Imap, display_name: "Spike".into(), email: "spike@example.com".into(), created_at: 0 };
         let dir = std::env::temp_dir().join(format!("overlook-spike-idle-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1743,6 +1744,7 @@ mod tests {
             outgoing: ServerEndpoint::new("127.0.0.1", smtp_port, Security::None, "spike"),
             pop3: None,
             imap: None,
+            oauth: None,
         };
         let account = Account { id: AccountId::from("imap:spike@example.com"), provider: ProviderKind::Imap, display_name: "Spike".into(), email: "spike@example.com".into(), created_at: 0 };
         let dir = std::env::temp_dir().join(format!("overlook-spike-m3-{}", std::process::id()));
@@ -1930,6 +1932,7 @@ mod tests {
                 outgoing: ServerEndpoint::new("127.0.0.1", env.smtp.addr.port(), Security::None, "jason@example.com"),
                 pop3: policy,
                 imap: None,
+                oauth: None,
             }
         }
 
@@ -2106,6 +2109,7 @@ mod tests {
                 outgoing: ServerEndpoint::new("127.0.0.1", smtp_port, Security::None, "spike"),
                 pop3: policy,
                 imap: None,
+                oauth: None,
             };
             let account = Account { id: AccountId::from("pop3:spike@example.com"), provider: ProviderKind::Pop3, display_name: "Spike".into(), email: "spike@example.com".into(), created_at: 0 };
             let dir = std::env::temp_dir().join(format!("overlook-spike-m4-{}", std::process::id()));

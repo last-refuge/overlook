@@ -12,10 +12,12 @@
 //! Each secret is one keyring item with the attributes `(application, account, kind)`:
 //! Gmail accounts hold OAuth tokens under [`KIND_OAUTH_TOKENS`]; IMAP and POP3 accounts
 //! hold their passwords under [`KIND_PASSWORD_INCOMING`] and, unless the outgoing server
-//! shares it, [`KIND_PASSWORD_OUTGOING`].
+//! shares it, [`KIND_PASSWORD_OUTGOING`]; IMAP and POP3 accounts that sign in with Microsoft
+//! hold their OAuth tokens under [`KIND_OAUTH_MICROSOFT`] instead of a password.
 
 use overlook_core::AccountId;
 use overlook_provider::gmail::OAuthTokens;
+use overlook_provider::microsoft::ClientConfig;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -23,6 +25,8 @@ const APPLICATION: &str = "ai.lastrefuge.Overlook";
 
 /// Gmail OAuth tokens, JSON-encoded.
 pub const KIND_OAUTH_TOKENS: &str = "oauth-tokens";
+/// Microsoft OAuth tokens of an IMAP or POP3 account, JSON-encoded.
+pub const KIND_OAUTH_MICROSOFT: &str = "oauth-tokens:microsoft";
 /// IMAP or POP3 password, UTF-8.
 pub const KIND_PASSWORD_INCOMING: &str = "password:incoming";
 /// SMTP password, UTF-8. Absent when "same as incoming" is ticked.
@@ -113,6 +117,7 @@ fn borrow<'a>(attrs: &'a HashMap<&'static str, String>) -> HashMap<&'a str, &'a 
 fn label(account: &AccountId, kind: &str) -> String {
     let what = match kind {
         KIND_OAUTH_TOKENS => "Gmail sign-in",
+        KIND_OAUTH_MICROSOFT => "Microsoft sign-in",
         KIND_PASSWORD_INCOMING => "mail server password",
         KIND_PASSWORD_OUTGOING => "outgoing server password",
         other => other,
@@ -190,6 +195,38 @@ pub fn delete_tokens(account: &AccountId) -> Result<(), VaultError> {
     delete_secret(account, KIND_OAUTH_TOKENS)
 }
 
+/// A Microsoft sign-in as stored: the tokens, and the app registration that issued them, so
+/// refreshes keep using that registration even if the built-in one or the configuration
+/// file changes later. The client id and tenant are public; only the tokens are secret.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredMicrosoft {
+    #[serde(flatten)]
+    tokens: OAuthTokens,
+    client_id: String,
+    tenant: String,
+}
+
+/// Saves the Microsoft sign-in of an IMAP or POP3 account, replacing any previous entry.
+/// Blocking.
+pub fn save_microsoft_tokens(account: &AccountId, tokens: &OAuthTokens, config: &ClientConfig) -> Result<(), VaultError> {
+    let stored = StoredMicrosoft { tokens: tokens.clone(), client_id: config.client_id.clone(), tenant: config.tenant.clone() };
+    let secret = serde_json::to_vec(&stored).map_err(corrupt)?;
+    save_secret(account, KIND_OAUTH_MICROSOFT, secret)
+}
+
+/// Loads the Microsoft sign-in of an account: its tokens and the registration that issued
+/// them. `Ok(None)` when nothing is stored. Blocking.
+pub fn load_microsoft_tokens(account: &AccountId) -> Result<Option<(OAuthTokens, ClientConfig)>, VaultError> {
+    match load_secret(account, KIND_OAUTH_MICROSOFT)? {
+        Some(bytes) => {
+            let stored: StoredMicrosoft = serde_json::from_slice(&bytes).map_err(corrupt)?;
+            let config = ClientConfig::new(stored.client_id, stored.tenant).map_err(corrupt)?;
+            Ok(Some((stored.tokens, config)))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Saves a server password (`KIND_PASSWORD_INCOMING` or `KIND_PASSWORD_OUTGOING`). Blocking.
 #[allow(dead_code)] // Used by the IMAP/POP3 account setup (milestone 2).
 pub fn save_password(account: &AccountId, kind: &str, password: &str) -> Result<(), VaultError> {
@@ -239,6 +276,17 @@ mod tests {
         });
         assert!(log.contains("DEBUG overlook::diag"));
         assert!(log.contains("synthetic-detail"));
+    }
+
+    #[test]
+    fn microsoft_sign_ins_keep_their_registration_beside_the_tokens() {
+        let tokens = OAuthTokens { access_token: "synthetic-access".into(), refresh_token: Some("synthetic-refresh".into()), expires_at: 5, scope: None, signed_in_at: 7 };
+        let stored = StoredMicrosoft { tokens: tokens.clone(), client_id: "client-a".into(), tenant: "common".into() };
+        let json = serde_json::to_string(&stored).unwrap();
+        assert!(json.contains("\"refresh_token\":\"synthetic-refresh\"") && json.contains("\"client_id\":\"client-a\""), "{json}");
+        let back: StoredMicrosoft = serde_json::from_str(&json).unwrap();
+        assert!(back.tokens == tokens && back.client_id == "client-a" && back.tenant == "common");
+        assert_eq!(label(&AccountId("imap:j@outlook.com".into()), KIND_OAUTH_MICROSOFT), "Overlook Microsoft sign-in (imap:j@outlook.com)");
     }
 
     #[test]

@@ -56,6 +56,7 @@ fn servers(env: &Env, smtp_port: u16, policy: Option<Pop3Policy>) -> MailServers
         outgoing: ServerEndpoint::new("127.0.0.1", smtp_port, Security::None, "jason@example.com"),
         pop3: policy,
         imap: None,
+        oauth: None,
     }
 }
 
@@ -404,7 +405,7 @@ fn real_pop3_server_round_trip() {
     let security = var("OVERLOOK_POP3_TEST_SECURITY").and_then(|s| Security::from_key(&s)).unwrap_or(Security::Tls);
     let port = var("OVERLOOK_POP3_TEST_PORT").and_then(|p| p.parse().ok()).unwrap_or(ServerProtocol::Pop3.default_port(security));
     let raw_dir = std::env::temp_dir().join(format!("overlook-pop3-real-{}", std::process::id()));
-    let servers = MailServers { incoming: ServerEndpoint::new(host, port, security, user.clone()), outgoing: ServerEndpoint::new("localhost", 25, Security::None, user), pop3: None, imap: None };
+    let servers = MailServers { incoming: ServerEndpoint::new(host, port, security, user.clone()), outgoing: ServerEndpoint::new("localhost", 25, Security::None, user), pop3: None, imap: None, oauth: None };
     let p = Pop3Provider::new(servers, password, &raw_dir);
     let acct = account();
     block(p.probe()).unwrap();
@@ -418,4 +419,36 @@ fn real_pop3_server_round_trip() {
     let changes = block(p.fetch_changes(&acct, snap.checkpoint.as_deref().unwrap())).unwrap();
     assert!(changes.message_ids.is_empty(), "a second poll lists nothing new");
     let _ = std::fs::remove_dir_all(&raw_dir);
+}
+
+#[test]
+fn oauth_accounts_sign_in_with_xoauth2() {
+    use crate::microsoft::{oauth::AuthError, ClientConfig, MicrosoftSession};
+    use crate::oauth::OAuthTokens;
+    for error_challenge in [false, true] {
+        let mut state = maildrop();
+        state.password = "fresh-token".into();
+        state.xoauth2_error_challenge = error_challenge;
+        let env = make_env(&format!("oauth-{error_challenge}"), state);
+        let stale = OAuthTokens { access_token: "revoked-token".into(), refresh_token: Some("refresh-1".into()), expires_at: overlook_core::time::now() + 3_600_000, scope: None, signed_in_at: 1 };
+        let session = MicrosoftSession::new(ClientConfig::new("synthetic-client", "common").unwrap(), "scopes", stale, Box::new(|_| {})).with_refresher(Box::new(|_, _, _| {
+            Ok(OAuthTokens { access_token: "fresh-token".into(), refresh_token: Some("refresh-2".into()), expires_at: overlook_core::time::now() + 3_600_000, scope: None, signed_in_at: 0 })
+        }));
+        let p = Pop3Provider::new(servers(&env, 1, None).with_oauth(OAuthIssuer::Microsoft), Credential::OAuth(std::sync::Arc::new(session)), env.raw_dir.clone()).with_timeout(Duration::from_secs(5));
+        block(p.probe()).unwrap();
+        let state = env.server.lock();
+        assert_eq!(state.tokens_seen, ["revoked-token", "fresh-token"]);
+        assert_eq!(state.commands("PASS"), 0, "no password is ever sent");
+        assert_eq!(state.commands("AUTH XOAUTH2"), 2);
+        if error_challenge {
+            assert!(state.log.iter().any(|l| l == "*"), "the error challenge is cancelled with *: {:?}", state.log);
+        }
+        assert!(state.log.iter().all(|l| !l.contains("token")), "{:?}", state.log);
+        drop(state);
+
+        let dead = MicrosoftSession::new(ClientConfig::new("synthetic-client", "common").unwrap(), "scopes", OAuthTokens { access_token: String::new(), refresh_token: Some("r".into()), expires_at: 0, scope: None, signed_in_at: 1 }, Box::new(|_| {}))
+            .with_refresher(Box::new(|_, _, _| Err(AuthError::Denied("invalid_grant: AADSTS70008: expired".into()))));
+        let p = Pop3Provider::new(servers(&env, 1, None), Credential::OAuth(std::sync::Arc::new(dead)), env.raw_dir.clone()).with_timeout(Duration::from_secs(5));
+        assert_eq!(block(p.probe()), Err(ProviderError::SignInRequired));
+    }
 }

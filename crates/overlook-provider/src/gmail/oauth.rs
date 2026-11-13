@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+// Provider-neutral pieces that started out here; Microsoft's sign-in shares them.
+pub use crate::oauth::{base64_url, url_decode, url_encode, CallbackError, OAuthTokens, Pkce};
+
 /// The OAuth client created in Google Cloud ("Desktop app" type).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientConfig {
@@ -31,36 +34,9 @@ impl ClientConfig {
     }
 }
 
-/// Tokens for one account. Stored in the system keyring, never in ordinary configuration.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OAuthTokens {
-    pub access_token: String,
-    pub refresh_token: Option<String>,
-    /// Unix milliseconds.
-    pub expires_at: i64,
-    pub scope: Option<String>,
-    /// Unix milliseconds of the sign-in that issued the refresh token; kept across
-    /// refreshes. 0 for tokens stored before this field existed.
-    #[serde(default)]
-    pub signed_in_at: i64,
-}
-
 impl std::fmt::Debug for ClientConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientConfig").field("client_id", &self.client_id).field("client_secret", &"[REDACTED]").finish()
-    }
-}
-
-impl std::fmt::Debug for OAuthTokens {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OAuthTokens").field("access_token", &"[REDACTED]").field("refresh_token", &"[REDACTED]").field("expires_at", &self.expires_at).field("scope", &self.scope).finish()
-    }
-}
-
-impl OAuthTokens {
-    /// Treats the token as expired one minute early to avoid racing the deadline.
-    pub fn is_expired(&self, now_ms: i64) -> bool {
-        now_ms + 60_000 >= self.expires_at
     }
 }
 
@@ -247,40 +223,6 @@ pub const SETTINGS_SCOPE_MARKER: &str = "gmail.settings.basic";
 pub const AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 pub const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 
-/// PKCE verifier/challenge pair (RFC 7636, S256).
-#[derive(Clone, PartialEq, Eq)]
-pub struct Pkce {
-    pub verifier: String,
-    pub challenge: String,
-}
-
-impl std::fmt::Debug for Pkce {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Pkce").field("verifier", &"[REDACTED]").field("challenge", &self.challenge).finish()
-    }
-}
-
-impl Pkce {
-    /// Builds a PKCE pair from fresh randomness.
-    pub fn random() -> Self {
-        let bytes: [u8; 48] = rand::random();
-        Self::from_random(&bytes)
-    }
-
-    /// Random opaque `state` value for the authorization request.
-    pub fn random_state() -> String {
-        let bytes: [u8; 24] = rand::random();
-        base64_url(&bytes)
-    }
-
-    /// Builds a PKCE pair from caller-supplied random bytes (32 to 96 bytes).
-    pub fn from_random(random: &[u8]) -> Self {
-        let verifier = base64_url(random);
-        let challenge = base64_url(&sha256(verifier.as_bytes()));
-        Self { verifier, challenge }
-    }
-}
-
 /// Parameters of an authorization request to open in the system browser.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizationRequest {
@@ -315,44 +257,8 @@ impl AuthorizationRequest {
 
     /// Validates the loopback callback query and returns the authorization code.
     pub fn parse_callback(&self, query: &str) -> Result<String, CallbackError> {
-        let mut code = None;
-        let mut state = None;
-        let mut error = None;
-        for pair in query.trim_start_matches('?').split('&') {
-            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-            let v = url_decode(v);
-            match url_decode(k).as_str() {
-                "code" if code.is_none() => code = Some(v),
-                "state" if state.is_none() => state = Some(v),
-                "error" if error.is_none() => error = Some(v),
-                "code" | "state" | "error" => return Err(CallbackError::Ambiguous),
-                _ => {}
-            }
-        }
-        if state.as_deref() != Some(self.state.as_str()) {
-            return Err(CallbackError::StateMismatch);
-        }
-        if code.is_some() && error.is_some() {
-            return Err(CallbackError::Ambiguous);
-        }
-        if error.is_some() {
-            // Never reflect an untrusted callback value into UI or logs.
-            return Err(CallbackError::Denied("access_denied".into()));
-        }
-        code.filter(|c| !c.is_empty()).ok_or(CallbackError::MissingCode)
+        crate::oauth::parse_callback(query, &self.state)
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum CallbackError {
-    #[error("the sign-in response contained ambiguous parameters")]
-    Ambiguous,
-    #[error("sign-in was cancelled or denied: {0}")]
-    Denied(String),
-    #[error("the sign-in response did not match this request")]
-    StateMismatch,
-    #[error("the sign-in response had no authorization code")]
-    MissingCode,
 }
 
 /// Form body for exchanging the code for tokens.
@@ -368,71 +274,6 @@ pub fn token_request_body(client_id: &str, code: &str, redirect_uri: &str, verif
     .map(|(k, v)| format!("{k}={}", url_encode(v)))
     .collect::<Vec<_>>()
     .join("&")
-}
-
-pub fn url_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
-pub fn url_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                let hex = |b: u8| (b as char).to_digit(16).map(|v| v as u8);
-                if let (Some(high), Some(low)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
-                    let v = high * 16 + low;
-                    out.push(v);
-                    i += 3;
-                    continue;
-                }
-                out.push(b'%');
-                i += 1;
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-pub fn base64_url(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
-    for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        out.push(TABLE[(n >> 18) as usize & 63] as char);
-        out.push(TABLE[(n >> 12) as usize & 63] as char);
-        if chunk.len() > 1 {
-            out.push(TABLE[(n >> 6) as usize & 63] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(TABLE[n as usize & 63] as char);
-        }
-    }
-    out
-}
-
-/// SHA-256 for the PKCE S256 challenge, from the RustCrypto `sha2` crate.
-fn sha256(data: &[u8]) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(data).into()
 }
 
 #[cfg(test)]
@@ -473,23 +314,6 @@ mod tests {
         assert!(log.contains("token response: accepted") && log.contains("token response: rejected"));
         assert!(log.contains("error=\"invalid_grant\""));
         assert!(!log.contains("-secret"), "{log}");
-    }
-
-    #[test]
-    fn pkce_matches_rfc_7636_appendix_b() {
-        // RFC 7636 Appendix B verifier and expected S256 challenge.
-        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-        let challenge = base64_url(&sha256(verifier.as_bytes()));
-        assert_eq!(challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
-    }
-
-    #[test]
-    fn sha256_known_vector() {
-        let digest = sha256(b"abc");
-        assert_eq!(
-            digest.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
     }
 
     #[test]

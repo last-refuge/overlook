@@ -755,14 +755,17 @@ impl MailWindow {
         let is_gmail = account.provider == ProviderKind::Gmail;
         let is_password_account = matches!(account.provider, ProviderKind::Imap | ProviderKind::Pop3);
         let servers = if is_password_account { self.store.servers(&account.id).ok().flatten() } else { None };
+        let oauth = servers.as_ref().and_then(|s| s.oauth);
         let connection_line = match (account.provider, &servers) {
             (ProviderKind::Gmail, _) => "Connected through the Gmail and Google Calendar APIs.".to_owned(),
             (ProviderKind::Sample, _) => "Sample account with fictional mail; nothing leaves this device.".to_owned(),
+            (ProviderKind::Imap, Some(s)) if s.oauth.is_some() => format!("Mail is read over IMAP from {} and sent through {}. Signed in with Microsoft; the sign-in is kept in the system keyring.", s.incoming.address(), s.outgoing.address()),
             (ProviderKind::Imap, Some(s)) => format!("Mail is read over IMAP from {} and sent through {}. Password kept in the system keyring.", s.incoming.address(), s.outgoing.address()),
+            (ProviderKind::Pop3, Some(s)) if s.oauth.is_some() => format!("Mail is downloaded over POP3 from {} and sent through {}. Signed in with Microsoft. This device holds the only copy.", s.incoming.address(), s.outgoing.address()),
             (ProviderKind::Pop3, Some(s)) => format!("Mail is downloaded over POP3 from {} and sent through {}. This device holds the only copy.", s.incoming.address(), s.outgoing.address()),
             (_, None) => "Server settings are not set up yet.".to_owned(),
         };
-        let sign_in_label = super::sign_in_label_for(account.provider);
+        let sign_in_label = super::sign_in_label_for(account.provider, oauth.is_some());
 
         let account_list = v_flex().gap(px(4.)).children(self.accounts.iter().map(|a| {
             let id = a.id.clone();
@@ -780,7 +783,7 @@ impl MailWindow {
                 .when(active, |d| d.bg(p.selection))
                 .when(!active, |d| d.hover(|d| d.bg(p.hover)))
                 .child(owner_avatar(&Address::named(&a.display_name, &a.email), 28., &p))
-                .child(v_flex().flex_1().min_w_0().child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).truncate().child(self.account_name(&a.id))).child(div().text_size(px(11.)).text_color(p.muted).truncate().child(format!("{} · {}", a.email, a.provider.label()))))
+                .child(v_flex().flex_1().min_w_0().child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).truncate().child(self.account_name(&a.id))).child(div().text_size(px(11.)).text_color(p.muted).truncate().child(format!("{} · {}", a.email, self.account_kind_label(a)))))
                 .on_click(cx.listener(move |this, _, window, cx| this.set_settings_account(id.clone(), window, cx)))
         }));
 
@@ -877,7 +880,7 @@ impl MailWindow {
                 let sign_out_id = account.id.clone();
                 d.child(section("Sign out", None)).child(setting_row(
                     "Sign out of this account",
-                    if is_gmail { "Revokes Overlook’s access at Google and deletes the stored sign-in. Downloaded mail stays on this device until you sign in again. Requires internet." } else { "Deletes the stored password from the system keyring. Downloaded mail stays on this device until you sign in again." },
+                    if is_gmail { "Revokes Overlook’s access at Google and deletes the stored sign-in. Downloaded mail stays on this device until you sign in again. Requires internet." } else if oauth.is_some() { "Deletes the stored Microsoft sign-in from the system keyring. Downloaded mail stays on this device until you sign in again. Microsoft can’t revoke a single sign-in for an app; to remove Overlook’s access there too, use your Microsoft account’s app permissions." } else { "Deletes the stored password from the system keyring. Downloaded mail stays on this device until you sign in again." },
                     Button::new("settings-sign-out").small().label("Sign out").on_click(cx.listener(move |this, _, window, cx| {
                         this.close_settings(window, cx);
                         this.sign_out_account(sign_out_id.clone(), None, window, cx);
@@ -1156,6 +1159,10 @@ impl MailWindow {
         let data_dir = crate::data_dir();
         let data_dir_text = data_dir.display().to_string();
         let config = crate::google_signin::client_config_path().display().to_string();
+        let microsoft_config = match overlook_provider::microsoft::ClientConfig::built_in() {
+            Some(_) if !crate::microsoft_signin::client_config_path().exists() => "Built into Overlook".to_owned(),
+            _ => crate::microsoft_signin::client_config_path().display().to_string(),
+        };
         v_flex()
             .gap(px(22.))
             .child(
@@ -1208,6 +1215,7 @@ impl MailWindow {
                 Button::new("about-backup").small().icon(icon("hard-drive-download").size(px(14.))).label("Back up mail…").loading(self.backing_up).disabled(self.backing_up).on_click(cx.listener(|this, _, window, cx| this.back_up_mail(window, cx))).into_any_element(),
             ))
             .child(setting_row("Google OAuth client", &config, div().into_any_element()))
+            .child(setting_row("Microsoft app registration", &microsoft_config, div().into_any_element()))
             .child(setting_row("Sign-in tokens", "Stored in the system keyring (Secret Service), never in files.", div().into_any_element()))
             .child(section("Keyboard", None))
             .child(div().text_size(px(12.)).text_color(p.muted).line_height(px(20.)).child(
@@ -1269,6 +1277,10 @@ impl MailWindow {
                 let g = t.clone();
                 menu = menu.item(PopupMenuItem::new("Gmail…").on_click(move |_, window, cx| {
                     let _ = g.update(cx, |this, cx| this.start_google_sign_in(None, window, cx));
+                }));
+                let m = t.clone();
+                menu = menu.item(PopupMenuItem::new("Microsoft (Outlook.com, Microsoft 365)…").on_click(move |_, window, cx| {
+                    let _ = m.update(cx, |this, cx| this.open_microsoft_setup(window, cx));
                 }));
                 let i = t.clone();
                 menu = menu.item(PopupMenuItem::new("IMAP…").on_click(move |_, window, cx| {
@@ -1495,6 +1507,7 @@ pub(crate) static SETTINGS_INDEX: &[SettingEntry] = &[
     entry(AB, "On this device", "Mail, events, drafts, and attachments", "Open the data folder.", "data folder storage location"),
     entry(AB, "On this device", "Back up mail", "Copies the database and messages to a folder you choose.", "backup export restore"),
     entry(AB, "On this device", "Google OAuth client", "", "oauth client config google"),
+    entry(AB, "On this device", "Microsoft app registration", "", "oauth client config microsoft outlook entra azure"),
     entry(AB, "On this device", "Sign-in tokens", "Stored in the system keyring.", "keyring secret service tokens"),
     entry(AB, "Keyboard", "Keyboard shortcuts", "", "keys shortcuts hotkeys keybindings"),
 ];

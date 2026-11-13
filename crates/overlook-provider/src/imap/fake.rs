@@ -139,7 +139,13 @@ impl FakeFolder {
 
 pub struct FakeState {
     pub user: String,
+    /// What `LOGIN` must present, and the bearer token `AUTHENTICATE XOAUTH2` must present.
     pub password: String,
+    /// Answer a refused `XOAUTH2` token with Gmail's JSON error challenge before the `NO`
+    /// (RFC 7628 §3.2.2), rather than Microsoft's immediate `NO`.
+    pub xoauth2_error_challenge: bool,
+    /// Every bearer token presented with `AUTHENTICATE XOAUTH2`, accepted or not.
+    pub tokens_seen: Vec<String>,
     pub capabilities: String,
     pub folders: Vec<FakeFolder>,
     pub subscribed: HashSet<String>,
@@ -170,6 +176,8 @@ impl Default for FakeState {
         Self {
             user: "jason@example.com".into(),
             password: "hunter2".into(),
+            xoauth2_error_challenge: false,
+            tokens_seen: Vec::new(),
             capabilities: "IMAP4rev1 UIDPLUS MOVE IDLE SPECIAL-USE LITERAL+ ENABLE".into(),
             folders: Vec::new(),
             subscribed: HashSet::new(),
@@ -333,6 +341,45 @@ impl Connection {
                         Login::AuthFailed => self.say(&format!("{tag} NO [AUTHENTICATIONFAILED] Authentication failed."))?,
                         Login::Ok if u == user && p == password => self.say(&format!("{tag} OK [CAPABILITY {caps}] Logged in"))?,
                         Login::Ok => self.say(&format!("{tag} NO [AUTHENTICATIONFAILED] Authentication failed."))?,
+                    }
+                }
+                "AUTHENTICATE" if args.eq_ignore_ascii_case("XOAUTH2") => {
+                    use base64::Engine;
+                    self.say("+ ")?;
+                    let mut response = String::new();
+                    if self.reader.read_line(&mut response)? == 0 {
+                        return Ok(());
+                    }
+                    let raw = base64::engine::general_purpose::STANDARD.decode(response.trim()).unwrap_or_default();
+                    let text = String::from_utf8_lossy(&raw).into_owned();
+                    let mut fields = text.split('\x01');
+                    let u = fields.next().and_then(|f| f.strip_prefix("user=")).unwrap_or_default().to_owned();
+                    let token = fields.next().and_then(|f| f.strip_prefix("auth=Bearer ")).unwrap_or_default().to_owned();
+                    let (behaviour, accepted, challenge) = {
+                        let mut s = self.state.lock().unwrap();
+                        s.tokens_seen.push(token.clone());
+                        (s.login, u == s.user && token == s.password, s.xoauth2_error_challenge)
+                    };
+                    match behaviour {
+                        Login::Bye => {
+                            self.say("* BYE Server shutting down")?;
+                            return Ok(());
+                        }
+                        Login::Unavailable => self.say(&format!("{tag} NO [UNAVAILABLE] Temporary authentication failure."))?,
+                        Login::Ok if accepted => self.say(&format!("{tag} OK [CAPABILITY {caps}] AUTHENTICATE completed."))?,
+                        _ => {
+                            if challenge {
+                                let error = base64::engine::general_purpose::STANDARD.encode(r#"{"status":"401","schemes":"bearer","scope":"https://mail.example/"}"#);
+                                self.say(&format!("+ {error}"))?;
+                                let mut empty = String::new();
+                                self.reader.read_line(&mut empty)?;
+                                if !empty.trim().is_empty() {
+                                    self.say(&format!("{tag} BAD The error challenge must be answered with an empty line."))?;
+                                    continue;
+                                }
+                            }
+                            self.say(&format!("{tag} NO [AUTHENTICATIONFAILED] AUTHENTICATE failed."))?;
+                        }
                     }
                 }
                 "NOOP" => self.say(&format!("{tag} OK NOOP completed."))?,

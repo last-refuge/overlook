@@ -5,13 +5,17 @@
 //! `imap::Client::new`, which is generic over `Read + Write`. STARTTLS is negotiated by hand
 //! on the raw socket before the client exists, exactly as the M0 spike did.
 //!
+//! Sign-in is `LOGIN` with a password, or `AUTHENTICATE XOAUTH2` with an access token for
+//! OAuth accounts (Microsoft); see [`Credential`].
+//!
 //! Error mapping, from the plan: a lost connection, a `BYE`, a socket timeout or a refused
 //! connection is [`ProviderError::Offline`]; `[AUTHENTICATIONFAILED]` (or any `NO` to
-//! `LOGIN`) is [`ProviderError::SignInRequired`]; `[UNAVAILABLE]`, `[INUSE]` and friends are
+//! `LOGIN` or `AUTHENTICATE`) is [`ProviderError::SignInRequired`]; `[UNAVAILABLE]`, `[INUSE]` and friends are
 //! [`ProviderError::Temporary`]; any other `NO` or `BAD` is [`ProviderError::Rejected`] with
 //! the server's own words. A failed TLS handshake is `Rejected` too: it will not pass on
 //! retry without a settings change.
 
+use crate::credential::{Credential, Secret};
 use crate::ProviderError;
 use imap_proto::types::ResponseCode;
 use overlook_core::{Security, ServerEndpoint};
@@ -136,15 +140,39 @@ impl imap::extensions::idle::SetReadTimeout for Stream {
     }
 }
 
-/// Connects, secures the connection as the endpoint asks, and logs in.
-pub fn connect(endpoint: &ServerEndpoint, password: &str, timeout: Duration) -> Result<Session, ProviderError> {
-    connect_with_socket(endpoint, password, timeout).map(|(session, _)| session)
+/// SASL `XOAUTH2` for `AUTHENTICATE`: the token answers the first, empty challenge. A second
+/// challenge carries the server's JSON error instead (RFC 7628 §3.2.2) and gets an empty
+/// response, after which the server sends its tagged `NO`.
+struct XOAuth2 {
+    response: String,
+    answered: std::cell::Cell<bool>,
+}
+
+impl imap::Authenticator for XOAuth2 {
+    type Response = Vec<u8>;
+    fn process(&self, _challenge: &[u8]) -> Vec<u8> {
+        if self.answered.replace(true) {
+            Vec::new()
+        } else {
+            self.response.as_bytes().to_vec()
+        }
+    }
+}
+
+/// Connects, secures the connection as the endpoint asks, and signs in.
+pub fn connect(endpoint: &ServerEndpoint, credential: &Credential, timeout: Duration) -> Result<Session, ProviderError> {
+    connect_with_socket(endpoint, credential, timeout).map(|(session, _)| session)
 }
 
 /// Like [`connect`], also returning a handle on the underlying socket. Shutting that handle
 /// down from another thread unblocks a read in progress, which is how the IDLE watcher is
-/// stopped promptly.
-pub fn connect_with_socket(endpoint: &ServerEndpoint, password: &str, timeout: Duration) -> Result<(Session, TcpStream), ProviderError> {
+/// stopped promptly. A refused access token is retried once on a new connection with a
+/// refreshed token.
+pub fn connect_with_socket(endpoint: &ServerEndpoint, credential: &Credential, timeout: Duration) -> Result<(Session, TcpStream), ProviderError> {
+    credential.sign_in(|secret| open(endpoint, secret, timeout))
+}
+
+fn open(endpoint: &ServerEndpoint, secret: Secret<'_>, timeout: Duration) -> Result<(Session, TcpStream), ProviderError> {
     if endpoint.is_insecure_remote() {
         return Err(ProviderError::Rejected(format!("refusing to connect to {} without encryption", endpoint.host)));
     }
@@ -174,8 +202,18 @@ pub fn connect_with_socket(endpoint: &ServerEndpoint, password: &str, timeout: D
     if endpoint.username.trim().is_empty() {
         return Err(ProviderError::SignInRequired);
     }
-    tracing::info!(target: "overlook::signin", host, port = endpoint.port, mechanism = "LOGIN", username = "[account]", password = "[REDACTED]", "IMAP sign-in");
-    let session = client.login(endpoint.username.trim(), password).map_err(|(e, _)| {
+    let user = endpoint.username.trim();
+    let signed_in = match secret {
+        Secret::Password(password) => {
+            tracing::info!(target: "overlook::signin", host, port = endpoint.port, mechanism = "LOGIN", username = "[account]", password = "[REDACTED]", "IMAP sign-in");
+            client.login(user, password)
+        }
+        Secret::AccessToken(token) => {
+            tracing::info!(target: "overlook::signin", host, port = endpoint.port, mechanism = secret.mechanism("LOGIN"), username = "[account]", access_token = "[REDACTED]", "IMAP sign-in");
+            client.authenticate("XOAUTH2", &XOAuth2 { response: crate::oauth::xoauth2_response(user, token), answered: Default::default() })
+        }
+    };
+    let session = signed_in.map_err(|(e, _)| {
         let error = login_error(&e);
         tracing::info!(target: "overlook::signin", host, outcome = if error == ProviderError::SignInRequired { "rejected" } else { "failed" }, "IMAP sign-in result");
         error
@@ -259,9 +297,9 @@ mod tests {
 
     #[test]
     fn refuses_plaintext_to_remote_hosts() {
-        let e = connect(&ServerEndpoint::new("imap.example.com", 143, Security::None, "j"), "pw", Duration::from_secs(1)).err();
+        let e = connect(&ServerEndpoint::new("imap.example.com", 143, Security::None, "j"), &"pw".into(), Duration::from_secs(1)).err();
         assert!(matches!(e, Some(ProviderError::Rejected(_))), "{e:?}");
         let unreachable = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
-        assert_eq!(connect(&ServerEndpoint::new("127.0.0.1", unreachable.port(), Security::None, "j"), "pw", Duration::from_secs(1)).err(), Some(ProviderError::Offline));
+        assert_eq!(connect(&ServerEndpoint::new("127.0.0.1", unreachable.port(), Security::None, "j"), &"pw".into(), Duration::from_secs(1)).err(), Some(ProviderError::Offline));
     }
 }
