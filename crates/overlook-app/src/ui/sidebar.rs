@@ -569,12 +569,30 @@ impl MailWindow {
                 // One shape for every folder; a label's color only tints it.
                 .child(icon(nav.icon).flex_none().size(px(16.)).text_color(color.unwrap_or(if current { p.accent } else { p.muted })))
                 .child(div().flex_1().truncate().child(nav.label.clone()))
+                // Unread mail in the Inbox is a filled pill; the unread in other folders is
+                // set in the action colour; totals (Starred, Drafts, Outbox) stay quiet.
                 .when(count > 0, |d| {
+                    let unread = matches!(nav.view, MailboxView::Kind(LabelKind::Inbox) | MailboxView::Label(_)) && !container;
+                    let inbox = nav.view == MailboxView::Kind(LabelKind::Inbox);
                     d.child(
                         div()
                             .flex_none()
                             .text_size(px(11.))
-                            .text_color(if current { p.accent } else { p.muted })
+                            .when(inbox, |d| {
+                                let (fill, ink) = count_pill(&p);
+                                d.min_w(px(20.))
+                                    .h(px(18.))
+                                    .px(px(6.))
+                                    .rounded(px(9.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(fill)
+                                    .text_color(ink)
+                                    .font_weight(FontWeight::BOLD)
+                            })
+                            .when(!inbox && unread, |d| d.font_weight(FontWeight::SEMIBOLD).text_color(if current { p.accent } else { p.foreground }))
+                            .when(!unread, |d| d.text_color(if current { p.accent } else { p.muted }))
                             .child(count.to_string()),
                     )
                 })
@@ -685,7 +703,7 @@ impl MailWindow {
 
         // Puts a 12px arrow in the same column as the rows' arrows.
         const HEADER_ARROW_INSET: f32 = 3.;
-        let section_header = |key: String, text: String, collapsed: bool, top: f32, cx: &mut Context<Self>| {
+        let section_header = |key: String, text: String, collapsed: bool, top: f32, mark: Option<AnyElement>, cx: &mut Context<Self>| {
             div()
                 .id(SharedString::from(format!("section-{key}")))
                 .h_flex()
@@ -703,7 +721,12 @@ impl MailWindow {
                 .text_color(p.muted)
                 .hover(|d| d.bg(p.hover))
                 .child(icon(if collapsed { "chevron-right" } else { "chevron-down" }).size(px(12.)).text_color(p.muted))
-                .child(div().flex_1().min_w_0().truncate().child(text))
+                // An account's service mark sits in the rows' icon column, its name in their
+                // label column.
+                .child(match mark {
+                    Some(mark) => h_flex().flex_1().min_w_0().items_center().gap(px(9.)).child(mark).child(div().flex_1().min_w_0().truncate().child(text)).into_any_element(),
+                    None => div().flex_1().min_w_0().truncate().child(text).into_any_element(),
+                })
                 .on_click(cx.listener(move |this, _, _window, cx| this.toggle_section(&key, cx)))
         };
 
@@ -755,7 +778,8 @@ impl MailWindow {
             let drag = super::AccountDrag { account: a.id.clone(), name: name.clone() };
             // The first header sits right under the Favorites line, whose own margin is the gap.
             let top = if i == 0 { 0. } else { m.header_top };
-            let header = section_header(key, name, collapsed, top, cx)
+            let mark = self.account_mark(a).render(16., &p);
+            let header = section_header(key, name, collapsed, top, Some(mark), cx)
                 .font_weight(FontWeight::SEMIBOLD)
                 .when(a.id == self.account.id && all_accounts, |d| d.text_color(p.foreground))
                 .when(reorderable, |d| d.on_drag(drag, |d: &super::AccountDrag, _pos, _window, cx| cx.new(|_| super::DragPreview { label: d.name.clone() })));
@@ -767,7 +791,7 @@ impl MailWindow {
                 if !folders.is_empty() {
                     let key = format!("folders:{}", a.id.0);
                     let folded = self.collapsed_sections.contains(&key);
-                    let title = section_header(key, "Folders".into(), folded, m.header_top, cx);
+                    let title = section_header(key, "Folders".into(), folded, m.header_top, None, cx);
                     column = column.child(top_level_target(title, &a.id, cx));
                     if !folded {
                         column = column.child(v_flex().gap(px(m.row_gap)).children(folders.into_iter().map(|nav| nav_button(self, "account", &a.id, nav, &pinned_list, cx))));
@@ -807,7 +831,7 @@ impl MailWindow {
             .flex_1()
             .min_h_0()
             // First thing in the sidebar: no gap above, the panel padding is enough.
-            .child(section_header("favorites".into(), "Favorites".into(), favorites_collapsed, 0., cx))
+            .child(section_header("favorites".into(), "Favorites".into(), favorites_collapsed, 0., None, cx))
             .when(!favorites_collapsed, |d| d.child(v_flex().gap(px(m.row_gap)).children(favorites)))
             // Favorites span every account; the line separates them from the account tree,
             // with the same gap above and below.
@@ -918,4 +942,12 @@ impl MailWindow {
                     ),
             ))
     }
+}
+
+/// The fill and ink of the Inbox's unread pill: the theme's message accent (Alexander's
+/// golden orange), with whichever ink reads on it.
+fn count_pill(p: &crate::theme::Palette) -> (Hsla, Hsla) {
+    let fill = p.message_accent();
+    let ink = if crate::theme::relative_luminance(fill) > 0.4 { gpui_kit::rgb(0x1F2A33).into() } else { gpui_kit::white() };
+    (fill, ink)
 }

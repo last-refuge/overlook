@@ -86,8 +86,16 @@ typography:
     fontFamily: "Inter, Noto Sans, sans-serif"
     fontSize: "11px"
     fontWeight: 400
+  subject:
+    fontFamily: "Inter, Noto Sans, sans-serif"
+    fontSize: "24px"
+    fontWeight: 600
+    lineHeight: "32px"
 rounded:
+  badge: "3px"
+  chip: "5px"
   control: "6px"
+  row: "7px"
   track: "8px"
   panel-sm: "10px"
   panel: "12px"
@@ -172,6 +180,77 @@ components:
     textColor: "{colors.ivory}"
     typography: "{typography.display}"
     height: "220px"
+  command-toolbar:
+    backgroundColor: "{colors.reading-white}"
+    rounded: "{rounded.track}"
+  toolbar-separator:
+    backgroundColor: "{colors.stone-divider}"
+    width: "1px"
+    height: "22px"
+  button-new-split:
+    backgroundColor: "{colors.pine-action}"
+    textColor: "{colors.reading-white}"
+    rounded: "{rounded.control}"
+    height: "36px"
+  inbox-count-pill:
+    backgroundColor: "{colors.pine-action}"
+    textColor: "{colors.reading-white}"
+    rounded: "{rounded.full}"
+    padding: "0 6px"
+    height: "18px"
+  conversation-row:
+    rounded: "{rounded.row}"
+    padding: "12px 11px"
+  conversation-row-unread:
+    backgroundColor: "{colors.unread-green}"
+    rounded: "{rounded.row}"
+  conversation-row-selected:
+    backgroundColor: "{colors.sage-selection}"
+    textColor: "{colors.charcoal}"
+    rounded: "{rounded.row}"
+  row-edge-bar:
+    backgroundColor: "{colors.pine-action}"
+    width: "3px"
+  thread-count-pill:
+    backgroundColor: "{colors.stone-hover}"
+    textColor: "{colors.moss-gray}"
+    rounded: "{rounded.full}"
+    padding: "0 6px"
+  file-chip:
+    backgroundColor: "{colors.reading-white}"
+    textColor: "{colors.charcoal}"
+    rounded: "{rounded.control}"
+    padding: "0 8px 0 3px"
+    height: "22px"
+  invitation-chip:
+    backgroundColor: "{colors.stone-hover}"
+    textColor: "{colors.charcoal}"
+    rounded: "{rounded.control}"
+    padding: "0 6px"
+    height: "22px"
+  quick-actions:
+    backgroundColor: "{colors.reading-white}"
+    rounded: "{rounded.row}"
+    padding: "2px"
+  label-pill:
+    backgroundColor: "{colors.stone-hover}"
+    textColor: "{colors.charcoal}"
+    rounded: "{rounded.full}"
+    padding: "0 9px"
+    height: "22px"
+  message-actions:
+    rounded: "{rounded.track}"
+    height: "28px"
+  reply-bar:
+    backgroundColor: "{colors.reading-white}"
+    textColor: "{colors.moss-gray}"
+    rounded: "{rounded.panel-sm}"
+    padding: "0 14px"
+    height: "44px"
+  service-mark:
+    backgroundColor: "{colors.reading-white}"
+    rounded: "{rounded.full}"
+    size: "16px"
 ---
 
 # Design System: Overlook
@@ -208,7 +287,8 @@ Other colorways supply their own action: Gray `#374151`, Blue `#245A96`, White `
 - **Pine** (#536E63) and **Mist** (#C6D5D5): illustration and atmospheric supporting tones in brand materials.
 
 ### Tertiary
-- **Beacon** (#FF9D32): the signature amber inherited from Last Refuge. In the app it appears in the horizon mark's beacon and the welcome choice-card beacon dot, and as Dark's brand accent. Alexander uses a golden-orange variant (`#FF9F0A`) for its message edge accent.
+- **Beacon** (#FF9D32): the signature amber inherited from Last Refuge. In the app it appears in the horizon mark's beacon and the welcome choice-card beacon dot, and as Dark's brand accent. Alexander uses a golden-orange variant (`#FF9F0A`) as its message accent.
+- **Message accent** (`Palette::message_accent()`): the theme's action colour everywhere except Alexander, where it is that golden orange. It paints the list's unread and selected edge bars and the Inbox unread pill, whose ink is chosen by luminance (`#1F2A33` on a fill brighter than 0.4, white otherwise).
 - **Deep Amber** (#92581D): Light's restrained amber; serves as Light's focus ring and brand accent, and as the secondary tone in Overlook's colour icons.
 - **Lantern Focus** (#FFBA6B): Dark's focus ring.
 
@@ -216,14 +296,23 @@ Other colorways supply their own action: Gray `#374151`, Blue `#245A96`, White `
 - **Midnight** (#101C24): brand anchor; app-icon tile, title-bar brand tile, welcome banner base and its veil.
 - **Ivory** (#F0EBDD): Dark's foreground text, and the colour of words on the welcome photograph in every theme.
 - **Paper** (#FAF8F2): brand-book and marketing reading surface only.
-- **Soft Stone** (#E1E2DC): Light's surface; title bar, dialogs, the welcome ground.
+- **Soft Stone** (#E1E2DC): Light's surface; the window chrome (title bar and module rail), dialogs, the welcome ground.
 - **Stone Frame** (#CDD1C9) / **Stone Sidebar** (#C4CBC1): Light's outer frame and folder navigation, slightly darker than the surface.
-- **Pale Green List** (#F3F7F1) / **Unread Green** (#E3EBE0): Light's message list and its unread rows.
+- **Pale Green List** (#F3F7F1) / **Unread Green** (#E3EBE0): Light's message list and its unread rows, one step darker. Unread rows stand one step apart from their list in every colorway (`Palette::list_unread()`): darker in the light colorways (the frame colour outside Light), and lifted in the dark ones, as the surface mixed 35% toward the selection, because a darker row there reads as a hole.
 - **Reading White** (#FFFFFF): the message centre in every light colorway; the card fill for welcome choices in light themes; the plate under third-party logos in every theme.
 - **Charcoal** (#29332E) / **Moss Gray** (#4B564D): Light's body and secondary text (about 10.0:1 and 5.9:1 against the reading surface).
 - **Stone Divider** (#A7B0A5), **Control Edge** (#657267), **Stone Hover** (#D5DAD1), **Sage Selection** (#BDCDBF): Light's structural lines, input borders, hover/chip fill and selection fill.
 - Dark's neutrals: Night Frame (#101A21), Night Surface (#17242C), Night Sidebar (#121F27), Night Muted (#A8B7BA), Night Divider (#30424B), Night Control Edge (#71878D), Night Hover (#23353F), Night Chip (#22323B), Night Selection (#28404C) with Night Selection Text (#DCECEF).
 - Status: success, warning and error each have an independent accessible value per mode (Light #386449 / #805015 / #A13E37; Dark #A8CEB1 / #F1BE78 / #FFB0A6).
+- **Chrome** (`Palette::chrome()`): the title bar and module rail. It is the surface in light colorways and the frame in dark ones (Night Frame in Dark), so in Dark the toolbar and panes float above the frame as they do on Alexander's teal navigation.
+
+### Content tints
+Quiet tints that identify content rather than the shell; each pair is tested for 4.5:1.
+- **Avatar tints:** four per mode, chosen by an FNV-1a hash of the lower-cased address so a person looks the same everywhere. Light: slate #D6E1E6 on #2C4D5E, amber #F1E2CF on #6E4515, plum #E9DCE7 on #5B3A55, pine #D9E5DC on #2F5243. Dark: #24404D on #CFE3EC, #3F3020 on #F6D7AE, #3B2B39 on #EAD3E6, #233A30 on #CFE6D8. Alexander keeps every avatar in its grey `avatar` tokens; the account owner's avatar takes the selection fill and text.
+- **File badges** (`Palette::file_badge`, shared by list chips and reader cards): programs and scripts in the error colour, archives, macro documents and SVG in the warning colour (12–15% tint in light, 25% in dark), so a hazard shows before anyone clicks. Then PDF #FBE9E7 / #A13E37, images #EEE8FA / #6E55B7, spreadsheets #DDEFE2 / #2F6B45, documents #DCE8F5 / #1F57A5, anything else chip and muted. In dark themes these pastels are darkened (lightness ×0.35, capped at 0.3; saturation ×0.6) so they don't glow.
+- **Label dots:** a label's slate, plum or amber from `Palette::label_color`.
+
+These tints live with the rest of the palette in `theme.rs` (`Palette::avatar_tint` and `Palette::file_badge`).
 
 ### Named Rules
 **The Beacon Rule.** Beacon amber is a small light, not a fill. It may appear as the mark's beacon or as a dot of a few pixels that lights on hover or focus. Never use it as a button fill, body text, or a wash.
@@ -243,14 +332,15 @@ Other colorways supply their own action: Gray `#374151`, Blue `#245A96`, White `
 - **Display** (400, 48px, 56px line): the welcome headline on the photograph, ivory. Max width 640px.
 - **Wordmark** (400, 22px, 30px line): the typed "Overlook" beside the brand tile in the title bar.
 - **Headline** (Inter 600, 18px, 24px line): section heads such as "Connect your mail".
-- **Title** (Inter 600, 16px, 22px line): featured choice-card names; reading-pane subjects at similar weight.
+- **Subject** (Inter 600, 24px, 32px line): the reading pane's conversation subject.
+- **Title** (Inter 600, 16px, 22px line): featured choice-card names.
 - **Lead** (Inter 400, 15px, 22px line): the line beneath the display headline; ivory at 84% opacity on the banner. Max width 520px.
 - **Control** (Inter 400, 14px): gpui-kit controls' default size (inputs, buttons, menus).
 - **Body** (Inter 400, 13px, 19px line): the window's base text size; secondary descriptions and segmented controls.
 - **Label** (Inter 500, 12px, 16px line): small headings for groups ("Another provider, or your own server"), metadata, the keyring line. The most-used size in the codebase.
 - **Caption** (Inter 400, 11px): badges, counts, dense metadata.
 
-Weights in use: Regular for reading, Medium for labels and quiet choices, Semibold for unread messages, selected segments and stronger hierarchy. No light weights in working UI.
+Weights in use: Regular for reading, Medium for labels, chips and quiet choices, Semibold for unread messages and unread folder counts, selected segments, thread counts and stronger hierarchy. Bold only for the Inbox unread pill, file-type badges and the sender of an unread folded message. No light weights in working UI.
 
 ### Named Rules
 **The Two Voices Rule.** Source Serif 4 Display appears only in brand moments (wordmark, welcome, About, marketing), never in mailbox rows, forms or dialogs. Inter carries everything else.
@@ -259,11 +349,21 @@ Weights in use: Regular for reading, Medium for labels and quiet choices, Semibo
 
 ## Layout
 
-The working window is the Outlook-style three-pane layout: folder navigation, message list, generous reading pane, with a title bar of 52px (density-dependent in the shell) carrying the lockup and commands.
+The working window is the Outlook-style three-pane layout, dense and complete:
+- **Title bar** (52px comfortable, 44px compact: 36px controls plus the density inset): the brand tile and wordmark; the search field, centred in the room left between wordmark and account and at most 620px wide; then the account's name (12px muted, truncating at 220px) beside its avatar.
+- **Module rail** (48px): Mail, Calendar, Contacts, with History and Settings at the foot.
+- **Command toolbar:** a white strip floating across the mail area on the navigation colour.
+- **Panes:** folder navigation (232px default), message list (340px default), and a generous reading pane; pane widths are saved.
+- **Status bar** at the foot: sync state, counts, and the account with its service mark.
+
+The toolbar follows the person's saved order. Commands belong to groups (`ToolbarGroup`: Create, Organize, Mark, Respond, Navigate, View, App); `StripPlan` draws a 1px separator wherever the group changes and pushes the trailing run of navigation and app commands to the far end. Labels are measured with the text system, so the strip shows every command that fits and overflows the rest into More. Labels drop to icons when the toolbar area is narrower than 1160px.
 
 Brand surfaces use a centred content column: the welcome screen caps its column at 1040px with 32px side gutters, and the banner's words align to that column's left edge. A full-bleed banner takes about a third of the window height, clamped between 220px and 300px, so a short window still shows every choice. Choice grids use flex-wrap with a basis per tier (260px featured, 200px compact) so columns fall from 3 or 4 to fewer at narrow widths (about 900px) without shrinking text.
 
-Spacing is a 2/4-based rhythm with 8px the most common step, then 10, 6 and 12. Group rhythm on the welcome: 36px above the section, 20px heading-to-grid, 16px between featured cards, 12px between compact cards, 32px before a quieter tier, 28px before a closing note, 44px bottom.
+Spacing is a 2/4-based rhythm with 8px the most common step, then 10, 6 and 12. List rows use 11px side padding and gap, and 12px vertical padding (8px when compact).
+
+### Named Rules
+**The Polish, Never Remove Rule.** The main window is refined, never simplified. Every command, pane and capability stays where people expect it: the full labelled, customisable toolbar, the module rail, Favorites, accounts and folders, Focused/Other, folded messages, the reply buttons and bar, the status bar. A redesign may regroup, tighten and enrich, but it may not fold away, merge or hide. A control with nothing behind it is not drawn at all, not even as a placeholder. Group rhythm on the welcome: 36px above the section, 20px heading-to-grid, 16px between featured cards, 12px between compact cards, 32px before a quieter tier, 28px before a closing note, 44px bottom.
 
 ## Elevation & Depth
 
@@ -273,6 +373,8 @@ Flat by default, layered by tone. Panes and cards separate by stepping between f
 - **Floating panel** (gpui-kit `shadow_lg`): dialogs, popovers, the command palette, history and folder management panels.
 - **Menu / dragged item** (`shadow_md`): toolbar menus and a calendar event while dragged.
 - **Raised segment** (`shadow_sm`): the selected option of a segmented control.
+- **Floating strip** (`shadow_sm`): the command toolbar, and a list row's hover quick actions, which float over its time.
+- **Docked field** (`shadow_xs`): the "Reply to…" bar at the foot of the reader.
 - **Focus ring** (`0 0 0 2px` in the theme's focus colour, no blur): keyboard focus on custom controls such as choice cards. A ring, not elevation.
 
 ### Named Rules
@@ -282,7 +384,7 @@ Flat by default, layered by tone. Panes and cards separate by stepping between f
 
 ## Shapes
 
-Softly rounded rectangles, sized to their role: 6px for controls and segments (the component library's base radius), 8px for tracks and small containers, 10px for the library's large radius, 12px for dialogs, floating panels and welcome choice cards. Plates and tiles round in proportion to their size (about 27% for logo plates; 28/128 of the tile for the brand tile, following the app icon). Dots, avatars and the beacon are full circles. Borders are 1px hairlines in the divider colour or a tone between divider and fill.
+Softly rounded rectangles, sized to their role: 3px for file-type badges, 5px for small chips, 6px for controls, segments and row chips (the component library's base radius), 7px for list rows and the quick-action strip, 8px for tracks, toolbars and small containers, 10px for the library's large radius, 12px for dialogs, floating panels and welcome choice cards. Plates and tiles round in proportion to their size (about 27% for logo plates; 28/128 of the tile for the brand tile, following the app icon). Dots, avatars, service marks and the beacon are full circles; counts and label pills are full capsules. Borders are 1px hairlines in the divider colour or a tone between divider and fill (often the control edge at 45%). Things that belong together share one border: folded messages join into one stack, and a message's reply commands into one segmented group.
 
 ## Components
 
@@ -326,6 +428,59 @@ The alpine-dawn photograph, cover-fit on a midnight base, with a midnight gradie
 ### Title-bar lockup
 The brand tile (midnight rounded square, ivory mark, amber beacon), typed wordmark, and on welcome and About only, "by Last Refuge" in 12px muted Inter.
 
+### Title bar and account
+On the chrome colour. The search field is centred, capped at 620px, with its Ctrl E hint. At the right sit the account's name in 12px muted text and the owner's avatar (29px, selection tint), with the account's 13px service mark badged on its lower-right corner on a ring of chrome. The badge has no hitbox, so a click reaches the account button.
+
+### Service marks
+Which service an account is with, pictured (`account_mark.rs`). It appears beside each account header in the folder pane (16px, in the rows' icon column), on the title-bar avatar (13px), and in the status bar (15px).
+- **Logo:** the provider's own mark (the same files as the welcome screen) on a white circle with a divider hairline in every theme, at 62% with its optical scale.
+- **Own:** Overlook's IMAP or POP3 colour icon at 72% on the chip colour, for servers without a known service.
+- **Sample account:** the brand tile.
+
+### Command toolbar
+A white (message-surface) strip, 8px radius, `shadow_sm`, one row of 36px commands with two-tone colour icons and sentence-case labels.
+- **Split New:** the module's own New in the solid action fill (Alexander's New message is its own steel blue #3E687E), joined to a 26px menu half behind a 28%-opacity on-action hairline. The menu offers the other two of New message, New event and New contact, with shortcuts.
+- **Groups:** a 1px × 22px divider-coloured separator with 4px margins between groups; navigation and app commands sit at the far end.
+- **Move to** carries a 13px muted chevron.
+- **Selected state** (such as a starred conversation's Unstar): selection fill and text.
+- **Rearranging:** the whole command is the drag handle; a 10px grip overlays the gap before it on hover and takes no width.
+- **Default mail order:** New message; Archive, Delete, Move to; Mark unread, Star; Reply, Reply all, Forward; then latest, previous and next, Sync, Appearance and Layout. Archive comes before Delete, and Mark and Star before Reply.
+
+### Folder pane
+- **Rows:** a 16px icon, a label and a count.
+- **Inbox unread:** a filled capsule (18px high, 20px minimum, 6px padding) in the message accent, with bold ink chosen by luminance.
+- **Unread in other folders and labels:** semibold, in the foreground colour (the accent when current).
+- **Totals** (Starred, Drafts, Outbox): plain muted figures.
+- **Account headers:** semibold, with the account's service mark.
+
+### Message list
+- **Header:** the folder title with "N unread · total" (or just the total) in 12px muted text. The Focused or Other tab not on show adds "· N" for its unread mail.
+- **Rows:**
+  - 7px radius, 32px tinted avatars, a 1px divider between rows.
+  - Unread rows take `list_unread()` and semibold text; selected and marked rows take the selection fill.
+  - A semibold thread-count capsule (chip fill, muted ink; on a selected row, 55% message-surface and selection text).
+- **Edge bar:** 3px, 2px radius, in the message accent, on unread rows and on the open row, like Outlook. Alexander's light-blue selection carries itself, so there the bar marks unread mail only.
+- **Extras line** (wraps rather than truncating):
+  - An invitation's date chip (calendar icon in the accent; "Cancelled" in the error colour). While the event awaits an answer, it also shows Accept (semibold, accent) and Decline (medium, muted) as 22px outlined buttons; once answered, the answer appears (Accepted in the success colour with a check).
+  - The first file as a file chip: white, divider edge, 6px radius, 22px, a coloured 8.5px bold type badge and the truncating name, at most 190px. A "+N" chip lists the others in its tooltip.
+  - The folder chip.
+- **Quick actions:** on hover, a small white strip (7px radius, divider edge, `shadow_sm`) floats over the time with 26 × 24px two-tone buttons:
+  - Archive (Restore in Trash, To Inbox outside it).
+  - Delete.
+  - Mark read or unread.
+  - Star.
+
+  A row's quick action changes only that row and leaves the open conversation open. On the open row it behaves exactly as the toolbar does.
+
+### Reader
+- **Subject** (24px semibold) with a 32px ghost Print button.
+- **Label pills:** 22px capsules on the chip fill with a 7px colour dot. Beside them, the message count, the participants and Expand all.
+- **Folded messages:** one line each (130px sender column, muted snippet, date), on message-surface mixed 25% toward hover. Neighbours join into one bordered stack with 8px outer corners.
+- **Message header:** the date (12px muted) above a segmented group (8px radius, 45% control-edge border) of Reply, Reply all and Forward. They are 32 × 28px segments with 16px two-tone colour icons, followed by a More menu.
+- **Attachments:** a header of "N attachments" and the total size, with an accent Save all for two or more files. Save all picks a folder, then copies or downloads each file, numbering clashes rather than overwriting. Then the attachment cards, and labelled Reply / Reply all / Forward buttons (Forward's icon in the brand accent).
+- **Reply bar:** at the foot of the reader while no reply is open, a 44px white field (10px radius, `shadow_xs`, 45% control-edge border, full edge on hover). It reads "Reply to {the sender's name}…", or "Reply all…" when that is the default, with a Ctrl R hint.
+- **Email paper:** 20px side and 6px top inset (the document brings its own top margin), 12px bottom.
+
 ## Do's and Don'ts
 
 ### Do:
@@ -335,6 +490,8 @@ The brand tile (midnight rounded square, ivory mark, amber beacon), typed wordma
 - **Do** give every custom interactive element a keyboard focus state in the theme's focus colour, and an accessible name.
 - **Do** show third-party sign-in marks unaltered, on white plates, with provenance recorded in `branding/providers/README.md`.
 - **Do** keep feedback transitions brief (120 to 180 ms); reserve longer motion for a single brand moment such as the welcome veil.
+- **Do** polish the main window without removing anything: keep the full labelled toolbar, every pane, and every command a person has today.
+- **Do** derive toolbar grouping from `ToolbarGroup`, so separators and the trailing run follow any order a person saves.
 
 ### Don't:
 - **Don't** use Beacon amber (#FF9D32) as a control fill, body text or wash; it is a small light.
@@ -343,3 +500,4 @@ The brand tile (midnight rounded square, ivory mark, amber beacon), typed wordma
 - **Don't** place the alpine landscape behind working mail; it belongs to onboarding, landing and launch surfaces.
 - **Don't** add shadows to cards at rest or to the horizon mark.
 - **Don't** invent screen-specific palettes or user-defined custom colours.
+- **Don't** draw a control that has nothing behind it, such as a search scope, a pop-out window or a selection mode the app doesn't have.

@@ -13,14 +13,17 @@ pub fn mail_pane(body: impl IntoElement, backdrop: Hsla, top_right_radius: Pixel
         .child(gpui_kit::base::RoundedFrameCover::top(px(8.), top_right_radius).backdrop(backdrop))
 }
 
-/// Circular initials avatar in the brand's muted green-gray.
+/// Circular initials avatar. Each person keeps one of four quiet tints (slate, amber,
+/// plum, pine), chosen from their address so they look the same in every list and
+/// message; Alexander keeps its avatars gray.
 pub fn avatar(address: &Address, size: f32, p: &Palette) -> Div {
+    let (fill, ink) = p.avatar_tint(&address.email);
     div()
         .flex_none()
         .size(px(size))
         .rounded_full()
-        .bg(p.avatar)
-        .text_color(p.avatar_ink)
+        .bg(fill)
+        .text_color(ink)
         .flex()
         .items_center()
         .justify_center()

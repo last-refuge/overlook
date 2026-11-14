@@ -1410,6 +1410,7 @@ impl MailWindow {
         self.refresh_idle_watchers();
         let _ = self.store.set_sync_state(&account.id, &SyncState::Syncing, None);
         self.accounts = self.store.accounts().unwrap_or_default();
+        self.account_marks.borrow_mut().clear();
         if self.account.id == account.id {
             self.account = account.clone();
         }

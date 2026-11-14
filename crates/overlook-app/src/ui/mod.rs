@@ -1,5 +1,6 @@
 //! The main mail window: header, sidebar, message list, reader, composer, status bar.
 
+mod account_mark;
 mod account_setup;
 mod calendar;
 mod calendar_setup;
@@ -594,6 +595,13 @@ pub struct MailWindow {
     rows_key: std::cell::RefCell<Option<RowsKey>>,
     /// Rows shown that are not day headings, for the count beside the title.
     rows_total: std::cell::Cell<usize>,
+    /// How many of those rows are unread, for the list's title line.
+    rows_unread: std::cell::Cell<usize>,
+    /// Unread conversations in the Other tab of the Inbox, for its tab label.
+    other_unread: usize,
+    /// The calendar event behind each invitation shown in the list, by its iCalendar UID:
+    /// looked up when a row first shows it, forgotten when mail or the calendar reloads.
+    invite_rows: std::cell::RefCell<HashMap<String, Option<list::InviteRow>>>,
     /// The row layout the list's cached heights were measured with.
     row_layout: std::cell::Cell<Option<RowLayout>>,
     drafts: Vec<Draft>,
@@ -663,6 +671,9 @@ pub struct MailWindow {
     /// Sidebar badges of the accounts other than the active one (the active one's are
     /// `counts`), including Drafts and Outbox; recounted in the background on every reload.
     account_counts: HashMap<AccountId, HashMap<MailboxView, usize>>,
+    /// Each account's service mark, worked out once from its server settings. Cleared
+    /// whenever the account list is reloaded.
+    account_marks: std::cell::RefCell<HashMap<AccountId, account_mark::AccountMark>>,
     /// Accounts whose badges the next `reload` recounts; see `mark_counts_stale`.
     account_counts_stale: HashSet<AccountId>,
     /// A recount is running; what turns stale meanwhile is recounted when it ends.
@@ -904,6 +915,9 @@ impl MailWindow {
             list_data_generation: 0,
             rows_key: Default::default(),
             rows_total: Default::default(),
+            rows_unread: Default::default(),
+            other_unread: 0,
+            invite_rows: Default::default(),
             row_layout: Default::default(),
             drafts: Vec::new(),
             outbox: Vec::new(),
@@ -949,6 +963,7 @@ impl MailWindow {
             collapsed_sections,
             account_labels: HashMap::new(),
             account_counts: HashMap::new(),
+            account_marks: Default::default(),
             account_counts_stale: HashSet::new(),
             account_counts_running: false,
             focused_enabled,
@@ -1235,6 +1250,7 @@ impl MailWindow {
             Ok(sample) => {
                 self.providers.insert(sample.id.clone(), providers::AccountProviders::new(Arc::new(self.sample.clone()), Some(Arc::new(self.sample.clone()))));
                 self.accounts = self.store.accounts().unwrap_or_default();
+                self.account_marks.borrow_mut().clear();
                 self.switch_account(sample.id, window, cx);
             }
             Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t load the sample mailbox: {e}")),
@@ -1272,6 +1288,20 @@ impl MailWindow {
     /// account's server settings; keep it out of per-row render paths.
     pub(crate) fn oauth_issuer(&self, account: &AccountId) -> Option<OAuthIssuer> {
         self.store.servers(account).ok().flatten().and_then(|s| s.oauth)
+    }
+
+    /// The service mark of `account`: its logo, or Overlook's IMAP, POP3 or own mark. Reads
+    /// the server settings of an IMAP or POP3 account once, then answers from memory.
+    pub(crate) fn account_mark(&self, account: &Account) -> account_mark::AccountMark {
+        if let Some(mark) = self.account_marks.borrow().get(&account.id) {
+            return *mark;
+        }
+        let servers = matches!(account.provider, ProviderKind::Imap | ProviderKind::Pop3)
+            .then(|| self.store.servers(&account.id).ok().flatten())
+            .flatten();
+        let mark = account_mark::AccountMark::of(account, servers.as_ref());
+        self.account_marks.borrow_mut().insert(account.id.clone(), mark);
+        mark
     }
 
     /// What kind of account this is, for account lists: "Microsoft" for an IMAP or POP3
@@ -1481,6 +1511,7 @@ impl MailWindow {
         self.account_counts_stale.remove(&id);
         self.refresh_idle_watchers();
         self.accounts = self.store.accounts().unwrap_or_default();
+        self.account_marks.borrow_mut().clear();
         crate::ui::toast(window, cx, crate::notify::Level::Info, format!("Removed {} from this device.", account.email));
         match self.accounts.first().map(|a| a.id.clone()) {
             Some(next) => {
@@ -1745,6 +1776,7 @@ impl MailWindow {
         }
         let _ = self.store.set_sync_state(&account.id, &SyncState::Syncing, None);
         self.accounts = self.store.accounts().unwrap_or_default();
+        self.account_marks.borrow_mut().clear();
         if let Some(warning) = sign_in_mismatch(expected.as_deref(), &email, added) {
             tracing::info!(target: "overlook::signin", account = %account.id.0, "signed in to a different Google account than the one being signed in again");
             crate::ui::toast(window, cx, crate::notify::Level::Warning, warning);
@@ -1837,6 +1869,12 @@ impl MailWindow {
         // Search coverage counts cached bodies, a full scan: only worth it while searching.
         self.search_coverage = if self.search_query.trim().is_empty() { String::new() } else { self.search_coverage_line(&acct) };
         self.counts = sidebar_counts(&self.mail_index, &owner, self.focused_enabled);
+        self.other_unread = if self.focused_enabled {
+            self.mail_index.view_count(&owner, &MailboxView::Kind(LabelKind::Inbox), Some(FocusTab::Other))
+        } else {
+            0
+        };
+        self.invite_rows.borrow_mut().clear();
         if !self.marked.is_empty() {
             let shown: HashSet<&ConversationId> = self.conversations.iter().map(|c| &c.id).collect();
             self.marked.retain(|id| shown.contains(id));
@@ -2185,6 +2223,42 @@ impl MailWindow {
                 match attachment.local_path.as_deref().map(PathBuf::from).filter(|p| p.exists()) {
                     Some(local) => this.finish_save(&local, &target, window, cx),
                     None => this.download_attachment(attachment.clone(), AfterDownload::SaveTo(target), window, cx),
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Saves every file of a message into one folder the person picks. Files already on
+    /// this device are copied at once; the rest download into it, each saying so when done.
+    /// A name already in the folder gets a number rather than being replaced.
+    pub(crate) fn save_all_attachments(&mut self, attachments: Vec<Attachment>, window: &mut Window, cx: &mut Context<Self>) {
+        if attachments.is_empty() {
+            return;
+        }
+        let receiver = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("Save here".into()) });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else { return };
+            let Some(dir) = paths.into_iter().next() else { return };
+            let _ = this.update_in(cx, |this, window, cx| {
+                let mut taken = HashSet::new();
+                let (mut copied, mut failed) = (0, Vec::new());
+                for attachment in attachments {
+                    let target = free_file_name(&dir, &attachment.filename, &mut taken);
+                    match attachment.local_path.as_deref().map(PathBuf::from).filter(|p| p.exists()) {
+                        Some(local) => match std::fs::copy(&local, &target) {
+                            Ok(_) => copied += 1,
+                            Err(e) => failed.push(format!("{}: {e}", attachment.filename)),
+                        },
+                        None => this.download_attachment(attachment, AfterDownload::SaveTo(target), window, cx),
+                    }
+                }
+                if copied > 0 {
+                    let files = if copied == 1 { "1 file".to_owned() } else { format!("{copied} files") };
+                    crate::ui::toast(window, cx, crate::notify::Level::Success, format!("Saved {files} to {}", dir.display()));
+                }
+                if !failed.is_empty() {
+                    crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t save {}", failed.join("; ")));
                 }
             });
         })
@@ -2902,13 +2976,20 @@ impl MailWindow {
         if ids.is_empty() {
             return;
         }
+        let next = self.removal_neighbour();
+        let changes = self.changes_to_inbox(&ids);
+        self.perform("Moved to Inbox", changes, true, window, cx);
+        self.select_after_removal(next, window, cx);
+    }
+
+    /// What putting `ids` back in the Inbox changes, as [`Self::move_to_inbox`] describes.
+    pub(crate) fn changes_to_inbox(&self, ids: &[MessageId]) -> Vec<LocalChange> {
         let of_kind = |kind: LabelKind| self.labels.iter().find(|l| l.kind == kind).map(|l| l.id.clone());
         let (trash, spam) = (of_kind(LabelKind::Trash), of_kind(LabelKind::Spam));
         let with_label = |label: &Option<LabelId>| -> Vec<MessageId> { ids.iter().filter(|id| self.mail_index.message(id).is_some_and(|m| label.as_ref().is_some_and(|l| m.has_label(l)))).cloned().collect() };
         let trashed = with_label(&trash);
         let junk = with_label(&spam);
         let others: Vec<MessageId> = ids.iter().filter(|id| !trashed.contains(id)).cloned().collect();
-        let next = self.removal_neighbour();
         let mut changes = vec![LocalChange::Untrash { message_ids: trashed }];
         if let (Some(spam), false) = (spam, junk.is_empty()) {
             changes.push(LocalChange::RemoveLabel { message_ids: junk, label_id: spam });
@@ -2916,8 +2997,7 @@ impl MailWindow {
         if let Some(inbox) = of_kind(LabelKind::Inbox) {
             changes.push(LocalChange::AddLabel { message_ids: others, label_id: inbox });
         }
-        self.perform("Moved to Inbox", changes, true, window, cx);
-        self.select_after_removal(next, window, cx);
+        changes
     }
 
     /// Applies a user label and, like moving to a folder, takes the messages out of the Inbox.
@@ -3861,7 +3941,13 @@ impl MailWindow {
                 h_flex()
                     .items_center()
                     .gap(px(10.))
-                    .child(format!("{} · {}", self.account.provider.label(), self.account.email))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .when(self.has_account(), |row| row.child(self.account_mark(&self.account).render(15., &p)))
+                            .child(format!("{} · {}", self.account.provider.label(), self.account.email)),
+                    )
                     .when(is_sample, |row| {
                         row.child(
                             Switch::new("connection")
@@ -4050,6 +4136,26 @@ fn shellexpand_home(path: &str) -> String {
     path.to_owned()
 }
 
+/// A path in `dir` for a file called `name` that neither exists yet nor was handed out in
+/// `taken`: `name`, then `name (2)`, `name (3)`…, keeping the extension last. Slashes in a
+/// sender's file name can't reach another folder.
+fn free_file_name(dir: &std::path::Path, name: &str, taken: &mut HashSet<PathBuf>) -> PathBuf {
+    let safe: String = name.chars().map(|c| if matches!(c, '/' | '\\' | '\0') { '_' } else { c }).collect();
+    let safe = if safe.trim().is_empty() || safe.starts_with('.') { format!("attachment{safe}") } else { safe };
+    let (stem, ext) = match safe.rfind('.') {
+        Some(i) if i > 0 => (safe[..i].to_owned(), safe[i..].to_owned()),
+        _ => (safe.clone(), String::new()),
+    };
+    let mut n = 1;
+    loop {
+        let candidate = dir.join(if n == 1 { safe.clone() } else { format!("{stem} ({n}){ext}") });
+        if !candidate.exists() && taken.insert(candidate.clone()) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 /// The app icon drawn from vectors: midnight rounded tile, ivory horizon mark, amber beacon.
 /// Crisp at any scale, unlike a downscaled bitmap.
 /// The mark and wordmark at the left of the title bar.
@@ -4159,7 +4265,7 @@ impl Render for MailWindow {
                 .child(self.render_app_rail(cx))
                 .child(v_flex().flex_1().min_w_0().h_full()
                     .child(self.render_header(cx))
-                    .child(self.render_app_toolbar(window.viewport_size().width - px(shell::RAIL_WIDTH), cx))
+                    .child(self.render_app_toolbar(window.viewport_size().width - px(shell::RAIL_WIDTH), window, cx))
                     .children(self.render_update_banner(cx))
                     .children(self.render_banner(cx))
                     .children(self.render_time_zone_prompt(cx))
@@ -4226,5 +4332,27 @@ mod new_mail_tests {
         assert!(new_inbox_mail(&before, &after, &account.email, NewMailNotifications::Off, false, 0).is_empty());
         assert!(new_inbox_mail(&after, &after, &account.email, NewMailNotifications::All, false, 0).is_empty(), "nothing new");
         assert!(new_inbox_mail(&before, &after, &account.email, NewMailNotifications::All, false, 6_000_000_000_000).is_empty(), "older than the session");
+    }
+}
+
+#[cfg(test)]
+mod save_all_tests {
+    use super::free_file_name;
+    use std::collections::HashSet;
+    // The parent's GPUI glob also exports a `test` proc macro.
+    use std::prelude::v1::test;
+
+    #[test]
+    fn files_saved_together_never_replace_each_other_or_leave_the_folder() {
+        let dir = std::env::temp_dir().join(format!("overlook-save-all-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Brief.pdf"), b"already here").unwrap();
+        let mut taken = HashSet::new();
+        assert_eq!(free_file_name(&dir, "Brief.pdf", &mut taken), dir.join("Brief (2).pdf"));
+        assert_eq!(free_file_name(&dir, "Brief.pdf", &mut taken), dir.join("Brief (3).pdf"));
+        assert_eq!(free_file_name(&dir, "notes", &mut taken), dir.join("notes"));
+        assert_eq!(free_file_name(&dir, "../../etc/passwd", &mut taken), dir.join("attachment.._.._etc_passwd"));
+        assert_eq!(free_file_name(&dir, "", &mut taken), dir.join("attachment"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

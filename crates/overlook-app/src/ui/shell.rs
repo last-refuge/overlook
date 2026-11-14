@@ -24,7 +24,7 @@ impl MailWindow {
             .h_full()
             .flex_none()
             .items_center()
-            .bg(p.surface)
+            .bg(p.chrome())
             .border_r_1()
             .border_color(p.divider.opacity(0.6))
             .child(
@@ -137,6 +137,7 @@ impl MailWindow {
     pub(super) fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *cx.palette();
         let owner = self.owner();
+        let mark = self.has_account().then(|| self.account_mark(&self.account));
         let search: AnyElement = match self.module {
             Module::Mail => Input::new(&self.search_input)
                 .prefix(icon("search").size(px(16.)).text_color(p.muted))
@@ -160,7 +161,7 @@ impl MailWindow {
                 .on_click(cx.listener(|this, _, window, cx| this.open_palette(window, cx)))
                 .into_any_element(),
         };
-        TitleBar::new().h(px(header_height(self.density))).bg(p.surface).child(
+        TitleBar::new().h(px(header_height(self.density))).bg(p.chrome()).child(
             h_flex()
                 .size_full()
                 .items_center()
@@ -176,19 +177,58 @@ impl MailWindow {
                         .line_height(px(30.))
                         .child("Overlook"),
                 )
-                .child(div().flex_1().min_w(px(140.)).max_w(px(640.)).child(search))
-                .child(div().flex_1())
+                // Search sits centred in the room between the wordmark and the account.
                 .child(
-                    Button::new("account-settings")
-                        .ghost()
-                        .size(px(HEADER_CONTROL_HEIGHT))
-                        .p(px(3.))
-                        .rounded_full()
-                        .accessibility_label("Account settings")
-                        .tooltip(format!("{} · {}", owner.display_name(), owner.email))
-                        .child(owner_avatar(&owner, 29., &p))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_settings(SettingsPage::Accounts, window, cx)
+                    div()
+                        .flex_1()
+                        .min_w(px(140.))
+                        .flex()
+                        .justify_center()
+                        .child(div().w_full().max_w(px(620.)).child(search)),
+                )
+                // Whose mail this is: the account's name beside its avatar, and the
+                // service it is with on the avatar's corner.
+                .when(mark.is_some(), |row| {
+                    row.child(
+                        div()
+                            .flex_shrink(1.)
+                            .min_w(px(0.))
+                            .max_w(px(220.))
+                            .mr(px(-14.))
+                            .truncate()
+                            .text_size(px(12.))
+                            .text_color(p.muted)
+                            .child(owner.display_name()),
+                    )
+                })
+                .child(
+                    div()
+                        .relative()
+                        .flex_none()
+                        .child(
+                            Button::new("account-settings")
+                                .ghost()
+                                .size(px(HEADER_CONTROL_HEIGHT))
+                                .p(px(3.))
+                                .rounded_full()
+                                .accessibility_label("Account settings")
+                                .tooltip(format!("{} · {}", owner.display_name(), owner.email))
+                                .child(owner_avatar(&owner, 29., &p))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_settings(SettingsPage::Accounts, window, cx)
+                                })),
+                        )
+                        // Painted over the button's corner; it has no hitbox, so a click
+                        // on it still reaches the button.
+                        .children(mark.map(|mark| {
+                            div()
+                                .absolute()
+                                .right(px(-3.))
+                                .bottom(px(-3.))
+                                .p(px(1.5))
+                                .rounded_full()
+                                .bg(p.chrome())
+                                .child(mark.render(13., &p))
                         })),
                 ),
         )
