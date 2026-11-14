@@ -513,7 +513,7 @@ fn parse_hex(value: &str) -> Option<Hsla> {
     (hex.len() == 6).then(|| u32::from_str_radix(hex, 16).ok()).flatten().map(c)
 }
 
-fn relative_luminance(color: Hsla) -> f32 {
+pub(crate) fn relative_luminance(color: Hsla) -> f32 {
     let rgba = Rgba::from(color);
     let channel = |v: f32| if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
     0.2126 * channel(rgba.r) + 0.7152 * channel(rgba.g) + 0.0722 * channel(rgba.b)
@@ -524,7 +524,7 @@ fn contrast(a: Hsla, b: Hsla) -> f32 {
     (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
 
-fn mix(a: Hsla, b: Hsla, t: f32) -> Hsla {
+pub(crate) fn mix(a: Hsla, b: Hsla, t: f32) -> Hsla {
     let (a, b) = (Rgba::from(a), Rgba::from(b));
     Rgba { r: a.r + (b.r - a.r) * t, g: a.g + (b.g - a.g) * t, b: a.b + (b.b - a.b) * t, a: 1. }.into()
 }
