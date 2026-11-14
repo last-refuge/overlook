@@ -45,7 +45,16 @@ const EMBEDDED: &[(&str, &[u8])] = &[
         "overlook/alpine-dawn.png",
         include_bytes!("../../../branding/assets/overlook-alpine-dawn.png"),
     ),
+    // The services' own marks for the welcome screen; provenance in branding/providers/README.md.
+    ("overlook/providers/google-g.png", include_bytes!("../../../branding/providers/google-g.png")),
+    ("overlook/providers/microsoft.svg", include_bytes!("../../../branding/providers/microsoft.svg")),
+    ("overlook/providers/icloud.svg", include_bytes!("../../../branding/providers/icloud.svg")),
+    ("overlook/providers/aol.svg", include_bytes!("../../../branding/providers/aol.svg")),
+    ("overlook/providers/proton-mail.svg", include_bytes!("../../../branding/providers/proton-mail.svg")),
+    ("overlook/providers/yahoo.svg", include_bytes!("../../../branding/providers/yahoo.svg")),
+    ("overlook/providers/fastmail.svg", include_bytes!("../../../branding/providers/fastmail.svg")),
 ];
+
 
 // Original full-color SVGs. Use images, not the monochrome icon mask renderer.
 macro_rules! color_icons {
@@ -88,6 +97,8 @@ color_icons! {
     Layout => "layout",
     Settings => "settings",
     History => "history",
+    Imap => "imap",
+    Pop3 => "pop3",
 }
 
 const ICON_THEMES: &[(&str, ResolvedTheme)] = &[
@@ -254,6 +265,24 @@ pub fn icon(name: &str) -> gpui_kit::component::Icon {
 mod tests {
     use super::*;
     use std::{collections::HashSet, sync::Arc};
+
+    #[test]
+    fn provider_marks_are_embedded_and_keep_their_colors() {
+        let assets = Assets;
+        let renderer = gpui_kit::SvgRenderer::new(Arc::new(Assets));
+        let marks = EMBEDDED.iter().map(|(path, _)| *path).filter(|path| path.starts_with("overlook/providers/"));
+        assert_eq!(marks.clone().count(), 7);
+        for path in marks {
+            let bytes = assets.load(path).unwrap().unwrap_or_else(|| panic!("{path} is embedded"));
+            if !path.ends_with(".svg") {
+                assert!(bytes.starts_with(b"\x89PNG"), "{path}");
+                continue;
+            }
+            let image = renderer.render_single_frame(&bytes, 4.).unwrap();
+            let colored = image.as_bytes(0).unwrap().as_chunks::<4>().0.iter().filter(|pixel| pixel[3] >= 250 && (pixel[0] != pixel[1] || pixel[1] != pixel[2])).count();
+            assert!(colored > 50, "{path} renders in its colors");
+        }
+    }
 
     #[test]
     fn color_icons_are_embedded_renderable_and_keep_their_color() {

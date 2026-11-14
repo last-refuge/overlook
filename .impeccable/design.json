@@ -1,0 +1,894 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-14T00:33:58+00:00",
+  "title": "Design System: Overlook",
+  "extensions": {
+    "colorMeta": {
+      "midnight": {
+        "role": "neutral",
+        "displayName": "Midnight",
+        "canonical": "#101C24",
+        "tonalRamp": [
+          "#030C14",
+          "#1A272F",
+          "#37444D",
+          "#55636D",
+          "#76858F",
+          "#98A7B2",
+          "#BCCCD7",
+          "#E1F1FD"
+        ]
+      },
+      "alpine-slate": {
+        "role": "secondary",
+        "displayName": "Alpine Slate",
+        "canonical": "#365F73",
+        "tonalRamp": [
+          "#000D15",
+          "#032939",
+          "#1E475A",
+          "#3E677C",
+          "#5F899E",
+          "#81ACC2",
+          "#A4D1E8",
+          "#DDF2FE"
+        ]
+      },
+      "pine": {
+        "role": "secondary",
+        "displayName": "Pine",
+        "canonical": "#536E63",
+        "tonalRamp": [
+          "#000F09",
+          "#112B22",
+          "#2F483E",
+          "#4D685D",
+          "#6E8A7E",
+          "#90ADA1",
+          "#B3D1C5",
+          "#D8F7EA"
+        ]
+      },
+      "mist": {
+        "role": "secondary",
+        "displayName": "Mist",
+        "canonical": "#C6D5D5",
+        "tonalRamp": [
+          "#040D0D",
+          "#1C2828",
+          "#384545",
+          "#576464",
+          "#788686",
+          "#9AA8A8",
+          "#BECDCD",
+          "#E3F2F2"
+        ]
+      },
+      "ivory": {
+        "role": "neutral",
+        "displayName": "Ivory",
+        "canonical": "#F0EBDD",
+        "tonalRamp": [
+          "#0E0B03",
+          "#29251A",
+          "#464236",
+          "#656155",
+          "#878275",
+          "#A9A598",
+          "#CEC9BB",
+          "#F3EEE0"
+        ]
+      },
+      "paper": {
+        "role": "neutral",
+        "displayName": "Paper",
+        "canonical": "#FAF8F2",
+        "tonalRamp": [
+          "#0C0B07",
+          "#262521",
+          "#43423D",
+          "#63615C",
+          "#84827D",
+          "#A7A59F",
+          "#CBC9C3",
+          "#F0EEE8"
+        ]
+      },
+      "beacon": {
+        "role": "tertiary",
+        "displayName": "Beacon",
+        "canonical": "#FF9D32",
+        "tonalRamp": [
+          "#150800",
+          "#381E03",
+          "#613601",
+          "#8B510F",
+          "#B86E18",
+          "#EB8A10",
+          "#FBBA7F",
+          "#FEEBDA"
+        ]
+      },
+      "stone-frame": {
+        "role": "neutral",
+        "displayName": "Stone Frame",
+        "canonical": "#CDD1C9",
+        "tonalRamp": [
+          "#0A0C07",
+          "#232620",
+          "#40433D",
+          "#5F635C",
+          "#80847C",
+          "#A3A79F",
+          "#C7CBC3",
+          "#ECF0E8"
+        ]
+      },
+      "soft-stone": {
+        "role": "neutral",
+        "displayName": "Soft Stone",
+        "canonical": "#E1E2DC",
+        "tonalRamp": [
+          "#0B0C08",
+          "#252621",
+          "#42423E",
+          "#61625D",
+          "#82837D",
+          "#A5A6A0",
+          "#C9CAC4",
+          "#EEEFE9"
+        ]
+      },
+      "stone-sidebar": {
+        "role": "neutral",
+        "displayName": "Stone Sidebar",
+        "canonical": "#C4CBC1",
+        "tonalRamp": [
+          "#080D07",
+          "#22271F",
+          "#3E443C",
+          "#5D635B",
+          "#7E857B",
+          "#A1A79E",
+          "#C5CCC2",
+          "#EAF1E7"
+        ]
+      },
+      "pale-green-list": {
+        "role": "neutral",
+        "displayName": "Pale Green List",
+        "canonical": "#F3F7F1",
+        "tonalRamp": [
+          "#0A0C08",
+          "#232622",
+          "#40433E",
+          "#5F625D",
+          "#80847E",
+          "#A3A6A1",
+          "#C7CAC5",
+          "#ECF0EA"
+        ]
+      },
+      "unread-green": {
+        "role": "neutral",
+        "displayName": "Unread Green",
+        "canonical": "#E3EBE0",
+        "tonalRamp": [
+          "#080D06",
+          "#21271F",
+          "#3E443B",
+          "#5D645A",
+          "#7E857B",
+          "#A0A89D",
+          "#C4CCC1",
+          "#E9F1E6"
+        ]
+      },
+      "reading-white": {
+        "role": "neutral",
+        "displayName": "Reading White",
+        "canonical": "#FFFFFF",
+        "tonalRamp": [
+          "#0B0B0B",
+          "#252525",
+          "#424242",
+          "#616161",
+          "#828282",
+          "#A5A5A5",
+          "#C9C9C9",
+          "#EEEEEE"
+        ]
+      },
+      "charcoal": {
+        "role": "neutral",
+        "displayName": "Charcoal",
+        "canonical": "#29332E",
+        "tonalRamp": [
+          "#050D09",
+          "#1E2823",
+          "#3A4540",
+          "#59645F",
+          "#7A8680",
+          "#9CA8A2",
+          "#C0CDC6",
+          "#E5F2EB"
+        ]
+      },
+      "moss-gray": {
+        "role": "neutral",
+        "displayName": "Moss Gray",
+        "canonical": "#4B564D",
+        "tonalRamp": [
+          "#050E07",
+          "#1E2820",
+          "#3B453D",
+          "#59655B",
+          "#7A867C",
+          "#9CA99F",
+          "#C0CDC2",
+          "#E5F3E8"
+        ]
+      },
+      "stone-divider": {
+        "role": "neutral",
+        "displayName": "Stone Divider",
+        "canonical": "#A7B0A5",
+        "tonalRamp": [
+          "#070D06",
+          "#20271F",
+          "#3D453B",
+          "#5C645A",
+          "#7D857B",
+          "#9FA89D",
+          "#C3CCC1",
+          "#E8F2E6"
+        ]
+      },
+      "control-edge": {
+        "role": "neutral",
+        "displayName": "Control Edge",
+        "canonical": "#657267",
+        "tonalRamp": [
+          "#050E06",
+          "#1D281F",
+          "#3A463C",
+          "#58655A",
+          "#79867B",
+          "#9BA99D",
+          "#BFCEC1",
+          "#E4F3E6"
+        ]
+      },
+      "stone-hover": {
+        "role": "neutral",
+        "displayName": "Stone Hover",
+        "canonical": "#D5DAD1",
+        "tonalRamp": [
+          "#090C07",
+          "#232620",
+          "#3F443C",
+          "#5F635B",
+          "#7F847C",
+          "#A2A79E",
+          "#C6CBC2",
+          "#EBF0E7"
+        ]
+      },
+      "pine-action": {
+        "role": "primary",
+        "displayName": "Pine Action",
+        "canonical": "#3F6654",
+        "tonalRamp": [
+          "#000F08",
+          "#032D1E",
+          "#244B3A",
+          "#446B59",
+          "#658D7A",
+          "#87B09C",
+          "#AAD5C0",
+          "#CFFAE5"
+        ]
+      },
+      "sage-selection": {
+        "role": "neutral",
+        "displayName": "Sage Selection",
+        "canonical": "#BDCDBF",
+        "tonalRamp": [
+          "#040E06",
+          "#1C291E",
+          "#39463B",
+          "#576659",
+          "#78877A",
+          "#9AAA9C",
+          "#BECEC0",
+          "#E3F4E5"
+        ]
+      },
+      "deep-amber": {
+        "role": "tertiary",
+        "displayName": "Deep Amber",
+        "canonical": "#92581D",
+        "tonalRamp": [
+          "#150800",
+          "#381E04",
+          "#613604",
+          "#8B5114",
+          "#AF733B",
+          "#D4965E",
+          "#FBBA81",
+          "#FEEBDB"
+        ]
+      },
+      "light-success": {
+        "role": "neutral",
+        "displayName": "Light Success",
+        "canonical": "#386449",
+        "tonalRamp": [
+          "#000F05",
+          "#042D18",
+          "#204C33",
+          "#406D51",
+          "#618F72",
+          "#83B294",
+          "#A7D7B7",
+          "#CCFDDC"
+        ]
+      },
+      "light-warning": {
+        "role": "neutral",
+        "displayName": "Light Warning",
+        "canonical": "#805015",
+        "tonalRamp": [
+          "#140800",
+          "#371F02",
+          "#5D380A",
+          "#85551B",
+          "#A97640",
+          "#CE9962",
+          "#F4BD86",
+          "#FFEBD8"
+        ]
+      },
+      "light-error": {
+        "role": "neutral",
+        "displayName": "Light Error",
+        "canonical": "#A13E37",
+        "tonalRamp": [
+          "#1E0101",
+          "#4D0003",
+          "#791716",
+          "#9F3C35",
+          "#C55F55",
+          "#ED8277",
+          "#FDB4AB",
+          "#FFE9E6"
+        ]
+      },
+      "night-frame": {
+        "role": "neutral",
+        "displayName": "Night Frame",
+        "canonical": "#101A21",
+        "tonalRamp": [
+          "#040C13",
+          "#1C272E",
+          "#38444C",
+          "#57636C",
+          "#78848D",
+          "#9AA7B1",
+          "#BECBD5",
+          "#E3F1FB"
+        ]
+      },
+      "night-surface": {
+        "role": "neutral",
+        "displayName": "Night Surface",
+        "canonical": "#17242C",
+        "tonalRamp": [
+          "#030D14",
+          "#1A272F",
+          "#36444D",
+          "#55646D",
+          "#75858F",
+          "#98A8B2",
+          "#BBCCD7",
+          "#E0F1FC"
+        ]
+      },
+      "night-sidebar": {
+        "role": "neutral",
+        "displayName": "Night Sidebar",
+        "canonical": "#121F27",
+        "tonalRamp": [
+          "#030D14",
+          "#1A272F",
+          "#36444D",
+          "#55646D",
+          "#75858F",
+          "#97A8B2",
+          "#BBCCD7",
+          "#E0F1FD"
+        ]
+      },
+      "night-muted": {
+        "role": "neutral",
+        "displayName": "Night Muted",
+        "canonical": "#A8B7BA",
+        "tonalRamp": [
+          "#040D0F",
+          "#1B272A",
+          "#384547",
+          "#566467",
+          "#778588",
+          "#99A8AB",
+          "#BDCCCF",
+          "#E2F2F5"
+        ]
+      },
+      "night-divider": {
+        "role": "neutral",
+        "displayName": "Night Divider",
+        "canonical": "#30424B",
+        "tonalRamp": [
+          "#010D15",
+          "#162830",
+          "#33454E",
+          "#51646E",
+          "#728690",
+          "#94A9B3",
+          "#B8CDD8",
+          "#DDF3FE"
+        ]
+      },
+      "night-control-edge": {
+        "role": "neutral",
+        "displayName": "Night Control Edge",
+        "canonical": "#71878D",
+        "tonalRamp": [
+          "#000E12",
+          "#15282D",
+          "#32464B",
+          "#50656B",
+          "#71878D",
+          "#93AAB0",
+          "#B6CED4",
+          "#DBF4FA"
+        ]
+      },
+      "night-hover": {
+        "role": "neutral",
+        "displayName": "Night Hover",
+        "canonical": "#23353F",
+        "tonalRamp": [
+          "#010D15",
+          "#162831",
+          "#32454F",
+          "#516470",
+          "#718691",
+          "#94A9B5",
+          "#B7CDDA",
+          "#DEF2FE"
+        ]
+      },
+      "night-chip": {
+        "role": "neutral",
+        "displayName": "Night Chip",
+        "canonical": "#22323B",
+        "tonalRamp": [
+          "#010D15",
+          "#182730",
+          "#34454E",
+          "#53646E",
+          "#738590",
+          "#95A8B3",
+          "#B9CDD8",
+          "#DEF2FE"
+        ]
+      },
+      "glacier-action": {
+        "role": "primary",
+        "displayName": "Glacier Action",
+        "canonical": "#A9CDD9",
+        "tonalRamp": [
+          "#000E13",
+          "#072A33",
+          "#274751",
+          "#466772",
+          "#678994",
+          "#89ACB7",
+          "#ACD0DC",
+          "#D7F4FE"
+        ]
+      },
+      "night-on-action": {
+        "role": "neutral",
+        "displayName": "Night On-Action",
+        "canonical": "#10232D",
+        "tonalRamp": [
+          "#000D16",
+          "#152832",
+          "#314550",
+          "#506570",
+          "#708692",
+          "#92A9B6",
+          "#B6CDDB",
+          "#DDF2FF"
+        ]
+      },
+      "night-selection": {
+        "role": "neutral",
+        "displayName": "Night Selection",
+        "canonical": "#28404C",
+        "tonalRamp": [
+          "#000D15",
+          "#112833",
+          "#2E4652",
+          "#4C6572",
+          "#6D8794",
+          "#8FAAB8",
+          "#B2CEDD",
+          "#DCF3FF"
+        ]
+      },
+      "night-selection-text": {
+        "role": "neutral",
+        "displayName": "Night Selection Text",
+        "canonical": "#DCECEF",
+        "tonalRamp": [
+          "#030D0F",
+          "#1B272A",
+          "#384547",
+          "#566467",
+          "#778588",
+          "#99A8AB",
+          "#BDCCCF",
+          "#E2F2F5"
+        ]
+      },
+      "lantern-focus": {
+        "role": "tertiary",
+        "displayName": "Lantern Focus",
+        "canonical": "#FFBA6B",
+        "tonalRamp": [
+          "#140800",
+          "#361F03",
+          "#5E3801",
+          "#865510",
+          "#B27219",
+          "#D89545",
+          "#FEB96A",
+          "#FFEBD6"
+        ]
+      },
+      "dark-success": {
+        "role": "neutral",
+        "displayName": "Dark Success",
+        "canonical": "#A8CEB1",
+        "tonalRamp": [
+          "#000F04",
+          "#0A2D17",
+          "#294B33",
+          "#486B51",
+          "#698D72",
+          "#8BB094",
+          "#AED4B7",
+          "#D3FADC"
+        ]
+      },
+      "dark-warning": {
+        "role": "neutral",
+        "displayName": "Dark Warning",
+        "canonical": "#F1BE78",
+        "tonalRamp": [
+          "#130900",
+          "#352000",
+          "#5A3B05",
+          "#815816",
+          "#A77830",
+          "#CC9B55",
+          "#F2BF79",
+          "#FEEBD4"
+        ]
+      },
+      "dark-error": {
+        "role": "neutral",
+        "displayName": "Dark Error",
+        "canonical": "#FFB0A6",
+        "tonalRamp": [
+          "#1F0000",
+          "#490908",
+          "#6B2A25",
+          "#8F4A43",
+          "#B46B63",
+          "#DA8E85",
+          "#FCB4AB",
+          "#FEE9E6"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Display",
+        "purpose": "Welcome headline on the photograph; brand moments only."
+      },
+      "wordmark": {
+        "displayName": "Wordmark",
+        "purpose": "Typed product name beside the brand tile in the title bar."
+      },
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "Section heads such as 'Connect your mail'."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Featured card names and strong item titles."
+      },
+      "lead": {
+        "displayName": "Lead",
+        "purpose": "The line under the display headline."
+      },
+      "control": {
+        "displayName": "Control",
+        "purpose": "Component-library default for inputs, buttons and menus."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "The window's base size; descriptions and segments."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Group labels, metadata, notes; the most-used size."
+      },
+      "caption": {
+        "displayName": "Caption",
+        "purpose": "Badges, counts and dense metadata."
+      }
+    },
+    "shadows": [
+      {
+        "name": "floating-panel",
+        "value": "gpui-kit shadow_lg",
+        "purpose": "Dialogs, popovers, command palette and floating panels."
+      },
+      {
+        "name": "menu",
+        "value": "gpui-kit shadow_md",
+        "purpose": "Toolbar menus and a dragged calendar event."
+      },
+      {
+        "name": "raised-segment",
+        "value": "gpui-kit shadow_sm",
+        "purpose": "The selected option of a segmented control."
+      },
+      {
+        "name": "focus-ring",
+        "value": "0 0 0 2px <theme focus colour>",
+        "purpose": "Keyboard focus on custom controls; not elevation."
+      }
+    ],
+    "motion": [
+      {
+        "name": "feedback",
+        "value": "120-180ms",
+        "purpose": "Brief state feedback per the brand system."
+      },
+      {
+        "name": "welcome-veil",
+        "value": "1400ms ease-out-quint, midnight veil opacity 0.6 to 0",
+        "purpose": "The welcome banner's dusk veil lifting once as the window opens; content never waits for it."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "welcome-column-max",
+        "value": "1040px"
+      },
+      {
+        "name": "supported-min-width",
+        "value": "900px"
+      }
+    ],
+    "colorways": {
+      "note": "Order: background, surface, sidebar, foreground, muted, divider, control border, hover, action, selection, selection text, focus (theme.rs).",
+      "gray": [
+        "#E5E7EB",
+        "#F3F4F6",
+        "#D1D5DB",
+        "#1F2937",
+        "#4B5563",
+        "#B8BEC7",
+        "#6B7280",
+        "#DDE1E7",
+        "#374151",
+        "#CDD5DF",
+        "#1F2937",
+        "#805015"
+      ],
+      "blue": [
+        "#EDF4FC",
+        "#F8FBFF",
+        "#DCE9F8",
+        "#172D4D",
+        "#4E6480",
+        "#C7D6E8",
+        "#657F9F",
+        "#E2EDFA",
+        "#245A96",
+        "#D3E4F8",
+        "#193F70",
+        "#805015"
+      ],
+      "white": [
+        "#FFFFFF",
+        "#FFFFFF",
+        "#FAFAFA",
+        "#20242B",
+        "#59616D",
+        "#E0E3E7",
+        "#767D87",
+        "#F0F2F5",
+        "#374151",
+        "#E5E9EF",
+        "#20242B",
+        "#805015"
+      ],
+      "alexander": [
+        "#E3E9EE",
+        "#FFFFFF",
+        "#E0E7ED",
+        "#182B46",
+        "#48596C",
+        "#C3CFD9",
+        "#63748A",
+        "#EAF0F4",
+        "#1F57A5",
+        "#E0EAF0",
+        "#17314D",
+        "#1F57A5"
+      ],
+      "pink": [
+        "#FCF0F5",
+        "#FFFAFC",
+        "#F5DFE9",
+        "#402536",
+        "#765364",
+        "#E8C9D8",
+        "#A06A84",
+        "#F6E4ED",
+        "#963D68",
+        "#F0D4E2",
+        "#692C4B",
+        "#805015"
+      ]
+    }
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The action fill for confirming commands in dialogs and setup.",
+      "html": "<button class=\"ds-btn-primary\">Connect</button>",
+      "css": ".ds-btn-primary { background:#3F6654; color:#FFFFFF; font:400 14px Inter, 'Noto Sans', sans-serif; padding:6px 14px; border:none; border-radius:6px; cursor:pointer; transition:background 150ms; } .ds-btn-primary:hover { background:#38594A; } .ds-btn-primary:active { background:#304D40; } .ds-btn-primary:focus-visible { outline:2px solid #92581D; outline-offset:2px; }"
+    },
+    {
+      "name": "Secondary Button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "Quiet companion action on the hover tone.",
+      "html": "<button class=\"ds-btn-secondary\">Cancel</button>",
+      "css": ".ds-btn-secondary { background:#D5DAD1; color:#29332E; font:400 14px Inter, 'Noto Sans', sans-serif; padding:6px 14px; border:none; border-radius:6px; cursor:pointer; transition:background 150ms; } .ds-btn-secondary:hover { background:#CFD4CB; } .ds-btn-secondary:focus-visible { outline:2px solid #92581D; outline-offset:2px; }"
+    },
+    {
+      "name": "Segmented Control",
+      "kind": "chip",
+      "refersTo": "segmented-track",
+      "description": "A track of options; the chosen one is a raised card with semibold text.",
+      "html": "<div class=\"ds-seg\"><button class=\"ds-seg-item ds-on\">Light</button><button class=\"ds-seg-item\">Dark</button><button class=\"ds-seg-item\">System</button></div>",
+      "css": ".ds-seg { display:inline-flex; gap:2px; padding:3px; border-radius:8px; background:#C4CBC1; border:1px solid #A7B0A5; font-family:Inter, 'Noto Sans', sans-serif; } .ds-seg-item { font-size:13px; padding:4px 10px; border-radius:6px; border:1px solid transparent; background:transparent; color:#4B564D; cursor:pointer; } .ds-seg-item:hover { background:#D5DAD1; color:#29332E; } .ds-seg-item.ds-on { background:#E1E2DC; color:#29332E; font-weight:600; border-color:#657267; box-shadow:0 1px 2px rgba(0,0,0,0.08); } .ds-seg-item:focus-visible { outline:2px solid #92581D; outline-offset:1px; }"
+    },
+    {
+      "name": "Text Field",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "gpui-kit input with Light's control edge (#657267) and focus ring.",
+      "html": "<input class=\"ds-input\" placeholder=\"you@example.com\">",
+      "css": ".ds-input { font:400 14px Inter, 'Noto Sans', sans-serif; color:#29332E; background:transparent; border:1px solid #657267; border-radius:6px; padding:6px 10px; width:240px; } .ds-input::placeholder { color:#4B564D; } .ds-input:focus-visible { outline:none; border-color:#92581D; box-shadow:0 0 0 2px #92581D; }"
+    },
+    {
+      "name": "Featured Choice Card",
+      "kind": "card",
+      "refersTo": "choice-card-featured",
+      "description": "A service to connect on the welcome screen: white logo plate, name, plain detail, arrow; the beacon lights on hover or focus.",
+      "html": "<button class=\"ds-card\"><span class=\"ds-plate\"><svg width=\"30\" height=\"30\" viewBox=\"0 0 24 24\"><circle cx=\"12\" cy=\"12\" r=\"9\" fill=\"none\" stroke=\"#3F6654\" stroke-width=\"2.4\"/></svg><span class=\"ds-beacon\"></span></span><span class=\"ds-text\"><span class=\"ds-name\">Gmail</span><span class=\"ds-detail\">Sign in with Google</span></span><span class=\"ds-arrow\"><svg width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M5 12h14\"/><path d=\"m12 5 7 7-7 7\"/></svg></span></button>",
+      "css": ".ds-card { display:flex; align-items:flex-start; gap:16px; min-height:112px; box-sizing:border-box; padding:30px 20px; border-radius:12px; background:#FFFFFF; border:1px solid #C5CBC3; font-family:Inter, 'Noto Sans', sans-serif; color:#29332E; cursor:pointer; text-align:left; width:320px; transition:background 150ms, border-color 150ms; } .ds-card:hover { background:#EBF0EC; border-color:#3F6654; } .ds-card:active { background:#DEE6DF; } .ds-card:focus-visible { outline:none; border-color:#92581D; box-shadow:0 0 0 2px #92581D; } .ds-plate { position:relative; flex:none; width:52px; height:52px; border-radius:14px; background:#FFFFFF; border:1px solid #D6DBD4; display:flex; align-items:center; justify-content:center; } .ds-beacon { position:absolute; top:-3px; right:-3px; width:7px; height:7px; border-radius:50%; background:#FF9D32; border:1px solid #EBF0EC; opacity:0; transition:opacity 150ms; } .ds-card:hover .ds-beacon, .ds-card:focus-visible .ds-beacon { opacity:1; } .ds-text { flex:1; display:flex; flex-direction:column; gap:2px; margin-top:5px; } .ds-name { font-size:16px; line-height:22px; font-weight:600; } .ds-detail { font-size:13px; line-height:18px; color:#4B564D; } .ds-arrow { flex:none; height:52px; display:flex; align-items:center; color:#4B564D; } .ds-card:hover .ds-arrow, .ds-card:focus-visible .ds-arrow { color:#3F6654; }"
+    },
+    {
+      "name": "Quiet Choice",
+      "kind": "custom",
+      "refersTo": "choice-card-quiet",
+      "description": "Generic IMAP or POP3: no fill or edge until hovered or focused, Overlook's own colour icon on a tinted plate.",
+      "html": "<button class=\"ds-quiet\"><span class=\"ds-qplate\"><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"22\" height=\"22\" viewBox=\"0 0 32 32\"><defs><linearGradient id=\"tone\" x1=\"0\" y1=\"0\" x2=\"1\" y2=\"1\"><stop stop-color=\"#76A58C\"/><stop offset=\"1\" stop-color=\"#3F6654\"/></linearGradient></defs><g fill=\"none\" stroke=\"#3F6654\" stroke-width=\"2.1\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><rect x=\"3.5\" y=\"5\" width=\"17\" height=\"9\" rx=\"2.6\" fill=\"#DDE9E1\"/><rect x=\"3.5\" y=\"18\" width=\"17\" height=\"9\" rx=\"2.6\" fill=\"#DDE9E1\"/><path d=\"M12 9.5h4.5M12 22.5h4.5\" stroke=\"url(#tone)\"/><path d=\"M26.5 7.5v17M23.5 10.5l3-3 3 3M23.5 21.5l3 3 3-3\" stroke=\"#92581D\" stroke-width=\"2.4\"/></g><g fill=\"#3F6654\"><circle cx=\"8\" cy=\"9.5\" r=\"1.3\"/><circle cx=\"8\" cy=\"22.5\" r=\"1.3\"/></g></svg>\n</span><span class=\"ds-qtext\"><span class=\"ds-qname\">IMAP account</span><span class=\"ds-qdetail\">Keeps your mail on the server</span></span></button>",
+      "css": ".ds-quiet { display:inline-flex; align-items:flex-start; gap:12px; min-height:56px; padding:9px 12px; border-radius:12px; background:transparent; border:1px solid transparent; font-family:Inter, 'Noto Sans', sans-serif; color:#29332E; cursor:pointer; text-align:left; transition:background 150ms, border-color 150ms; } .ds-quiet:hover { background:#EBF0EC; border-color:#3F6654; } .ds-quiet:focus-visible { outline:none; border-color:#92581D; box-shadow:0 0 0 2px #92581D; } .ds-qplate { margin-top:3px; width:32px; height:32px; border-radius:9px; background:#DEE6DF; display:flex; align-items:center; justify-content:center; } .ds-qtext { display:flex; flex-direction:column; gap:2px; } .ds-qname { font-size:13px; line-height:19px; font-weight:500; } .ds-qdetail { font-size:12px; line-height:17px; color:#4B564D; }"
+    },
+    {
+      "name": "Horizon Banner",
+      "kind": "custom",
+      "refersTo": "welcome-banner",
+      "description": "Welcome-only brand band: photograph on midnight, a left midnight shade, ivory serif headline. The photo is replaced here by a midnight-to-slate gradient.",
+      "html": "<div class=\"ds-banner\"><div class=\"ds-banner-inner\"><div class=\"ds-display\">A calmer place for your mail.</div><div class=\"ds-lead\">Welcome to Overlook. Connect an account to bring your mail in.</div></div></div>",
+      "css": ".ds-banner { position:relative; height:240px; background:linear-gradient(90deg, rgba(16,28,36,0.95) 0%, rgba(16,28,36,0.6) 68%), linear-gradient(180deg, #2A4656 0%, #101C24 100%); display:flex; align-items:center; padding:0 32px; overflow:hidden; } .ds-banner-inner { display:flex; flex-direction:column; gap:12px; } .ds-display { font:400 48px/56px 'Source Serif 4 Display', Georgia, serif; color:#F0EBDD; max-width:640px; } .ds-lead { font:400 15px/22px Inter, 'Noto Sans', sans-serif; color:rgba(240,235,221,0.84); max-width:520px; } @keyframes ds-veil { from { opacity:0.6 } to { opacity:0 } } .ds-banner::after { content:''; position:absolute; inset:0; background:#101C24; opacity:0; animation:ds-veil 1400ms cubic-bezier(0.22,1,0.36,1); pointer-events:none; } @media (prefers-reduced-motion: reduce) { .ds-banner::after { animation:none; } }"
+    },
+    {
+      "name": "Dialog Panel",
+      "kind": "card",
+      "refersTo": "dialog-panel",
+      "description": "Floating panel for dialogs and popovers: surface fill, hairline edge, large soft shadow.",
+      "html": "<div class=\"ds-dialog\"><div class=\"ds-dialog-title\">Remove account?</div><div class=\"ds-dialog-body\">Mail downloaded for this account is removed from this device.</div></div>",
+      "css": ".ds-dialog { width:340px; background:#E1E2DC; border:1px solid #A7B0A5; border-radius:12px; padding:20px; box-shadow:0 10px 15px -3px rgba(0,0,0,0.1), 0 4px 6px -4px rgba(0,0,0,0.1); font-family:Inter, 'Noto Sans', sans-serif; color:#29332E; } .ds-dialog-title { font-size:16px; line-height:22px; font-weight:600; margin-bottom:6px; } .ds-dialog-body { font-size:13px; line-height:19px; color:#4B564D; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "A Clear View of What Matters",
+    "overview": "Overlook translates an alpine overlook into a working mail client: a place to pause and see the landscape clearly. The system is two registers kept firmly apart. The working interface (mail lists, reading pane, settings, dialogs, the welcome's choices) is neutral, spacious and literal: Inter on theme surfaces, pine or glacier-blue for action, flat cards on tonal grounds. The brand register (the horizon mark, the serif wordmark, the alpine-dawn photograph, a single amber beacon) appears only at edges of the experience: title-bar lockup, welcome, About, launch materials. Mail content always outweighs branding.\n\nDensity is Outlook-familiar: a three-pane workspace, 12 to 13 px Inter for metadata and lists, generous reading surfaces that stay white in every light colorway. Seven colorways (Light \"Soft stone\", Dark, Gray, Blue, White, Alexander, Pink, plus Follow system, which can adopt an Omarchy desktop palette) all share one icon set, one layout, one type hierarchy and one set of status colors; only color changes. The palettes are centralized in `crates/overlook-app/src/theme.rs` and tested for contrast; no screen invents its own palette.\n\nConfirmed rejections, from the brand system: no bright neon, fantasy mountains, oversized moons, orange sunset washes or camping insignia; no landscape behind working mail; no amber body text on pale grounds; no wilderness puns or jokes about overlooking mail.",
+    "keyCharacteristics": [
+      "Neutral-first: roughly 85% surfaces and text, 10% slate/pine and selection, at most 5% warm accent.",
+      "Two type voices: Source Serif 4 Display for brand moments, Inter for everything that works.",
+      "Flat tonal layering at rest; shadows only for floating elevation.",
+      "The beacon: one small amber light, never a fill colour for controls.",
+      "Every interactive element has a visible keyboard focus state in the theme's focus colour."
+    ],
+    "rules": [
+      {
+        "name": "The Beacon Rule",
+        "body": "Beacon amber is a small light, not a fill. It may appear as the mark's beacon or as a dot of a few pixels that lights on hover or focus. Never use it as a button fill, body text, or a wash.",
+        "section": "colors"
+      },
+      {
+        "name": "The One Palette Source Rule",
+        "body": "Every app colour comes from `Palette` in `theme.rs`, or is derived from it with a stated mix (as the welcome's card tones are). Brand constants (Midnight, Ivory, Beacon) are painted only on brand material: the tile, the mark, the photograph.",
+        "section": "colors"
+      },
+      {
+        "name": "The White Paper Rule",
+        "body": "Every light colorway keeps a white message centre; email content renders on white paper with `#20242B` ink regardless of the shell theme. Sender colours always win.",
+        "section": "colors"
+      },
+      {
+        "name": "The Two Voices Rule",
+        "body": "Source Serif 4 Display appears only in brand moments (wordmark, welcome, About, marketing), never in mailbox rows, forms or dialogs. Inter carries everything else.",
+        "section": "typography"
+      },
+      {
+        "name": "The Sentence Case Rule",
+        "body": "Headings and labels are plain sentence case in Inter; there are no uppercase labels above headings. The one native exception is the calendar's weekday column headers (11px uppercase day abbreviations), which are data labels, not decoration.",
+        "section": "typography"
+      },
+      {
+        "name": "The Flat-At-Rest Rule",
+        "body": "Cards on a page carry no shadow; they lift by fill and a 1px edge. If a ground and its cards are too close in luminance (the white-surface colorways), step the ground toward the frame or ink rather than adding a shadow.",
+        "section": "elevation"
+      },
+      {
+        "name": "The Unshadowed Mark Rule",
+        "body": "The horizon mark and app icon are never given shadows in the product.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do take every colour from `Palette` and test new foreground/background pairs for 4.5:1 (3:1 for focus and control boundaries), as `theme.rs` does.",
+      "Do keep the message centre white in every light colorway and email on white paper.",
+      "Do put a midnight shade under any words set on the photograph.",
+      "Do give every custom interactive element a keyboard focus state in the theme's focus colour, and an accessible name.",
+      "Do show third-party sign-in marks unaltered, on white plates, with provenance recorded in `branding/providers/README.md`.",
+      "Do keep feedback transitions brief (120 to 180 ms); reserve longer motion for a single brand moment such as the welcome veil."
+    ],
+    "donts": [
+      "Don't use Beacon amber (#FF9D32) as a control fill, body text or wash; it is a small light.",
+      "Don't set amber body text on a pale background.",
+      "Don't use Source Serif 4 Display in mailbox rows, forms or dialogs.",
+      "Don't place the alpine landscape behind working mail; it belongs to onboarding, landing and launch surfaces.",
+      "Don't add shadows to cards at rest or to the horizon mark.",
+      "Don't invent screen-specific palettes or user-defined custom colours."
+    ]
+  }
+}

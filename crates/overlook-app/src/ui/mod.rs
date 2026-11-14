@@ -24,6 +24,7 @@ mod shell;
 mod toolbar;
 mod widgets;
 mod time_zone;
+mod welcome;
 
 use overlook_provider::gmail::api::SessionExpiry;
 use crate::assets::icon;
@@ -4052,23 +4053,6 @@ fn shellexpand_home(path: &str) -> String {
 /// The app icon drawn from vectors: midnight rounded tile, ivory horizon mark, amber beacon.
 /// Crisp at any scale, unlike a downscaled bitmap.
 /// The mark and wordmark at the left of the title bar.
-fn brand_lockup(p: &Palette) -> impl IntoElement {
-    h_flex()
-        .items_center()
-        .gap(px(10.))
-        .w(px(214.))
-        .flex_none()
-        .child(brand_tile(30.))
-        .child(
-            div()
-                .font_family("Source Serif 4 Display")
-                .text_size(px(22.))
-                .line_height(px(30.))
-                .text_color(p.foreground)
-                .child("Overlook"),
-        )
-}
-
 fn brand_tile(size: f32) -> impl IntoElement {
     let midnight: Hsla = Rgba::from(gpui_kit::rgb(0x101C24)).into();
     let ivory: Hsla = Rgba::from(gpui_kit::rgb(0xF0EBDD)).into();
@@ -4105,7 +4089,7 @@ impl Render for MailWindow {
             tracing::info!("startup: first frame after {} ms", crate::since_start_ms());
         }
         if !self.has_account() {
-            return self.render_no_account(cx).into_any_element();
+            return self.render_no_account(window, cx).into_any_element();
         }
         let p: Palette = *cx.palette();
         v_flex()
@@ -4190,58 +4174,6 @@ impl Render for MailWindow {
             .when(self.quick_look.is_some(), |d| d.child(self.render_quick_look(cx)))
             .when(self.palette.is_some(), |d| d.child(self.render_palette(cx)))
             .into_any_element()
-    }
-}
-
-impl MailWindow {
-    /// The whole window while the device has no accounts: only adding one is possible.
-    fn render_no_account(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let p: Palette = *cx.palette();
-        v_flex()
-            .id("mail-window")
-            .key_context(WINDOW_CONTEXT)
-            .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|_, _: &QuitOverlook, _window, cx| cx.defer(crate::lifecycle::quit)))
-            .on_action(cx.listener(Self::on_escape))
-            .size_full()
-            .bg(p.background)
-            .text_color(p.foreground)
-            .font_family("Inter")
-            .text_size(px(13.))
-            .relative()
-            .child(
-                TitleBar::new()
-                    .h(px(52.))
-                    .bg(p.surface)
-                    .child(h_flex().size_full().items_center().pl(px(12.)).child(brand_lockup(&p))),
-            )
-            .children(self.render_banner(cx))
-            .child(
-                v_flex()
-                    .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(6.))
-                    .text_color(p.muted)
-                    .child(icon("mail").size(px(28.)).text_color(p.divider))
-                    .child(div().text_size(px(14.)).font_weight(FontWeight::MEDIUM).text_color(p.foreground).child("No accounts on this device"))
-                    .child(div().text_size(px(12.)).child("Add an account to start reading and sending mail."))
-                    .child(
-                        h_flex()
-                            .flex_wrap()
-                            .justify_center()
-                            .gap(px(8.))
-                            .pt(px(10.))
-                            .child(Button::new("empty-add-gmail").primary().small().label("Add Gmail account").on_click(cx.listener(|this, _, window, cx| this.start_google_sign_in(None, window, cx))))
-                            .child(Button::new("empty-add-microsoft").small().label("Add Microsoft account").on_click(cx.listener(|this, _, window, cx| this.open_microsoft_setup(window, cx))))
-                            .children(overlook_provider::app_passwords::GUIDES.iter().map(|&guide| {
-                                Button::new(SharedString::from(format!("empty-add-{}", guide.short_name.to_ascii_lowercase()))).small().label(format!("Add {} account", guide.short_name)).on_click(cx.listener(move |this, _, window, cx| this.open_guided_setup(guide, window, cx)))
-                            }))
-                            .child(Button::new("empty-add-imap").small().label("Add IMAP account").on_click(cx.listener(|this, _, window, cx| this.open_account_setup(ProviderKind::Imap, SetupMode::New, window, cx))))
-                            .child(Button::new("empty-add-pop3").small().label("Add POP3 account").on_click(cx.listener(|this, _, window, cx| this.open_account_setup(ProviderKind::Pop3, SetupMode::New, window, cx)))),
-                    ),
-            )
-            .when(self.account_setup.is_some(), |d| d.child(self.render_account_setup(cx)))
     }
 }
 
