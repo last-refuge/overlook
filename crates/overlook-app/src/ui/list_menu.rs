@@ -67,6 +67,8 @@ mod tests {
             unread_count: unread,
             starred,
             has_attachments: false,
+            attachment_names: Vec::new(),
+            invitation: None,
             participants: Vec::new(),
             latest_message_id: MessageId::from(id),
             label_ids: label_ids.iter().map(|l| LabelId::from(*l)).collect::<BTreeSet<_>>(),

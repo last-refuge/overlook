@@ -179,9 +179,66 @@ impl Palette {
         if self.resolved == ResolvedTheme::Light { c(0xF3F7F1) } else { self.surface }
     }
 
-    /// Unread rows sit one step darker than the list they belong to.
+    /// Unread rows stand one step apart from the list they belong to: darker in the light
+    /// colorways, and in the dark ones lifted toward the selection, since a darker row
+    /// there reads as a hole in the list.
     pub fn list_unread(&self) -> Hsla {
-        if self.resolved == ResolvedTheme::Light { c(0xE3EBE0) } else { self.background }
+        if self.resolved == ResolvedTheme::Light {
+            c(0xE3EBE0)
+        } else if self.is_dark() {
+            mix(self.surface, self.selection, 0.35)
+        } else {
+            self.background
+        }
+    }
+
+    /// The fill and ink of someone's avatar. Each person keeps one of four quiet tints
+    /// (slate, amber, plum, pine), chosen from their address so they look the same in every
+    /// list and message; Alexander keeps its avatars gray.
+    pub fn avatar_tint(&self, email: &str) -> (Hsla, Hsla) {
+        const LIGHT: [(u32, u32); 4] = [(0xD6E1E6, 0x2C4D5E), (0xF1E2CF, 0x6E4515), (0xE9DCE7, 0x5B3A55), (0xD9E5DC, 0x2F5243)];
+        const DARK: [(u32, u32); 4] = [(0x24404D, 0xCFE3EC), (0x3F3020, 0xF6D7AE), (0x3B2B39, 0xEAD3E6), (0x233A30, 0xCFE6D8)];
+        if self.resolved == ResolvedTheme::Alexander || email.is_empty() {
+            return (self.avatar, self.avatar_ink);
+        }
+        // FNV-1a: stable across runs and platforms, unlike the standard hasher.
+        let hash = email.trim().to_lowercase().bytes().fold(0x811c_9dc5_u32, |h, b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193));
+        let (fill, ink) = if self.is_dark() { DARK } else { LIGHT }[(hash % 4) as usize];
+        (c(fill), c(ink))
+    }
+
+    /// The badge colours of a file type: programs and scripts red, archives and macro
+    /// documents amber, so a hazard shows before anyone clicks; then PDFs, images,
+    /// spreadsheets and documents each in their own pastel.
+    pub fn file_badge(&self, filename: &str) -> (Hsla, Hsla) {
+        use overlook_core::attachment_policy::{risk, Risk};
+        match (risk(filename), overlook_core::file_badge(filename).as_str()) {
+            (Risk::Dangerous, _) => (self.error.opacity(if self.is_dark() { 0.25 } else { 0.12 }), self.error),
+            (Risk::Caution, _) => (self.warning.opacity(if self.is_dark() { 0.25 } else { 0.15 }), self.warning),
+            (_, "PDF") => (self.pastel(0xFBE9E7), self.pastel(0xA13E37)),
+            // SVG is a caution badge above (scripts can ride in it), so it never gets here.
+            (_, "FIG" | "PNG" | "JPG" | "JPEG" | "GIF" | "WEBP" | "HEIC") => (self.pastel(0xEEE8FA), self.pastel(0x6E55B7)),
+            (_, "XLSX" | "XLS" | "CSV" | "ODS") => (self.pastel(0xDDEFE2), self.pastel(0x2F6B45)),
+            (_, "DOC" | "DOCX" | "ODT" | "RTF") => (self.pastel(0xDCE8F5), self.pastel(0x1F57A5)),
+            _ => (self.chip, self.muted),
+        }
+    }
+
+    /// A pastel badge tone, darkened in the dark colorways so it does not glow.
+    fn pastel(&self, hex: u32) -> Hsla {
+        let mut h = c(hex);
+        if self.is_dark() {
+            h.l = (h.l * 0.35).min(0.3);
+            h.s *= 0.6;
+        }
+        h
+    }
+
+    /// The window's frame behind the title bar and the module rail. Light colorways use
+    /// their surface; dark ones step down to the frame, so the toolbar and the panes float
+    /// above it as they do on Alexander's teal.
+    pub fn chrome(&self) -> Hsla {
+        if self.is_dark() { self.background } else { self.surface }
     }
 
     /// Keep mail on light paper in every shell theme; sender-authored colors still win.
@@ -770,6 +827,47 @@ magenta = "#ad8ee6"
             let (a, b) = (luminance(fg), luminance(bg));
             assert!((a.max(b) + 0.05) / (a.min(b) + 0.05) >= 3.0);
         }
+    }
+
+    #[test]
+    fn dark_frames_the_window_and_lifts_unread_rows() {
+        let dark = Palette::for_theme(ResolvedTheme::Dark);
+        assert_eq!(dark.chrome(), dark.background, "the title bar and rail sit on the frame");
+        assert!(luminance(dark.list_unread()) > luminance(dark.list_surface()), "unread rows lift above the list");
+        assert!(luminance(dark.list_unread()) < luminance(dark.selection), "and stay below the selection");
+        for theme in [ResolvedTheme::Light, ResolvedTheme::Alexander, ResolvedTheme::White] {
+            let p = Palette::for_theme(theme);
+            assert_eq!(p.chrome(), p.surface, "{theme:?}");
+            assert!(luminance(p.list_unread()) <= luminance(p.list_surface()), "{theme:?}: unread rows sit darker");
+        }
+    }
+
+    #[test]
+    fn avatar_tints_are_stable_readable_and_gray_on_alexander() {
+        for theme in [ResolvedTheme::Light, ResolvedTheme::Dark, ResolvedTheme::Blue, ResolvedTheme::Pink] {
+            let p = Palette::for_theme(theme);
+            // The same person gets the same tint whatever the case of their address.
+            assert_eq!(p.avatar_tint("Maya@Northstar.example"), p.avatar_tint("maya@northstar.example"));
+            let mut fills = std::collections::HashSet::new();
+            for email in ["maya@northstar.example", "alex@studio.example", "daniel@studio.example", "sophie@example.com", "read@discovery.example", "orders@supply.example"] {
+                let (fill, ink) = p.avatar_tint(email);
+                let (a, b) = (luminance(fill), luminance(ink));
+                assert!((a.max(b) + 0.05) / (a.min(b) + 0.05) >= 4.5, "{theme:?}: {email}");
+                fills.insert(color_hex(fill));
+            }
+            assert!(fills.len() > 1, "{theme:?}: people get different tints");
+        }
+        let alexander = Palette::for_theme(ResolvedTheme::Alexander);
+        assert_eq!(alexander.avatar_tint("maya@northstar.example"), (alexander.avatar, alexander.avatar_ink));
+    }
+
+    #[test]
+    fn file_badges_warn_before_they_decorate() {
+        let p = Palette::for_theme(ResolvedTheme::Light);
+        assert_eq!(p.file_badge("setup.exe").1, p.error);
+        assert_eq!(p.file_badge("archive.zip").1, p.warning);
+        assert_ne!(p.file_badge("Brief.pdf"), p.file_badge("Payouts.xlsx"));
+        assert_eq!(p.file_badge("notes.txt"), (p.chip, p.muted));
     }
 
     #[test]

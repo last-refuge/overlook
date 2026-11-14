@@ -220,6 +220,7 @@ impl MailWindow {
     }
 
     pub(crate) fn reload_calendar(&mut self) {
+        self.invite_rows.borrow_mut().clear();
         self.calendars = self.store.calendars(&self.account.id).unwrap_or_default();
         let (from, to) = self.cal_range();
         self.cal_events = self.store.events_between(&self.account.id, from, to).unwrap_or_default();

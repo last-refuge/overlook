@@ -606,7 +606,7 @@ pub fn sample_mailbox(account: &Account, now: Timestamp) -> MailboxSnapshot {
         mk("notes", &daniel, vec![me.clone()], "Notes from our conversation",
            "Thanks again for making the time today.",
            "<p>Hi Jason,</p><p>Thanks again for making the time today. It was helpful to walk through the direction together.</p><p>I’ll collect the remaining feedback and send it over tomorrow. We’re aligned on the timeline and ready for the next stage.</p><p>Daniel</p>",
-           at(1, 16, 24), true, false, &["inbox", "projects"], vec![]),
+           at(1, 16, 24), true, false, &["inbox", "projects"], vec![("Launch-timeline.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", 48_211)]),
         mk("linear", &Address::named("Linear", "digest@linear.example"), vec![me.clone()], "Your project update",
            "12 issues completed. Here’s what’s next.",
            "<p>A productive week.</p><p>Your team completed 12 issues across design and development. The next milestone is the creative handoff, followed by final testing.</p><table><tr><th>Area</th><th>Done</th></tr><tr><td>Design</td><td>5</td></tr><tr><td>Development</td><td>7</td></tr></table><p>You can review the remaining tasks with your team.</p>",
@@ -628,6 +628,35 @@ pub fn sample_mailbox(account: &Account, now: Timestamp) -> MailboxSnapshot {
            "<table width=\"100%\"><tr><td><h2>Your order has shipped</h2><p>Order <strong>#48213</strong> is on its way and should arrive Thursday.</p></td></tr><tr><td><table><tr><td>Field notebook ×2</td><td align=\"right\">$24.00</td></tr><tr><td>Brass pencil</td><td align=\"right\">$18.00</td></tr><tr><td><strong>Total</strong></td><td align=\"right\"><strong>$42.00</strong></td></tr></table></td></tr></table><p><a href=\"https://northstar-supply.example/track/48213\">Track your package</a></p>",
            at(2, 7, 12), true, false, &["inbox"], vec![]),
     ];
+    let mut messages = messages;
+
+    // Invitations to two of the sample calendar's events: one still waiting for an answer,
+    // one already accepted.
+    let events = sample_events(account, now);
+    let invite = |summary: &str, organizer: &Address| {
+        let event = events.iter().find(|e| e.summary == summary).expect("sample event");
+        overlook_core::ics::Invitation {
+            uid: event.ical_uid.clone().unwrap_or_default(),
+            method: "REQUEST".into(),
+            summary: Some(event.summary.clone()),
+            start: Some(event.start),
+            start_date: None,
+            all_day: event.all_day,
+            organizer_email: Some(organizer.email.clone()),
+        }
+    };
+    let mut golive = mk("golive", &maya, vec![me.clone()], "Invitation: Launch day go/no-go",
+        "A short call to confirm we’re ready to launch.",
+        "<p>Hi Jason,</p><p>A short call to confirm we’re ready to launch: final checks on the homepage, the campaign and the handoff notes.</p><p>Maya</p>",
+        at(0, 11, 2), false, false, &["inbox", "projects"], vec![]);
+    golive.invitation = Some(invite("Launch day go/no-go", &maya));
+    let mut walk = mk("walk", &sophie, vec![me.clone()], "Invitation: Trail walk",
+        "Saturday morning, from the ridge trailhead.",
+        "<p>Saturday morning, from the ridge trailhead. Bring a jacket, it’s cool up top.</p><p>Sophie</p>",
+        at(1, 18, 30), true, false, &["inbox", "personal"], vec![]);
+    walk.invitation = Some(invite("Trail walk", &sophie));
+    messages.push(golive);
+    messages.push(walk);
 
     MailboxSnapshot { labels, messages, message_ids: Vec::new(), checkpoint: Some("sample-1".into()) }
 }
@@ -681,6 +710,19 @@ mod tests {
                 assert!(label_ids.contains(l), "message references unknown label {l}");
             }
             assert!(m.body.is_cached());
+        }
+    }
+
+    #[test]
+    fn sample_invitations_belong_to_sample_events() {
+        let now = 1_760_000_000_000;
+        let events = sample_events(&account(), now);
+        let invitations: Vec<_> = sample_mailbox(&account(), now).messages.into_iter().filter_map(|m| m.invitation).collect();
+        assert_eq!(invitations.len(), 2);
+        for invitation in invitations {
+            let event = events.iter().find(|e| e.ical_uid.as_deref() == Some(invitation.uid.as_str())).expect("an event for the invitation");
+            assert_eq!(invitation.start, Some(event.start));
+            assert!(event.is_invitation());
         }
     }
 

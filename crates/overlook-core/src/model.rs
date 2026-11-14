@@ -287,18 +287,23 @@ impl Attachment {
 
     /// Short uppercase type badge for attachment cards: `PDF`, `PNG`, `FIG`, `FILE`.
     pub fn badge(&self) -> String {
-        let ext = self
-            .filename
-            .rsplit('.')
-            .next()
-            .filter(|e| e.len() <= 4 && *e != self.filename)
-            .map(|e| e.to_uppercase());
-        ext.unwrap_or_else(|| "FILE".to_owned())
+        file_badge(&self.filename)
     }
 
     pub fn human_size(&self) -> String {
         human_size(self.size_bytes)
     }
+}
+
+/// A file's type as a short badge, from its extension: `PDF`, `XLSX`, or `FILE` when the
+/// name has no short extension.
+pub fn file_badge(filename: &str) -> String {
+    filename
+        .rsplit('.')
+        .next()
+        .filter(|e| !e.is_empty() && e.len() <= 4 && *e != filename)
+        .map(|e| e.to_uppercase())
+        .unwrap_or_else(|| "FILE".to_owned())
 }
 
 pub fn human_size(bytes: u64) -> String {
@@ -388,6 +393,11 @@ pub struct ConversationSummary {
     pub unread_count: usize,
     pub starred: bool,
     pub has_attachments: bool,
+    /// The names of the files attached in the conversation, newest message first and each
+    /// name once. Images drawn inside a message's text are not files and are left out.
+    pub attachment_names: Vec<String>,
+    /// The invitation carried by the newest message that has one.
+    pub invitation: Option<crate::ics::Invitation>,
     /// Participants other than the account owner, most recent sender first, de-duplicated.
     pub participants: Vec<Address>,
     pub latest_message_id: MessageId,
@@ -437,6 +447,12 @@ impl ConversationSummary {
         for m in messages {
             label_ids.extend(m.label_ids.iter().cloned());
         }
+        let mut attachment_names: Vec<String> = Vec::new();
+        for a in sorted.iter().flat_map(|m| &m.attachments).filter(|a| !a.is_inline_image()) {
+            if !attachment_names.contains(&a.filename) {
+                attachment_names.push(a.filename.clone());
+            }
+        }
         Some(Self {
             id: latest.conversation_id.clone(),
             account_id: latest.account_id.clone(),
@@ -447,6 +463,8 @@ impl ConversationSummary {
             unread_count: messages.iter().filter(|m| !m.is_read).count(),
             starred: messages.iter().any(|m| m.is_starred),
             has_attachments: messages.iter().any(Message::has_attachments),
+            attachment_names,
+            invitation: sorted.iter().find_map(|m| m.invitation.clone()),
             participants,
             latest_message_id: latest.id.clone(),
             label_ids,
@@ -876,6 +894,45 @@ mod tests {
         assert_eq!(list[1].email, "alex@studio.example");
         assert!(list[1].looks_valid());
         assert!(!Address::new(None, "nope").looks_valid());
+    }
+
+    #[test]
+    fn conversation_summary_names_its_files_and_invitation() {
+        let file = |message: &Message, name: &str, mime: &str, cid: Option<&str>| Attachment {
+            id: AttachmentId(format!("{}-{name}", message.id.0)),
+            message_id: message.id.clone(),
+            filename: name.into(),
+            mime_type: mime.into(),
+            size_bytes: 10,
+            local_path: None,
+            provider_id: None,
+            content_id: cid.map(str::to_owned),
+        };
+        let maya = Address::named("Maya Chen", "maya@northstar.example");
+        let mut first = msg(maya.clone(), 1_000);
+        first.attachments = vec![file(&first, "Brief.pdf", "application/pdf", None)];
+        let mut latest = msg(maya, 2_000);
+        latest.attachments = vec![
+            file(&latest, "Homepage.fig", "application/octet-stream", None),
+            file(&latest, "logo.png", "image/png", Some("logo@x")),
+            file(&latest, "Brief.pdf", "application/pdf", None),
+        ];
+        latest.invitation = Some(crate::ics::Invitation {
+            uid: "event-1".into(),
+            method: "REQUEST".into(),
+            summary: Some("Review".into()),
+            start: Some(5_000),
+            start_date: None,
+            all_day: false,
+            organizer_email: None,
+        });
+        let s = ConversationSummary::from_messages(&[first, latest], "jason@example.com", &BTreeSet::new()).unwrap();
+        // Newest first, each name once, and the image drawn in the text left out.
+        assert_eq!(s.attachment_names, vec!["Homepage.fig".to_owned(), "Brief.pdf".to_owned()]);
+        assert_eq!(s.invitation.map(|i| i.uid), Some("event-1".to_owned()));
+        assert_eq!(file_badge("Payouts.xlsx"), "XLSX");
+        assert_eq!(file_badge("README"), "FILE");
+        assert_eq!(file_badge("archive."), "FILE");
     }
 
     #[test]

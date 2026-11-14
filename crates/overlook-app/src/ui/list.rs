@@ -2,7 +2,7 @@
 
 use super::widgets::*;
 use super::{ListRow, MailWindow, RowLayout, RowsKey};
-use crate::assets::icon;
+use crate::assets::{color_icon, icon, ColorIcon as C};
 use crate::theme::ActivePalette;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
@@ -14,7 +14,7 @@ use gpui_kit::base::{h_flex, v_flex};
 use overlook_core::status::draft_state_label;
 use overlook_core::time::{day_group, relative_label, DayGroup};
 use overlook_core::*;
-use overlook_store::{ListFilter, MailboxView};
+use overlook_store::{ListFilter, LocalChange, MailboxView};
 
 /// Explains IMAP folders that hold folders but no mail (`\Noselect`).
 pub(super) const FOLDER_ONLY_HELP_URL: &str = "https://github.com/last-refuge/overlook/blob/main/docs/folder-only-mailboxes.md";
@@ -40,6 +40,71 @@ fn changed_span<T: PartialEq>(old: &[T], new: &[T]) -> Option<(std::ops::Range<u
     Some((prefix..old.len() - suffix, new.len() - prefix - suffix))
 }
 
+/// A command on a row of the list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RowAction {
+    Archive,
+    Delete,
+    ToggleRead,
+    ToggleStar,
+}
+
+/// The calendar event an invitation in the list belongs to: its time, and whether you can
+/// still answer it.
+#[derive(Clone, Debug)]
+pub(crate) struct InviteRow {
+    event: EventId,
+    start: i64,
+    end: i64,
+    all_day: bool,
+    can_respond: bool,
+    response: Option<ResponseStatus>,
+}
+
+/// `2–3 PM` or `10:00–10:30 AM`: the suffix once when both ends share it.
+fn clock_range(start: i64, end: i64) -> String {
+    let (a, b) = (overlook_core::tz::format_clock(start), overlook_core::tz::format_clock(end));
+    match (a.rsplit_once(' '), b.rsplit_once(' ')) {
+        (Some((from, first)), Some((_, last))) if first == last => format!("{from}–{b}"),
+        _ => format!("{a}–{b}"),
+    }
+}
+
+/// A file named on a row: its type badge and its name, which gives way first when space
+/// runs short.
+fn file_chip(name: &str, p: &crate::theme::Palette) -> Div {
+    let (fill, ink) = p.file_badge(name);
+    h_flex()
+        .flex_shrink(1.)
+        .min_w(px(0.))
+        .max_w(px(190.))
+        .items_center()
+        .gap(px(5.))
+        .h(px(22.))
+        .pl(px(3.))
+        .pr(px(8.))
+        .rounded(px(6.))
+        .bg(p.message_surface())
+        .border_1()
+        .border_color(p.divider)
+        .text_size(px(11.5))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(p.foreground)
+        .child(
+            div()
+                .flex_none()
+                .px(px(3.))
+                .rounded(px(3.))
+                .bg(fill)
+                .text_color(ink)
+                .text_size(px(8.5))
+                .line_height(px(15.))
+                .font_weight(FontWeight::BOLD)
+                .child(overlook_core::file_badge(name)),
+        )
+        .child(div().min_w_0().truncate().child(name.to_owned()))
+}
+
 impl MailWindow {
     pub(super) fn render_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *cx.palette();
@@ -52,6 +117,7 @@ impl MailWindow {
         self.refresh_list_rows(compact);
         let no_rows = self.shown_rows.borrow().is_empty();
         let total = self.rows_total.get();
+        let unread = self.rows_unread.get();
         let focus_split = self.inbox_focus().is_some();
         let inbox_tab = self.inbox_tab;
         let filter = self.filter;
@@ -86,7 +152,14 @@ impl MailWindow {
                             .line_height(px(30.))
                             .child(title),
                     )
-                    .child(chip(total.to_string(), &p))
+                    // How much is here, and how much of it is unread.
+                    .child(
+                        div()
+                            .pt(px(3.))
+                            .text_size(px(12.))
+                            .text_color(p.muted)
+                            .child(if unread > 0 { format!("{unread} unread · {total}") } else { total.to_string() }),
+                    )
                     .child(div().flex_1())
                     .when(focus_split, |row| {
                         let t = this.clone();
@@ -124,10 +197,20 @@ impl MailWindow {
                     .border_b_1()
                     .border_color(p.divider)
                     .when(focus_split, |row| {
+                        // The tab not on show says how much unread mail waits in it.
+                        let focused_unread = self.counts.get(&MailboxView::Kind(LabelKind::Inbox)).copied().unwrap_or(0);
+                        let other_unread = self.other_unread;
                         let focus_tab = |label: &'static str, tab: FocusTab, cx: &mut Context<Self>| {
                             let active = inbox_tab == tab;
+                            let waiting = match tab {
+                                FocusTab::Focused => focused_unread,
+                                FocusTab::Other => other_unread,
+                            };
                             div()
                                 .id(SharedString::from(format!("focus-{label}")))
+                                .flex()
+                                .items_baseline()
+                                .gap(px(4.))
                                 .pb(px(10.))
                                 .border_b_2()
                                 .border_color(if active { p.accent } else { gpui_kit::transparent_black() })
@@ -136,6 +219,7 @@ impl MailWindow {
                                 .font_weight(if active { FontWeight::MEDIUM } else { FontWeight::NORMAL })
                                 .cursor_pointer()
                                 .child(label)
+                                .when(!active && waiting > 0, |d| d.child(div().text_size(px(12.)).child(format!("· {waiting}"))))
                                 .on_click(cx.listener(move |this, _, window, cx| this.set_inbox_tab(tab, window, cx)))
                         };
                         row.child(focus_tab("Focused", FocusTab::Focused, cx)).child(focus_tab("Other", FocusTab::Other, cx))
@@ -247,6 +331,7 @@ impl MailWindow {
         if self.rows_key.borrow().as_ref() != Some(&key) {
             let rows = self.list_rows();
             self.rows_total.set(rows.iter().filter(|r| !matches!(r, ListRow::Group(..))).count());
+            self.rows_unread.set(rows.iter().filter(|r| matches!(r, ListRow::Conversation(c) if c.is_unread())).count());
             self.sync_list_state(&rows);
             *self.rows_key.borrow_mut() = Some(key);
         }
@@ -345,9 +430,14 @@ impl MailWindow {
         let menu_id = c.id.clone();
         let has_junk = self.labels.iter().any(|l| l.kind == LabelKind::Spam);
         let can_delete_forever = self.can_delete_forever();
+        // What the row carries under its preview: an invitation's time, its files by name,
+        // and its folder.
+        let invitation: Vec<AnyElement> = c.invitation.as_ref().filter(|_| !compact).map(|inv| self.invitation_chip(c, inv, cx)).unwrap_or_default();
+        let extras = !compact && (c.has_attachments || label_name.is_some() || !invitation.is_empty());
 
         div()
             .id(SharedString::from(format!("conv-{}", c.id)))
+            .group("conversation-row")
             .relative()
             .h_flex()
             .items_start()
@@ -376,7 +466,7 @@ impl MailWindow {
                         .bg(p.message_accent()),
                 )
             })
-            .when(!compact && self.prefs.show_avatars, |d| d.child(avatar(&who, 30., &p).mt(px(1.))))
+            .when(!compact && self.prefs.show_avatars, |d| d.child(avatar(&who, 32., &p)))
             .child(
                 v_flex()
                     .flex_1()
@@ -396,8 +486,20 @@ impl MailWindow {
                                     .text_color(p.foreground)
                                     .child(c.participant_line()),
                             )
+                            // How many messages the conversation holds.
                             .when(c.message_count > 1, |d| {
-                                d.child(div().text_size(px(11.)).text_color(p.muted).child(c.message_count.to_string()))
+                                d.child(
+                                    div()
+                                        .flex_none()
+                                        .px(px(6.))
+                                        .rounded(px(8.))
+                                        .bg(if highlighted { p.message_surface().opacity(0.55) } else { p.chip })
+                                        .text_size(px(11.))
+                                        .line_height(px(16.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(if highlighted { p.selection_text } else { p.muted })
+                                        .child(c.message_count.to_string()),
+                                )
                             })
                             .when(pending, |d| {
                                 d.child(
@@ -432,16 +534,38 @@ impl MailWindow {
                                 .child(c.snippet.clone()),
                         )
                     })
-                    .when(!compact && (c.has_attachments || label_name.is_some()), |d| {
+                    .when(extras, |d| {
+                        let files = &c.attachment_names;
+                        // Wraps rather than cutting off what doesn't fit; the list measures
+                        // rows again whenever its width changes.
                         d.child(
                             h_flex()
+                                .flex_wrap()
                                 .items_center()
-                                .gap(px(6.))
+                                .gap_x(px(5.))
+                                .gap_y(px(4.))
                                 .mt(px(4.))
+                                .min_w_0()
                                 .text_size(px(11.))
                                 .text_color(p.muted)
-                                .when(c.has_attachments, |d| {
+                                .children(invitation)
+                                // The files by name and type; a message whose only parts are
+                                // pictures in its text keeps the plain "Attachments" note.
+                                .when(c.has_attachments && files.is_empty(), |d| {
                                     d.child(icon("paperclip").size(px(12.)).text_color(p.muted)).child("Attachments")
+                                })
+                                // The first file by name, and how many more: two names would
+                                // each be cut to a few letters in a list of usual width.
+                                .children(files.first().map(|name| file_chip(name, &p)))
+                                .when(files.len() > 1, |d| {
+                                    let more = files.len() - 1;
+                                    let names = files[1..].join(", ");
+                                    d.child(
+                                        div()
+                                            .id(SharedString::from(format!("more-files-{}", c.id)))
+                                            .child(chip(format!("+{more}"), &p))
+                                            .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(names.clone()).build(window, cx)),
+                                    )
                                 })
                                 .children(label_name.map(|l| chip(l, &p))),
                         )
@@ -462,6 +586,7 @@ impl MailWindow {
                         this.set_starred(vec![star_id.clone()], !starred, window, cx);
                     })),
             )
+            .child(self.row_quick_actions(c, cx))
             .on_drag(drag, |d: &super::ConversationDrag, _pos, _window, cx| {
                 let label = if d.count > 1 { format!("{} · {} messages", d.title, d.count) } else { d.title.clone() };
                 cx.new(|_| super::DragPreview { label })
@@ -477,6 +602,188 @@ impl MailWindow {
                 }
             }))
             .context_menu(move |menu, window, cx| Self::row_menu(menu, me.clone(), &menu_id, has_junk, can_delete_forever, window, cx))
+    }
+
+    /// The commands a row offers while the pointer is over it, floating over its time and
+    /// star: archive (or restore), delete, read or unread, and star. They act on that row
+    /// alone, so whatever is open stays open.
+    fn row_quick_actions(&self, c: &ConversationSummary, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = *cx.palette();
+        let state = super::list_menu::selection_state([c], &self.labels);
+        let (archive_label, archive_icon) = if state.all_in_trash {
+            ("Restore", C::Move)
+        } else if !state.any_in_inbox {
+            ("To Inbox", C::Move)
+        } else {
+            ("Archive", C::Archive)
+        };
+        let mut actions = vec![(RowAction::Archive, archive_label, archive_icon)];
+        if !state.all_in_trash {
+            actions.push((RowAction::Delete, "Delete", C::Delete));
+        }
+        actions.push(if state.any_unread { (RowAction::ToggleRead, "Mark read", C::Read) } else { (RowAction::ToggleRead, "Mark unread", C::Mail) });
+        actions.push((RowAction::ToggleStar, if state.all_starred { "Unstar" } else { "Star" }, C::Star));
+        h_flex()
+            .absolute()
+            .top(px(6.))
+            .right(px(6.))
+            .gap(px(2.))
+            .p(px(2.))
+            .rounded(px(7.))
+            .bg(p.message_surface())
+            .border_1()
+            .border_color(p.divider)
+            .shadow_sm()
+            // Hidden elements take no clicks, so the row reads normally until hovered.
+            .invisible()
+            .group_hover("conversation-row", |s| s.visible())
+            .children(actions.into_iter().map(|(action, label, glyph)| {
+                let id = c.id.clone();
+                Button::new(SharedString::from(format!("quick-{action:?}-{}", c.id)))
+                    .ghost()
+                    .xsmall()
+                    .w(px(26.))
+                    .h(px(24.))
+                    .child(color_icon(glyph, 15., &p))
+                    .accessibility_label(label)
+                    .tooltip(label)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.row_action(&id, action, window, cx);
+                    }))
+            }))
+    }
+
+    /// A row's own command. The open conversation acts as the toolbar would, moving on to
+    /// the next one after archiving; any other row changes alone and the selection stays.
+    pub(super) fn row_action(&mut self, id: &ConversationId, action: RowAction, window: &mut Window, cx: &mut Context<Self>) {
+        if self.marked.is_empty() && self.selected.as_ref() == Some(id) {
+            match action {
+                RowAction::Archive => self.on_archive(&super::ArchiveSelected, window, cx),
+                RowAction::Delete => self.on_trash(&super::TrashSelected, window, cx),
+                RowAction::ToggleRead => self.on_toggle_read(&super::ToggleRead, window, cx),
+                RowAction::ToggleStar => self.on_toggle_star(&super::ToggleStar, window, cx),
+            }
+            return;
+        }
+        let Some(row) = self.conversations.iter().find(|c| &c.id == id).cloned() else { return };
+        let state = super::list_menu::selection_state([&row], &self.labels);
+        let ids = self.mail_index.message_ids_in(id);
+        match action {
+            RowAction::Archive if state.all_in_trash || !state.any_in_inbox => {
+                let changes = self.changes_to_inbox(&ids);
+                self.perform("Moved to Inbox", changes, true, window, cx);
+            }
+            RowAction::Archive => self.perform("Archived", vec![LocalChange::Archive { message_ids: ids }], true, window, cx),
+            RowAction::Delete if !state.all_in_trash => self.perform("Moved to Trash", vec![LocalChange::Trash { message_ids: ids }], true, window, cx),
+            RowAction::Delete => {}
+            RowAction::ToggleRead => self.set_read(ids, state.any_unread, window, cx),
+            RowAction::ToggleStar => self.set_starred(vec![row.latest_message_id.clone()], !state.all_starred, window, cx),
+        }
+    }
+
+    /// The date of an invitation, and Accept and Decline when the event is on your
+    /// calendar and still waits for your answer; once answered, the answer. Separate
+    /// pieces, so a narrow row wraps between them rather than cutting one off.
+    fn invitation_chip(&self, c: &ConversationSummary, inv: &overlook_core::ics::Invitation, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let p = *cx.palette();
+        let event = self.invite_row(&c.account_id, &inv.uid);
+        let day = |ts: i64| overlook_core::tz::zoned(ts).strftime("%a %b %-d").to_string();
+        let clock = overlook_core::tz::format_clock;
+        let when = match &event {
+            Some(e) if e.all_day => format!("{} · All day", day(e.start)),
+            Some(e) => format!("{} · {}", day(e.start), clock_range(e.start, e.end)),
+            None => match inv.start_in_zone(&self.time_zone) {
+                Some(s) if inv.all_day => format!("{} · All day", day(s)),
+                Some(s) => format!("{} · {}", day(s), clock(s)),
+                None => "Invitation".to_owned(),
+            },
+        };
+        let cancelled = inv.is_cancellation();
+        let date = h_flex()
+            .flex_none()
+            .items_center()
+            .gap(px(4.))
+            .h(px(22.))
+            .px(px(6.))
+            .rounded(px(6.))
+            .bg(p.chip)
+            .text_size(px(11.5))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(if cancelled { p.error } else { p.foreground })
+            .child(icon(if cancelled { "calendar-x" } else { "calendar" }).size(px(12.)).text_color(if cancelled { p.error } else { p.accent }))
+            .child(if cancelled { format!("Cancelled · {when}") } else { when });
+        let mut row: Vec<AnyElement> = vec![date.into_any_element()];
+        if let Some(e) = event.filter(|_| !cancelled) {
+            match e.response {
+                Some(ResponseStatus::NeedsAction) | None if e.can_respond => {
+                    for (label, response) in [("Accept", ResponseStatus::Accepted), ("Decline", ResponseStatus::Declined)] {
+                        let event_id = e.event.clone();
+                        row.push(
+                            // Accept is the answer most invitations get, so it leads: semibold in
+                            // the action colour. Decline stays quiet.
+                            Button::new(SharedString::from(format!("rsvp-{label}-{}", c.id)))
+                                .ghost()
+                                .xsmall()
+                                .flex_none()
+                                .h(px(22.))
+                                .px(px(6.))
+                                .border_1()
+                                .border_color(p.control_border.opacity(0.45))
+                                .child(div().text_size(px(11.5)).map(|d| if response == ResponseStatus::Accepted {
+                                    d.font_weight(FontWeight::SEMIBOLD).text_color(p.accent)
+                                } else {
+                                    d.font_weight(FontWeight::MEDIUM).text_color(p.muted)
+                                }).child(label))
+                                .accessibility_label(label)
+                                .tooltip(format!("{label} this invitation"))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.respond_to_event(event_id.clone(), response, window, cx);
+                                }))
+                                .into_any_element(),
+                        );
+                    }
+                }
+                Some(response) if response != ResponseStatus::NeedsAction => {
+                    let accepted = response == ResponseStatus::Accepted;
+                    row.push(
+                        h_flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .text_size(px(11.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(if accepted { p.success } else { p.muted })
+                            .when(accepted, |d| d.child(icon("check").size(px(12.)).text_color(p.success)))
+                            .child(response.label())
+                            .into_any_element(),
+                    );
+                }
+                _ => {}
+            }
+        }
+        row
+    }
+
+    /// The calendar event behind an invitation in the list, from memory after the first
+    /// look. Rows of the open account only, so the account is checked.
+    fn invite_row(&self, account: &AccountId, uid: &str) -> Option<InviteRow> {
+        if account != &self.account.id {
+            return None;
+        }
+        if let Some(found) = self.invite_rows.borrow().get(uid) {
+            return found.clone();
+        }
+        let found = self.store.event_by_ical_uid(account, uid).ok().flatten().map(|e| InviteRow {
+            event: e.id.clone(),
+            start: e.start,
+            end: e.end,
+            all_day: e.all_day,
+            can_respond: e.is_invitation(),
+            response: e.my_response(),
+        });
+        self.invite_rows.borrow_mut().insert(uid.to_owned(), found.clone());
+        found
     }
 
     /// The right-click menu of a conversation row. The row joins the selection first, so

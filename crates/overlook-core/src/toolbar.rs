@@ -50,6 +50,66 @@ pub enum ToolbarAction {
     Unknown,
 }
 
+/// Commands that belong together. The strip draws a separator where the group changes, so
+/// the grouping follows any order the person saves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolbarGroup {
+    /// New message, event or contact.
+    Create,
+    /// Archive, delete, move and edit: where an item goes.
+    Organize,
+    /// Read and starred state.
+    Mark,
+    /// Reply, reply all, forward, and writing to a contact.
+    Respond,
+    /// Moving through conversations or calendar periods.
+    Navigate,
+    /// The calendar's day, week, month and agenda views.
+    View,
+    /// Sync, appearance and layout.
+    App,
+}
+
+impl ToolbarAction {
+    pub fn group(self) -> ToolbarGroup {
+        use ToolbarAction::*;
+        match self {
+            NewMessage | NewEvent | NewContact => ToolbarGroup::Create,
+            Archive | DeleteMail | MoveMail | MoveFocus | AlwaysMoveFocus | EditEvent
+            | DeleteEvent | EditContact | DeleteContact => ToolbarGroup::Organize,
+            ToggleRead | ToggleStar => ToolbarGroup::Mark,
+            Reply | ReplyAll | Forward | ContactMessage | ContactMail => ToolbarGroup::Respond,
+            JumpLatest | PreviousConversation | NextConversation | Today | PreviousPeriod
+            | NextPeriod => ToolbarGroup::Navigate,
+            Day | Week | Month | Agenda => ToolbarGroup::View,
+            Sync | Appearance | Layout | Unknown => ToolbarGroup::App,
+        }
+    }
+}
+
+/// How a run of strip commands is drawn: which commands get a separator before them, and
+/// where the trailing navigation and app commands start, which sit at the far end.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StripPlan {
+    /// One entry per command: true when a separator goes before it.
+    pub separators: Vec<bool>,
+    /// The first command of the trailing run of navigation and app commands. `None` when
+    /// the strip doesn't end in one, or holds nothing else.
+    pub trailing: Option<usize>,
+}
+
+impl StripPlan {
+    pub fn of(actions: &[ToolbarAction]) -> Self {
+        let tail = |a: &ToolbarAction| matches!(a.group(), ToolbarGroup::Navigate | ToolbarGroup::App);
+        let run = actions.iter().rev().take_while(|a| tail(a)).count();
+        let trailing = (run > 0 && run < actions.len()).then(|| actions.len() - run);
+        let separators = (0..actions.len())
+            .map(|i| i > 0 && Some(i) != trailing && actions[i].group() != actions[i - 1].group())
+            .collect();
+        Self { separators, trailing }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolbarArea {
     Strip,
@@ -191,12 +251,23 @@ impl ToolbarLayout {
         true
     }
 
-    /// The largest prefix that fits. Temporarily overflowed commands keep their saved position.
-    pub fn visible_count(&self, available: f32, width: impl Fn(ToolbarAction) -> f32) -> usize {
+    /// The largest prefix that fits, with `separator` counted wherever the group changes.
+    /// Temporarily overflowed commands keep their saved position.
+    pub fn visible_count(
+        &self,
+        available: f32,
+        width: impl Fn(ToolbarAction) -> f32,
+        separator: f32,
+    ) -> usize {
         let mut used = 0.;
+        let mut previous: Option<ToolbarGroup> = None;
         self.strip
             .iter()
             .take_while(|action| {
+                if previous.is_some_and(|group| group != action.group()) {
+                    used += separator;
+                }
+                previous = Some(action.group());
                 used += width(**action);
                 used <= available.max(0.)
             })
@@ -313,9 +384,41 @@ mod tests {
     fn overflow_is_reversible_and_never_edits_preferences() {
         let layout = ToolbarModule::Mail.default_layout();
         let original = layout.clone();
-        assert_eq!(layout.visible_count(95., |_| 30.), 3);
-        assert_eq!(layout.visible_count(0., |_| 30.), 0);
-        assert_eq!(layout.visible_count(5000., |_| 30.), layout.strip.len());
+        assert_eq!(layout.visible_count(95., |_| 30., 0.), 3);
+        assert_eq!(layout.visible_count(0., |_| 30., 0.), 0);
+        assert_eq!(layout.visible_count(5000., |_| 30., 0.), layout.strip.len());
+        // New message, then a separator before Archive and Delete.
+        assert_eq!(layout.visible_count(95., |_| 30., 10.), 2);
         assert_eq!(layout, original);
+    }
+
+    #[test]
+    fn groups_are_separated_and_navigation_and_app_commands_trail() {
+        let mail = ToolbarModule::Mail.default_layout();
+        let plan = StripPlan::of(&mail.strip);
+        let before: Vec<_> = mail
+            .strip
+            .iter()
+            .zip(&plan.separators)
+            .filter(|(_, sep)| **sep)
+            .map(|(a, _)| *a)
+            .collect();
+        // Navigation starts the trailing run, so the spacer stands in for its separator.
+        assert_eq!(before, vec![Archive, ToggleRead, Reply, Sync]);
+        assert_eq!(plan.trailing.map(|i| mail.strip[i]), Some(JumpLatest));
+
+        let calendar = ToolbarModule::Calendar.default_layout();
+        let plan = StripPlan::of(&calendar.strip);
+        assert_eq!(plan.trailing.map(|i| calendar.strip[i]), Some(Sync));
+        assert!(plan.separators[1], "Today starts its own group after New event");
+
+        // Any saved order keeps working: groups split wherever they meet.
+        let plan = StripPlan::of(&[Reply, Archive, Reply]);
+        assert_eq!(plan.separators, vec![false, true, true]);
+        assert_eq!(plan.trailing, None);
+        // A strip of navigation and app commands only is left as it is.
+        assert_eq!(StripPlan::of(&[Sync, NextConversation]).trailing, None);
+        assert_eq!(StripPlan::of(&[]).trailing, None);
+        assert!(StripPlan::of(&[]).separators.is_empty());
     }
 }

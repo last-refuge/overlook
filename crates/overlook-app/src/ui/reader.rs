@@ -2,7 +2,7 @@
 
 use super::widgets::*;
 use super::MailWindow;
-use crate::assets::icon;
+use crate::assets::{color_icon, icon, ColorIcon as C};
 use crate::theme::ActivePalette;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
@@ -273,13 +273,14 @@ impl MailWindow {
                 .into_any_element();
         };
 
-        let labels: Vec<String> = summary
+        let labels: Vec<(String, Option<Hsla>)> = summary
             .label_ids
             .iter()
             .filter_map(|id| self.labels.iter().find(|l| &l.id == id))
             .filter(|l| l.kind == LabelKind::User)
-            .map(|l| overlook_core::sidebar::folder_title(&l.name).to_owned())
+            .map(|l| (overlook_core::sidebar::folder_title(&l.name).to_owned(), p.label_color(l.color.as_deref())))
             .collect();
+        let newest = self.thread.iter().max_by_key(|m| m.date).cloned();
 
         let header = v_flex()
             .px(px(28.))
@@ -287,11 +288,30 @@ impl MailWindow {
             .pb(px(14.))
             .gap(px(10.))
             .child(
-                div()
-                    .text_size(px(24.))
-                    .line_height(px(32.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(summary.subject.clone()),
+                h_flex()
+                    .items_start()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(24.))
+                            .line_height(px(32.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(summary.subject.clone()),
+                    )
+                    // The conversation as printed: its newest message, with the history it quotes.
+                    .children(newest.map(|m| {
+                        Button::new("print-conversation")
+                            .ghost()
+                            .small()
+                            .size(px(32.))
+                            .p(px(0.))
+                            .child(icon("printer").size(px(17.)).text_color(p.muted))
+                            .accessibility_label("Print")
+                            .tooltip("Print…")
+                            .on_click(cx.listener(move |this, _, window, cx| this.print_message(m.clone(), window, cx)))
+                    })),
             )
             .child(
                 h_flex()
@@ -300,7 +320,20 @@ impl MailWindow {
                     .gap(px(8.))
                     .text_size(px(12.))
                     .text_color(p.muted)
-                    .children(labels.into_iter().map(|l| chip(l, &p).text_color(p.accent)))
+                    .children(labels.into_iter().map(|(name, color)| {
+                        h_flex()
+                            .flex_none()
+                            .items_center()
+                            .gap(px(6.))
+                            .h(px(22.))
+                            .px(px(9.))
+                            .rounded(px(11.))
+                            .bg(p.chip)
+                            .text_color(p.foreground)
+                            .font_weight(FontWeight::MEDIUM)
+                            .children(color.map(|color| div().size(px(7.)).rounded_full().bg(color)))
+                            .child(name)
+                    }))
                     .child(format!(
                         "{} message{}",
                         summary.message_count,
@@ -345,13 +378,20 @@ impl MailWindow {
         let mut reply = composing.then(|| self.render_composer(cx).into_any_element());
         let source = self.composer.as_ref().and_then(|c| c.draft.in_reply_to.as_ref());
         let mut messages = Vec::with_capacity(self.thread.len() + 1);
-        for m in &self.thread {
-            let expanded = m.id == latest_id || self.expanded.contains(&m.id);
-            messages.push(div().flex_none().mx(px(24.)).my(px(4.)).child(if expanded {
-                self.render_message_expanded(m, cx).into_any_element()
-            } else {
-                self.render_message_collapsed(m, cx).into_any_element()
-            }).into_any_element());
+        // Folded messages next to each other join into one bordered stack.
+        let folded: Vec<bool> = self.thread.iter().map(|m| m.id != latest_id && !self.expanded.contains(&m.id)).collect();
+        for (i, m) in self.thread.iter().enumerate() {
+            let expanded = !folded[i];
+            let first = i == 0 || !folded[i - 1];
+            let last = i + 1 == folded.len() || !folded[i + 1];
+            messages.push(div().flex_none().mx(px(24.))
+                .when(expanded || first, |d| d.mt(px(4.)))
+                .when(expanded || last, |d| d.mb(px(4.)))
+                .child(if expanded {
+                    self.render_message_expanded(m, cx).into_any_element()
+                } else {
+                    self.render_message_collapsed(m, first, last, cx).into_any_element()
+                }).into_any_element());
             if source == Some(&m.id) {
                 if let Some(reply) = reply.take() { messages.push(div().flex_none().w_full().child(reply).into_any_element()); }
             }
@@ -360,6 +400,8 @@ impl MailWindow {
         // the remaining conversation in that case.
         if let Some(reply) = reply.take() { messages.push(div().flex_none().w_full().child(reply).into_any_element()); }
         let reply_space = if composing { (self.reader_scroll.bounds().size.height * 0.3).max(px(28.)) } else { px(20.) };
+        // Waiting under the conversation while no reply is open: one click starts one.
+        let reply_bar = (self.composer.is_none() && !self.thread.is_empty()).then(|| self.render_reply_bar(cx));
 
         container
             .child(
@@ -415,10 +457,56 @@ impl MailWindow {
                         cx.notify();
                     })),
             )
+            .children(reply_bar)
             .into_any_element()
     }
 
-    fn render_message_collapsed(&self, m: &Message, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The bar at the foot of the reader that starts a reply, the way the preference says
+    /// (to the sender, or to everyone), to the newest message.
+    fn render_reply_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let p = *cx.palette();
+        let newest = self.thread.iter().max_by_key(|m| m.date);
+        let to = newest.and_then(|m| if m.is_outgoing { m.to.first().cloned() } else { Some(m.reply_to.clone().unwrap_or_else(|| m.from.clone())) });
+        let all = self.prefs.reply_all_by_default;
+        let text = match (&to, all) {
+            (_, true) => "Reply all…".to_owned(),
+            (Some(who), false) => format!("Reply to {}…", who.display_name()),
+            (None, false) => "Reply…".to_owned(),
+        };
+        div()
+            .flex_none()
+            .px(px(28.))
+            .pt(px(10.))
+            .pb(px(16.))
+            .child(
+                h_flex()
+                    .id("reply-bar")
+                    .w_full()
+                    .h(px(44.))
+                    .items_center()
+                    .gap(px(10.))
+                    .px(px(14.))
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(p.control_border.opacity(0.45))
+                    .bg(p.message_surface())
+                    .shadow_xs()
+                    .cursor_text()
+                    .text_size(px(14.))
+                    .text_color(p.muted)
+                    .hover(|d| d.border_color(p.control_border))
+                    .child(icon(if all { "reply-all" } else { "reply" }).size(px(16.)).text_color(p.accent))
+                    .child(div().flex_1().min_w_0().truncate().child(text))
+                    .child(kbd("Ctrl R", &p))
+                    .on_click(cx.listener(|this, _, window, cx| this.reply_default(window, cx))),
+            )
+            .into_any_element()
+    }
+
+    /// A folded message: one line with who wrote it, the start of what they wrote, and when.
+    /// `first` and `last` say where it sits in a stack of folded messages, which share one
+    /// border with lines between them.
+    fn render_message_collapsed(&self, m: &Message, first: bool, last: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *cx.palette();
         let id = m.id.clone();
         let full_date = format_full(m.date, &self.time_zone);
@@ -431,20 +519,25 @@ impl MailWindow {
             .gap(px(12.))
             .px(px(14.))
             .py(px(10.))
-            .rounded(px(8.))
-            .border_1()
+            .border_x_1()
+            .border_b_1()
+            .when(first, |d| d.border_t_1().rounded_t(px(8.)))
+            .when(last, |d| d.rounded_b(px(8.)))
             .border_color(p.divider)
-            .bg(p.message_surface())
+            .bg(crate::theme::mix(p.message_surface(), p.hover, 0.25))
             .cursor_pointer()
             .hover(|d| d.bg(p.hover))
             .child(if m.is_outgoing { owner_avatar(&owner, 28., &p) } else { avatar(&who, 28., &p) })
             .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .child(div().truncate().text_size(px(13.)).font_weight(if m.is_read { FontWeight::MEDIUM } else { FontWeight::SEMIBOLD }).child(who.display_name()))
-                    .child(div().truncate().text_size(px(12.)).text_color(p.muted).child(m.snippet.clone())),
+                div()
+                    .flex_none()
+                    .w(px(130.))
+                    .truncate()
+                    .text_size(px(13.))
+                    .font_weight(if m.is_read { FontWeight::MEDIUM } else { FontWeight::BOLD })
+                    .child(who.display_name()),
             )
+            .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).text_color(p.muted).child(m.snippet.clone()))
             .when(m.attachments.iter().any(|a| !embedded_in_body(a, &m.body)), |d| d.child(icon("paperclip").size(px(13.)).text_color(p.muted)))
             .when(m.is_starred, |d| d.child(icon("star").size(px(13.)).text_color(p.warning)))
             .child(div().id(SharedString::from(format!("message-date-{}", m.id))).flex_none().text_size(px(11.)).text_color(p.muted).child(format!("{} · {}", overlook_core::tz::zoned(m.date).strftime("%b %-d"), overlook_core::tz::format_clock(m.date))).tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(full_date.clone()).build(window, cx)))
@@ -518,14 +611,27 @@ impl MailWindow {
                             })
                             .child(self.render_recipients(m, cx)),
                     )
-                    .child(v_flex().items_end().gap(px(4.))
-                        .child(self.message_reply_actions(m, true, cx))
-                        .child(div().text_size(px(11.)).text_color(p.muted).child(format!("{} · {}", overlook_core::tz::zoned(m.date).strftime("%b %-d, %Y"), overlook_core::tz::format_clock(m.date)))))
-                    .child(
+                    // When it was sent, over the message's own commands: reply, reply all,
+                    // forward, and the rest in a menu, joined in one segmented group.
+                    .child(v_flex().items_end().gap(px(6.))
+                        .child(div().text_size(px(12.)).text_color(p.muted).child(format!("{} · {}", overlook_core::tz::zoned(m.date).strftime("%b %-d, %Y"), overlook_core::tz::format_clock(m.date))))
+                        .child(h_flex()
+                            .items_center()
+                            .rounded(px(8.))
+                            .border_1()
+                            .border_color(p.control_border.opacity(0.45))
+                            .overflow_hidden()
+                            .child(self.message_reply_actions(m, true, cx))
+                            .child(
                         Button::new(SharedString::from(format!("mmenu-{}", m.id)))
                             .ghost()
-                            .xsmall()
-                            .icon(icon("ellipsis-vertical").size(px(15.)))
+                            .small()
+                            .w(px(32.))
+                            .h(px(28.))
+                            .p(px(0.))
+                            .rounded(px(0.))
+                            .child(icon("ellipsis").size(px(16.)).text_color(p.muted))
+                            .accessibility_label("More actions for this message")
                             .tooltip("More actions for this message")
                             .dropdown_menu(move |menu, _window, _cx| {
                                 let m = menu_message.clone();
@@ -547,6 +653,7 @@ impl MailWindow {
                                 let menu = item(menu, "Save as .eml…", t.clone(), m.clone(), |this, m, w, cx| this.save_message_eml(m, w, cx));
                                 item(menu, "View source", t.clone(), m, |this, m, w, cx| this.view_message_source(m, w, cx))
                             }),
+                            )),
                     ),
             )
             .children(self.pinned_contact_card(m, cx))
@@ -595,15 +702,33 @@ impl MailWindow {
             })
             .child(div().w_full().min_w_0().child(body_view))
             .when(!attachments.is_empty(), |d| {
+                let total: u64 = attachments.iter().map(|a| a.size_bytes).sum();
+                let all: Vec<Attachment> = attachments.iter().map(|a| (*a).clone()).collect();
                 d.child(
                     v_flex()
                         .gap(px(10.))
                         .pt(px(6.))
+                        // How many files, how big together, and Save all for more than one.
                         .child(
-                            div()
+                            h_flex()
+                                .items_center()
+                                .gap(px(10.))
                                 .text_size(px(12.))
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(format!("{} attachment{}", attachments.len(), if attachments.len() == 1 { "" } else { "s" })),
+                                .text_color(p.muted)
+                                .child(div().font_weight(FontWeight::MEDIUM).text_color(p.foreground).child(format!("{} attachment{}", attachments.len(), if attachments.len() == 1 { "" } else { "s" })))
+                                .child(human_size(total))
+                                .child(div().flex_1())
+                                .when(all.len() > 1, |row| {
+                                    row.child(
+                                        Button::new(SharedString::from(format!("save-all-{}", m.id)))
+                                            .ghost()
+                                            .small()
+                                            .child(h_flex().items_center().gap(px(5.)).text_color(p.accent).font_weight(FontWeight::MEDIUM).child(icon("download").size(px(14.)).text_color(p.accent)).child("Save all"))
+                                            .accessibility_label("Save all")
+                                            .tooltip("Save every file to a folder")
+                                            .on_click(cx.listener(move |this, _, window, cx| this.save_all_attachments(all.clone(), window, cx))),
+                                    )
+                                }),
                         )
                         .child(
                             h_flex()
@@ -616,17 +741,27 @@ impl MailWindow {
             .child(self.message_reply_actions(m, false, cx))
     }
 
+    /// Reply, reply all and forward for one message: icon segments in its header
+    /// (`compact`), labelled buttons under it.
     fn message_reply_actions(&self, message: &Message, compact: bool, cx: &mut Context<Self>) -> AnyElement {
-        h_flex().items_center().flex_wrap().gap(px(6.)).children([
+        let p = *cx.palette();
+        h_flex().items_center().when(!compact, |d| d.flex_wrap().gap(px(6.))).children([
             ("reply", "Reply", DraftKind::Reply),
             ("reply-all", "Reply all", DraftKind::ReplyAll),
             ("forward", "Forward", DraftKind::Forward),
         ].into_iter().map(|(glyph, label, kind)| {
             let source_id = message.id.clone();
+            let two_tone = match kind {
+                DraftKind::ReplyAll => C::ReplyAll,
+                DraftKind::Forward => C::Forward,
+                _ => C::Reply,
+            };
             Button::new(SharedString::from(format!("message-{glyph}-{}-{compact}", message.id)))
-                .small().icon(icon(glyph).size(px(if compact { 14. } else { 15. })))
-                .when(compact, |b| b.ghost().xsmall())
-                .when(!compact, |b| b.label(label))
+                .small()
+                // The header's segments draw Overlook's two-tone glyphs at full size; a
+                // button's own icon slot would shrink them to its size.
+                .when(compact, |b| b.ghost().w(px(32.)).h(px(28.)).p(px(0.)).rounded(px(0.)).border_r_1().border_color(p.divider).child(color_icon(two_tone, 16., &p)))
+                .when(!compact, |b| b.icon(icon(glyph).size(px(15.)).text_color(if glyph == "forward" { p.brand_accent } else { p.accent })).label(label))
                 .tooltip(format!("{label} to this message")).accessibility_label(label)
                 .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
@@ -967,17 +1102,8 @@ fn embedded_in_body(attachment: &Attachment, body: &Body) -> bool {
 
 fn attachment_card(a: &Attachment, p: &crate::theme::Palette, downloading: bool, thumbnail: Option<std::path::PathBuf>) -> Div {
     use overlook_core::attachment_policy::{risk, Risk};
-    // Programs and scripts get a red badge, archives and macro documents a yellow one,
-    // so the hazard is visible before anyone clicks.
     let risk = risk(&a.filename);
-    let badge_bg = match (risk, a.badge().as_str()) {
-        (Risk::Dangerous, _) => (p.error.opacity(if p.is_dark() { 0.25 } else { 0.12 }), p.error),
-        (Risk::Caution, _) => (p.warning.opacity(if p.is_dark() { 0.25 } else { 0.15 }), p.warning),
-        (_, "PDF") => (c(0xFBE9E7, p), c(0xA13E37, p)),
-        // SVG is a caution badge above (scripts can ride in it), so it never gets here.
-        (_, "FIG" | "PNG" | "JPG") => (c(0xEEE8FA, p), c(0x6E55B7, p)),
-        _ => (p.chip, p.muted),
-    };
+    let badge_bg = p.file_badge(&a.filename);
     let ext_color = match risk {
         Risk::Dangerous => Some(p.error),
         Risk::Caution => Some(p.warning),
@@ -1061,18 +1187,6 @@ fn split_extension(name: &str) -> (&str, &str) {
     }
 }
 
-fn c(hex: u32, p: &crate::theme::Palette) -> Hsla {
-    if p.is_dark() {
-        // Darken pastel badges for the dark theme so they do not glow.
-        let mut h: Hsla = Rgba::from(gpui_kit::rgb(hex)).into();
-        h.l = (h.l * 0.35).min(0.3);
-        h.s *= 0.6;
-        h
-    } else {
-        Rgba::from(gpui_kit::rgb(hex)).into()
-    }
-}
-
 /// Standard base64 with padding, enough for `data:` URLs.
 fn base64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -1131,7 +1245,9 @@ fn plain_text_html(text: &str) -> String {
 /// keeps full-width tables, authored body backgrounds, fallbacks and loading frames
 /// inside the same readable paper without rewriting the message's own layout.
 fn email_paper(body: impl IntoElement) -> Div {
-    div().w_full().min_w_0().px(px(20.)).py(px(16.)).rounded(px(6.))
+    // The document brings its own top margin; a short inset above it keeps the first line
+    // close to the header in light colorways, where the paper and the card are one white.
+    div().w_full().min_w_0().px(px(20.)).pt(px(6.)).pb(px(12.)).rounded(px(6.))
         .bg(rgb(crate::theme::EMAIL_PAPER)).text_color(rgb(crate::theme::EMAIL_INK))
         .child(body)
 }

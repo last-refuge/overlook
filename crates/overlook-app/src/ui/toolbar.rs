@@ -6,8 +6,21 @@ use gpui_kit::base::actions::Confirm;
 use gpui_kit::component::button::ButtonCustomVariant;
 use gpui_kit::component::{popover::Popover, scroll::ScrollableElement, Disableable};
 use overlook_core::toolbar::{
-    ToolbarAction as A, ToolbarArea as Area, ToolbarLayout, ToolbarModule as M,
+    StripPlan, ToolbarAction as A, ToolbarArea as Area, ToolbarLayout, ToolbarModule as M,
 };
+
+/// The room a group separator takes in the strip: the line, its margins and the gaps.
+const SEPARATOR_WIDTH: f32 = 13.;
+/// The menu half of the split New button.
+const SPLIT_WIDTH: f32 = 26.;
+
+/// The other things the split New button can make, beside the module's own.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NewItem {
+    Message,
+    Event,
+    Contact,
+}
 
 impl From<Module> for M {
     fn from(module: Module) -> Self {
@@ -360,19 +373,7 @@ impl MailWindow {
             .when(command.selected, |b| {
                 b.bg(p.selection).text_color(p.selection_text)
             })
-            .when(command.primary && !in_more, |b| {
-                if action == A::NewMessage && p.resolved == ResolvedTheme::Alexander {
-                    b.custom(ButtonCustomVariant::new(cx)
-                        .color(rgb(0x3E687E).into())
-                        .foreground(p.on_action)
-                        .hover(rgb(0x375C6F).into())
-                        .active(rgb(0x2F4F60).into()))
-                        // Custom variants tint the normal fill; this action stays solid.
-                        .bg(rgb(0x3E687E))
-                } else {
-                    b.primary()
-                }
-            })
+            .when(command.primary && !in_more, |b| primary_fill(b, action, &p, cx))
             .when(in_more, |b| b.w_full().justify_start())
             .child(
                 h_flex()
@@ -380,7 +381,11 @@ impl MailWindow {
                     .gap(px(6.))
                     .when(in_more, |row| row.w_full())
                     .child(command.glyph.render(&p, command.primary && !in_more))
-                    .when(!only_icon, |row| row.child(label)),
+                    .when(!only_icon, |row| row.child(label))
+                    // Move to opens a list of folders to pick from.
+                    .when(action == A::MoveMail && !only_icon && !in_more, |row| {
+                        row.child(icon("chevron-down").size(px(13.)).text_color(p.muted))
+                    }),
             );
         if self.toolbar_editing {
             return button.into_any_element();
@@ -388,16 +393,88 @@ impl MailWindow {
         match action {
             A::Appearance => self.appearance_menu(button, cx).into_any_element(),
             A::Layout => self.layout_menu(button, cx).into_any_element(),
-            _ => button
-                .on_action(cx.listener(move |this, _: &Confirm, window, cx| {
-                    cx.stop_propagation();
-                    this.run_toolbar_command(action, window, cx);
-                }))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.run_toolbar_command(action, window, cx)
-                }))
-                .into_any_element(),
+            _ => {
+                let button = button
+                    .on_action(cx.listener(move |this, _: &Confirm, window, cx| {
+                        cx.stop_propagation();
+                        this.run_toolbar_command(action, window, cx);
+                    }))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.run_toolbar_command(action, window, cx)
+                    }));
+                if command.primary && !in_more {
+                    self.split_new_button(action, button, cx)
+                } else {
+                    button.into_any_element()
+                }
+            }
         }
+    }
+
+    /// The module's New button joined to a menu of the other things Overlook can make, so a
+    /// message, an event or a contact is one click away from anywhere.
+    fn split_new_button(&self, action: A, button: Button, cx: &mut Context<Self>) -> AnyElement {
+        let p = *cx.palette();
+        let items: Vec<NewItem> = match action {
+            A::NewEvent => vec![NewItem::Message, NewItem::Contact],
+            A::NewContact => vec![NewItem::Message, NewItem::Event],
+            _ => vec![NewItem::Event, NewItem::Contact],
+        };
+        let this = cx.entity().downgrade();
+        let menu = primary_fill(Button::new("toolbar-new-more"), action, &p, cx)
+            .small()
+            .h(px(HEADER_CONTROL_HEIGHT))
+            .w(px(SPLIT_WIDTH))
+            .px(px(0.))
+            .flex_none()
+            .rounded_tl(px(0.))
+            .rounded_bl(px(0.))
+            .border_l_1()
+            .border_color(p.on_action.opacity(0.28))
+            .icon(icon("chevron-down").size(px(14.)))
+            .accessibility_label("More new items")
+            .tooltip("New event, message or contact")
+            .dropdown_menu(move |mut menu, _window, _cx| {
+                for item in &items {
+                    let (label, glyph, hint) = match item {
+                        NewItem::Message => ("New message", "square-pen", "Ctrl N"),
+                        NewItem::Event => ("New event", "calendar-plus", "Ctrl Shift A"),
+                        NewItem::Contact => ("New contact", "user-plus", ""),
+                    };
+                    let (t, item) = (this.clone(), *item);
+                    let label = if hint.is_empty() { label.to_owned() } else { format!("{label}  ·  {hint}") };
+                    menu = menu.item(PopupMenuItem::new(label).icon(icon(glyph)).on_click(move |_, window, cx| {
+                        let _ = t.update(cx, |this, cx| this.start_new_item(item, window, cx));
+                    }));
+                }
+                menu
+            });
+        h_flex()
+            .flex_none()
+            .items_center()
+            .child(button.rounded_tr(px(0.)).rounded_br(px(0.)))
+            .child(menu)
+            .into_any_element()
+    }
+
+    /// Opens the module a new item belongs to and starts it there.
+    fn start_new_item(&mut self, item: NewItem, window: &mut Window, cx: &mut Context<Self>) {
+        self.toolbar_more_open = false;
+        match item {
+            NewItem::Message => {
+                self.set_module(Module::Mail, window, cx);
+                self.compose_new(window, cx);
+            }
+            NewItem::Event => {
+                self.set_module(Module::Calendar, window, cx);
+                self.start_new_event(window, cx);
+            }
+            NewItem::Contact => {
+                self.set_module(Module::Contacts, window, cx);
+                self.start_new_contact(None, window, cx);
+            }
+        }
+        cx.notify();
     }
 
     fn save_toolbar_layout(&mut self, layout: ToolbarLayout, cx: &mut Context<Self>) {
@@ -453,13 +530,20 @@ impl MailWindow {
             .when(area == Area::More, |row| row.w_full())
             .child(
                 h_flex()
+                    .relative()
                     .items_center()
                     .group("toolbar-command")
+                    .child(child)
+                    // The grip shows on hover in the gap before the command, taking no room
+                    // of its own: the whole command is the drag handle.
                     .when(area == Area::Strip, |row| {
                         row.child(
                             div()
-                                .w(px(10.))
-                                .h(px(30.))
+                                .absolute()
+                                .left(px(-9.))
+                                .top_0()
+                                .bottom_0()
+                                .w(px(8.))
                                 .flex()
                                 .items_center()
                                 .justify_center()
@@ -467,8 +551,7 @@ impl MailWindow {
                                 .group_hover("toolbar-command", |style| style.opacity(0.75))
                                 .child(icon("grip-vertical").size(px(10.)).text_color(p.muted)),
                         )
-                    })
-                    .child(child),
+                    }),
             )
             .can_drop(move |value, _, _| {
                 value
@@ -487,27 +570,81 @@ impl MailWindow {
     pub(super) fn render_app_toolbar(
         &self,
         width: Pixels,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let p = *cx.palette();
         let compact = width < px(1160.);
         let layout = self.toolbar_layouts.layout(self.module.into());
-        let visible = layout.visible_count(f32::from(width) - 90., |action| {
-            let command = self.toolbar_command(action);
-            if command.primary {
-                command.label.len() as f32 * 7.5 + 54.
-            } else if compact
-                || matches!(command.glyph, Glyph::Symbol(_))
-                || matches!(action, A::Appearance | A::Layout)
-            {
-                50.
-            } else {
-                command.label.len() as f32 * 7.5 + 54.
-            }
-        });
+        // Labels are measured in the buttons' own font, so the strip shows every command
+        // that fits and overflows only what doesn't.
+        let font = window.text_style().font();
+        let label_size = window.rem_size() * 0.875;
+        let label_width = |label: &str| {
+            let run = TextRun {
+                len: label.len(),
+                font: font.clone(),
+                color: p.foreground,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            f32::from(
+                window
+                    .text_system()
+                    .shape_line(SharedString::from(label.to_owned()), label_size, &[run], None)
+                    .width,
+            )
+        };
+        // The drop edge, padding, icon and gap around a label, and the strip's gap after it.
+        const LABELLED: f32 = 2. + 16. + 20. + 6. + 2. + 1.;
+        const ICON_ONLY: f32 = 2. + 16. + 20. + 2. - 3.;
+        let visible = layout.visible_count(
+            f32::from(width) - 90.,
+            |action| {
+                let command = self.toolbar_command(action);
+                if command.primary {
+                    label_width(&command.label) + LABELLED + SPLIT_WIDTH
+                } else if compact
+                    || matches!(command.glyph, Glyph::Symbol(_))
+                    || matches!(action, A::Appearance | A::Layout)
+                {
+                    ICON_ONLY
+                } else {
+                    label_width(&command.label) + LABELLED
+                }
+            },
+            SEPARATOR_WIDTH,
+        );
         let overflow = layout.strip[visible..].to_vec();
         let before = overflow.first().copied();
         let module = M::from(self.module);
+        // Groups are separated wherever they meet, and the trailing navigation and app
+        // commands sit at the far end, whatever order was saved.
+        let shown = &layout.strip[..visible];
+        let plan = StripPlan::of(shown);
+        let mut items: Vec<AnyElement> = Vec::with_capacity(shown.len() * 2);
+        for (i, action) in shown.iter().enumerate() {
+            if plan.trailing == Some(i) {
+                items.push(self.toolbar_gap(*action, cx));
+            } else if plan.separators[i] {
+                items.push(
+                    div()
+                        .flex_none()
+                        .w(px(1.))
+                        .h(px(22.))
+                        .mx(px(4.))
+                        .bg(p.divider)
+                        .into_any_element(),
+                );
+            }
+            let button = self.toolbar_button(*action, compact, false, cx);
+            items.push(
+                self.draggable_command(*action, Area::Strip, button, cx)
+                    .into_any_element(),
+            );
+        }
+        let trailing = plan.trailing.is_some();
         let toolbar = h_flex()
             .w_full()
             .flex_none()
@@ -518,21 +655,12 @@ impl MailWindow {
             .rounded(px(8.))
             .bg(p.message_surface())
             .shadow_sm()
-            .children(
-                layout.strip[..visible]
-                    .iter()
-                    .map(|action| {
-                        let button = self.toolbar_button(*action, compact, false, cx);
-                        self.draggable_command(*action, Area::Strip, button, cx)
-                            .into_any_element()
-                    })
-                    .collect::<Vec<_>>(),
-            )
+            .children(items)
             .child(
                 div()
                     .id("toolbar-drop-end")
-                    .flex_1()
-                    .min_w(px(22.))
+                    .when(trailing, |d| d.flex_none().w(px(10.)))
+                    .when(!trailing, |d| d.flex_1().min_w(px(22.)))
                     .h(px(HEADER_CONTROL_HEIGHT))
                     .rounded(px(5.))
                     .can_drop(move |value, _, _| {
@@ -561,6 +689,31 @@ impl MailWindow {
         div().w_full().flex_none().px(px(4.)).pt(px(3.))
             .bg(p.navigation_palette().sidebar)
             .child(toolbar)
+    }
+
+    /// The space before the trailing commands. Dropping a command here puts it first among
+    /// them.
+    fn toolbar_gap(&self, first: A, cx: &mut Context<Self>) -> AnyElement {
+        let p = *cx.palette();
+        let module = M::from(self.module);
+        div()
+            .id("toolbar-drop-gap")
+            .flex_1()
+            .min_w(px(12.))
+            .h(px(HEADER_CONTROL_HEIGHT))
+            .rounded(px(5.))
+            .can_drop(move |value, _, _| {
+                value
+                    .downcast_ref::<ToolbarDrag>()
+                    .is_some_and(|d| d.module == module)
+            })
+            .drag_over::<ToolbarDrag>(move |style, _, _, _| {
+                style.bg(p.selection).border_1().border_color(p.action)
+            })
+            .on_drop(cx.listener(move |this, d: &ToolbarDrag, _, cx| {
+                this.drop_toolbar_action(d, Area::Strip, Some(first), cx)
+            }))
+            .into_any_element()
     }
 
     fn toolbar_more(&self, overflow: Vec<A>, cx: &mut Context<Self>) -> impl IntoElement {
@@ -909,5 +1062,24 @@ impl MailWindow {
         ));
         self.draggable_command(action, area, row.into_any_element(), cx)
             .into_any_element()
+    }
+}
+
+/// The solid fill of a New button. Alexander's New message is its own steel blue; the rest
+/// use the theme's action colour.
+fn primary_fill(button: Button, action: A, p: &Palette, cx: &mut Context<MailWindow>) -> Button {
+    if p.resolved == ResolvedTheme::Alexander && action == A::NewMessage {
+        button
+            .custom(
+                ButtonCustomVariant::new(cx)
+                    .color(rgb(0x3E687E).into())
+                    .foreground(p.on_action)
+                    .hover(rgb(0x375C6F).into())
+                    .active(rgb(0x2F4F60).into()),
+            )
+            // Custom variants tint the normal fill; this action stays solid.
+            .bg(rgb(0x3E687E))
+    } else {
+        button.primary()
     }
 }
