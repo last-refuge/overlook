@@ -13,6 +13,12 @@ Overlook keeps secrets only in the system keyring, through the `oo7` crate (0.4)
 If the keyring is missing or locked, Overlook shows an error and stops; it never falls back to a file
 (`crates/overlook-app/src/credentials.rs:1-5`).
 
+Overlook decides which of `oo7`'s two backends to use itself (`credentials.rs`, `sandboxed` and
+`keyring`). A Flatpak or Snap sandbox is `/.flatpak-info`, `FLATPAK_ID` or `SNAP`, and nothing else:
+`GTK_USE_PORTAL` only asks GTK to send GTK's dialogs through the portals, and `oo7`'s own sandbox
+test counts it as proof of one, which put mail passwords in `~/.local/share/keyrings/default.keyring`
+for anyone who sets that variable session-wide.
+
 Every secret is one keyring item with exactly three attributes (`credentials.rs:99-101`):
 
 | Attribute     | Value                                                                     |

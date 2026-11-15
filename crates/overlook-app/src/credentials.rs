@@ -32,6 +32,39 @@ pub const KIND_PASSWORD_INCOMING: &str = "password:incoming";
 /// SMTP password, UTF-8. Absent when "same as incoming" is ticked.
 pub const KIND_PASSWORD_OUTGOING: &str = "password:outgoing";
 
+/// True only when this process really runs inside a container sandbox, where the session bus
+/// and the Secret Service are out of reach and the secrets portal is the only door.
+///
+/// `GTK_USE_PORTAL` is deliberately not a signal. It asks GTK to send GTK's own dialogs
+/// through the xdg-desktop-portal; it says nothing about the process being sandboxed. The
+/// `oo7` 0.4 helper behind `Keyring::new` treats it as proof of a sandbox, so a user who set
+/// it session-wide had mail passwords written to `~/.local/share/keyrings/default.keyring`
+/// instead of the system keyring. That file is encrypted with the secrets portal's
+/// per-application secret, and the portal derives the application id from how the app was
+/// launched: once an `ai.lastrefuge.Overlook.desktop` entry exists, KDE starts the app as
+/// `app-ai.lastrefuge.Overlook@<id>.service`, the portal hands it a different secret, and
+/// every stored password then reads back as `IncorrectSecret`.
+fn sandboxed() -> bool {
+    sandboxed_with(|name| std::env::var_os(name).is_some(), std::path::Path::new("/"))
+}
+
+/// [`sandboxed`] with its inputs passed in, so the rule can be checked without a container.
+fn sandboxed_with(var_set: impl Fn(&str) -> bool, root: &std::path::Path) -> bool {
+    var_set("FLATPAK_ID") || var_set("SNAP") || root.join(".flatpak-info").exists()
+}
+
+/// The keyring to use: the Secret Service outside a sandbox, the portal's file backend inside
+/// one. Chosen here rather than by `oo7::Keyring::new`, which asks `ashpd` whether the process
+/// is sandboxed and counts `GTK_USE_PORTAL` as proof.
+async fn keyring() -> Result<oo7::Keyring, oo7::Error> {
+    if sandboxed() {
+        tracing::debug!(target: "overlook::diag", "sandboxed: using the secrets portal file keyring");
+        return Ok(oo7::Keyring::File(std::sync::Arc::new(oo7::file::Keyring::load_default().await?)));
+    }
+    let service = oo7::dbus::Service::<'static>::new().await?;
+    Ok(oo7::Keyring::DBus(service.default_collection().await?))
+}
+
 fn runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {
@@ -131,7 +164,7 @@ pub fn save_secret(account: &AccountId, kind: &str, secret: Vec<u8>) -> Result<(
     let label = label(account, kind);
     let op = Operation::Write;
     let result = runtime().block_on(async move {
-        let keyring = oo7::Keyring::new().await.map_err(|e| unavailable(op, e))?;
+        let keyring = keyring().await.map_err(|e| unavailable(op, e))?;
         keyring.create_item(&label, &borrow(&attrs), secret, true).await.map_err(|e| unavailable(op, e))
     });
     audited(op, account, kind, result, |_| true)
@@ -142,7 +175,7 @@ pub fn load_secret(account: &AccountId, kind: &str) -> Result<Option<Vec<u8>>, V
     let attrs = attributes(account, kind);
     let op = Operation::Read;
     let result = runtime().block_on(async move {
-        let keyring = oo7::Keyring::new().await.map_err(|e| unavailable(op, e))?;
+        let keyring = keyring().await.map_err(|e| unavailable(op, e))?;
         let items = keyring.search_items(&borrow(&attrs)).await.map_err(|e| unavailable(op, e))?;
         let Some(item) = items.into_iter().next() else { return Ok(None) };
         let secret = item.secret().await.map_err(|e| unavailable(op, e))?;
@@ -157,7 +190,7 @@ pub fn delete_secret(account: &AccountId, kind: &str) -> Result<(), VaultError> 
     let attrs = attributes(account, kind);
     let op = Operation::Delete;
     let result = runtime().block_on(async move {
-        let keyring = oo7::Keyring::new().await.map_err(|e| unavailable(op, e))?;
+        let keyring = keyring().await.map_err(|e| unavailable(op, e))?;
         keyring.delete(&borrow(&attrs)).await.map_err(|e| unavailable(op, e))
     });
     audited(op, account, kind, result, |_| true)
@@ -168,7 +201,7 @@ pub fn delete_all_secrets(account: &AccountId) -> Result<(), VaultError> {
     let attrs = account_attributes(account);
     let op = Operation::DeleteAll;
     let result = runtime().block_on(async move {
-        let keyring = oo7::Keyring::new().await.map_err(|e| unavailable(op, e))?;
+        let keyring = keyring().await.map_err(|e| unavailable(op, e))?;
         keyring.delete(&borrow(&attrs)).await.map_err(|e| unavailable(op, e))
     });
     audited(op, account, "*", result, |_| true)
@@ -302,5 +335,23 @@ mod tests {
         assert!(log.contains(r#"outcome="not-found""#));
         assert!(log.contains(r#"op="write" kind="password:outgoing" account=acct-synthetic outcome="keyring-unavailable""#), "{log}");
         assert!(!log.contains("synthetic-secret"));
+    }
+
+    #[test]
+    fn a_portal_hint_is_not_a_sandbox() {
+        // GTK_USE_PORTAL=1, set session-wide, used to send every mail password to oo7's file
+        // keyring: its key is the portal's per-application secret, and the portal changes the
+        // application id once a .desktop entry lets it tell how the app was launched.
+        let bare = std::path::Path::new("/nonexistent-overlook-sandbox-root");
+        assert!(!sandboxed_with(|_| false, bare));
+        assert!(!sandboxed_with(|name| name == "GTK_USE_PORTAL", bare));
+        assert!(sandboxed_with(|name| name == "FLATPAK_ID", bare));
+        assert!(sandboxed_with(|name| name == "SNAP", bare));
+
+        let container = std::env::temp_dir().join("overlook-sandbox-marker-test");
+        std::fs::create_dir_all(&container).unwrap();
+        std::fs::write(container.join(".flatpak-info"), b"[Application]\n").unwrap();
+        assert!(sandboxed_with(|_| false, &container));
+        std::fs::remove_dir_all(&container).ok();
     }
 }
