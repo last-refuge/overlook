@@ -1114,6 +1114,31 @@ impl Contact {
     }
 }
 
+/// Contacts kept at a CardDAV server, for an IMAP or POP3 account. Saved only after the
+/// person agreed that the account's incoming mail password may be sent to `server_url`
+/// (Fastmail's app passwords allow contacts by default). The password stays in the keyring.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactsConnection {
+    pub account_id: AccountId,
+    pub server_url: String,
+    pub username: String,
+    /// The address book new contacts go to, once one has been found.
+    pub default_book: Option<String>,
+}
+
+/// A CardDAV card as last read from or written to the server: where it lives, its version,
+/// and the contact as it was then. An edit made here is the difference between `base` and
+/// the edited contact, which is applied to the server's current copy, so changes made
+/// elsewhere in the meantime survive.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactCard {
+    pub contact_id: String,
+    pub address_book: String,
+    pub url: String,
+    pub etag: String,
+    pub base: Contact,
+}
+
 /// Automatic replies ("vacation responder") as the provider stores them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]

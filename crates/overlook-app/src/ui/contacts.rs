@@ -15,6 +15,31 @@ use gpui_kit::*;
 use overlook_core::time::now;
 use overlook_core::*;
 
+/// Where an account's contacts live, which decides what the Contacts page says and allows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ContactsSource {
+    /// Google Contacts, through the Gmail sign-in.
+    Google,
+    /// A CardDAV server, by the service's name ("Fastmail").
+    Server(&'static str),
+    /// The sample account's fictional contacts.
+    Sample,
+    /// No contacts service: contacts added stay on this device.
+    #[default]
+    Device,
+}
+
+impl ContactsSource {
+    /// The address book's name in the sidebar's filter.
+    pub fn book_name(self) -> String {
+        match self {
+            Self::Google => "Google Contacts".into(),
+            Self::Server(name) => format!("{name} contacts"),
+            Self::Sample | Self::Device => "Address book".into(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContactFilter {
     All,
@@ -36,7 +61,28 @@ pub struct ContactForm {
 }
 
 impl MailWindow {
+    /// Where `account`'s contacts live. Reads the account's contacts connection.
+    pub(crate) fn contacts_source_of(&self, account: &Account) -> ContactsSource {
+        match account.provider {
+            ProviderKind::Gmail => ContactsSource::Google,
+            ProviderKind::Sample => ContactsSource::Sample,
+            ProviderKind::Imap | ProviderKind::Pop3 => match self.store.contacts_connection(&account.id).ok().flatten() {
+                Some(connection) if connection.server_url == overlook_provider::caldav::carddav::FASTMAIL_CARDDAV_URL => ContactsSource::Server("Fastmail"),
+                Some(_) => ContactsSource::Server("Your contacts server"),
+                None => ContactsSource::Device,
+            },
+        }
+    }
+
+    /// Whether `account` is at Fastmail and its contacts could be connected with its mail
+    /// password. Reads its server settings.
+    pub(crate) fn fastmail_contacts_available(&self, account: &Account) -> bool {
+        matches!(account.provider, ProviderKind::Imap | ProviderKind::Pop3)
+            && self.store.servers(&account.id).ok().flatten().is_some_and(|servers| crate::carddav_sync::contacts_server(&servers).is_some())
+    }
+
     pub(crate) fn reload_contacts(&mut self) {
+        self.contacts_source = self.contacts_source_of(&self.account);
         self.contacts = self.store.contacts(&self.account.id).unwrap_or_default();
         self.contact_index = super::contact_card::index_contacts(&self.contacts);
         if let Some(sel) = &self.contact_selected {
@@ -71,7 +117,11 @@ impl MailWindow {
     }
 
     fn contacts_writable(&self) -> bool {
-        self.providers.get(&self.account.id).is_some_and(|p| p.mail.has_contacts_write_access())
+        match self.contacts_source {
+            ContactsSource::Server(_) => true,
+            ContactsSource::Device => false,
+            ContactsSource::Google | ContactsSource::Sample => self.providers.get(&self.account.id).is_some_and(|p| p.mail.has_contacts_write_access()),
+        }
     }
 
     pub(crate) fn start_new_contact(&mut self, prefill: Option<Address>, window: &mut Window, cx: &mut Context<Self>) {
@@ -185,7 +235,14 @@ impl MailWindow {
                 self.contact_form = None;
                 self.reload_contacts();
                 self.contact_selected = Some(contact.id.clone());
-                crate::ui::toast(window, cx, crate::notify::Level::Info, if self.contacts_writable() { "Saved on this device. Syncing to Google Contacts…" } else { "Saved on this device. Sign in again to sync it to Google Contacts." });
+                let saved = match (self.contacts_source, self.contacts_writable()) {
+                    (ContactsSource::Google, true) => "Saved on this device. Syncing to Google Contacts…".to_owned(),
+                    (ContactsSource::Google, false) => "Saved on this device. Sign in again to sync it to Google Contacts.".to_owned(),
+                    (ContactsSource::Server(name), _) => format!("Saved on this device. Syncing to {name}…"),
+                    (ContactsSource::Sample, _) => "Saved on this device. Syncing…".to_owned(),
+                    (ContactsSource::Device, _) => "Saved on this device.".to_owned(),
+                };
+                crate::ui::toast(window, cx, crate::notify::Level::Info, saved);
                 if self.connected(&self.account.id) {
                     self.sync_now(window, cx);
                 }
@@ -250,10 +307,10 @@ impl MailWindow {
         let book = self.contacts.iter().filter(|c| c.in_address_book).count();
         let other = total - book;
         let writable = self.contacts_writable();
-        let item = |label: &'static str, count: usize, filter: ContactFilter, icon_name: &'static str, cx: &mut Context<Self>| {
+        let item = |label: SharedString, count: usize, filter: ContactFilter, icon_name: &'static str, cx: &mut Context<Self>| {
             let active = self.contact_filter == filter;
             h_flex()
-                .id(SharedString::from(format!("cfilter-{label}")))
+                .id(SharedString::from(format!("cfilter-{filter:?}")))
                 .items_center()
                 .gap(px(10.))
                 .min_h(px(32.))
@@ -275,9 +332,32 @@ impl MailWindow {
             .text_color(p.foreground)
             .p(px(10.))
             .gap(px(12.))
-            .child(v_flex().gap(px(2.)).child(item("All", total, ContactFilter::All, "users", cx)).child(item("Google Contacts", book, ContactFilter::AddressBook, "book-user", cx)).child(item("Other contacts", other, ContactFilter::Other, "user-round", cx)))
+            .child(
+                v_flex()
+                    .gap(px(2.))
+                    .child(item("All".into(), total, ContactFilter::All, "users", cx))
+                    .child(item(self.contacts_source.book_name().into(), book, ContactFilter::AddressBook, "book-user", cx))
+                    .child(item("Other contacts".into(), other, ContactFilter::Other, "user-round", cx)),
+            )
             .child(div().flex_1())
-            .when(!writable, |d| {
+            // Contacts kept only here, for an account with no contacts service.
+            .when(self.contacts_source == ContactsSource::Device, |d| {
+                d.child(
+                    div()
+                        .p(px(10.))
+                        .rounded(px(8.))
+                        .bg(p.chip)
+                        .text_size(px(11.))
+                        .text_color(cx.palette().muted)
+                        .whitespace_normal()
+                        .child(if self.fastmail_contacts_available(&self.account) {
+                            "Contacts you add stay on this device. To see and edit your Fastmail contacts here, connect them in Settings → Accounts."
+                        } else {
+                            "Contacts you add stay on this device."
+                        }),
+                )
+            })
+            .when(!writable && self.contacts_source == ContactsSource::Google, |d| {
                 let email = self.account.email.clone();
                 d.child(
                     v_flex()
@@ -319,7 +399,11 @@ impl MailWindow {
                             .p(px(20.))
                             .text_size(px(13.))
                             .text_color(p.muted)
-                            .child(if self.contacts.is_empty() { "No contacts yet. They arrive with the next sync, or add one." } else { "No contacts match." })
+                            .child(match (self.contacts.is_empty(), self.contacts_source) {
+                                (true, ContactsSource::Device) => "No contacts yet. Contacts you add stay on this device.",
+                                (true, _) => "No contacts yet. They arrive with the next sync, or add one.",
+                                (false, _) => "No contacts match.",
+                            })
                             .into_any_element()
                     } else {
                         v_flex()
@@ -402,7 +486,14 @@ impl MailWindow {
                                 (Some(t), Some(o)) => format!("{t} · {o}"),
                                 _ => t,
                             })))
-                            .child(div().text_size(px(11.)).text_color(p.muted).child(if c.pending { "Saved on this device, waiting to sync" } else if c.in_address_book { "In your Google Contacts" } else { "Someone you have corresponded with" })),
+                            .child(div().text_size(px(11.)).text_color(p.muted).child(match (c.pending, c.in_address_book, self.contacts_source) {
+                                (true, _, ContactsSource::Device) => "Saved on this device".to_owned(),
+                                (true, _, _) => "Saved on this device, waiting to sync".to_owned(),
+                                (false, true, ContactsSource::Google) => "In your Google Contacts".to_owned(),
+                                (false, true, ContactsSource::Server(name)) => format!("In your {name} contacts"),
+                                (false, true, _) => "In your address book".to_owned(),
+                                (false, false, _) => "Someone you have corresponded with".to_owned(),
+                            })),
                     ),
             )
             .child(divider(&p))

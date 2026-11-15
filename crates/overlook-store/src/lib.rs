@@ -14,6 +14,7 @@
 
 mod index;
 mod calendar_connections;
+mod contact_cards;
 mod caldav;
 mod caldav_outbox;
 mod schema;
@@ -1384,6 +1385,13 @@ impl Store {
                 Some(s) => serde_json::from_str(&s).ok(),
                 None => None,
             })
+        })
+    }
+
+    pub fn delete_setting(&self, key: &str) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute("DELETE FROM settings WHERE key=?1", [key])?;
+            Ok(())
         })
     }
 

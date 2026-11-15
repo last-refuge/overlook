@@ -125,10 +125,15 @@ pub fn contacts_synced_key(account: &AccountId) -> String {
     format!("contacts_synced_at:{}", account.0)
 }
 
-/// Refreshes the address book once a day. Failures are logged and retried next time; they
-/// never affect the mail sync state.
+/// Refreshes the address book once a day, or for an account whose contacts are at a CardDAV
+/// server, sends edits and checks for changes ([`crate::carddav_sync`]). Failures are logged and
+/// retried next time; they never affect the mail sync state.
 async fn sync_contacts(store: &Store, provider: &dyn MailProvider, account: &Account) {
     const DAY: i64 = 24 * 3_600_000;
+    if let Ok(Some(connection)) = store.contacts_connection(&account.id) {
+        crate::carddav_sync::run(store, account, &connection);
+        return;
+    }
     let key = contacts_synced_key(&account.id);
     let last = store.setting::<i64>(&key).ok().flatten().unwrap_or(0);
     if now() - last < DAY {
@@ -567,8 +572,14 @@ async fn replay_operations(
     // A send waits out the undo delay in the Outbox; the window syncs again when it ends.
     let undo_ms = i64::from(store.setting::<overlook_core::prefs::Prefs>("prefs").ok().flatten().map(|p| p.undo_send_secs).unwrap_or(0)) * 1000;
     let mut final_state = SyncState::UpToDate;
+    // Contact edits of an account with a CardDAV connection go to that server, earlier in the
+    // sync, not to the mail provider.
+    let contacts_elsewhere = store.contacts_connection(&acct).ok().flatten().is_some();
     for (op, covered) in plan.send {
         if matches!(op.kind, OperationKind::SendDraft { .. }) && overlook_core::time::now() - op.created_at < undo_ms {
+            continue;
+        }
+        if contacts_elsewhere && op.kind.is_contact() {
             continue;
         }
         set_states(&covered, OperationState::InFlight, None);

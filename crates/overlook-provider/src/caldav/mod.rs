@@ -1,14 +1,17 @@
-//! CalDAV discovery, snapshots and conditional writes. Run network work off the UI thread.
+//! CalDAV discovery, snapshots and conditional writes, and CardDAV contacts over the same
+//! transport (`carddav`). Run network work off the UI thread.
 //!
 //! The read service is independent of the mutation-oriented CalendarProvider trait.
 //! Personal-event writes use a separate durable outbox; meeting scheduling is not enabled.
 
 mod codec;
+pub mod carddav;
 mod collection_sync;
 mod edit;
 #[cfg(feature = "fake-servers")]
 pub mod fake;
 mod read;
+pub mod vcard;
 mod write;
 mod xml;
 pub use edit::{
@@ -278,11 +281,22 @@ impl CalDavClient {
         depth: &str,
         started: Instant,
     ) -> Result<(Url, Vec<xml::DavResponse>), CalDavError> {
+        self.propfind_with(target, depth, xml::DISCOVERY_PROPERTIES, started)
+    }
+
+    /// A PROPFIND asking for `properties`: calendar discovery, or address books for CardDAV.
+    fn propfind_with(
+        &self,
+        target: &Url,
+        depth: &str,
+        properties: &str,
+        started: Instant,
+    ) -> Result<(Url, Vec<xml::DavResponse>), CalDavError> {
         let (url, body) = self.request_xml(
             target,
             "PROPFIND",
             depth,
-            xml::DISCOVERY_PROPERTIES,
+            properties,
             MAX_RESPONSE_BYTES,
             started,
         )?;

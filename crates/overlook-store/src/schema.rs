@@ -2,7 +2,32 @@
 
 use rusqlite::Connection;
 
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17, V18, V19, V20];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17, V18, V19, V20, V21];
+
+/// Contacts from a CardDAV server (Fastmail first): the connection the person agreed to, and
+/// each card's version as last seen, which edits are applied against. Tables of their own,
+/// so nothing that exists is altered.
+const V21: &str = "
+BEGIN;
+CREATE TABLE contact_connections (
+    account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+    server_url TEXT NOT NULL,
+    username TEXT NOT NULL,
+    default_book TEXT,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE contact_cards (
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    contact_id TEXT NOT NULL,
+    address_book TEXT NOT NULL,
+    url TEXT NOT NULL,
+    etag TEXT NOT NULL,
+    base_json TEXT NOT NULL,
+    PRIMARY KEY(account_id, contact_id)
+);
+PRAGMA user_version = 21;
+COMMIT;
+";
 
 /// The change history behind Undo, Ctrl+Z and the History view.
 const V20: &str = "

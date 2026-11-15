@@ -631,6 +631,8 @@ pub struct MailWindow {
     contact_index: HashMap<String, usize>,
     // Contacts module state.
     pub(crate) contacts: Vec<Contact>,
+    /// Where the open account's contacts live; set with the contacts.
+    pub(crate) contacts_source: contacts::ContactsSource,
     pub(crate) contact_selected: Option<String>,
     pub(crate) contact_search: Entity<InputState>,
     pub(crate) contact_query: String,
@@ -937,6 +939,7 @@ impl MailWindow {
             contact_card: None,
             recipients_expanded: BTreeSet::new(),
             contact_index: HashMap::new(),
+            contacts_source: Default::default(),
             contacts: Vec::new(),
             contact_selected: None,
             contact_search,
