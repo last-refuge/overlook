@@ -348,10 +348,8 @@ mod tests {
         assert!(sandboxed_with(|name| name == "FLATPAK_ID", bare));
         assert!(sandboxed_with(|name| name == "SNAP", bare));
 
-        let container = std::env::temp_dir().join("overlook-sandbox-marker-test");
-        std::fs::create_dir_all(&container).unwrap();
-        std::fs::write(container.join(".flatpak-info"), b"[Application]\n").unwrap();
-        assert!(sandboxed_with(|_| false, &container));
-        std::fs::remove_dir_all(&container).ok();
+        let container = tempfile::tempdir().unwrap();
+        std::fs::write(container.path().join(".flatpak-info"), b"[Application]\n").unwrap();
+        assert!(sandboxed_with(|_| false, container.path()));
     }
 }
