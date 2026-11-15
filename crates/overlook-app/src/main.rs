@@ -7,6 +7,7 @@ mod browser_engine;
 mod browser_body;
 mod credentials;
 mod caldav_sync;
+mod carddav_sync;
 mod google_signin;
 mod lifecycle;
 mod loopback;

@@ -3,6 +3,7 @@ use roxmltree::{Document, Node, ParsingOptions};
 
 const DAV: &str = "DAV:";
 const CALDAV: &str = "urn:ietf:params:xml:ns:caldav";
+const CARDDAV: &str = "urn:ietf:params:xml:ns:carddav";
 const APPLE: &str = "http://apple.com/ns/ical/";
 
 pub(super) const DISCOVERY_PROPERTIES: &str = r#"<?xml version="1.0" encoding="utf-8"?>
@@ -11,12 +12,22 @@ pub(super) const DISCOVERY_PROPERTIES: &str = r#"<?xml version="1.0" encoding="u
 <d:displayname/><a:calendar-color/><d:current-user-privilege-set/>
 <d:supported-report-set/><d:sync-token/><c:supported-calendar-component-set/></d:prop></d:propfind>"#;
 
+/// The same discovery for address books (RFC 6352): where the principal keeps them, and
+/// which collections are address books.
+pub(super) const CARD_DISCOVERY_PROPERTIES: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+<d:prop><d:current-user-principal/><card:addressbook-home-set/><d:resourcetype/>
+<d:displayname/><d:current-user-privilege-set/></d:prop></d:propfind>"#;
+
 #[derive(Debug, Default)]
 pub(super) struct DavResponse {
     pub href: String,
     pub principal: Option<String>,
     pub homes: Vec<String>,
+    /// Where the principal keeps its address books (CardDAV).
+    pub card_homes: Vec<String>,
     pub is_calendar: bool,
+    pub is_address_book: bool,
     pub resource_type_known: bool,
     pub supports_events: bool,
     pub name: Option<String>,
@@ -26,11 +37,11 @@ pub(super) struct DavResponse {
     pub sync_token: Option<String>,
 }
 
-fn child<'a, 'input>(node: Node<'a, 'input>, ns: &str, name: &str) -> Option<Node<'a, 'input>> {
+pub(super) fn child<'a, 'input>(node: Node<'a, 'input>, ns: &str, name: &str) -> Option<Node<'a, 'input>> {
     node.children().find(|n| n.has_tag_name((ns, name)))
 }
 
-fn text(node: Node<'_, '_>) -> String {
+pub(super) fn text(node: Node<'_, '_>) -> String {
     node.children()
         .filter(|n| n.is_text())
         .filter_map(|n| n.text())
@@ -39,7 +50,7 @@ fn text(node: Node<'_, '_>) -> String {
         .to_owned()
 }
 
-fn status(node: Node<'_, '_>) -> Result<u16, CalDavError> {
+pub(super) fn status(node: Node<'_, '_>) -> Result<u16, CalDavError> {
     let raw = text(node);
     let mut parts = raw.split_whitespace();
     let version = parts.next().unwrap_or_default();
@@ -144,8 +155,15 @@ pub(super) fn parse_multistatus(body: &str) -> Result<Vec<DavResponse>, CalDavEr
                             .filter(|n| n.has_tag_name((DAV, "href")))
                             .map(text),
                     ),
+                    (Some(CARDDAV), "addressbook-home-set") => item.card_homes.extend(
+                        property
+                            .children()
+                            .filter(|n| n.has_tag_name((DAV, "href")))
+                            .map(text),
+                    ),
                     (Some(DAV), "resourcetype") => {
                         item.is_calendar = child(property, CALDAV, "calendar").is_some();
+                        item.is_address_book = child(property, CARDDAV, "addressbook").is_some();
                         item.resource_type_known = true;
                     }
                     (Some(DAV), "displayname") => item.name = Some(text(property)),

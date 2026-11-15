@@ -24,7 +24,7 @@ impl From<CalDavError> for CalDavWriteError {
     }
 }
 
-fn strong_etag(etag: &str) -> bool {
+pub(super) fn strong_etag(etag: &str) -> bool {
     etag.len() >= 2
         && etag.len() <= 1024
         && etag.starts_with('"')
@@ -41,6 +41,19 @@ impl CalDavClient {
         body: &str,
         condition: Option<(&str, &str)>,
     ) -> Result<(u16, Option<String>, String), CalDavError> {
+        self.typed_resource_request(href, method, body, condition, "text/calendar", 2 * 1024 * 1024)
+    }
+
+    /// One resource: an iCalendar event, or a vCard for CardDAV, up to `limit` bytes.
+    pub(super) fn typed_resource_request(
+        &self,
+        href: &str,
+        method: &str,
+        body: &str,
+        condition: Option<(&str, &str)>,
+        media_type: &str,
+        limit: u64,
+    ) -> Result<(u16, Option<String>, String), CalDavError> {
         let url = self.resolve(&self.endpoint, href)?;
         let auth = format!(
             "Basic {}",
@@ -51,8 +64,8 @@ impl CalDavClient {
             .method(method)
             .uri(url.as_str())
             .header("Authorization", auth)
-            .header("Content-Type", "text/calendar; charset=utf-8")
-            .header("Accept", "text/calendar");
+            .header("Content-Type", format!("{media_type}; charset=utf-8"))
+            .header("Accept", media_type);
         if let Some((key, value)) = condition {
             builder = builder.header(key, value);
         }
@@ -78,7 +91,7 @@ impl CalDavClient {
             let bytes = response
                 .body_mut()
                 .with_config()
-                .limit(2 * 1024 * 1024)
+                .limit(limit)
                 .read_to_vec()
                 .map_err(|_| CalDavError::Network)?;
             String::from_utf8(bytes)

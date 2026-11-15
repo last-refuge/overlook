@@ -115,6 +115,8 @@ pub struct AccountSetup {
     pub generation: u64,
     /// Explicit consent to reuse this new Fastmail account's incoming credential.
     pub connect_calendars: bool,
+    /// The same consent, for the account's contacts at Fastmail's contacts server.
+    pub connect_contacts: bool,
     /// Set when the account signs in with Microsoft instead of a password.
     pub oauth: Option<OAuthIssuer>,
     /// A Microsoft sign-in made in this dialog and not stored yet: the connection test and
@@ -492,6 +494,7 @@ impl MailWindow {
                     if let Some(setup) = this.account_setup.as_mut() {
                         // A changed login must not carry an earlier credential choice.
                         setup.connect_calendars = false;
+                        setup.connect_contacts = false;
                     }
                     cx.notify();
                 }
@@ -540,6 +543,7 @@ impl MailWindow {
             checked: None,
             generation: 0,
             connect_calendars: false,
+            connect_contacts: false,
             oauth: servers.as_ref().and_then(|s| s.oauth),
             microsoft: None,
             signin_cancel: None,
@@ -1324,6 +1328,7 @@ impl MailWindow {
         let mode = setup.mode.clone();
         let is_new = matches!(mode, SetupMode::New);
         let connect_calendars = is_new && setup.connect_calendars;
+        let connect_contacts = is_new && setup.connect_contacts;
         let account = match &mode {
             SetupMode::Edit(id) | SetupMode::UpdatePassword(id) => match self.accounts.iter().find(|a| &a.id == id).cloned() {
                 Some(mut a) => {
@@ -1403,6 +1408,8 @@ impl MailWindow {
         // Calendar configuration is durable before starting its worker. A failure
         // is reported independently and never rolls back a working mail account.
         let calendar_result = caldav_sync::add_fastmail_calendars(&self.store, &account, &servers, connect_calendars);
+        // Contacts likewise: only with the person's consent, and never rolling back the mail.
+        let contacts_result = if connect_contacts { crate::carddav_sync::connect(&self.store, &account, &servers).map(Some) } else { Ok(None) };
         self.providers.insert(account.id.clone(), bundle);
         self.provider_issues.remove(&account.id);
         // The IDLE watcher follows the provider: started for a new account, restarted when
@@ -1430,6 +1437,9 @@ impl MailWindow {
             Ok(None) => {},
             Err(error) => crate::ui::toast(window, cx, crate::notify::Level::Warning,
                 format!("Mail is ready, but calendars could not be added. {error}")),
+        }
+        if let Err(error) = contacts_result {
+            crate::ui::toast(window, cx, crate::notify::Level::Warning, format!("Mail is ready, but contacts could not be connected. {error}"));
         }
         self.sync_account(account.id, window, cx);
     }
@@ -1465,6 +1475,9 @@ impl MailWindow {
         let in_browser = setup.signin_cancel.is_some();
         let offer_calendars = setup.mode == SetupMode::New && setup.kind == ProviderKind::Imap && !is_microsoft
             && fastmail_preset_for_login(setup.in_host.read(cx).value().trim(), setup.in_user.read(cx).value().trim()).is_some();
+        // Fastmail's contacts work with POP3 mail too: they're a separate server.
+        let offer_contacts = setup.mode == SetupMode::New && !is_microsoft
+            && overlook_provider::caldav::carddav::fastmail_contacts_server(setup.in_host.read(cx).value().trim()).is_some();
         let title = match (&setup.mode, setup.step) {
             (SetupMode::New, SetupStep::Basics) if is_microsoft => "Add a Microsoft account".to_owned(),
             (SetupMode::New, SetupStep::Basics) if setup.guide.is_some() => format!("Add {} account", with_article(setup.guide.map(|g| g.provider).unwrap_or_default())),
@@ -1561,6 +1574,18 @@ impl MailWindow {
                             cx.notify();
                         })))
                     .child(div().text_size(px(12.)).text_color(p.muted).child("Use a Fastmail app password with calendar access. Calendars connect in the background after you add the account. If access is denied, mail keeps working and you can enter a separate calendar password in Settings → Accounts → Calendars.")))
+                .when(offer_contacts, |d| d
+                    .child(divider(&p))
+                    .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child("Fastmail contacts"))
+                    .child(Switch::new("setup-fastmail-contacts")
+                        .checked(setup.connect_contacts).disabled(busy.is_some())
+                        .label("Connect contacts using this mail password")
+                        .accessibility_label("Connect Fastmail contacts using this mail password")
+                        .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                            if let Some(setup) = this.account_setup.as_mut() { setup.connect_contacts = *checked; }
+                            cx.notify();
+                        })))
+                    .child(div().text_size(px(12.)).text_color(p.muted).child("Your Fastmail contacts appear in Overlook, and changes you make here go back to Fastmail. Fastmail’s app passwords allow contacts unless you limited them. If access is denied, mail keeps working.")))
                 .when(!is_pop3, |d| {
                     d.child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).pt(px(6.)).child("Folders on the server"))
                         .child(div().text_size(px(12.)).text_color(p.muted).child("Sent, Trash and Archive are found from the server’s folder list. Name a folder here only when the server gets it wrong (paths as the server names them, like INBOX/Archive)."))
