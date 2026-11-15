@@ -9,7 +9,7 @@
 
 use ksni::blocking::{Handle, TrayMethods};
 use ksni::menu::{MenuItem, StandardItem};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 const PLAIN_ICON: &str = "ai.lastrefuge.Overlook-symbolic";
@@ -125,16 +125,26 @@ fn icon_dir() -> Option<PathBuf> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     DIR.get_or_init(|| {
         let base = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("overlook-tray-icons");
-        let apps = base.join("hicolor/scalable/apps");
-        std::fs::create_dir_all(&apps).ok()?;
-        for (name, svg) in [(PLAIN_ICON, PLAIN_SVG), (UNREAD_ICON, UNREAD_SVG)] {
-            for dir in [&base, &apps] {
-                std::fs::write(dir.join(format!("{name}.svg")), svg).ok()?;
-            }
-        }
+        write_icons(&base).ok()?;
         Some(base)
     })
     .clone()
+}
+
+/// The folder also holds each icon under its bare name, with no extension. Quickshell, which draws
+/// Omarchy's bar, falls back to `IconThemePath` by opening `<IconThemePath>/<IconName>` exactly as
+/// written, so a file called `<IconName>.svg` is never found and the bar shows its missing-icon
+/// checkerboard instead of the Overlook mark. Qt reads the SVG from the bare file by its contents.
+fn write_icons(base: &Path) -> std::io::Result<()> {
+    let apps = base.join("hicolor/scalable/apps");
+    std::fs::create_dir_all(&apps)?;
+    for (name, svg) in [(PLAIN_ICON, PLAIN_SVG), (UNREAD_ICON, UNREAD_SVG)] {
+        for dir in [base, apps.as_path()] {
+            std::fs::write(dir.join(format!("{name}.svg")), svg)?;
+        }
+        std::fs::write(base.join(name), svg)?;
+    }
+    Ok(())
 }
 
 fn pixmaps() -> &'static Vec<ksni::Icon> {
@@ -172,6 +182,20 @@ mod tests {
         let icon = argb_icon(&img);
         assert_eq!(icon.data, vec![40, 10, 20, 30]);
         assert!(pixmaps().iter().any(|i| i.width == 32) && pixmaps().iter().any(|i| i.width == 64), "both sizes decode");
+    }
+
+    #[test]
+    fn each_icon_is_written_under_its_bare_name_and_as_svg() {
+        let base = std::env::temp_dir().join(format!("overlook-tray-icons-test-{}", std::process::id()));
+        write_icons(&base).unwrap();
+        for (name, svg) in [(PLAIN_ICON, PLAIN_SVG), (UNREAD_ICON, UNREAD_SVG)] {
+            // Quickshell opens `<IconThemePath>/<IconName>` as is; other trays look for the .svg
+            // beside it or in the `hicolor` theme.
+            assert_eq!(std::fs::read_to_string(base.join(name)).unwrap(), svg);
+            assert_eq!(std::fs::read_to_string(base.join(format!("{name}.svg"))).unwrap(), svg);
+            assert_eq!(std::fs::read_to_string(base.join("hicolor/scalable/apps").join(format!("{name}.svg"))).unwrap(), svg);
+        }
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
