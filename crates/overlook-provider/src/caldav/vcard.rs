@@ -228,10 +228,16 @@ impl Card {
         let position = old.filter(|o| !o.trim().is_empty()).and_then(|o| self.lines.iter().position(|l| l.is(name) && same(l, o)));
         match (position, new) {
             (Some(i), Some(v)) => {
+                // Changed to a value another line already has: that line goes, so the value
+                // isn't listed twice, and this one keeps its place as the main one.
+                let duplicate = self.lines.iter().enumerate().position(|(j, l)| j != i && l.is(name) && same(l, v));
                 let line = &mut self.lines[i];
                 let uri = line.value.trim_start().to_ascii_lowercase().starts_with(scheme) && !scheme.is_empty();
                 line.value = if uri { format!("{scheme}{}", escape(v)) } else { escape(v) };
                 line.original = None;
+                if let Some(j) = duplicate {
+                    self.lines.remove(j);
+                }
             }
             (Some(i), None) => {
                 self.lines.remove(i);
@@ -250,26 +256,38 @@ impl Card {
     }
 
     /// Sets the given and family names in `N`, keeping its other parts, and the display name.
-    fn set_names(&mut self, given: Option<&str>, family: Option<&str>, display: Option<&str>) {
+    /// Sets the name parts given as `Some` and keeps the others as the server has them, so an
+    /// edit to the given name here and one to the family name elsewhere both survive. The
+    /// display name follows the names that result, or `fallback` when both are empty.
+    fn set_names(&mut self, given: Option<Option<&str>>, family: Option<Option<&str>>, fallback: Option<&str>) {
         let clean = |v: Option<&str>| v.map(str::trim).unwrap_or_default().to_owned();
-        match self.lines.iter().position(|l| l.is("N")) {
+        let (given_now, family_now) = match self.lines.iter().position(|l| l.is("N")) {
             Some(i) => {
                 let line = &mut self.lines[i];
                 let mut parts = split_unescaped(&line.value, ';');
                 parts.resize(parts.len().max(5), String::new());
-                parts[0] = escape_component(&clean(family));
-                parts[1] = escape_component(&clean(given));
+                if let Some(family) = family {
+                    parts[0] = escape_component(&clean(family));
+                }
+                if let Some(given) = given {
+                    parts[1] = escape_component(&clean(given));
+                }
                 line.value = parts.join(";");
                 line.original = None;
+                (unescape(&parts[1]), unescape(&parts[0]))
             }
             None => {
+                let (given, family) = (clean(given.flatten()), clean(family.flatten()));
                 let at = self.lines.iter().position(|l| l.is("FN")).map(|i| i + 1).unwrap_or_else(|| self.end_index());
-                let value = format!("{};{};;;", escape_component(&clean(family)), escape_component(&clean(given)));
+                let value = format!("{};{};;;", escape_component(&family), escape_component(&given));
                 self.lines.insert(at, Line::new("N", Vec::new(), value));
+                (given, family)
             }
-        }
-        if let Some(display) = display.map(str::trim).filter(|d| !d.is_empty()) {
-            self.set_text("FN", Some(display));
+        };
+        let display = format!("{} {}", given_now.trim(), family_now.trim()).trim().to_owned();
+        let display = if display.is_empty() { fallback.map(str::trim).unwrap_or_default().to_owned() } else { display };
+        if !display.is_empty() {
+            self.set_text("FN", Some(&display));
         }
     }
 
@@ -346,8 +364,9 @@ pub fn apply_changes(card: &str, before: &Contact, after: &Contact, now: i64) ->
     let mut touched = false;
     // The form rebuilds the display name from the given and family names, so only a change
     // to those renames the card; a custom display name ("Dr. Maya Chen") otherwise stays.
-    if changed(&before.given_name, &after.given_name) || changed(&before.family_name, &after.family_name) {
-        card.set_names(after.given_name.as_deref(), after.family_name.as_deref(), after.name.as_deref().or(Some(after.email.as_str())));
+    let (given, family) = (changed(&before.given_name, &after.given_name), changed(&before.family_name, &after.family_name));
+    if given || family {
+        card.set_names(given.then_some(after.given_name.as_deref()), family.then_some(after.family_name.as_deref()), after.name.as_deref().or(Some(after.email.as_str())));
         touched = true;
     }
     if !before.email.trim().eq_ignore_ascii_case(after.email.trim()) {
@@ -519,10 +538,11 @@ fn escape_component(value: &str) -> String {
 }
 
 fn strip_scheme<'a>(value: &'a str, scheme: &str) -> &'a str {
-    if !scheme.is_empty() && value.len() >= scheme.len() && value[..scheme.len()].eq_ignore_ascii_case(scheme) {
-        &value[scheme.len()..]
-    } else {
-        value
+    // `get` rather than slicing: a value from the server may have a multi-byte character
+    // where the scheme would end ("１２３４" in a TEL).
+    match value.get(..scheme.len()) {
+        Some(prefix) if !scheme.is_empty() && prefix.eq_ignore_ascii_case(scheme) => &value[scheme.len()..],
+        _ => value,
     }
 }
 
@@ -622,6 +642,30 @@ mod tests {
     }
 
     #[test]
+    fn a_name_edit_keeps_the_other_name_part_as_the_server_has_it() {
+        let before = contact(&Card::parse(FASTMAIL_STYLE).unwrap().fields());
+        // Married name added on a phone while a given-name edit waited here.
+        let newer = FASTMAIL_STYLE.replace("N:Chen;Maya;;;", "N:Chen-Rivera;Maya;;;");
+        let mut after = before.clone();
+        after.given_name = Some("Maya R.".into());
+        after.name = Some("Maya R. Chen".into());
+        let edited = apply_changes(&newer, &before, &after, 0).unwrap();
+        assert!(edited.contains("N:Chen-Rivera;Maya R.;;;\r\n"), "{edited}");
+        assert!(edited.contains("FN:Maya R. Chen-Rivera\r\n"), "{edited}");
+    }
+
+    #[test]
+    fn values_with_wide_characters_where_a_scheme_would_end_are_read() {
+        // Full-width digits are three bytes each, so "tel:" would end inside one.
+        let card = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Kenji Mori\r\nTEL:１２３４５\r\nEMAIL:ñandú@example.test\r\nEND:VCARD\r\n";
+        let fields = Card::parse(card).unwrap().fields();
+        assert_eq!(fields.phone.as_deref(), Some("１２３４５"));
+        assert_eq!(fields.emails, vec!["ñandú@example.test"]);
+        assert_eq!(strip_scheme("tél", "tel:"), "tél");
+        assert_eq!(strip_scheme("TEL:+1 555", "tel:"), "+1 555");
+    }
+
+    #[test]
     fn a_custom_display_name_stays_unless_the_names_change() {
         let card = FASTMAIL_STYLE.replace("FN:Maya Chen", "FN:Dr. Maya Chen");
         let before = contact(&Card::parse(&card).unwrap().fields());
@@ -642,6 +686,17 @@ mod tests {
         let edited = apply_changes(FASTMAIL_STYLE, &before, &after, 0).unwrap();
         assert!(!edited.contains("maya@northstar.example"));
         assert!(edited.contains("maya.chen@home.example"));
+    }
+
+    #[test]
+    fn choosing_another_address_on_the_card_doesnt_list_it_twice() {
+        let before = contact(&Card::parse(FASTMAIL_STYLE).unwrap().fields());
+        let mut after = before.clone();
+        after.email = "maya.chen@home.example".into();
+        let edited = apply_changes(FASTMAIL_STYLE, &before, &after, 0).unwrap();
+        assert_eq!(edited.matches("maya.chen@home.example").count(), 1, "{edited}");
+        assert!(edited.contains("item1.EMAIL;TYPE=INTERNET;TYPE=pref:maya.chen@home.example\r\n"), "the main address keeps its place: {edited}");
+        assert!(!edited.contains("maya@northstar.example"));
     }
 
     #[test]

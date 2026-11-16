@@ -72,6 +72,16 @@ impl PendingSignIn {
         incoming: ServerProtocol,
         login_hint: Option<String>,
     ) -> Result<Self, String> {
+        Self::start_with_scopes(config, scopes(incoming), login_hint)
+    }
+
+    /// The same sign-in for other scopes: contacts, which Microsoft grants on a token of
+    /// their own.
+    pub fn start_with_scopes(
+        config: ClientConfig,
+        scopes: String,
+        login_hint: Option<String>,
+    ) -> Result<Self, String> {
         // The redirect goes to `localhost`, which a browser may reach on either address.
         let (listeners, port) = loopback::bind(true)?;
         let request = AuthorizationRequest {
@@ -82,7 +92,7 @@ impl PendingSignIn {
             state: Pkce::random_state(),
             pkce: Pkce::random(),
             login_hint,
-            scopes: scopes(incoming),
+            scopes,
         };
         let url = request.url();
         tracing::info!(target: "overlook::signin", issuer = "microsoft", authorization_endpoint = %request.config.authorize_endpoint(), redirect_uri = %request.redirect_uri, scope = %request.scopes, code_challenge_method = "S256", code_challenge = "[REDACTED]", state = "[REDACTED]", "sign-in started: Microsoft consent opens in the system browser");

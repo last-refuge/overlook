@@ -1124,6 +1124,50 @@ pub struct ContactsConnection {
     pub username: String,
     /// The address book new contacts go to, once one has been found.
     pub default_book: Option<String>,
+    #[serde(default)]
+    pub credential: ContactsCredential,
+    /// When this connection was made, as the store has it (0 until saved). A sync saves its
+    /// results only into the connection it started with: not one disconnected meanwhile, nor
+    /// one made again since, even at the same address.
+    #[serde(default)]
+    pub connected_at: Timestamp,
+}
+
+/// How a contacts connection signs in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContactsCredential {
+    /// The account's incoming mail password, which the person agreed may be used here.
+    #[default]
+    IncomingMail,
+    /// A password of the connection's own, in the keyring under [`ContactsConnection::SECRET_KIND`].
+    Separate,
+    /// A Microsoft sign-in that allows contacts only, kept apart from the mail sign-in, for
+    /// Outlook contacts through Microsoft Graph.
+    Microsoft,
+}
+
+impl ContactsCredential {
+    pub fn as_key(self) -> &'static str {
+        match self {
+            Self::IncomingMail => "incoming-mail",
+            Self::Separate => "separate",
+            Self::Microsoft => "microsoft",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Self {
+        match key {
+            "separate" => Self::Separate,
+            "microsoft" => Self::Microsoft,
+            _ => Self::IncomingMail,
+        }
+    }
+}
+
+impl ContactsConnection {
+    /// The keyring entry of a separate contacts password, beside the account's mail ones.
+    pub const SECRET_KIND: &'static str = "password:contacts";
 }
 
 /// A CardDAV card as last read from or written to the server: where it lives, its version,

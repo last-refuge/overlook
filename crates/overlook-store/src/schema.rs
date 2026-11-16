@@ -2,7 +2,12 @@
 
 use rusqlite::Connection;
 
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17, V18, V19, V20, V21];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17, V18, V19, V20, V21, V22];
+
+/// Contacts servers other than Fastmail may take a password of their own.
+const V22: &str = "
+ALTER TABLE contact_connections ADD COLUMN credential TEXT NOT NULL DEFAULT 'incoming-mail';
+";
 
 /// Contacts from a CardDAV server (Fastmail first): the connection the person agreed to, and
 /// each card's version as last seen, which edits are applied against. Tables of their own,

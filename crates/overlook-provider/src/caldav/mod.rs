@@ -111,6 +111,10 @@ pub struct CalDavClient {
     username: String,
     password: String,
     agent: ureq::Agent,
+    /// Hosts besides the endpoint's that this service's discovery may hand off to, over
+    /// HTTPS on the default port: iCloud's per-account contacts servers. `None` for everything
+    /// else, which keeps every request on the approved origin.
+    also_approved: Option<fn(&str) -> bool>,
 }
 
 impl fmt::Debug for CalDavClient {
@@ -136,7 +140,13 @@ impl CalDavClient {
             username: settings.username.clone(),
             password,
             agent: agent(true),
+            also_approved: None,
         })
+    }
+
+    /// Whether `url` is on a host this service is known to hand discovery to.
+    fn also_approved(&self, url: &Url) -> bool {
+        self.also_approved.is_some_and(|approved| url.scheme() == "https" && url.port().is_none() && url.host_str().is_some_and(approved))
     }
 
     /// Resolves a principal, all advertised calendar homes, and VEVENT collections.
@@ -267,7 +277,7 @@ impl CalDavClient {
         {
             return Err(CalDavError::InvalidResponse("Calendar resource URLs must not contain credentials, query parameters, or fragments."));
         }
-        if url.origin() != self.endpoint.origin() {
+        if url.origin() != self.endpoint.origin() && !self.also_approved(&url) {
             return Err(CalDavError::UnapprovedOrigin(
                 url.origin().ascii_serialization(),
             ));

@@ -13,7 +13,10 @@
 //! Gmail accounts hold OAuth tokens under [`KIND_OAUTH_TOKENS`]; IMAP and POP3 accounts
 //! hold their passwords under [`KIND_PASSWORD_INCOMING`] and, unless the outgoing server
 //! shares it, [`KIND_PASSWORD_OUTGOING`]; IMAP and POP3 accounts that sign in with Microsoft
-//! hold their OAuth tokens under [`KIND_OAUTH_MICROSOFT`] instead of a password.
+//! hold their OAuth tokens under [`KIND_OAUTH_MICROSOFT`] instead of a password. Contacts
+//! connections keep their own: a contacts server's password under
+//! [`overlook_core::ContactsConnection::SECRET_KIND`], and the Microsoft sign-in that allows
+//! contacts under [`KIND_OAUTH_MICROSOFT_CONTACTS`].
 
 use overlook_core::AccountId;
 use overlook_provider::gmail::OAuthTokens;
@@ -27,6 +30,8 @@ const APPLICATION: &str = "ai.lastrefuge.Overlook";
 pub const KIND_OAUTH_TOKENS: &str = "oauth-tokens";
 /// Microsoft OAuth tokens of an IMAP or POP3 account, JSON-encoded.
 pub const KIND_OAUTH_MICROSOFT: &str = "oauth-tokens:microsoft";
+/// The Microsoft sign-in that allows contacts, apart from the mail one, JSON-encoded.
+pub const KIND_OAUTH_MICROSOFT_CONTACTS: &str = "oauth-tokens:microsoft-contacts";
 /// IMAP or POP3 password, UTF-8.
 pub const KIND_PASSWORD_INCOMING: &str = "password:incoming";
 /// SMTP password, UTF-8. Absent when "same as incoming" is ticked.
@@ -118,8 +123,10 @@ fn label(account: &AccountId, kind: &str) -> String {
     let what = match kind {
         KIND_OAUTH_TOKENS => "Gmail sign-in",
         KIND_OAUTH_MICROSOFT => "Microsoft sign-in",
+        KIND_OAUTH_MICROSOFT_CONTACTS => "Microsoft contacts sign-in",
         KIND_PASSWORD_INCOMING => "mail server password",
         KIND_PASSWORD_OUTGOING => "outgoing server password",
+        overlook_core::ContactsConnection::SECRET_KIND => "contacts server password",
         other => other,
     };
     format!("Overlook {what} ({})", account.0)
@@ -209,15 +216,34 @@ struct StoredMicrosoft {
 /// Saves the Microsoft sign-in of an IMAP or POP3 account, replacing any previous entry.
 /// Blocking.
 pub fn save_microsoft_tokens(account: &AccountId, tokens: &OAuthTokens, config: &ClientConfig) -> Result<(), VaultError> {
-    let stored = StoredMicrosoft { tokens: tokens.clone(), client_id: config.client_id.clone(), tenant: config.tenant.clone() };
-    let secret = serde_json::to_vec(&stored).map_err(corrupt)?;
-    save_secret(account, KIND_OAUTH_MICROSOFT, secret)
+    save_microsoft_in(account, KIND_OAUTH_MICROSOFT, tokens, config)
 }
 
 /// Loads the Microsoft sign-in of an account: its tokens and the registration that issued
 /// them. `Ok(None)` when nothing is stored. Blocking.
 pub fn load_microsoft_tokens(account: &AccountId) -> Result<Option<(OAuthTokens, ClientConfig)>, VaultError> {
-    match load_secret(account, KIND_OAUTH_MICROSOFT)? {
+    load_microsoft_from(account, KIND_OAUTH_MICROSOFT)
+}
+
+/// Saves the Microsoft sign-in that allows contacts, replacing any previous one. The mail
+/// sign-in is a separate entry and never changes here. Blocking.
+pub fn save_microsoft_contacts_tokens(account: &AccountId, tokens: &OAuthTokens, config: &ClientConfig) -> Result<(), VaultError> {
+    save_microsoft_in(account, KIND_OAUTH_MICROSOFT_CONTACTS, tokens, config)
+}
+
+/// Loads the Microsoft sign-in that allows contacts. Blocking.
+pub fn load_microsoft_contacts_tokens(account: &AccountId) -> Result<Option<(OAuthTokens, ClientConfig)>, VaultError> {
+    load_microsoft_from(account, KIND_OAUTH_MICROSOFT_CONTACTS)
+}
+
+fn save_microsoft_in(account: &AccountId, kind: &str, tokens: &OAuthTokens, config: &ClientConfig) -> Result<(), VaultError> {
+    let stored = StoredMicrosoft { tokens: tokens.clone(), client_id: config.client_id.clone(), tenant: config.tenant.clone() };
+    let secret = serde_json::to_vec(&stored).map_err(corrupt)?;
+    save_secret(account, kind, secret)
+}
+
+fn load_microsoft_from(account: &AccountId, kind: &str) -> Result<Option<(OAuthTokens, ClientConfig)>, VaultError> {
+    match load_secret(account, kind)? {
         Some(bytes) => {
             let stored: StoredMicrosoft = serde_json::from_slice(&bytes).map_err(corrupt)?;
             let config = ClientConfig::new(stored.client_id, stored.tenant).map_err(corrupt)?;
