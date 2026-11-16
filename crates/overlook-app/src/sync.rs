@@ -249,16 +249,18 @@ fn coverage_key(account: &AccountId) -> String {
 }
 
 /// Adds snapshot ids to the backlog (de-duplicated). With `only_missing`, ids already on
-/// disk are skipped; otherwise they are re-downloaded (used when the mapping gained fields).
+/// disk are skipped; otherwise they are re-downloaded (used when the mapping gained fields),
+/// through their own queue, since the backlog skips bodies already here.
 fn enqueue(store: &Store, account: &AccountId, ids: Vec<ProviderId>, only_missing: bool) {
-    let mut backlog = backlog(store, account);
+    let key = if only_missing { backlog_key(account) } else { redownload_key(account) };
+    let mut queued = queue(store, &key);
     for pid in ids {
-        let present = store.message_id_for_provider_id(account, &pid).ok().flatten().is_some();
-        if (!only_missing || !present) && !backlog.contains(&pid) {
-            backlog.push(pid);
+        let present = only_missing && store.message_id_for_provider_id(account, &pid).ok().flatten().is_some();
+        if !present && !queued.contains(&pid) {
+            queued.push(pid);
         }
     }
-    save_backlog(store, account, &backlog);
+    save_queue(store, &key, &queued);
 }
 
 /// Queues bodies for messages a provider reported header-only (`RemoteChanges::message_ids`).
@@ -361,6 +363,13 @@ fn headers_key(account: &AccountId) -> String {
     format!("download_headers:{}", account.0)
 }
 
+/// Messages downloaded again on purpose though their bodies are here (a mapping that gained
+/// fields, a part parsed differently now). Kept apart from the backlog, which skips bodies
+/// already downloaded.
+fn redownload_key(account: &AccountId) -> String {
+    format!("redownload_backlog:{}", account.0)
+}
+
 /// Stored messages whose labels changed without the provider saying to what: their headers
 /// (with labels) are fetched again.
 fn refresh_key(account: &AccountId) -> String {
@@ -451,7 +460,8 @@ fn apply_relabels(store: &Store, account: &AccountId, relabeled: &[overlook_prov
                 updated.push(m);
             }
             (Some(_), None) => refresh.push(change.provider_id.clone()),
-            (None, Some(state)) if state.label_ids.iter().any(|l| wanted.contains(l)) => fetch.push(change.provider_id.clone()),
+            // Gmail's star is a flag here, not a stored label.
+            (None, Some(state)) if state.is_starred || state.label_ids.iter().any(|l| wanted.contains(l)) => fetch.push(change.provider_id.clone()),
             (None, _) => {}
         }
     }
@@ -511,31 +521,28 @@ fn drain_header_queue(store: &Store, provider: &dyn MailProvider, account: &Acco
     Ok(())
 }
 
-/// Takes messages downloaded elsewhere (opened before the queue reached them) out of the
-/// download queues. A sync draining at the same moment may still fetch one again; that only
-/// costs quota.
-pub fn dequeue(store: &Store, account: &AccountId, done: &[ProviderId]) {
-    for key in [backlog_key(account), headers_key(account), refresh_key(account)] {
-        let ids = queue(store, &key);
-        let left: Vec<ProviderId> = ids.iter().filter(|p| !done.contains(p)).cloned().collect();
-        if left.len() != ids.len() {
-            save_queue(store, &key, &left);
-        }
-    }
-}
-
 /// Messages still to download for an account, for the status bar.
 pub fn queued_downloads(store: &Store, account: &AccountId) -> usize {
-    backlog(store, account).len().max(queue(store, &headers_key(account)).len())
+    // Everything listed by its headers also waits in the backlog for its body.
+    backlog(store, account).len() + queue(store, &redownload_key(account)).len()
 }
 
 /// Downloads queued message bodies in small batches, committing after each batch so an
 /// interruption (quota, offline, crash) keeps what was fetched. Headers waiting to be listed
-/// go first. Stops when the slice ending at `deadline` is used up.
+/// go first, then bodies not downloaded yet, then deliberate re-downloads. Stops when the
+/// slice ending at `deadline` is used up.
 fn drain_backlog(store: &Store, provider: &dyn MailProvider, account: &Account, outcome: &mut SyncOutcome, deadline: Instant) -> Result<(), ProviderError> {
     drain_headers(store, provider, account, outcome, deadline)?;
+    drain_body_queue(store, provider, account, outcome, deadline, &backlog_key(&account.id), true)?;
+    drain_body_queue(store, provider, account, outcome, deadline, &redownload_key(&account.id), false)
+}
+
+/// `skip_cached`: a body that arrived meanwhile (the message was opened, and downloaded
+/// then) is not fetched again. Only this sync writes the queues (one sync per account at a
+/// time), so the window never edits them and nothing it does can lose a queued message.
+fn drain_body_queue(store: &Store, provider: &dyn MailProvider, account: &Account, outcome: &mut SyncOutcome, deadline: Instant, key: &str, skip_cached: bool) -> Result<(), ProviderError> {
     let acct = &account.id;
-    let mut ids = backlog(store, acct);
+    let mut ids = queue(store, key);
     if ids.is_empty() {
         return Ok(());
     }
@@ -545,13 +552,24 @@ fn drain_backlog(store: &Store, provider: &dyn MailProvider, account: &Account, 
             outcome.more_to_download = true;
             return Ok(());
         }
+        let mut take = 0;
+        let mut batch = Vec::new();
+        while batch.len() < DOWNLOAD_BATCH && take < ids.len() {
+            if !skip_cached || body_cached(store, acct, &ids[take]) != Some(true) {
+                batch.push(ids[take].clone());
+            }
+            take += 1;
+        }
+        if batch.is_empty() {
+            ids.drain(..take);
+            save_queue(store, key, &ids);
+            continue;
+        }
         let protected = store.pending_message_ids(acct).unwrap_or_default();
-        let take = ids.len().min(DOWNLOAD_BATCH);
-        let batch: Vec<ProviderId> = ids[..take].to_vec();
         let mut messages = match pollster_block(provider.fetch_messages(account, &batch, &labels)) {
             Ok(m) => m,
             Err(e) => {
-                save_backlog(store, acct, &ids);
+                save_queue(store, key, &ids);
                 return Err(e);
             }
         };
@@ -559,7 +577,7 @@ fn drain_backlog(store: &Store, provider: &dyn MailProvider, account: &Account, 
         store.merge_remote_messages(&messages, &protected).map_err(|e| ProviderError::Temporary(e.to_string()))?;
         outcome.downloaded += messages.len();
         ids.drain(..take);
-        save_backlog(store, acct, &ids);
+        save_queue(store, key, &ids);
     }
     Ok(())
 }
@@ -2535,9 +2553,8 @@ mod tests {
         let store = Arc::new(Store::open_in_memory().unwrap());
         let account = gmail_account();
         store.upsert_account(&account).unwrap();
-        for l in [gmail_label(LabelKind::Inbox, "INBOX"), gmail_label(LabelKind::Starred, "STARRED")] {
-            store.upsert_label(&l).unwrap();
-        }
+        // As with real Gmail, the star is a flag, not a stored label.
+        store.upsert_label(&gmail_label(LabelKind::Inbox, "INBOX")).unwrap();
         store.upsert_messages(stored).unwrap();
         store.set_checkpoint(&account.id, Some("history-1")).unwrap();
         // The first download happened long ago, with today's coverage.
@@ -2556,19 +2573,21 @@ mod tests {
         let gone = gmail_message(3, true);
         let (store, account) = gmail_store(&[kept.clone(), refreshed.clone(), gone.clone()]);
         let provider = Arc::new(Metered::default());
-        // 200 new messages arrived while Overlook was closed; one older message was moved
-        // back to the Inbox and another was archived elsewhere, neither of them stored here.
+        // 200 new messages arrived while Overlook was closed. Of the older messages not
+        // stored here, one was moved back to the Inbox, one archived elsewhere, and one
+        // starred where it lies in the archive.
         let new: Vec<Message> = (100..300).map(|n| gmail_message(n, true)).collect();
         let back_in_inbox = gmail_message(50, true);
         let archived_elsewhere = gmail_message(51, false);
+        let starred_elsewhere = gmail_message(52, false);
         {
             let mut mailbox = provider.mailbox.lock().unwrap();
-            for m in new.iter().chain([&back_in_inbox, &archived_elsewhere, &refreshed]) {
+            for m in new.iter().chain([&back_in_inbox, &archived_elsewhere, &starred_elsewhere, &refreshed]) {
                 mailbox.insert(pid(m).0, m.clone());
             }
         }
         let read_and_starred = overlook_provider::LabelState {
-            label_ids: [LabelId("gmail:j:INBOX".into()), LabelId("gmail:j:STARRED".into())].into_iter().collect(),
+            label_ids: [LabelId("gmail:j:INBOX".into())].into_iter().collect(),
             is_read: true,
             is_starred: true,
             ..Default::default()
@@ -2582,6 +2601,7 @@ mod tests {
                 overlook_provider::Relabel { provider_id: pid(&refreshed), state: None },
                 overlook_provider::Relabel { provider_id: pid(&back_in_inbox), state: Some(overlook_provider::LabelState { label_ids: back_in_inbox.label_ids.clone(), ..Default::default() }) },
                 overlook_provider::Relabel { provider_id: pid(&archived_elsewhere), state: Some(Default::default()) },
+                overlook_provider::Relabel { provider_id: pid(&starred_elsewhere), state: Some(overlook_provider::LabelState { is_starred: true, ..Default::default() }) },
             ],
             ..Default::default()
         });
@@ -2613,9 +2633,9 @@ mod tests {
         let bodies = provider.bodies.lock().unwrap().clone();
         let unique: BTreeSet<&String> = bodies.iter().collect();
         assert_eq!(unique.len(), bodies.len(), "no body is fetched twice");
-        assert_eq!(bodies.len(), 201, "the 200 new messages and the one back in the Inbox");
+        assert_eq!(bodies.len(), 202, "the 200 new messages, the one back in the Inbox and the starred one");
         assert!(!bodies.contains(&pid(&kept).0), "a relabeled stored message isn't downloaded again");
-        for m in new.iter().chain([&back_in_inbox]) {
+        for m in new.iter().chain([&back_in_inbox, &starred_elsewhere]) {
             assert!(store.message(&m.id).unwrap().is_some_and(|m| m.body.is_cached()), "{} downloaded", m.id);
         }
         assert!(store.message(&archived_elsewhere.id).unwrap().is_none(), "an old message archived elsewhere isn't fetched");
@@ -2664,13 +2684,20 @@ mod tests {
     }
 
     #[test]
-    fn an_opened_message_leaves_the_download_queues() {
-        let (store, account) = gmail_store(&[]);
-        let ids: Vec<ProviderId> = (1..4).map(|n| ProviderId(format!("{n:016x}"))).collect();
-        save_backlog(&store, &account.id, &ids);
-        save_queue(&store, &headers_key(&account.id), &ids);
-        dequeue(&store, &account.id, &ids[1..2]);
-        assert_eq!(backlog(&store, &account.id), vec![ids[0].clone(), ids[2].clone()]);
-        assert_eq!(queue(&store, &headers_key(&account.id)), vec![ids[0].clone(), ids[2].clone()]);
+    fn a_body_downloaded_meanwhile_isnt_fetched_again_but_a_redownload_is() {
+        let opened = gmail_message(7, true);
+        let waiting = gmail_message(8, true);
+        let (store, account) = gmail_store(&[opened.clone(), Message { body: Body::default(), ..waiting.clone() }]);
+        let provider = Metered::default();
+        provider.mailbox.lock().unwrap().extend([opened.clone(), waiting.clone()].map(|m| (pid(&m).0, m)));
+        *provider.allowance.lock().unwrap() = 1_000_000;
+        // Both were queued for their bodies; the first was opened and downloaded meanwhile.
+        save_backlog(&store, &account.id, &[pid(&opened), pid(&waiting)]);
+        // A one-time re-parse asks for the opened one again on purpose.
+        enqueue(&store, &account.id, vec![pid(&opened)], false);
+        let mut outcome = SyncOutcome::default();
+        drain_backlog(&store, &provider, &account, &mut outcome, Instant::now() + Duration::from_secs(5)).unwrap();
+        assert_eq!(*provider.bodies.lock().unwrap(), vec![pid(&waiting).0, pid(&opened).0], "the backlog skips the opened message; the re-download fetches it");
+        assert_eq!(queued_downloads(&store, &account.id), 0);
     }
 }

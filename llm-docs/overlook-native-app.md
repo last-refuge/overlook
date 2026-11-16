@@ -366,7 +366,8 @@ Google's own sync guide says to download a message in full once, and afterwards 
   own added/removed labels are applied on top. That is right whether or not they already include the change.
   `sync::apply_relabels` updates stored copies in place through `merge_remote_messages`, so pending local
   changes still win. A stored message whose change came without labels goes to the `refresh_headers:<account>`
-  queue. One not stored is fetched only if it is now in the Inbox or Starred.
+  queue. One not stored is fetched only if it is now in the Inbox or starred (the star is the `is_starred`
+  flag; Gmail's STARRED isn't a stored label).
 - New messages (not drafts or chats, and not deleted in the same window) become `to_download`, Inbox first,
   then newest first (Gmail ids grow over time).
 - Deletions apply at once. The checkpoint then moves past everything read, so a quota stop never makes the
@@ -379,9 +380,12 @@ are first listed through `download_headers:<account>` (`fetch_headers`, 30 per b
 from `download_backlog:<account>` (10 per batch). Every batch commits on its own. A sync downloads for at most
 `DOWNLOAD_SLICE` (20 s), then hands back with `SyncOutcome::more_to_download`, and the window starts the next
 sync at once. The user's own changes go out between slices, and the quota budget paces the whole thing.
-Opening a message whose body hasn't arrived downloads it at once, at normal priority
-(`MailWindow::fetch_missing_bodies`), and takes it out of the queues (`sync::dequeue`); meanwhile the reader
-says "Downloading this message…". The status bar shows "Downloading N messages…" while the queue drains, and
+Opening a message whose body hasn't arrived (selecting it, or a folder or search showing it first)
+downloads it at once, at normal priority (`MailWindow::fetch_missing_bodies`); meanwhile the reader says
+"Downloading this message…". The window never edits the queues, since a sync may be saving them at that
+moment. Instead the backlog skips a body already here when it takes each batch. Deliberate re-downloads of
+messages that have bodies (mapping refreshes, invitation and inline-image re-parses) use their own queue,
+`redownload_backlog:<account>`, which doesn't skip. The status bar shows "Downloading N messages…" while the queue drains, and
 "Last synced" names the day when it wasn't today.
 
 A five-day absence with a few hundred new messages costs about 2 units in history, a few hundred × 20 for

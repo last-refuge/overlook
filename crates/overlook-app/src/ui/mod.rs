@@ -1997,7 +1997,8 @@ impl MailWindow {
     }
 
     /// Downloads the bodies the open conversation lacks right away, ahead of the download
-    /// queue (which skips them once they are here).
+    /// queue, which skips them once they are here. The window never edits the queues: a
+    /// sync may be saving them at the same moment.
     fn fetch_missing_bodies(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let missing: Vec<(MessageId, ProviderId)> = self
             .thread
@@ -2022,9 +2023,8 @@ impl MailWindow {
                     let mut messages = provider.fetch_messages(&account, &pids, &labels).await?;
                     crate::sync::reconcile_incoming(&store, &account.id, &mut messages, &mut Vec::new());
                     let protected = store.pending_message_ids(&account.id).unwrap_or_default();
-                    store.merge_remote_messages(&messages, &protected).map_err(|e| overlook_provider::ProviderError::Temporary(e.to_string()))?;
-                    crate::sync::dequeue(&store, &account.id, &pids);
-                    Ok::<(), overlook_provider::ProviderError>(())
+                    // The download queue skips it now that its body is here.
+                    store.merge_remote_messages(&messages, &protected).map_err(|e| overlook_provider::ProviderError::Temporary(e.to_string()))
                 })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -2491,6 +2491,7 @@ impl MailWindow {
             self.marked.clear();
             self.expanded.clear();
             self.load_thread(cx);
+            self.fetch_conversation_extras(window, cx);
         }
         self.list_focus.focus(window, cx);
         cx.notify();
@@ -2511,6 +2512,7 @@ impl MailWindow {
             self.selected = self.conversations.first().map(|c| c.id.clone());
             self.marked.clear();
             self.load_thread(cx);
+            self.fetch_conversation_extras(window, cx);
         }
         self.start_online_search(window, cx);
         cx.notify();
