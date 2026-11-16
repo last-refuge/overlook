@@ -1,6 +1,11 @@
-//! The window while the device has no accounts: a welcome beneath the alpine-dawn horizon,
-//! then the services to connect. Gmail, Microsoft and iCloud Mail lead as larger choices, the
-//! other guided services follow, and any IMAP or POP3 server sits on a quieter line.
+//! The add-account page: a welcome beneath the alpine-dawn horizon, then the services to
+//! connect. Gmail, Microsoft and iCloud Mail lead as larger choices, the other guided services
+//! follow, and any IMAP or POP3 server sits on a quieter line.
+//!
+//! It is the whole window while the device has no accounts (a new install), with the sample
+//! mailbox offered at the foot. Settings → Accounts → Add account and the account menu open
+//! it over the mail window to add another (`open_add_account`): then it has a Close button,
+//! Escape closes it, and it closes itself once the new account is connected.
 //!
 //! Every choice is a focusable button with an accessible name, wearing its service's own mark
 //! (see `branding/providers/README.md`). Hovering or focusing a choice draws its edge and lights
@@ -295,11 +300,47 @@ fn mark_plate(mark: Mark, size: f32, group: &SharedString, lit: bool, p: &Palett
 }
 
 impl MailWindow {
-    /// The whole window while the device has no accounts: only adding one is possible.
+    /// Opens the add-account page over the mail window, in the main window.
+    pub(crate) fn open_add_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.in_main_window(cx, |this, window, cx| this.open_add_account(window, cx)) {
+            return;
+        }
+        self.adding_account = Some(self.accounts.iter().map(|a| a.id.clone()).collect());
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn close_add_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.adding_account = None;
+        self.focus_current_module(window, cx);
+        cx.notify();
+    }
+
+    /// The add-account page: the whole window while the device has no accounts, or over the
+    /// mail window while another is added.
     pub(super) fn render_no_account(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p: Palette = *cx.palette();
         let tones = Tones::of(&p);
         let banner = (f32::from(window.viewport_size().height) * 0.32).clamp(BANNER_MIN, BANNER_MAX);
+        let adding = self.has_account();
+        let title = h_flex()
+            .size_full()
+            .items_center()
+            .pl(px(12.))
+            .pr(px(8.))
+            .child(endorsed_lockup(&p))
+            .child(div().flex_1())
+            .when(adding, |d| {
+                d.child(
+                    Button::new("add-account-close")
+                        .ghost()
+                        .small()
+                        .icon(icon("x").size(px(14.)))
+                        .label("Close")
+                        .tooltip("Back to your mail (Esc)")
+                        .on_click(cx.listener(|this, _, window, cx| this.close_add_account(window, cx))),
+                )
+            });
         v_flex()
             .id("mail-window")
             .key_context(WINDOW_CONTEXT)
@@ -312,21 +353,22 @@ impl MailWindow {
             .font_family("Inter")
             .text_size(px(13.))
             .relative()
-            .child(TitleBar::new().h(px(52.)).bg(p.surface).child(h_flex().size_full().items_center().pl(px(12.)).child(endorsed_lockup(&p))))
+            .child(TitleBar::new().h(px(52.)).bg(p.surface).child(title))
             .children(self.render_banner(cx))
             .child(
                 v_flex()
                     .id("welcome")
                     .flex_1()
                     .min_h_0()
-                    .child(div().flex_none().w_full().child(horizon(banner)).child(self.render_choices(&p, tones, cx)))
+                    .child(div().flex_none().w_full().child(horizon(banner, adding)).child(self.render_choices(&p, tones, adding, cx)))
                     .overflow_y_scrollbar(),
             )
             .when(self.account_setup.is_some(), |d| d.child(self.render_account_setup(cx)))
     }
 
-    /// "Connect your mail": the featured services, the others, then any server.
-    fn render_choices(&self, p: &Palette, tones: Tones, cx: &mut Context<Self>) -> impl IntoElement {
+    /// "Connect your mail": the featured services, the others, then any server. A new install
+    /// can also look around in the sample mailbox first.
+    fn render_choices(&self, p: &Palette, tones: Tones, adding: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let card = |choice: Choice, size: Size, cx: &mut Context<Self>| {
             let connect = choice.connect;
             let on_click = cx.listener(move |this, _: &ClickEvent, window, cx| this.connect_service(connect, window, cx));
@@ -345,7 +387,7 @@ impl MailWindow {
                 .child(
                     v_flex()
                         .gap(px(4.))
-                        .child(div().text_size(px(18.)).line_height(px(24.)).font_weight(FontWeight::SEMIBOLD).child("Connect your mail"))
+                        .child(div().text_size(px(18.)).line_height(px(24.)).font_weight(FontWeight::SEMIBOLD).child(if adding { "Add an account" } else { "Connect your mail" }))
                         .child(div().text_size(px(13.)).line_height(px(19.)).text_color(p.muted).child("Choose where your mail lives. Overlook fills in the settings and shows you how to sign in.")),
                 )
                 .child(h_flex().flex_wrap().items_stretch().gap(px(16.)).mt(px(20.)).children(featured))
@@ -363,7 +405,18 @@ impl MailWindow {
                         .text_color(p.muted)
                         .child(icon("lock-keyhole").size(px(14.)))
                         .child("Passwords and sign-ins are kept in your system keyring, never in files."),
-                ),
+                )
+                .when(!adding, |d| {
+                    d.child(
+                        h_flex().mt(px(16.)).ml(px(-12.)).child(
+                            Button::new("welcome-sample")
+                                .ghost()
+                                .small()
+                                .label("Look around in a sample mailbox first")
+                                .on_click(cx.listener(|this, _, window, cx| this.load_sample_account(window, cx))),
+                        ),
+                    )
+                }),
         )
     }
 
@@ -380,7 +433,7 @@ impl MailWindow {
 /// The alpine-dawn lake with the welcome on its dark water, aligned to the choices below. A
 /// midnight shade under the words keeps them legible whatever the crop; the dusk veil over
 /// the whole scene thins once as the window opens.
-fn horizon(height: f32) -> impl IntoElement {
+fn horizon(height: f32, adding: bool) -> impl IntoElement {
     let midnight = hex(MIDNIGHT);
     let ivory = hex(IVORY);
     div()
@@ -408,7 +461,11 @@ fn horizon(height: f32) -> impl IntoElement {
                     .justify_center()
                     .gap(px(12.))
                     .child(div().max_w(px(640.)).font_family("Source Serif 4 Display").text_size(px(48.)).line_height(px(56.)).text_color(ivory).child("A calmer place for your mail."))
-                    .child(div().max_w(px(520.)).text_size(px(15.)).line_height(px(22.)).text_color(ivory.opacity(0.84)).child("Welcome to Overlook. Connect an account to bring your mail in.")),
+                    .child(div().max_w(px(520.)).text_size(px(15.)).line_height(px(22.)).text_color(ivory.opacity(0.84)).child(if adding {
+                        "Connect another account. Its mail, calendar and contacts join the rest."
+                    } else {
+                        "Welcome to Overlook. Connect an account to bring your mail in."
+                    })),
             ),
         )
 }

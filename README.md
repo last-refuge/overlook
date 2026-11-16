@@ -154,8 +154,11 @@ when there is one. **Update now** downloads the release, verifies its checksum, 
 through a polkit password dialog when Overlook was installed with pacman, or by swapping the binary when it
 lives in your own prefix. Then **Restart Overlook**. Nothing about you is sent during the check.
 
-On first launch, choose to load a **sample mailbox** or start empty and connect your own account. The sample
-account's connection is a switch in the status bar; flip it to watch offline changes sync.
+On first launch, Overlook opens on its welcome page: pick where your mail lives (Gmail, Microsoft, iCloud,
+Yahoo, AOL, Fastmail, Proton, or any IMAP or POP3 server) and it walks you through connecting it. To look
+around first, choose **Look around in a sample mailbox first** at the foot of the page. The sample account's
+connection is a switch in the status bar; flip it to watch offline changes sync. Adding another account later
+(Settings → Accounts → **Add account**, or the account menu) opens the same page.
 
 ## Connect Gmail
 
