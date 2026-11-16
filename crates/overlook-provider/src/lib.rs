@@ -33,6 +33,29 @@ use std::pin::Pin;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+thread_local! {
+    static BACKGROUND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` as background work on this thread: providers that meter their requests (Gmail's
+/// quota budget) leave headroom for what the user does meanwhile, such as opening a message
+/// or sending one. Provider futures run on the calling thread, so this covers them.
+pub fn as_background<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BACKGROUND.with(|b| b.set(self.0));
+        }
+    }
+    let _restore = Restore(BACKGROUND.with(|b| b.replace(true)));
+    f()
+}
+
+/// Whether this thread is inside [`as_background`].
+pub fn is_background() -> bool {
+    BACKGROUND.with(|b| b.get())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProviderError {
     /// The provider cannot be reached. Local work stays queued.
@@ -100,6 +123,35 @@ pub struct RemoteChanges {
     /// or mail an online search downloaded). Stored copies of them are not stale, and the
     /// ones not stored are not downloaded.
     pub untracked: Vec<ProviderId>,
+    /// Messages whose labels or flags changed, reported without their content (Gmail's
+    /// change history lists them). The engine updates stored copies in place; one it doesn't
+    /// have is downloaded only if it now belongs in the Inbox or Starred.
+    pub relabeled: Vec<Relabel>,
+    /// New messages to download, most wanted first (Inbox, then newest). The engine fetches
+    /// their headers first when there are many, then queues the bodies; nothing is fetched
+    /// inside `fetch_changes`, so a quota stop never loses the catch-up's progress.
+    pub to_download: Vec<ProviderId>,
+}
+
+/// A message's labels and flags as the provider has them now, without its content.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LabelState {
+    pub label_ids: std::collections::BTreeSet<LabelId>,
+    pub is_read: bool,
+    pub is_starred: bool,
+    pub is_important: bool,
+    pub category: Option<String>,
+    /// The provider files it as sent mail.
+    pub is_sent: bool,
+}
+
+/// A message whose labels changed at the provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Relabel {
+    pub provider_id: ProviderId,
+    /// `None` when the provider reported a change without the result; the engine refreshes
+    /// the stored copy's headers instead.
+    pub state: Option<LabelState>,
 }
 
 /// A folder a rename or move changed, before and after. For IMAP the id changes with the
@@ -208,6 +260,19 @@ pub trait MailProvider: Send + Sync {
     /// exist are skipped.
     fn fetch_messages(&self, _account: &Account, _ids: &[ProviderId], _labels: &[Label]) -> BoxFuture<'_, Result<Vec<Message>, ProviderError>> {
         Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// Whether [`Self::fetch_headers`] costs less than a full download (Gmail charges a
+    /// third), so a large catch-up lists messages first and downloads bodies after.
+    fn has_cheap_headers(&self) -> bool {
+        false
+    }
+
+    /// Downloads messages without their bodies (headers, labels, snippet), for providers
+    /// where that costs less than the full message; the body follows from the backlog.
+    /// Others download the full message.
+    fn fetch_headers(&self, account: &Account, ids: &[ProviderId], labels: &[Label]) -> BoxFuture<'_, Result<Vec<Message>, ProviderError>> {
+        self.fetch_messages(account, ids, labels)
     }
 
     /// Applies an idempotent mailbox operation. The result reports identity changes the

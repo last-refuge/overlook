@@ -8,7 +8,7 @@ use base64::Engine;
 use overlook_core::sanitize::html_to_text;
 use overlook_core::*;
 use serde_json::Value;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 pub fn local_message_id(account: &AccountId, gmail_id: &str) -> MessageId {
     MessageId(format!("{}:{gmail_id}", account.0))
@@ -140,13 +140,8 @@ pub fn message_from_json(account: &Account, v: &Value, labels: &HashMap<String, 
         text = html.as_deref().map(html_to_text);
     }
 
-    let mut label_ids = BTreeSet::new();
-    for raw in &label_ids_raw {
-        if let Some(local) = labels.get(raw) {
-            label_ids.insert(local.clone());
-        }
-    }
-    let outgoing = has("SENT") || from.email.eq_ignore_ascii_case(&account.email);
+    let state = label_state(&label_ids_raw, labels);
+    let outgoing = state.is_sent || from.email.eq_ignore_ascii_case(&account.email);
 
     Some(Message {
         id: local_id,
@@ -162,19 +157,33 @@ pub fn message_from_json(account: &Account, v: &Value, labels: &HashMap<String, 
         snippet,
         body: Body { text, html },
         date,
-        is_read: !has("UNREAD"),
-        is_starred: has("STARRED"),
+        is_read: state.is_read,
+        is_starred: state.is_starred,
         is_outgoing: outgoing,
-        label_ids,
+        label_ids: state.label_ids,
         attachments,
         rfc_message_id: header("Message-ID").or_else(|| header("Message-Id")),
         in_reply_to: header("In-Reply-To"),
         references: header("References").map(|r| r.split_whitespace().map(str::to_owned).collect()).unwrap_or_default(),
-        category: label_ids_raw.iter().find_map(|l| l.strip_prefix("CATEGORY_").map(|c| c.to_ascii_lowercase())),
-        is_important: has("IMPORTANT"),
+        category: state.category,
+        is_important: state.is_important,
         focus_override: None,
         invitation,
     })
+}
+
+/// What a message's Gmail labels mean: the local label ids, read and starred, and the
+/// Focused Inbox hints. Shared by full downloads and the label changes in Gmail's history.
+pub fn label_state<S: AsRef<str>>(raw: &[S], labels: &HashMap<String, LabelId>) -> crate::LabelState {
+    let has = |name: &str| raw.iter().any(|l| l.as_ref() == name);
+    crate::LabelState {
+        label_ids: raw.iter().filter_map(|r| labels.get(r.as_ref()).cloned()).collect(),
+        is_read: !has("UNREAD"),
+        is_starred: has("STARRED"),
+        is_important: has("IMPORTANT"),
+        category: raw.iter().find_map(|l| l.as_ref().strip_prefix("CATEGORY_").map(|c| c.to_ascii_lowercase())),
+        is_sent: has("SENT"),
+    }
 }
 
 /// A MIME header of one part of the payload.
@@ -256,6 +265,36 @@ mod tests {
             email: "jason@example.com".into(),
             created_at: 0,
         }
+    }
+
+    #[test]
+    fn a_metadata_download_is_a_header_only_row() {
+        let labels: HashMap<String, LabelId> = [("INBOX".to_owned(), LabelId("g1:INBOX".into()))].into_iter().collect();
+        let v = serde_json::json!({
+            "id": "1a1e55a378b81bb3",
+            "threadId": "1a1e55a378b81bb3",
+            "labelIds": ["INBOX", "UNREAD", "CATEGORY_PERSONAL"],
+            "snippet": "MA has been a battle for us",
+            "internalDate": "1794413135487",
+            "payload": {
+                "mimeType": "multipart/alternative",
+                "headers": [
+                    {"name": "From", "value": "Brian Perrott <bperrott@example.com>"},
+                    {"name": "To", "value": "jason@example.com"},
+                    {"name": "Subject", "value": "Re: Moving to Lendr"},
+                    {"name": "Message-ID", "value": "<abc@example.com>"}
+                ]
+            }
+        });
+        let m = message_from_json(&account(), &v, &labels).unwrap();
+        assert!(!m.body.is_cached(), "the body follows from the queue");
+        assert_eq!(m.subject, "Re: Moving to Lendr");
+        assert_eq!(m.from.email, "bperrott@example.com");
+        assert_eq!(m.snippet, "MA has been a battle for us");
+        assert!(!m.is_read);
+        assert_eq!(m.category.as_deref(), Some("personal"));
+        assert!(m.label_ids.contains(&LabelId("g1:INBOX".into())));
+        assert_eq!(m.date, 1794413135487);
     }
 
     #[test]

@@ -156,6 +156,11 @@ pub(crate) fn new_inbox_mail(
     out
 }
 
+/// "1 message", "340 messages".
+fn messages_phrase(n: usize) -> String {
+    if n == 1 { "1 message".to_owned() } else { format!("{n} messages") }
+}
+
 /// Shows an in-app toast and, when the Omarchy option is on, the same message as a
 /// desktop notification. Plain information stays in the app.
 pub(crate) fn toast(window: &mut Window, cx: &mut App, level: crate::notify::Level, text: impl Into<SharedString>) {
@@ -610,6 +615,10 @@ pub struct MailWindow {
     drafts: Vec<Draft>,
     outbox: Vec<Draft>,
     status: AccountStatus,
+    /// Messages of the active account still queued for download (status bar).
+    queued_downloads: usize,
+    /// Opened messages whose bodies are downloading now, ahead of the queue.
+    pub(crate) bodies_loading: HashSet<MessageId>,
 
     selected: Option<ConversationId>,
     /// The rows picked with Ctrl/Shift-click, Shift-arrows or Ctrl-A, `selected` among
@@ -927,6 +936,8 @@ impl MailWindow {
             drafts: Vec::new(),
             outbox: Vec::new(),
             status: AccountStatus::default(),
+            queued_downloads: 0,
+            bodies_loading: HashSet::new(),
             selected: None,
             marked: BTreeSet::new(),
             outbox_selected: None,
@@ -1852,6 +1863,7 @@ impl MailWindow {
         self.refresh_mail();
         self.reload_drafts();
         self.status = self.store.account_status(&acct).unwrap_or_default();
+        self.queued_downloads = crate::sync::queued_downloads(&self.store, &acct);
         self.reload_account_labels();
         self.refresh_account_counts(cx);
         self.load_thread(cx);
@@ -1975,6 +1987,59 @@ impl MailWindow {
         let unwritten = self.unwritten_changes();
         self.apply_to_thread(&unwritten);
         if history_changed { self.prepare_thread_history(cx); }
+    }
+
+    /// What opening a conversation needs from the server: bodies not downloaded yet (mail
+    /// listed by its headers during a catch-up), then inline images.
+    fn fetch_conversation_extras(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.fetch_missing_bodies(window, cx);
+        self.fetch_inline_images(window, cx);
+    }
+
+    /// Downloads the bodies the open conversation lacks right away, ahead of the download
+    /// queue, which skips them once they are here. The window never edits the queues: a
+    /// sync may be saving them at the same moment.
+    fn fetch_missing_bodies(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let missing: Vec<(MessageId, ProviderId)> = self
+            .thread
+            .iter()
+            .filter(|m| !m.body.is_cached() && m.account_id == self.account.id && !self.bodies_loading.contains(&m.id))
+            .filter_map(|m| Some((m.id.clone(), m.provider_id.clone()?)))
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let Some(provider) = self.providers.get(&self.account.id).map(|p| p.mail.clone()) else { return };
+        let account = self.account.clone();
+        let store = self.store.clone();
+        let labels = self.labels.clone();
+        let ids: Vec<MessageId> = missing.iter().map(|(id, _)| id.clone()).collect();
+        let pids: Vec<ProviderId> = missing.into_iter().map(|(_, pid)| pid).collect();
+        self.bodies_loading.extend(ids.iter().cloned());
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let mut messages = provider.fetch_messages(&account, &pids, &labels).await?;
+                    crate::sync::reconcile_incoming(&store, &account.id, &mut messages, &mut Vec::new());
+                    let protected = store.pending_message_ids(&account.id).unwrap_or_default();
+                    // The download queue skips it now that its body is here.
+                    store.merge_remote_messages(&messages, &protected).map_err(|e| overlook_provider::ProviderError::Temporary(e.to_string()))
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                for id in &ids {
+                    this.bodies_loading.remove(id);
+                }
+                if let Err(e) = result {
+                    tracing::warn!("could not download an opened message: {e}");
+                }
+                this.load_thread(cx);
+                this.fetch_inline_images(window, cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Downloads the inline images of the open conversation that are not cached yet.
@@ -2426,6 +2491,7 @@ impl MailWindow {
             self.marked.clear();
             self.expanded.clear();
             self.load_thread(cx);
+            self.fetch_conversation_extras(window, cx);
         }
         self.list_focus.focus(window, cx);
         cx.notify();
@@ -2446,6 +2512,7 @@ impl MailWindow {
             self.selected = self.conversations.first().map(|c| c.id.clone());
             self.marked.clear();
             self.load_thread(cx);
+            self.fetch_conversation_extras(window, cx);
         }
         self.start_online_search(window, cx);
         cx.notify();
@@ -2544,7 +2611,7 @@ impl MailWindow {
         self.selected = id;
         self.marked.clear();
         self.load_thread(cx);
-        self.fetch_inline_images(window, cx);
+        self.fetch_conversation_extras(window, cx);
         // Reading marks the conversation read: a local change with its pending operation.
         let unread: Vec<MessageId> = self.thread.iter().filter(|m| !m.is_read).map(|m| m.id.clone()).collect();
         if !unread.is_empty() {
@@ -2825,7 +2892,7 @@ impl MailWindow {
             self.marked.clear();
         }
         self.load_thread(cx);
-        self.fetch_inline_images(window, cx);
+        self.fetch_conversation_extras(window, cx);
         self.schedule_prerender(cx);
         cx.notify();
     }
@@ -3387,7 +3454,9 @@ impl MailWindow {
                     Some(SyncState::SyncFailed(_)) | Some(SyncState::Paused(_)) => {
                         let attempts = this.retry_attempts.entry(account.id.clone()).or_insert(0);
                         *attempts += 1;
-                        let base = overlook_provider::backoff_seconds(*attempts).max(if outcome.rate_limited { 60 } else { 15 });
+                        // A quota stop lifts when the provider's minute is over; nothing is
+                        // lost meanwhile, so retry then rather than backing off further.
+                        let base = if outcome.rate_limited { 65 } else { overlook_provider::backoff_seconds(*attempts).max(15) };
                         this.next_retry.insert(account.id.clone(), now() + (base as i64) * 1000);
                     }
                     _ => {}
@@ -3448,7 +3517,9 @@ impl MailWindow {
                 }
                 let more_pending = this.store.pending_count(&account.id).unwrap_or(0) > 0;
                 let paused = this.next_retry.get(&account.id).is_some_and(|t| *t > now());
-                if !paused && (this.sync_requested.contains(&account.id) || (more_pending && !outcome.stopped_offline && outcome.applied > 0)) {
+                // A download that used its slice continues at once; the provider's quota budget
+                // paces it, and the user's changes go out between slices.
+                if !paused && (this.sync_requested.contains(&account.id) || outcome.more_to_download || (more_pending && !outcome.stopped_offline && outcome.applied > 0)) {
                     this.sync_account(account.id.clone(), window, cx);
                 }
             });
@@ -3891,17 +3962,27 @@ impl MailWindow {
         let status = &self.status;
         let is_sample = self.is_sample(&self.account.id);
         let online = self.sample.is_online();
+        let queued = self.queued_downloads;
+        let catching_up = |text: &str| if queued > 0 { format!("{text} {} left to download.", messages_phrase(queued)) } else { text.to_owned() };
         let (dot, state_text) = match &status.state {
+            SyncState::UpToDate if queued > 0 => (p.accent, format!("Downloading {}…", messages_phrase(queued))),
             SyncState::UpToDate => (p.success, "Up to date".to_owned()),
+            SyncState::Syncing if queued > 0 => (p.accent, format!("Downloading {}…", messages_phrase(queued))),
             SyncState::Syncing => (p.accent, "Syncing your changes…".to_owned()),
-            SyncState::Paused(reason) => (p.accent, reason.clone()),
+            SyncState::Paused(reason) => (p.accent, catching_up(reason)),
             SyncState::Offline => (p.muted, status.state.sentence(status.pending_operations)),
             SyncState::SignInRequired => (p.warning, status.state.sentence(0)),
             SyncState::SyncFailed(reason) => (p.warning, format!("Sync failed: {reason}")),
         };
         let last = status.last_successful_sync.map(|ts| {
-            let (_, t, _) = overlook_core::time::civil_in_zone(ts, &self.time_zone);
-            format!("Last synced {}", format_clock(t))
+            let (date, t, _) = overlook_core::time::civil_in_zone(ts, &self.time_zone);
+            let (today, _, _) = overlook_core::time::civil_in_zone(now(), &self.time_zone);
+            // A sync from another day says which day, so an old one doesn't pass for today's.
+            if date == today {
+                format!("Last synced {}", format_clock(t))
+            } else {
+                format!("Last synced {} {}, {}", overlook_core::time::MONTHS_SHORT[(date.month as usize).saturating_sub(1) % 12], date.day, format_clock(t))
+            }
         });
         let unread: usize = self.conversations.iter().filter(|c| c.is_unread()).count();
         let center = if self.view == MailboxView::Kind(LabelKind::Drafts) {

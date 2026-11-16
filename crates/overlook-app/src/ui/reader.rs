@@ -666,7 +666,13 @@ impl MailWindow {
                         .bg(p.chip)
                         .text_size(px(12.))
                         .text_color(p.muted)
-                        .child("This message hasn’t been downloaded. Connect to read it."),
+                        .child(if self.bodies_loading.contains(&m.id) {
+                            "Downloading this message…"
+                        } else if self.connected(&m.account_id) {
+                            "This message hasn’t been downloaded yet. It’s in the download queue."
+                        } else {
+                            "This message hasn’t been downloaded. Connect to read it."
+                        }),
                 )
             })
             .children(m.invitation.as_ref().map(|inv| self.render_invitation_card(inv, cx)))
