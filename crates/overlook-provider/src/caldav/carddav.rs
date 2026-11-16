@@ -18,11 +18,106 @@ const BATCH: usize = 25;
 const MAX_BOOKS: usize = 64;
 const MAX_CARDS: usize = 50_000;
 
-/// The contacts server for an account whose incoming mail server is Fastmail's. Judged by
-/// the server, never by the address: a custom domain at Fastmail still counts, and an address
-/// that merely looks like Fastmail's doesn't send its password there.
-pub fn fastmail_contacts_server(incoming_host: &str) -> Option<&'static str> {
-    crate::app_passwords::FASTMAIL.owns_host(incoming_host).then_some(FASTMAIL_CARDDAV_URL)
+/// A contacts service Overlook recognises from an account's mail servers.
+#[derive(Debug, Clone, Copy)]
+pub struct ContactsService {
+    pub name: &'static str,
+    pub server_url: &'static str,
+    /// Which sign-in name the service takes.
+    pub user_name: UserName,
+    /// What the person should know about the password before connecting.
+    pub password_note: &'static str,
+    also_approved: Option<fn(&str) -> bool>,
+}
+
+/// Services are the same when they start at the same server.
+impl PartialEq for ContactsService {
+    fn eq(&self, other: &Self) -> bool {
+        self.server_url == other.server_url
+    }
+}
+
+impl Eq for ContactsService {}
+
+/// The sign-in name a contacts service takes, from the account's mail settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserName {
+    /// The incoming mail server's user name.
+    Incoming,
+    /// A whole address: iCloud signs in to mail with the name alone but to contacts with the
+    /// whole @icloud.com address, which the outgoing server already uses.
+    FullAddress,
+}
+
+pub static FASTMAIL_CONTACTS: ContactsService = ContactsService {
+    name: "Fastmail",
+    server_url: FASTMAIL_CARDDAV_URL,
+    user_name: UserName::Incoming,
+    password_note: "Uses this account’s app password, which allows contacts unless you limited it when you made it.",
+    also_approved: None,
+};
+
+/// iCloud Contacts. Discovery starts at `contacts.icloud.com` and hands each account to a
+/// server of its own (`p42-contacts.icloud.com`), which is still Apple's.
+pub static ICLOUD_CONTACTS: ContactsService = ContactsService {
+    name: "iCloud",
+    server_url: "https://contacts.icloud.com/",
+    user_name: UserName::FullAddress,
+    password_note: "Uses this account’s app-specific password, which works for iCloud Contacts too.",
+    also_approved: Some(icloud_contacts_host),
+};
+
+/// iCloud in mainland China, which has servers of its own. Never chosen from the mail
+/// servers, which are shared; the person enters it.
+pub static ICLOUD_CHINA_CONTACTS: ContactsService = ContactsService { server_url: "https://contacts.icloud.com.cn/", ..ICLOUD_CONTACTS };
+
+/// Yahoo's contacts server. Other apps have found it unreliable, so mail never depends on it.
+pub static YAHOO_CONTACTS: ContactsService = ContactsService {
+    name: "Yahoo",
+    server_url: "https://carddav.address.yahoo.com/",
+    user_name: UserName::Incoming,
+    password_note: "Uses this account’s app password. Yahoo’s contacts server has refused some apps; if it refuses Overlook, mail keeps working.",
+    also_approved: None,
+};
+
+/// AOL's contacts server, on the same platform as Yahoo's.
+pub static AOL_CONTACTS: ContactsService = ContactsService {
+    name: "AOL",
+    server_url: "https://carddav.aol.com/",
+    user_name: UserName::Incoming,
+    password_note: "Uses this account’s app password. AOL’s contacts server has refused some apps; if it refuses Overlook, mail keeps working.",
+    also_approved: None,
+};
+
+/// The contacts service of an account, by its incoming mail server. Judged by the server,
+/// never by the address: a custom domain at Fastmail still counts, and an address that merely
+/// looks like a service's doesn't send its password there.
+pub fn service_for_host(incoming_host: &str) -> Option<&'static ContactsService> {
+    use crate::app_passwords::{AOL, FASTMAIL, ICLOUD, YAHOO};
+    [(&FASTMAIL, &FASTMAIL_CONTACTS), (&ICLOUD, &ICLOUD_CONTACTS), (&YAHOO, &YAHOO_CONTACTS), (&AOL, &AOL_CONTACTS)]
+        .into_iter()
+        .find(|(guide, _)| guide.owns_host(incoming_host))
+        .map(|(_, service)| service)
+}
+
+/// The known service a contacts server URL belongs to, for its name and its rules.
+pub fn service_for_url(server_url: &str) -> Option<&'static ContactsService> {
+    let normalize = |u: &str| u.trim().trim_end_matches('/').to_ascii_lowercase();
+    [&FASTMAIL_CONTACTS, &ICLOUD_CONTACTS, &ICLOUD_CHINA_CONTACTS, &YAHOO_CONTACTS, &AOL_CONTACTS].into_iter().find(|s| normalize(s.server_url) == normalize(server_url))
+}
+
+/// iCloud's contacts servers: the main one and the per-account `pNN-contacts` hosts, for the
+/// global and the mainland China services. Nothing else under icloud.com.
+fn icloud_contacts_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    let Some(name) = host.strip_suffix(".icloud.com").or_else(|| host.strip_suffix(".icloud.com.cn")) else {
+        return false;
+    };
+    name == "contacts"
+        || name
+            .strip_prefix('p')
+            .and_then(|n| n.strip_suffix("-contacts"))
+            .is_some_and(|digits| (1..=4).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -142,7 +237,9 @@ impl CardDavClient {
         if password.is_empty() {
             return Err(CardDavError::InvalidConfiguration("Enter the app password."));
         }
-        Ok(Self { dav: CalDavClient::new(&settings, password)? })
+        let mut dav = CalDavClient::new(&settings, password)?;
+        dav.also_approved = service_for_url(server_url).and_then(|s| s.also_approved);
+        Ok(Self { dav })
     }
 
     /// Finds the principal's address books: through the server's root, its RFC 6764
@@ -301,6 +398,11 @@ impl CardDavClient {
             if let Some((etag, card)) = entry.found {
                 found.push((url, etag, card));
             }
+        }
+        // Only an explicit 404 or 410 says a card is gone. A reply that leaves one out is
+        // incomplete, and taking it as complete would drop that contact here.
+        if seen.len() != wanted.len() {
+            return Err(CardDavError::InvalidResponse);
         }
         Ok(found)
     }
@@ -521,7 +623,7 @@ mod tests {
 
         fn client(&self) -> CardDavClient {
             // Plain HTTP only inside unit tests, never through a public constructor.
-            CardDavClient { dav: CalDavClient { endpoint: self.url.clone(), username: "me@example.test".into(), password: "test-app-password".into(), agent: agent(false) } }
+            CardDavClient { dav: CalDavClient { endpoint: self.url.clone(), username: "me@example.test".into(), password: "test-app-password".into(), agent: agent(false), also_approved: None } }
         }
 
         fn finish(mut self) -> Vec<String> {
@@ -621,6 +723,34 @@ mod tests {
     }
 
     #[test]
+    fn a_fetch_that_leaves_a_card_out_is_an_error_not_a_deletion() {
+        let mut replies = discovery();
+        replies.push(reply(
+            207,
+            &multistatus(&format!(
+                "{}{}",
+                response("/dav/addressbooks/user/me/Default/a1.vcf", "<d:getetag>\"v1\"</d:getetag><d:resourcetype/>"),
+                response("/dav/addressbooks/user/me/Default/b2.vcf", "<d:getetag>\"v2\"</d:getetag><d:resourcetype/>"),
+            )),
+            "",
+        ));
+        // Asked for both, answered for one: b2 isn't said to be gone, it's missing.
+        replies.push(reply(207, &multistatus(&response("/dav/addressbooks/user/me/Default/a1.vcf", &format!("<d:getetag>\"v1\"</d:getetag><card:address-data>{CARD}</card:address-data>"))), ""));
+        let server = Script::new(replies);
+        assert_eq!(server.client().snapshot(|_| None).unwrap_err(), CardDavError::InvalidResponse);
+        server.finish();
+        // A card deleted between the listing and the fetch is answered with 404, and dropped.
+        let mut replies = discovery();
+        replies.push(reply(207, &multistatus(&response("/dav/addressbooks/user/me/Default/a1.vcf", "<d:getetag>\"v1\"</d:getetag><d:resourcetype/>")), ""));
+        replies.push(reply(207, &multistatus("<d:response><d:href>/dav/addressbooks/user/me/Default/a1.vcf</d:href><d:status>HTTP/1.1 404 Not Found</d:status></d:response>"), ""));
+        replies.push(reply(207, &multistatus(&response("/dav/addressbooks/user/me/Shared/", "<d:resourcetype><d:collection/><card:addressbook/></d:resourcetype>")), ""));
+        let server = Script::new(replies);
+        let snapshot = server.client().snapshot(|_| None).unwrap();
+        server.finish();
+        assert!(snapshot.cards.is_empty() && snapshot.unchanged.is_empty());
+    }
+
+    #[test]
     fn an_incomplete_listing_is_an_error_not_an_empty_book() {
         let mut replies = discovery();
         replies.push(reply(207, &multistatus("<d:response><d:href>/dav/addressbooks/user/me/Default/a1.vcf</d:href><d:propstat><d:prop><d:getetag/></d:prop><d:status>HTTP/1.1 507 Insufficient Storage</d:status></d:propstat></d:response>"), ""));
@@ -655,12 +785,38 @@ mod tests {
     }
 
     #[test]
-    fn only_fastmail_servers_get_the_fastmail_contacts_server() {
-        assert_eq!(fastmail_contacts_server("imap.fastmail.com"), Some(FASTMAIL_CARDDAV_URL));
-        assert_eq!(fastmail_contacts_server("eu-imap.fastmail.com."), Some(FASTMAIL_CARDDAV_URL));
-        assert_eq!(fastmail_contacts_server("pop.fastmail.com"), Some(FASTMAIL_CARDDAV_URL));
-        assert_eq!(fastmail_contacts_server("mail.messagingengine.com"), Some(FASTMAIL_CARDDAV_URL));
-        assert_eq!(fastmail_contacts_server("fastmail.com.attacker.example"), None);
-        assert_eq!(fastmail_contacts_server("imap.example.com"), None);
+    fn each_service_is_known_by_its_mail_servers() {
+        let named = |host: &str| service_for_host(host).map(|s| s.name);
+        assert_eq!(named("imap.fastmail.com"), Some("Fastmail"));
+        assert_eq!(named("eu-imap.fastmail.com."), Some("Fastmail"));
+        assert_eq!(named("pop.fastmail.com"), Some("Fastmail"));
+        assert_eq!(named("mail.messagingengine.com"), Some("Fastmail"));
+        assert_eq!(named("imap.mail.me.com"), Some("iCloud"));
+        assert_eq!(named("imap.mail.yahoo.com"), Some("Yahoo"));
+        assert_eq!(named("imap.aol.com"), Some("AOL"));
+        assert_eq!(named("fastmail.com.attacker.example"), None);
+        assert_eq!(named("imap.example.com"), None);
+        assert_eq!(service_for_url("https://contacts.icloud.com"), Some(&ICLOUD_CONTACTS));
+        assert_eq!(service_for_url("https://contacts.icloud.com.cn/").map(|s| s.name), Some("iCloud"));
+        assert_eq!(service_for_url("https://dav.example.org/"), None);
+    }
+
+    #[test]
+    fn icloud_may_hand_off_only_to_apples_contacts_servers() {
+        for host in ["contacts.icloud.com", "p42-contacts.icloud.com", "P101-CONTACTS.icloud.com", "p07-contacts.icloud.com.cn"] {
+            assert!(icloud_contacts_host(host), "{host}");
+        }
+        for host in ["icloud.com", "p42-caldav.icloud.com", "evil-contacts.icloud.com", "p-contacts.icloud.com", "p12345-contacts.icloud.com", "p42-contacts.icloud.com.evil.example", "p42-contacts.example.com"] {
+            assert!(!icloud_contacts_host(host), "{host}");
+        }
+        let icloud = CardDavClient::new(ICLOUD_CONTACTS.server_url, "me@icloud.com", "app-specific".into()).unwrap();
+        let base = icloud.dav.endpoint.clone();
+        assert!(icloud.dav.resolve(&base, "https://p42-contacts.icloud.com:443/123/carddavhome/").is_ok());
+        for refused in ["http://p42-contacts.icloud.com/123/", "https://p42-contacts.icloud.com:8443/123/", "https://elsewhere.example/123/"] {
+            assert!(matches!(icloud.dav.resolve(&base, refused), Err(CalDavError::UnapprovedOrigin(_))), "{refused}");
+        }
+        // Only iCloud's connection has the exception.
+        let fastmail = CardDavClient::new(FASTMAIL_CONTACTS.server_url, "me@example.test", "app".into()).unwrap();
+        assert!(matches!(fastmail.dav.resolve(&fastmail.dav.endpoint, "https://p42-contacts.icloud.com/123/"), Err(CalDavError::UnapprovedOrigin(_))));
     }
 }

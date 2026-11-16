@@ -1475,9 +1475,8 @@ impl MailWindow {
         let in_browser = setup.signin_cancel.is_some();
         let offer_calendars = setup.mode == SetupMode::New && setup.kind == ProviderKind::Imap && !is_microsoft
             && fastmail_preset_for_login(setup.in_host.read(cx).value().trim(), setup.in_user.read(cx).value().trim()).is_some();
-        // Fastmail's contacts work with POP3 mail too: they're a separate server.
-        let offer_contacts = setup.mode == SetupMode::New && !is_microsoft
-            && overlook_provider::caldav::carddav::fastmail_contacts_server(setup.in_host.read(cx).value().trim()).is_some();
+        // A service's contacts work with POP3 mail too: they're a separate server.
+        let offer_contacts = if setup.mode == SetupMode::New && !is_microsoft { overlook_provider::caldav::carddav::service_for_host(setup.in_host.read(cx).value().trim()) } else { None };
         let title = match (&setup.mode, setup.step) {
             (SetupMode::New, SetupStep::Basics) if is_microsoft => "Add a Microsoft account".to_owned(),
             (SetupMode::New, SetupStep::Basics) if setup.guide.is_some() => format!("Add {} account", with_article(setup.guide.map(|g| g.provider).unwrap_or_default())),
@@ -1574,18 +1573,18 @@ impl MailWindow {
                             cx.notify();
                         })))
                     .child(div().text_size(px(12.)).text_color(p.muted).child("Use a Fastmail app password with calendar access. Calendars connect in the background after you add the account. If access is denied, mail keeps working and you can enter a separate calendar password in Settings → Accounts → Calendars.")))
-                .when(offer_contacts, |d| d
+                .when_some(offer_contacts, |d, service| d
                     .child(divider(&p))
-                    .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child("Fastmail contacts"))
-                    .child(Switch::new("setup-fastmail-contacts")
+                    .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(format!("{} contacts", service.name)))
+                    .child(Switch::new("setup-service-contacts")
                         .checked(setup.connect_contacts).disabled(busy.is_some())
                         .label("Connect contacts using this mail password")
-                        .accessibility_label("Connect Fastmail contacts using this mail password")
+                        .accessibility_label(format!("Connect {} contacts using this mail password", service.name))
                         .on_click(cx.listener(|this, checked: &bool, _, cx| {
                             if let Some(setup) = this.account_setup.as_mut() { setup.connect_contacts = *checked; }
                             cx.notify();
                         })))
-                    .child(div().text_size(px(12.)).text_color(p.muted).child("Your Fastmail contacts appear in Overlook, and changes you make here go back to Fastmail. Fastmail’s app passwords allow contacts unless you limited them. If access is denied, mail keeps working.")))
+                    .child(div().text_size(px(12.)).text_color(p.muted).whitespace_normal().child(format!("Your {name} contacts appear in Overlook, and changes you make here go back to {name}. {note} If access is denied, mail keeps working.", name = service.name, note = service.password_note))))
                 .when(!is_pop3, |d| {
                     d.child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).pt(px(6.)).child("Folders on the server"))
                         .child(div().text_size(px(12.)).text_color(p.muted).child("Sent, Trash and Archive are found from the server’s folder list. Name a folder here only when the server gets it wrong (paths as the server names them, like INBOX/Archive)."))

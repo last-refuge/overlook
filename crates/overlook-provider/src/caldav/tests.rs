@@ -86,6 +86,7 @@ impl Server {
             username: "me@example.test".into(),
             password: "test-app-password".into(),
             agent: agent(false),
+            also_approved: None,
         }
     }
 

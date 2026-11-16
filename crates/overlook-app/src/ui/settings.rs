@@ -79,6 +79,8 @@ pub struct SettingsState {
     pub work_end: Entity<InputState>,
     pub time_zone: Entity<ComboboxState<SearchableVec<ZoneChoice>>>,
     pub caldav: Option<super::calendar_setup::CalendarSetup>,
+    /// Connecting contacts for an IMAP or POP3 account.
+    pub contacts: super::contacts_setup::ContactsSetup,
     /// Filters every page's settings by name; non-empty shows results instead of a page.
     pub search: Entity<InputState>,
     /// The setting a search result jumped to: scrolled into view and briefly highlighted.
@@ -467,6 +469,7 @@ impl MailWindow {
             work_end,
             time_zone,
             caldav,
+            contacts: Default::default(),
             search,
             scroll_target: None,
             _subscriptions: subs,
@@ -773,11 +776,11 @@ impl MailWindow {
         };
         let sign_in_label = super::sign_in_label_for(account.provider, oauth.is_some());
         let contacts_source = self.contacts_source_of(&account);
-        let can_connect_contacts = servers.as_ref().is_some_and(|s| crate::carddav_sync::contacts_server(s).is_some());
         let contacts_about = match contacts_source {
             super::contacts::ContactsSource::Google => "Your Google Contacts and the people you have written to, for recipient suggestions and sender cards.".to_owned(),
-            super::contacts::ContactsSource::Server(name) => format!("Your {name} contacts, kept in step both ways: changes made here go to {name}, and changes made there arrive within 15 minutes."),
-            _ if can_connect_contacts => "The people you have written to, for recipient suggestions and sender cards. Connect your Fastmail contacts to see and edit them here.".to_owned(),
+            super::contacts::ContactsSource::Server(Some(name)) => format!("Your {name} contacts, kept in step both ways: changes made here go to {name}, and changes made there arrive within 15 minutes."),
+            super::contacts::ContactsSource::Server(None) => "Your contacts server’s contacts, kept in step both ways: changes made here go to the server, and changes made there arrive within 15 minutes.".to_owned(),
+            _ if is_password_account => "The people you have written to, for recipient suggestions and sender cards. Connect a contacts server to see and edit your contacts here.".to_owned(),
             _ => "The people you have written to, for recipient suggestions and sender cards.".to_owned(),
         };
 
@@ -870,80 +873,29 @@ impl MailWindow {
             .child(section("Automatic replies", Some("An out-of-office reply sent for you while it is on. Stored at your mail service, so it works even when Overlook is closed.")))
             .children(self.render_vacation(state, &account, cx))
             .child(section("Contacts", Some(contacts_about.as_str())))
-            .child({
+            // IMAP and POP3 accounts connect a contacts server; Gmail and the sample have theirs.
+            .children(if is_password_account { self.render_contacts_connection(&account, servers.as_ref(), cx) } else { Vec::new() })
+            .when(!is_password_account, |d| d.child({
                 let count = self.store.contact_count(&account.id).unwrap_or(0);
                 let counted = format!("{count} contact{}", if count == 1 { "" } else { "s" });
                 let acct_id = account.id.clone();
                 let e = email.clone();
-                match contacts_source {
-                    // Contacts at a CardDAV server: when they were last checked, or why not.
-                    super::contacts::ContactsSource::Server(name) => {
-                        let status = crate::carddav_sync::status(&self.store, &account.id);
-                        let note = match &status {
-                            Some(crate::carddav_sync::ContactsStatus { error: Some(error), .. }) => error.clone(),
-                            Some(status) if status.at > 0 => format!("Last checked at {}. Checked every 15 minutes.", overlook_core::tz::format_clock(status.at)),
-                            _ => "Checked every 15 minutes.".to_owned(),
-                        };
-                        let (sync_id, off_id) = (acct_id.clone(), acct_id.clone());
-                        setting_row(
-                            &counted,
-                            &note,
-                            h_flex()
-                                .gap(px(6.))
-                                .child(Button::new("contacts-sync").ghost().small().icon(icon("refresh-cw").size(px(14.))).label("Sync contacts now").on_click(cx.listener(move |this, _, window, cx| {
-                                    let _ = this.store.set_setting(&crate::sync::contacts_synced_key(&sync_id), &0i64);
-                                    this.sync_account(sync_id.clone(), window, cx);
-                                })))
-                                .child(Button::new("contacts-disconnect").ghost().small().label("Disconnect").on_click(cx.listener(move |this, _, window, cx| {
-                                    match crate::carddav_sync::disconnect(&this.store, &off_id) {
-                                        Ok(()) => crate::ui::toast(window, cx, crate::notify::Level::Info, format!("Disconnected your {name} contacts. They stay at {name}.")),
-                                        Err(error) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t disconnect contacts: {error}")),
-                                    }
-                                    this.reload_contacts();
-                                    cx.notify();
-                                })))
-                                .into_any_element(),
-                        )
-                    }
-                    // Fastmail accounts can connect their contacts with the mail password.
-                    super::contacts::ContactsSource::Device if can_connect_contacts => {
-                        let connect_account = account.clone();
-                        setting_row(
-                            "Fastmail contacts",
-                            "See and edit your Fastmail contacts here; changes go back to Fastmail. Uses this account’s app password, which allows contacts unless you limited it when you made it.",
-                            Button::new("contacts-connect").small().label("Connect contacts").on_click(cx.listener(move |this, _, window, cx| {
-                                let Some(servers) = this.store.servers(&connect_account.id).ok().flatten() else { return };
-                                match crate::carddav_sync::connect(&this.store, &connect_account, &servers) {
-                                    Ok(_) => {
-                                        crate::ui::toast(window, cx, crate::notify::Level::Info, "Connecting your Fastmail contacts…");
-                                        this.reload_contacts();
-                                        this.sync_account(connect_account.id.clone(), window, cx);
-                                    }
-                                    Err(error) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t connect contacts: {error}")),
-                                }
-                                cx.notify();
-                            })).into_any_element(),
-                        )
-                    }
-                    _ => {
-                        let has_access = self.providers.get(&account.id).is_some_and(|p| p.mail.has_contacts_access());
-                        setting_row(
-                            &counted,
-                            if has_access { "Refreshed once a day." } else if is_gmail { "Sign in again to let Overlook read your contacts." } else { "" },
-                            h_flex()
-                                .gap(px(6.))
-                                .when(!has_access && is_gmail, |r| r.child(Button::new("contacts-signin").small().label("Sign in again").on_click(cx.listener(move |this, _, window, cx| this.start_google_sign_in(Some(e.clone()), window, cx)))))
-                                .when(has_access, |r| {
-                                    r.child(Button::new("contacts-sync").ghost().small().icon(icon("refresh-cw").size(px(14.))).label("Sync contacts now").on_click(cx.listener(move |this, _, window, cx| {
-                                        let _ = this.store.set_setting(&crate::sync::contacts_synced_key(&acct_id), &0i64);
-                                        this.sync_now(window, cx);
-                                    })))
-                                })
-                                .into_any_element(),
-                        )
-                    }
-                }
-            })
+                let has_access = self.providers.get(&account.id).is_some_and(|p| p.mail.has_contacts_access());
+                setting_row(
+                    &counted,
+                    if has_access { "Refreshed once a day." } else if is_gmail { "Sign in again to let Overlook read your contacts." } else { "" },
+                    h_flex()
+                        .gap(px(6.))
+                        .when(!has_access && is_gmail, |r| r.child(Button::new("contacts-signin").small().label("Sign in again").on_click(cx.listener(move |this, _, window, cx| this.start_google_sign_in(Some(e.clone()), window, cx)))))
+                        .when(has_access, |r| {
+                            r.child(Button::new("contacts-sync").ghost().small().icon(icon("refresh-cw").size(px(14.))).label("Sync contacts now").on_click(cx.listener(move |this, _, window, cx| {
+                                let _ = this.store.set_setting(&crate::sync::contacts_synced_key(&acct_id), &0i64);
+                                this.sync_now(window, cx);
+                            })))
+                        })
+                        .into_any_element(),
+                )
+            }))
             .when(account.provider != ProviderKind::Sample && issue.is_none(), |d| {
                 let sign_out_id = account.id.clone();
                 d.child(section("Sign out", None)).child(setting_row(
@@ -1457,7 +1409,7 @@ impl MailWindow {
     }
 }
 
-fn section(title: &str, description: Option<&str>) -> Div {
+pub(super) fn section(title: &str, description: Option<&str>) -> Div {
     div().child(scroll_target(title, v_flex()
         .gap(px(2.))
         .pt(px(6.))
@@ -1465,7 +1417,7 @@ fn section(title: &str, description: Option<&str>) -> Div {
         .children(description.map(|d| div().text_size(px(12.)).child(d.to_owned()).opacity(0.7)))))
 }
 
-fn setting_row(label: &str, description: &str, control: AnyElement) -> Div {
+pub(super) fn setting_row(label: &str, description: &str, control: AnyElement) -> Div {
     div().child(scroll_target(label, h_flex()
         .items_center()
         .gap(px(24.))
@@ -1544,7 +1496,7 @@ pub(crate) static SETTINGS_INDEX: &[SettingEntry] = &[
     entry(AC, "Signatures", "Use for replies and forwards", "Default signature for replies and forwards.", "signature default reply forward"),
     entry(AC, "Automatic replies", "Send automatic replies", "An out-of-office reply sent for you while it is on.", "vacation out of office away autoresponder"),
     entry(AC, "Automatic replies", "Only reply to people in my contacts", "", "vacation out of office"),
-    entry(AC, "Contacts", "Contacts", "Google or Fastmail contacts, for recipient suggestions and sender cards.", "address book sync contacts google fastmail carddav connect"),
+    entry(AC, "Contacts", "Contacts", "Contacts from Google, Microsoft, iCloud, Fastmail or another CardDAV server, for recipient suggestions and sender cards.", "address book sync contacts google microsoft outlook fastmail icloud yahoo aol nextcloud carddav connect server"),
     entry(AC, "Sign out", "Sign out of this account", "Deletes the stored sign-in.", "log out logout revoke keyring"),
     entry(AC, "Remove", "Remove this account from this device", "Deletes downloaded mail, events, drafts, and stored sign-in.", "delete account"),
     entry(GE, "Appearance", "Theme", "Follow system picks Light or Dark from your desktop setting.", "dark light mode appearance colors omarchy"),

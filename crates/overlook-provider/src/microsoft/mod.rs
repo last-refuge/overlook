@@ -6,10 +6,12 @@
 //! - `oauth`: the app registration, the authorization request (PKCE, loopback redirect),
 //!   token exchange and refresh, and the account details in the ID token.
 //! - `session`: the account's token source for the mail protocols.
+//! - `contacts`: Outlook contacts through Microsoft Graph, with a sign-in of their own.
 //!
 //! Mail itself goes through the ordinary IMAP, POP3 and SMTP providers: a Microsoft account
 //! is an IMAP (or POP3) account whose [`overlook_core::MailServers::oauth`] says Microsoft.
 
+pub mod contacts;
 pub mod oauth;
 pub mod session;
 

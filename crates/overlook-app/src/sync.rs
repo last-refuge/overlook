@@ -125,13 +125,19 @@ pub fn contacts_synced_key(account: &AccountId) -> String {
     format!("contacts_synced_at:{}", account.0)
 }
 
-/// Refreshes the address book once a day, or for an account whose contacts are at a CardDAV
-/// server, sends edits and checks for changes ([`crate::carddav_sync`]). Failures are logged and
+/// Refreshes the address book once a day, or for an account whose contacts are at a contacts
+/// server, sends edits and checks for changes ([`crate::carddav_sync`], or
+/// [`crate::graph_contacts_sync`] for Microsoft's). Failures are logged and
 /// retried next time; they never affect the mail sync state.
-async fn sync_contacts(store: &Store, provider: &dyn MailProvider, account: &Account) {
+async fn sync_contacts(store: &Store, provider: &dyn MailProvider, account: &Account, outcome: &mut SyncOutcome) {
     const DAY: i64 = 24 * 3_600_000;
     if let Ok(Some(connection)) = store.contacts_connection(&account.id) {
-        crate::carddav_sync::run(store, account, &connection);
+        // Edits the server refused for good are shown like any other change that couldn't sync.
+        let refused = match connection.credential {
+            ContactsCredential::Microsoft => crate::graph_contacts_sync::run(store, account, &connection),
+            _ => crate::carddav_sync::run(store, account, &connection),
+        };
+        outcome.failed.extend(refused);
         return;
     }
     let key = contacts_synced_key(&account.id);
@@ -843,7 +849,7 @@ pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calend
     if let Some(cal) = &calendar {
         sync_calendar(&store, cal.as_ref(), &account, &mut outcome);
     }
-    sync_contacts(&store, provider.as_ref(), &account).await;
+    sync_contacts(&store, provider.as_ref(), &account, &mut outcome).await;
 
     let mut final_state = if pre_state == SyncState::UpToDate {
         replay_operations(&store, &provider, &calendar, &account, &mut outcome).await

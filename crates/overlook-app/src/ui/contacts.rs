@@ -15,13 +15,17 @@ use gpui_kit::*;
 use overlook_core::time::now;
 use overlook_core::*;
 
+/// How the contacts of an account that signs in with Microsoft are named.
+pub const MICROSOFT: &str = "Microsoft";
+
 /// Where an account's contacts live, which decides what the Contacts page says and allows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ContactsSource {
     /// Google Contacts, through the Gmail sign-in.
     Google,
-    /// A CardDAV server, by the service's name ("Fastmail").
-    Server(&'static str),
+    /// A CardDAV server: a known service's name ("Fastmail", "iCloud"), or `None` for a
+    /// server the person entered.
+    Server(Option<&'static str>),
     /// The sample account's fictional contacts.
     Sample,
     /// No contacts service: contacts added stay on this device.
@@ -34,8 +38,8 @@ impl ContactsSource {
     pub fn book_name(self) -> String {
         match self {
             Self::Google => "Google Contacts".into(),
-            Self::Server(name) => format!("{name} contacts"),
-            Self::Sample | Self::Device => "Address book".into(),
+            Self::Server(Some(name)) => format!("{name} contacts"),
+            Self::Server(None) | Self::Sample | Self::Device => "Address book".into(),
         }
     }
 }
@@ -67,18 +71,25 @@ impl MailWindow {
             ProviderKind::Gmail => ContactsSource::Google,
             ProviderKind::Sample => ContactsSource::Sample,
             ProviderKind::Imap | ProviderKind::Pop3 => match self.store.contacts_connection(&account.id).ok().flatten() {
-                Some(connection) if connection.server_url == overlook_provider::caldav::carddav::FASTMAIL_CARDDAV_URL => ContactsSource::Server("Fastmail"),
-                Some(_) => ContactsSource::Server("Your contacts server"),
+                Some(connection) if connection.credential == ContactsCredential::Microsoft => ContactsSource::Server(Some(MICROSOFT)),
+                Some(connection) => ContactsSource::Server(overlook_provider::caldav::carddav::service_for_url(&connection.server_url).map(|s| s.name)),
                 None => ContactsSource::Device,
             },
         }
     }
 
-    /// Whether `account` is at Fastmail and its contacts could be connected with its mail
-    /// password. Reads its server settings.
-    pub(crate) fn fastmail_contacts_available(&self, account: &Account) -> bool {
-        matches!(account.provider, ProviderKind::Imap | ProviderKind::Pop3)
-            && self.store.servers(&account.id).ok().flatten().is_some_and(|servers| crate::carddav_sync::contacts_server(&servers).is_some())
+    /// The contacts service `account`'s mail is with, when Overlook knows it (Fastmail,
+    /// iCloud, Yahoo, AOL, or Microsoft for an account that signs in with Microsoft). Reads
+    /// its server settings.
+    pub(crate) fn known_contacts_service(&self, account: &Account) -> Option<&'static str> {
+        if !matches!(account.provider, ProviderKind::Imap | ProviderKind::Pop3) {
+            return None;
+        }
+        let servers = self.store.servers(&account.id).ok().flatten()?;
+        if servers.oauth == Some(OAuthIssuer::Microsoft) {
+            return Some(MICROSOFT);
+        }
+        crate::carddav_sync::contacts_service(&servers).map(|s| s.name)
     }
 
     pub(crate) fn reload_contacts(&mut self) {
@@ -238,7 +249,8 @@ impl MailWindow {
                 let saved = match (self.contacts_source, self.contacts_writable()) {
                     (ContactsSource::Google, true) => "Saved on this device. Syncing to Google Contacts…".to_owned(),
                     (ContactsSource::Google, false) => "Saved on this device. Sign in again to sync it to Google Contacts.".to_owned(),
-                    (ContactsSource::Server(name), _) => format!("Saved on this device. Syncing to {name}…"),
+                    (ContactsSource::Server(Some(name)), _) => format!("Saved on this device. Syncing to {name}…"),
+                    (ContactsSource::Server(None), _) => "Saved on this device. Syncing to your contacts server…".to_owned(),
                     (ContactsSource::Sample, _) => "Saved on this device. Syncing…".to_owned(),
                     (ContactsSource::Device, _) => "Saved on this device.".to_owned(),
                 };
@@ -350,10 +362,9 @@ impl MailWindow {
                         .text_size(px(11.))
                         .text_color(cx.palette().muted)
                         .whitespace_normal()
-                        .child(if self.fastmail_contacts_available(&self.account) {
-                            "Contacts you add stay on this device. To see and edit your Fastmail contacts here, connect them in Settings → Accounts."
-                        } else {
-                            "Contacts you add stay on this device."
+                        .child(match self.known_contacts_service(&self.account) {
+                            Some(name) => format!("Contacts you add stay on this device. To see and edit your {name} contacts here, connect them in Settings → Accounts."),
+                            None => "Contacts you add stay on this device. To keep them on a contacts server, connect one in Settings → Accounts.".to_owned(),
                         }),
                 )
             })
@@ -490,7 +501,7 @@ impl MailWindow {
                                 (true, _, ContactsSource::Device) => "Saved on this device".to_owned(),
                                 (true, _, _) => "Saved on this device, waiting to sync".to_owned(),
                                 (false, true, ContactsSource::Google) => "In your Google Contacts".to_owned(),
-                                (false, true, ContactsSource::Server(name)) => format!("In your {name} contacts"),
+                                (false, true, ContactsSource::Server(Some(name))) => format!("In your {name} contacts"),
                                 (false, true, _) => "In your address book".to_owned(),
                                 (false, false, _) => "Someone you have corresponded with".to_owned(),
                             })),

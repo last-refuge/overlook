@@ -12,6 +12,7 @@ mod folder_window;
 mod history;
 mod contact_card;
 mod contacts;
+mod contacts_setup;
 mod mail_highlight;
 mod palette;
 mod prompt;
