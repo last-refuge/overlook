@@ -207,3 +207,17 @@ Brand assets and the HTML design preview keep their existing maintenance command
 - v1.6.20 published 2026-11-06: [release](https://github.com/last-refuge/overlook/releases/tag/v1.6.20), tag at `374d6076931ebb1ef826d180bc2ab048c4f240ed`. [PR #12](https://github.com/last-refuge/overlook/pull/12) passed both checks and was squash-merged. The event details use a plain `overflow_y_scroll` area, in the modal and the side panel. No test in the repo covers this layout, because the kit's `test-support` feature adds packages to the lockfile. A throwaway headless GPUI test reproduced the bug and measured the fix on a copy of the layout. Not yet confirmed on screen when this was written. Working version is now 1.6.21.
 
 - v1.6.22 published 2026-11-14: [release](https://github.com/last-refuge/overlook/releases/tag/v1.6.22), tag at `48bafee6955a6b0ae68def53de1f90ae81037f99`. It carries PRs #19 to #26: Microsoft accounts signing in over IMAP, POP3 and SMTP (tested with a real account); guided app-password setup for iCloud, Yahoo, AOL and Fastmail; Proton Mail through Bridge, trusting Bridge's certificate by fingerprint, with trust required before saving; the welcome screen under the alpine horizon; and the polished main window (grouped toolbar with a split New button, service marks, richer list rows with file and invitation chips and hover quick actions, a joined reader with Save all and a "Reply to…" bar, and Dark's floating toolbar). Also ammonia for RUSTSEC-2026-0533. The [release workflow](https://github.com/last-refuge/overlook/actions/runs/43616615235) passed, including the supply-chain scan. The pacman package and the tarball match `SHA256SUMS`, both binaries report 1.6.22, and the installer dry run selects 1.6.22. Working version is now 1.6.23.
+- v1.7.0 published 2026-11-16: [release](https://github.com/last-refuge/overlook/releases/tag/v1.7.0), tag at `d45123ec4f87b804e97e8bbba9c986dddf5e3912`. It carries PRs #27 to #32. The headline is the Gmail catch-up redesign ([#31](https://github.com/last-refuge/overlook/pull/31)). After five days away, 1.6.22 livelocked on Google's "Units per minute per user" quota (6,000 units since May 2026, 60 per full `messages.get`). The fix:
+  - a per-account quota budget (`gmail/quota.rs`);
+  - a history-only catch-up that applies label changes without downloading;
+  - headers first, then bodies;
+  - persisted queues and 20-second download slices;
+  - on-demand body downloads and download progress in the status bar.
+
+  The user's stuck account caught up with the dev build. Also in this release:
+  - the add-account page for Settings → Add account, the account menu and new installs ([#32](https://github.com/last-refuge/overlook/pull/32));
+  - CardDAV contacts sync for Fastmail, iCloud, Yahoo, AOL, Microsoft and any server (#29, #30);
+  - the tray icon on Quickshell bars (#27);
+  - the keyring backend with `GTK_USE_PORTAL` set (#28).
+
+  The metainfo got entries for 1.7.0 and the missing 1.6.22. The release workflow passed, the pacman package and the tarball match `SHA256SUMS`, both binaries report 1.7.0, and the installer dry run selects 1.7.0. Working version is now 1.7.1.
