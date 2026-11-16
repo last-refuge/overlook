@@ -27,6 +27,8 @@ struct Server<'a> {
     read_only: RefCell<Vec<String>>,
     /// Runs while the server lists its cards: something done here meanwhile.
     on_snapshot: RefCell<Option<Box<dyn FnOnce() + 'a>>>,
+    /// Runs while the server lists its address books.
+    on_address_books: RefCell<Option<Box<dyn FnOnce() + 'a>>>,
 }
 
 impl Server<'_> {
@@ -55,6 +57,9 @@ impl Server<'_> {
 impl ContactsServer for Server<'_> {
     fn address_books(&self) -> Result<Vec<AddressBook>, CardDavError> {
         self.check()?;
+        if let Some(meanwhile) = self.on_address_books.borrow_mut().take() {
+            meanwhile();
+        }
         Ok(vec![AddressBook { url: BOOK.into(), name: "Personal".into(), writable: true }])
     }
 
@@ -309,6 +314,29 @@ fn a_new_contact_deleted_after_a_lost_reply_is_deleted_there_too() {
     assert!(server.cards.borrow().is_empty(), "the card the lost try made is deleted too");
     assert!(store.contacts(&account.id).unwrap().is_empty());
     assert!(store.contact_cards(&account.id).unwrap().is_empty());
+}
+
+#[test]
+fn a_new_contact_waits_for_a_connection_made_while_it_was_on_its_way() {
+    let (store, account, conn) = setup();
+    let server = Server::default();
+    let mut sophie = Contact::new_local(account.id.clone(), now());
+    sophie.name = Some("Sophie Williams".into());
+    store.save_contact_locally(&account.id, &sophie).unwrap();
+    // While the address book for it is found, the person connects another server.
+    let (shared, id) = (&store, account.id.clone());
+    *server.on_address_books.borrow_mut() = Some(Box::new(move || {
+        disconnect(shared, &id).unwrap();
+        let other = ContactsConnection { account_id: id.clone(), server_url: "https://other.example.test/".into(), username: "me@other.example.test".into(), default_book: None, credential: ContactsCredential::Separate, connected_at: 0 };
+        shared.save_contacts_connection(&other).unwrap();
+    }));
+    assert!(matches!(sync(&store, &account, &conn, &server, false), Err(CardDavError::InvalidConfiguration(_))));
+    assert!(server.cards.borrow().is_empty(), "nothing went to the old server");
+    let current = store.contacts_connection(&account.id).unwrap().unwrap();
+    assert_eq!((current.server_url.as_str(), current.default_book.as_deref()), ("https://other.example.test/", None), "the new connection isn't pointed at the old server's book");
+    assert!(store.contact_cards(&account.id).unwrap().is_empty(), "no record of the old server's address");
+    let waiting = store.pending_operations(&account.id).unwrap();
+    assert!(waiting.iter().any(|op| op.state == OperationState::Pending && op.kind.contact_id() == Some(sophie.id.as_str())), "it waits for the next sync, to the new server");
 }
 
 #[test]

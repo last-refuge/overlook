@@ -136,6 +136,8 @@ A second review round found two more, also fixed with tests:
 - Bringing a retried create's copy up to date compared it with the server's current copy, so a note added on a phone before the retry was taken for a local deletion. It now compares with the record of what the first try sent.
 - "Use these contacts" could switch a Microsoft connection to another account and then send the first account's waiting edits with the second account's sign-in.
 
+A third round found that a sync could still write into a connection made while it ran: the record of a new contact's upload, and the default address book, could point the new connection at the old server. Every write a sync makes is now conditional on its connection still being the account's.
+
 ## Code
 
 - **Provider:**

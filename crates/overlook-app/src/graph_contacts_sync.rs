@@ -258,8 +258,11 @@ fn create(store: &Store, account: &Account, connection: &ContactsConnection, ser
     let earlier = store.contact_card(&account.id, contact_id).ok().flatten();
     if earlier.is_none() {
         let record = ContactCard { contact_id: contact_id.to_owned(), address_book: String::new(), url: String::new(), etag: String::new(), base: contact.clone() };
-        if let Err(error) = store.save_contact_card(&account.id, &record) {
-            return Sent::Failed(error.to_string());
+        match store.save_contact_card(connection, &record) {
+            Ok(true) => {}
+            // Disconnected or connected again meanwhile: the next sync sends it there.
+            Ok(false) => return Sent::Retry(GraphError::ConnectionChanged),
+            Err(error) => return Sent::Failed(error.to_string()),
         }
     }
     match create_once(server, contact_id, &contact, earlier.as_ref().map(|card| &card.base)) {

@@ -65,6 +65,9 @@ pub enum GraphError {
     Rejected(String),
     #[error("Microsoft answered with HTTP {0}.")]
     UnexpectedStatus(u16),
+    /// The connection was disconnected or made again while a sync ran; that sync stops.
+    #[error("The contacts connection changed during the sync.")]
+    ConnectionChanged,
 }
 
 fn nullable_vec<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Vec<T>, D::Error> {

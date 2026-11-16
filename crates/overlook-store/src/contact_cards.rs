@@ -109,9 +109,15 @@ impl Store {
         })
     }
 
-    pub fn set_contacts_default_book(&self, account: &AccountId, book: &str) -> Result<()> {
+    /// Sets (or, with `None`, forgets) the address book new contacts go to, while `connection`
+    /// is still the account's: a sync of a connection replaced meanwhile mustn't point the new
+    /// one at the old server's book.
+    pub fn set_contacts_default_book(&self, connection: &ContactsConnection, book: Option<&str>) -> Result<()> {
         self.with_conn(|c| {
-            c.execute("UPDATE contact_connections SET default_book=?2 WHERE account_id=?1", params![account.0, book])?;
+            c.execute(
+                "UPDATE contact_connections SET default_book=?5 WHERE account_id=?1 AND server_url=?2 AND username=?3 AND created_at=?4",
+                params![connection.account_id.0, connection.server_url, connection.username, connection.connected_at, book],
+            )?;
             Ok(())
         })
     }
@@ -205,10 +211,19 @@ impl Store {
 
     /// Records where a contact added here is being sent, and what is sent, before the request
     /// goes: if the reply is lost, the retry knows both. Its version stays empty until the
-    /// server's copy is read.
-    pub fn save_contact_card(&self, account: &AccountId, card: &ContactCard) -> Result<()> {
+    /// server's copy is read. Returns `false`, saving nothing, once `connection` is no longer
+    /// the account's, so a sync of a replaced connection leaves no record pointing at its
+    /// server.
+    pub fn save_contact_card(&self, connection: &ContactsConnection, card: &ContactCard) -> Result<bool> {
+        let account = &connection.account_id;
         ensure_same_account(&card.base.account_id, account, "contact")?;
-        self.with_tx(|tx| upsert_card_tx(tx, account, card))
+        self.with_tx(|tx| {
+            if !connected_tx(tx, connection)? {
+                return Ok(false);
+            }
+            upsert_card_tx(tx, account, card)?;
+            Ok(true)
+        })
     }
 
     pub fn delete_contact_card(&self, account: &AccountId, contact_id: &str) -> Result<()> {
@@ -429,6 +444,27 @@ mod tests {
         assert!(store.contact_cards(&account).unwrap().is_empty());
         store.apply_contact_download(&again, &[card(&account, 1, "Maya")]).unwrap();
         assert_eq!(store.contact_cards(&account).unwrap().len(), 1, "the current connection's results are saved");
+    }
+
+    #[test]
+    fn a_replaced_connections_sync_writes_nothing_into_the_new_one() {
+        let (store, account) = store();
+        let old = connect(&store, &account);
+        store.remove_contacts_connection(&account).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        // Made again with the same server and user name: still another connection.
+        let new = connect(&store, &account);
+        let local = Contact::new_local(account.clone(), 10);
+        let record = ContactCard { contact_id: local.id.clone(), address_book: "https://dav.example.test/book/".into(), url: "https://dav.example.test/book/x.vcf".into(), etag: String::new(), base: local };
+        assert!(!store.save_contact_card(&old, &record).unwrap());
+        assert!(store.contact_cards(&account).unwrap().is_empty());
+        store.set_contacts_default_book(&old, Some("https://dav.example.test/old-book/")).unwrap();
+        assert_eq!(store.contacts_connection(&account).unwrap().unwrap().default_book, None);
+        assert!(store.save_contact_card(&new, &record).unwrap());
+        store.set_contacts_default_book(&new, Some("https://dav.example.test/book/")).unwrap();
+        assert_eq!(store.contacts_connection(&account).unwrap().unwrap().default_book.as_deref(), Some("https://dav.example.test/book/"));
+        store.set_contacts_default_book(&new, None).unwrap();
+        assert_eq!(store.contacts_connection(&account).unwrap().unwrap().default_book, None);
     }
 
     #[test]

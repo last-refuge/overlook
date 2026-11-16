@@ -344,7 +344,7 @@ fn default_book(store: &Store, connection: &ContactsConnection, server: &dyn Con
     }
     let books = server.address_books().map_err(Sent::from)?;
     let book = choose_default_book(&books).ok_or_else(|| Sent::Failed("There’s no address book here that new contacts can be added to.".into()))?;
-    let _ = store.set_contacts_default_book(&connection.account_id, &book);
+    let _ = store.set_contacts_default_book(connection, Some(&book));
     Ok(book)
 }
 
@@ -380,8 +380,11 @@ fn create(store: &Store, account: &Account, connection: &ContactsConnection, ser
             };
             let url = card_url(&book, &new_card_uid(contact_id));
             let record = ContactCard { contact_id: contact_id.to_owned(), address_book: book.clone(), url: url.clone(), etag: String::new(), base: contact.clone() };
-            if let Err(error) = store.save_contact_card(&account.id, &record) {
-                return Sent::Failed(error.to_string());
+            match store.save_contact_card(connection, &record) {
+                Ok(true) => {}
+                // Disconnected or connected elsewhere meanwhile: the next sync sends it there.
+                Ok(false) => return Sent::Retry(CardDavError::InvalidConfiguration("The contacts connection changed during the sync.")),
+                Err(error) => return Sent::Failed(error.to_string()),
             }
             (book, url)
         }
@@ -401,7 +404,7 @@ fn create(store: &Store, account: &Account, connection: &ContactsConnection, ser
         Ok(WriteOutcome::Missing) => {
             // The address book is gone: find another next time.
             let _ = store.delete_contact_card(&account.id, contact_id);
-            let _ = store.save_contacts_connection(&ContactsConnection { default_book: None, ..connection.clone() });
+            let _ = store.set_contacts_default_book(connection, None);
             Sent::Retry(CardDavError::UnexpectedStatus(404))
         }
         Err(error) => error.into(),
@@ -509,7 +512,7 @@ fn pull(store: &Store, account: &Account, connection: &ContactsConnection, serve
     let still_there = connection.default_book.as_ref().is_some_and(|b| snapshot.address_books.iter().any(|a| &a.url == b && a.writable));
     if !still_there {
         if let Some(book) = choose_default_book(&snapshot.address_books) {
-            let _ = store.set_contacts_default_book(&account.id, &book);
+            let _ = store.set_contacts_default_book(connection, Some(&book));
         }
     }
     Ok(cards.len())
