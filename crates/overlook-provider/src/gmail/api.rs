@@ -44,9 +44,9 @@ pub type InvalidationSink = Box<dyn Fn() + Send + Sync>;
 // Session limits are shared with Microsoft sign-ins; see `crate::oauth`.
 pub use crate::oauth::{session_expiry, session_idle_expired, SessionExpiry, SESSION_IDLE_LIMIT_MS, SESSION_MAX_AGE_MS};
 
-/// Minimum spacing between requests. Gmail meters usage in quota units per user per minute;
-/// a `messages.get` costs 5 units, so 6 requests per second stays well inside the default
-/// allowance while keeping a 150-message download under half a minute.
+/// Minimum spacing between requests, on top of the quota budget (`quota.rs`), which is what
+/// keeps an account under Google's per-minute limit; this only stops a run of cheap calls
+/// from arriving all at once.
 pub const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(170);
 
 pub struct GmailClient {
@@ -60,6 +60,9 @@ pub struct GmailClient {
     session_lock: Mutex<()>,
     active: AtomicBool,
     api_base: String,
+    batch_url: String,
+    /// The account's share of Google's per-user quota; see `quota.rs`.
+    budget: super::quota::QuotaBudget,
 }
 
 impl GmailClient {
@@ -77,7 +80,7 @@ impl GmailClient {
             .timeout_global(Some(Duration::from_secs(40)))
             .build()
             .into();
-        Self { config, tokens: Mutex::new(tokens), on_tokens, on_invalidated: None, agent, last_request: Mutex::new(None), session_lock: Mutex::new(()), active: AtomicBool::new(true), api_base: API_BASE.into() }
+        Self { config, tokens: Mutex::new(tokens), on_tokens, on_invalidated: None, agent, last_request: Mutex::new(None), session_lock: Mutex::new(()), active: AtomicBool::new(true), api_base: API_BASE.into(), batch_url: BATCH_URL.into(), budget: super::quota::QuotaBudget::new() }
     }
 
     pub fn with_on_invalidated(mut self, sink: InvalidationSink) -> Self {
@@ -201,6 +204,7 @@ impl GmailClient {
     #[cfg(any(test, feature = "fake-servers"))]
     pub fn with_test_endpoint(mut self, endpoint: String) -> Self {
         assert!(endpoint.starts_with("http://127.0.0.1:"));
+        self.batch_url = format!("{endpoint}/batch");
         self.api_base = endpoint;
         self.agent = ureq::Agent::config_builder().http_status_as_error(false).https_only(false).max_redirects(0).timeout_global(Some(Duration::from_secs(5))).build().into();
         self
@@ -218,8 +222,17 @@ impl GmailClient {
         format!("?{}", query.iter().map(|(k, v)| format!("{k}={}", url_encode(v))).collect::<Vec<_>>().join("&"))
     }
 
+    /// What a request to `url` costs against the account's Gmail quota: nothing for the
+    /// Calendar and People APIs, which Google meters separately.
+    fn cost(&self, method: &str, url: &str) -> u32 {
+        match url.strip_prefix(self.api_base.as_str()) {
+            Some(rest) => super::quota::cost(method, rest.trim_start_matches('/')),
+            None => 0,
+        }
+    }
+
     pub fn get_url(&self, url: &str) -> Result<serde_json::Value, ApiError> {
-        self.with_retry(|token| {
+        self.with_retry(self.cost("GET", url), |token| {
             self.agent
                 .get(url)
                 .header("Authorization", &format!("Bearer {token}"))
@@ -229,7 +242,7 @@ impl GmailClient {
     }
 
     pub fn post_url(&self, url: &str, body: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
-        self.with_retry(|token| {
+        self.with_retry(self.cost("POST", url), |token| {
             self.agent
                 .post(url)
                 .header("Authorization", &format!("Bearer {token}"))
@@ -239,7 +252,7 @@ impl GmailClient {
     }
 
     pub fn patch_url(&self, url: &str, body: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
-        self.with_retry(|token| {
+        self.with_retry(self.cost("PATCH", url), |token| {
             self.agent
                 .patch(url)
                 .header("Authorization", &format!("Bearer {token}"))
@@ -249,7 +262,7 @@ impl GmailClient {
     }
 
     pub fn put_url(&self, url: &str, body: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
-        self.with_retry(|token| {
+        self.with_retry(self.cost("PUT", url), |token| {
             self.agent
                 .put(url)
                 .header("Authorization", &format!("Bearer {token}"))
@@ -259,7 +272,7 @@ impl GmailClient {
     }
 
     pub fn delete_url(&self, url: &str) -> Result<serde_json::Value, ApiError> {
-        self.with_retry(|token| {
+        self.with_retry(self.cost("DELETE", url), |token| {
             self.agent
                 .delete(url)
                 .header("Authorization", &format!("Bearer {token}"))
@@ -269,7 +282,22 @@ impl GmailClient {
     }
 
     /// Runs the request, refreshing the token once on 401 and mapping statuses to errors.
+    /// `cost` is spent from the quota budget first, outside the session lock, so a request
+    /// waiting for quota doesn't hold up one that has it.
     fn with_retry(
+        &self,
+        cost: u32,
+        request: impl Fn(&str) -> Result<ureq::http::Response<ureq::Body>, ApiError>,
+    ) -> Result<serde_json::Value, ApiError> {
+        self.budget.spend(cost);
+        let result = self.send_with_retry(request);
+        if matches!(result, Err(ApiError::RateLimited(_))) {
+            self.budget.exhausted();
+        }
+        result
+    }
+
+    fn send_with_retry(
         &self,
         request: impl Fn(&str) -> Result<ureq::http::Response<ureq::Body>, ApiError>,
     ) -> Result<serde_json::Value, ApiError> {
@@ -320,10 +348,25 @@ impl GmailClient {
     /// relative to `users/me` (for example `messages/abc?format=full`). The outer result is the
     /// request itself; each inner result is that call's own outcome, in the order given.
     pub fn batch_get(&self, paths: &[String]) -> Result<Vec<Result<serde_json::Value, ApiError>>, ApiError> {
-        let _session = self.session_lock.lock().unwrap();
         if paths.is_empty() {
             return Ok(Vec::new());
         }
+        // Each call in a batch counts on its own against the quota.
+        self.budget.spend(paths.iter().map(|p| super::quota::cost("GET", p)).sum());
+        let result = self.send_batch(paths);
+        let limited = match &result {
+            Err(ApiError::RateLimited(_)) => true,
+            Ok(parts) => parts.iter().any(|p| matches!(p, Err(ApiError::RateLimited(_)))),
+            Err(_) => false,
+        };
+        if limited {
+            self.budget.exhausted();
+        }
+        result
+    }
+
+    fn send_batch(&self, paths: &[String]) -> Result<Vec<Result<serde_json::Value, ApiError>>, ApiError> {
+        let _session = self.session_lock.lock().unwrap();
         let boundary = format!("overlook_batch_{}", overlook_core::time::now());
         let mut body = String::new();
         for (i, path) in paths.iter().enumerate() {
@@ -335,7 +378,7 @@ impl GmailClient {
             self.throttle();
             let mut response = self
                 .agent
-                .post(BATCH_URL)
+                .post(&self.batch_url)
                 .header("Authorization", &format!("Bearer {token}"))
                 .header("Content-Type", &format!("multipart/mixed; boundary={boundary}"))
                 .send(body.as_bytes())

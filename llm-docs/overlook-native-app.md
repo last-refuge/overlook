@@ -299,10 +299,10 @@ colour choices (by design), and underline, which Markdown has no mark for.
   banner shows "Overlook X is installed. Restart to start using it." `updater::installed_exe()` strips
   the ` (deleted)` suffix, which `current_exe()` keeps, so Restart works after a pacman upgrade.
 - **Reminders** have Snooze 5 min on the in-app toast; a snoozed reminder returns once.
-- **Gmail batch endpoint.** `GmailClient::batch_get` sends up to 20 `messages.get` calls in one
-  multipart request to `batch/gmail/v1`; `fetch_messages` uses it for every multi-message download (first
-  sync, backlog, online search). Per-part 429s surface as `RateLimited` like before; quota units are unchanged,
-  round trips are twenty times fewer.
+- **Gmail batch endpoint.** `GmailClient::batch_get` sends several `messages.get` calls in one multipart
+  request to `batch/gmail/v1` (10 full messages or 30 header-only ones per batch, see below); every
+  multi-message download uses it. Per-part 429s surface as `RateLimited`. Each call in a batch still counts
+  on its own against the quota; batches only save round trips.
 - **PDF previews** render through poppler's `pdftoppm` (`pdf_preview.rs`, cached under
   `~/.cache/overlook/pdf/` by path, size and mtime; first 40 pages at 1400 px; first-page thumbnails on cards).
   Without `pdftoppm` the card opens the system viewer and says what to install.
@@ -338,10 +338,55 @@ pipeline. `cargo run -p overlook-core --example sanitize_dump -- file.html` insp
 1. Create a Google Cloud OAuth client of type **Desktop app** with the Gmail API enabled and the scopes `gmail.modify`, `gmail.send`, `openid`, `userinfo.email` on the consent screen (Testing mode with test users is fine for development; restricted-scope verification is needed for public release).
 2. Save the downloaded JSON as `~/.config/overlook/google-oauth-client.json` (owner-only permissions). It is never embedded in the binary or committed.
 3. In Overlook open the account menu (chevron button at the bottom of the sidebar) → **Add Gmail account…**, or launch with `OVERLOOK_SIGN_IN=gmail`. The system browser opens Google's consent screen; Overlook listens on a loopback port with PKCE, exchanges the code, reads the user's email, and stores tokens in the system keyring (Secret Service via `oo7`). Tokens refresh automatically; a revoked grant turns into the **Sign-in required** state with a "Sign in again" action, and local work is kept.
-4. The first sync lists the 150 most recent messages (ids only, cheap), then downloads full bodies in batches of 20, committing after every batch. The backlog is persisted (`settings` key `download_backlog:<account>`), so quota pauses, going offline, or a crash never lose progress. Later syncs use `users.history.list` from the saved checkpoint; an expired checkpoint triggers a full resynchronization that preserves pending local intent.
+4. The first sync lists the 150 most recent messages (ids only, cheap), lists them by their headers (`format=metadata`) so the message list fills within the first batch, then downloads full bodies. Later syncs read `users.history.list` from the saved checkpoint; an expired checkpoint triggers a full resynchronization that preserves pending local intent. See **Catching up** below.
 5. Mailbox actions map to `batchModify` (UNREAD/STARRED/INBOX/user labels) and `messages.trash`/`untrash`. Send builds RFC 822 with threading headers (lettre) and posts to `messages.send`; a transport failure after the request is **uncertain** and is reconciled with `rfc822msgid:` before any retry.
 
-Gmail meters usage in quota units per user per minute. Overlook spaces requests about 170 ms apart and, when Gmail still answers with a quota error, enters the **Paused** state and backs off (60 s, growing to 5 minutes) instead of hammering the API. In a fresh project the observed budget allowed roughly 40 full-message downloads per minute, so a first download of 150 messages can take a few minutes. Check **APIs & Services → Gmail API → Quotas** in Google Cloud if downloads pause often.
+### Quota
+
+Gmail meters usage in quota units per user per minute. Since May 2026 the limit for new projects is
+**6,000 units per user per minute**, and calls are priced by Google
+([quota table](https://developers.google.com/workspace/gmail/api/reference/quota)): `messages.get` 60 in
+full (`full`/`raw`/`html`), 20 for `metadata`/`minimal`; `history.list` 2; `labels.list` and `getProfile` 1;
+`messages.list` 5; `messages.attachments.get` 20; `batchModify` 50; `messages.send` 100. A full download is
+therefore at most 100 messages a minute. `gmail/quota.rs` holds the price list (`quota::cost`, by method and
+path; Calendar and People URLs cost nothing, they have their own quotas) and a per-account token bucket
+(`QuotaBudget`, one per `GmailClient`): 80 units/s up to a burst of 1,000, so no minute spends more than 5,800.
+Every request spends its cost before it takes the session lock. Work inside `overlook_provider::as_background`
+(the sync engine's `download`) also leaves a 400-unit reserve, so opening or sending a message never queues
+behind a catch-up. A 429 empties the bucket. The sync engine then shows **Paused** and retries after 65
+seconds, when the minute has passed; queued work is kept, not repeated.
+
+### Catching up
+
+Google's own sync guide says to download a message in full once, and afterwards only follow its labels.
+`GmailProvider::fetch_changes` therefore reads the history (`HistoryReplay`) and downloads nothing:
+
+- Label changes become `RemoteChanges::relabeled` with the labels they leave (`mapping::label_state`, shared
+  with full downloads). The entry's message `labelIds`, when given, are taken as its labels, and the entry's
+  own added/removed labels are applied on top. That is right whether or not they already include the change.
+  `sync::apply_relabels` updates stored copies in place through `merge_remote_messages`, so pending local
+  changes still win. A stored message whose change came without labels goes to the `refresh_headers:<account>`
+  queue. One not stored is fetched only if it is now in the Inbox or Starred.
+- New messages (not drafts or chats, and not deleted in the same window) become `to_download`, Inbox first,
+  then newest first (Gmail ids grow over time).
+- Deletions apply at once. The checkpoint then moves past everything read, so a quota stop never makes the
+  next sync re-read or re-download anything.
+
+`sync::queue_downloads` puts new mail at the head of the queues, keeping the newest `CATCH_UP_LIMIT` (1,000);
+older ones stay on the server for online search. Up to `DIRECT_DOWNLOAD` (25) download in full straight
+away. With more, and a provider whose headers cost less (`MailProvider::has_cheap_headers`, only Gmail), they
+are first listed through `download_headers:<account>` (`fetch_headers`, 30 per batch) and their bodies follow
+from `download_backlog:<account>` (10 per batch). Every batch commits on its own. A sync downloads for at most
+`DOWNLOAD_SLICE` (20 s), then hands back with `SyncOutcome::more_to_download`, and the window starts the next
+sync at once. The user's own changes go out between slices, and the quota budget paces the whole thing.
+Opening a message whose body hasn't arrived downloads it at once, at normal priority
+(`MailWindow::fetch_missing_bodies`), and takes it out of the queues (`sync::dequeue`); meanwhile the reader
+says "Downloading this message…". The status bar shows "Downloading N messages…" while the queue drains, and
+"Last synced" names the day when it wasn't today.
+
+A five-day absence with a few hundred new messages costs about 2 units in history, a few hundred × 20 for
+headers (listed within a minute or two), then × 60 for bodies in the background. Label churn costs nothing.
+Check **APIs & Services → Gmail API → Quotas** in Google Cloud if downloads pause often.
 
 Environment switches for development:
 

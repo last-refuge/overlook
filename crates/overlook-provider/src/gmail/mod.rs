@@ -5,6 +5,7 @@
 //! - `mapping`: Gmail JSON to Overlook's domain types. Outgoing RFC 822 bytes for
 //!   `messages.send` come from the shared `crate::outgoing` builder.
 //! - `provider`: the `MailProvider` implementation.
+//! - `quota`: what each call costs and the budget that keeps an account under Google's limit.
 
 pub mod api;
 pub mod calendar;
@@ -12,6 +13,7 @@ pub mod mapping;
 mod drafts;
 pub mod oauth;
 pub mod provider;
+pub mod quota;
 
 pub use api::GmailClient;
 pub use oauth::{AuthorizationRequest, ClientConfig, OAuthTokens, Pkce, UserInfo};

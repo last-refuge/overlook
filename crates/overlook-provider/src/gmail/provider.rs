@@ -27,6 +27,112 @@ pub const INITIAL_VIEWS: &[(&str, usize)] = &[
     ("in:spam", 10),
 ];
 
+/// Full messages per batch request: 10 × 60 quota units stays inside the budget's burst
+/// (`quota.rs`), so a batch never waits for more than the bucket holds.
+const FULL_BATCH: usize = 10;
+/// Header-only messages (`format=metadata`, 20 units) per batch request.
+const HEADER_BATCH: usize = 30;
+
+/// Gmail's change history, replayed in order: what happened to each message since the
+/// checkpoint.
+#[derive(Default)]
+struct HistoryReplay {
+    /// Per Gmail id: whether it arrived in this window, and its labels as last reported
+    /// (`None` until a record carries them).
+    seen: HashMap<String, Seen>,
+    deleted: BTreeSet<String>,
+}
+
+#[derive(Default)]
+struct Seen {
+    added: bool,
+    relabeled: bool,
+    labels: Option<BTreeSet<String>>,
+}
+
+impl HistoryReplay {
+    fn is_empty(&self) -> bool {
+        self.seen.is_empty() && self.deleted.is_empty()
+    }
+
+    fn record(&mut self, record: &Value) {
+        let entries = |key: &str| record.get(key).and_then(|a| a.as_array()).cloned().unwrap_or_default();
+        for entry in entries("messagesAdded") {
+            self.change(&entry, true, &[], &[]);
+        }
+        for entry in entries("labelsAdded") {
+            let added = strings(entry.get("labelIds"));
+            self.change(&entry, false, &added, &[]);
+        }
+        for entry in entries("labelsRemoved") {
+            let removed = strings(entry.get("labelIds"));
+            self.change(&entry, false, &[], &removed);
+        }
+        for entry in entries("messagesDeleted") {
+            if let Some(id) = entry.get("message").and_then(|m| m.get("id")).and_then(|i| i.as_str()) {
+                self.deleted.insert(id.to_owned());
+            }
+        }
+    }
+
+    /// One history entry for a message. The message's own `labelIds`, when given, are its
+    /// labels; the entry's added or removed labels go on top, which changes nothing if they
+    /// already include the change and is right if they predate it.
+    fn change(&mut self, entry: &Value, added: bool, add: &[String], remove: &[String]) {
+        let Some(message) = entry.get("message") else { return };
+        let Some(id) = message.get("id").and_then(|i| i.as_str()) else { return };
+        let seen = self.seen.entry(id.to_owned()).or_default();
+        seen.added |= added;
+        seen.relabeled |= !added;
+        if let Some(labels) = message.get("labelIds").and_then(|l| l.as_array()) {
+            seen.labels = Some(labels.iter().filter_map(|l| l.as_str().map(str::to_owned)).collect());
+        }
+        if let Some(labels) = seen.labels.as_mut() {
+            labels.extend(add.iter().cloned());
+            for label in remove {
+                labels.remove(label);
+            }
+        }
+    }
+
+    /// Label changes for messages that were already there, the new messages to download
+    /// (Inbox first, then newest first; drafts and chats left out), and the deletions.
+    fn finish(self, index: &HashMap<String, LabelId>) -> (Vec<crate::Relabel>, Vec<String>, Vec<String>) {
+        let mut relabeled = Vec::new();
+        let mut new: Vec<(bool, String)> = Vec::new();
+        for (id, seen) in self.seen {
+            if self.deleted.contains(&id) {
+                continue;
+            }
+            let has = |name: &str| seen.labels.as_ref().is_some_and(|l| l.contains(name));
+            if seen.added {
+                if !has("DRAFT") && !has("CHAT") {
+                    new.push((has("INBOX"), id));
+                }
+            } else if seen.relabeled {
+                let state = seen.labels.as_ref().map(|l| mapping::label_state(&l.iter().collect::<Vec<_>>(), index));
+                relabeled.push(crate::Relabel { provider_id: ProviderId(id), state });
+            }
+        }
+        // Gmail ids grow over time, so the largest is the newest.
+        new.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| newest_first(&a.1, &b.1)));
+        relabeled.sort_by(|a, b| newest_first(&a.provider_id.0, &b.provider_id.0));
+        (relabeled, new.into_iter().map(|(_, id)| id).collect(), self.deleted.into_iter().collect())
+    }
+}
+
+fn strings(v: Option<&Value>) -> Vec<String> {
+    v.and_then(|a| a.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default()
+}
+
+/// Orders Gmail ids (hexadecimal, growing over time) newest first.
+fn newest_first(a: &str, b: &str) -> std::cmp::Ordering {
+    match (u64::from_str_radix(a, 16), u64::from_str_radix(b, 16)) {
+        (Ok(x), Ok(y)) => y.cmp(&x),
+        _ => b.len().cmp(&a.len()).then_with(|| b.cmp(a)),
+    }
+}
+
 pub struct GmailProvider {
     client: Arc<GmailClient>,
     initial_messages: usize,
@@ -101,6 +207,30 @@ impl GmailProvider {
             }
         }
         message
+    }
+
+    /// Downloads `ids` through the batch endpoint, `chunk` at a time. Messages that no
+    /// longer exist are skipped. `finish` also fetches a calendar part Gmail left as an
+    /// attachment (full downloads only).
+    fn fetch_batched(&self, account: &Account, ids: &[String], format: &str, chunk: usize, index: &HashMap<String, LabelId>, finish: bool) -> Result<Vec<Message>, ProviderError> {
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(chunk) {
+            let paths: Vec<String> = chunk.iter().map(|id| format!("messages/{id}?format={format}")).collect();
+            let results = self.client.batch_get(&paths)?;
+            for (id, result) in chunk.iter().zip(results) {
+                match result {
+                    Ok(v) => {
+                        let message = message_from_json(account, &v, index);
+                        if let Some(m) = if finish { self.finish_message(message, id) } else { message } {
+                            out.push(m);
+                        }
+                    }
+                    Err(ApiError::NotFound) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Lists ids for every view in [`INITIAL_VIEWS`], newest first, de-duplicated.
@@ -436,41 +566,34 @@ impl MailProvider for GmailProvider {
         let ids: Vec<String> = ids.iter().map(|p| p.0.clone()).collect();
         let index = Self::label_index(labels);
         Box::pin(async move {
-            let mut out = Vec::with_capacity(ids.len());
             if ids.len() == 1 {
-                if let Some(m) = self.fetch_message(&account, &ids[0], &index)? {
-                    out.push(m);
-                }
-                return Ok(out);
+                return Ok(self.fetch_message(&account, &ids[0], &index)?.into_iter().collect());
             }
-            // One HTTP request per batch instead of one per message.
-            for chunk in ids.chunks(super::api::BATCH_SIZE) {
-                let paths: Vec<String> = chunk.iter().map(|id| format!("messages/{id}?format=full")).collect();
-                let results = self.client.batch_get(&paths)?;
-                for (id, result) in chunk.iter().zip(results) {
-                    match result {
-                        Ok(v) => {
-                            if let Some(m) = self.finish_message(message_from_json(&account, &v, &index), id) {
-                                out.push(m);
-                            }
-                        }
-                        Err(ApiError::NotFound) => {}
-                        Err(e) => return Err(e.into()),
-                    }
-                }
-            }
-            Ok(out)
+            self.fetch_batched(&account, &ids, "full", FULL_BATCH, &index, true)
         })
     }
 
-    fn fetch_changes(&self, account: &Account, checkpoint: &str) -> BoxFuture<'_, Result<RemoteChanges, ProviderError>> {
+    fn has_cheap_headers(&self) -> bool {
+        true
+    }
+
+    fn fetch_headers(&self, account: &Account, ids: &[ProviderId], labels: &[Label]) -> BoxFuture<'_, Result<Vec<Message>, ProviderError>> {
         let account = account.clone();
+        let ids: Vec<String> = ids.iter().map(|p| p.0.clone()).collect();
+        let index = Self::label_index(labels);
+        Box::pin(async move { self.fetch_batched(&account, &ids, "metadata", HEADER_BATCH, &index, false) })
+    }
+
+    /// Reads Gmail's change history since `checkpoint` and reports it without downloading a
+    /// single message: deletions, label changes with the labels they leave (applied to stored
+    /// copies as they are), and the new messages to download, Inbox first and newest first.
+    /// History costs 2 quota units a page of up to 500 changes, so even a long absence costs
+    /// little here; the downloads are queued and paced by the sync engine.
+    fn fetch_changes(&self, account: &Account, checkpoint: &str) -> BoxFuture<'_, Result<RemoteChanges, ProviderError>> {
         let checkpoint = checkpoint.to_owned();
+        let account = account.clone();
         Box::pin(async move {
-            let mut added: BTreeSet<String> = BTreeSet::new();
-            let mut changed: BTreeSet<String> = BTreeSet::new();
-            let mut deleted: BTreeSet<String> = BTreeSet::new();
-            let mut labels_touched = false;
+            let mut history = HistoryReplay::default();
             let mut new_checkpoint = checkpoint.clone();
             let mut page: Option<String> = None;
             loop {
@@ -487,55 +610,26 @@ impl MailProvider for GmailProvider {
                     new_checkpoint = h.to_owned();
                 }
                 for record in v.get("history").and_then(|h| h.as_array()).into_iter().flatten() {
-                    let ids_in = |key: &str| -> Vec<String> {
-                        record
-                            .get(key)
-                            .and_then(|a| a.as_array())
-                            .map(|a| a.iter().filter_map(|x| x.get("message").and_then(|m| m.get("id")).and_then(|i| i.as_str()).map(str::to_owned)).collect())
-                            .unwrap_or_default()
-                    };
-                    added.extend(ids_in("messagesAdded"));
-                    deleted.extend(ids_in("messagesDeleted"));
-                    let label_changes: Vec<String> = ids_in("labelsAdded").into_iter().chain(ids_in("labelsRemoved")).collect();
-                    if !label_changes.is_empty() {
-                        labels_touched = true;
-                    }
-                    changed.extend(label_changes);
+                    history.record(record);
                 }
                 page = v.get("nextPageToken").and_then(|t| t.as_str()).map(str::to_owned);
                 if page.is_none() {
                     break;
                 }
             }
-            for id in &deleted {
-                added.remove(id);
-                changed.remove(id);
-            }
-            let labels = if labels_touched || !added.is_empty() { Some(self.labels(&account)?) } else { None };
-            let index = match &labels {
-                Some(l) => Self::label_index(l),
-                None => HashMap::new(),
-            };
-            let mut upserts = Vec::new();
-            for id in added.iter().chain(changed.iter()) {
-                match self.fetch_message(&account, id, &index) {
-                    Ok(Some(m)) => upserts.push(m),
-                    Ok(None) => {}
-                    Err(e) => {
-                        warn!("gmail: could not fetch {id}: {e:?}");
-                        return Err(e.into());
-                    }
-                }
+            let labels = if history.is_empty() { None } else { Some(self.labels(&account)?) };
+            let index = labels.as_deref().map(Self::label_index).unwrap_or_default();
+            let (relabeled, to_download, deleted) = history.finish(&index);
+            if !to_download.is_empty() || !relabeled.is_empty() {
+                info!("gmail: {} new, {} relabeled, {} deleted since the last sync", to_download.len(), relabeled.len(), deleted.len());
             }
             Ok(RemoteChanges {
                 labels,
-                upserts,
                 deleted: deleted.iter().map(|id| mapping::local_message_id(&account.id, id)).collect(),
-                message_ids: Vec::new(),
-                deleted_provider_ids: Vec::new(),
                 checkpoint: Some(new_checkpoint),
-                complete: None,
-                untracked: Vec::new(),
+                relabeled,
+                to_download: to_download.into_iter().map(ProviderId).collect(),
+                ..Default::default()
             })
         })
     }
@@ -864,5 +958,74 @@ fn with_inbox_spelling(full: &str, mut call: impl FnMut(&str) -> Result<serde_js
     match call(&format!("Inbox/{rest}")) {
         Err(ApiError::Client(400, _)) => call(&format!("INBOX/{rest}")),
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod catch_up_tests {
+    use super::*;
+
+    fn index() -> HashMap<String, LabelId> {
+        ["INBOX", "STARRED", "UNREAD", "Label_7"].iter().map(|l| (l.to_string(), LabelId(format!("gmail:j:{l}")))).collect()
+    }
+
+    fn replay(records: Value) -> (Vec<crate::Relabel>, Vec<String>, Vec<String>) {
+        let mut history = HistoryReplay::default();
+        for record in records.as_array().unwrap() {
+            history.record(record);
+        }
+        history.finish(&index())
+    }
+
+    #[test]
+    fn history_reports_label_results_without_downloads() {
+        let (relabeled, new, deleted) = replay(json!([
+            {"labelsRemoved": [{"message": {"id": "a1", "labelIds": ["INBOX"]}, "labelIds": ["UNREAD"]}]},
+            {"labelsAdded": [{"message": {"id": "a1", "labelIds": ["INBOX", "STARRED"]}, "labelIds": ["STARRED"]}]},
+            // A change reported without the message's labels: its stored copy is refreshed.
+            {"labelsAdded": [{"message": {"id": "a2"}, "labelIds": ["Label_7"]}]},
+        ]));
+        assert!(new.is_empty() && deleted.is_empty());
+        let a1 = relabeled.iter().find(|r| r.provider_id.0 == "a1").unwrap().state.clone().unwrap();
+        assert!(a1.is_read && a1.is_starred);
+        assert_eq!(a1.label_ids, [LabelId("gmail:j:INBOX".into()), LabelId("gmail:j:STARRED".into())].into_iter().collect());
+        assert_eq!(relabeled.iter().find(|r| r.provider_id.0 == "a2").unwrap().state, None);
+    }
+
+    #[test]
+    fn a_removal_applies_on_top_of_labels_that_predate_it() {
+        // Whether the entry's labelIds include its own change or not, the result is the same.
+        let (relabeled, _, _) = replay(json!([
+            {"labelsRemoved": [{"message": {"id": "b1", "labelIds": ["INBOX", "UNREAD"]}, "labelIds": ["INBOX"]}]},
+        ]));
+        let state = relabeled[0].state.clone().unwrap();
+        assert!(!state.label_ids.contains(&LabelId("gmail:j:INBOX".into())), "archived");
+        assert!(!state.is_read);
+    }
+
+    #[test]
+    fn new_mail_comes_inbox_first_then_newest_without_drafts_or_chats() {
+        let (relabeled, new, deleted) = replay(json!([
+            {"messagesAdded": [{"message": {"id": "00000000000000a0", "labelIds": ["CATEGORY_UPDATES"]}}]},
+            {"messagesAdded": [{"message": {"id": "00000000000000b0", "labelIds": ["INBOX", "UNREAD"]}}]},
+            {"messagesAdded": [{"message": {"id": "00000000000000c0", "labelIds": ["INBOX"]}}]},
+            {"messagesAdded": [{"message": {"id": "00000000000000d0", "labelIds": ["DRAFT"]}}]},
+            {"messagesAdded": [{"message": {"id": "00000000000000e0", "labelIds": ["CHAT"]}}]},
+            // Arrived and was deleted while Overlook was away: nothing to do.
+            {"messagesAdded": [{"message": {"id": "00000000000000f0", "labelIds": ["INBOX"]}}]},
+            {"messagesDeleted": [{"message": {"id": "00000000000000f0"}}]},
+            // Arrived, then was read: still just new mail, downloaded with its labels.
+            {"labelsRemoved": [{"message": {"id": "00000000000000b0", "labelIds": ["INBOX"]}, "labelIds": ["UNREAD"]}]},
+        ]));
+        assert_eq!(new, vec!["00000000000000c0", "00000000000000b0", "00000000000000a0"]);
+        assert!(relabeled.is_empty());
+        assert_eq!(deleted, vec!["00000000000000f0"]);
+    }
+
+    #[test]
+    fn gmail_ids_order_newest_first() {
+        let mut ids = vec!["1a1d59fd198400b3", "1a1e55a378b81bb3", "1a1d5993538c6e43"];
+        ids.sort_by(|a, b| newest_first(a, b));
+        assert_eq!(ids, vec!["1a1e55a378b81bb3", "1a1d59fd198400b3", "1a1d5993538c6e43"]);
     }
 }
