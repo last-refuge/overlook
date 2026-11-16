@@ -27,12 +27,12 @@ Overlook's preset used the full address for IMAP before this change, against App
 | Presets | `crates/overlook-provider/src/autoconfig.rs` | `preset()` takes a guided service's own settings first. For iCloud addresses the IMAP user name is now the name part and the SMTP user name is the full address. The old iCloud table row is gone. |
 | User name fallback | `ImapProvider::probe_user_names` | Signs in with each user name form in turn and returns the one accepted. A temporary failure stops it, so only refusals lead to another try. |
 | Setup dialog | `crates/overlook-app/src/ui/account_setup.rs` | Guided mode: the explanation, a **Create an app-specific password** button (`account.apple.com`), "App-specific password" as the field label with an `xxxx-xxxx-xxxx-xxxx` placeholder, Apple's settings without a lookup, the user name fallback in **Test connection**, and refusal hints. |
-| Entry points | sidebar account menu, Settings → Accounts → Add account, empty window, `OVERLOOK_SIGN_IN=icloud` | **Add iCloud account…** opens the guided dialog for any address, including a custom domain. |
+| Entry points | the add-account page (Settings → Accounts → Add account, the account menu's Add account…, a new install), `OVERLOOK_SIGN_IN=icloud` | The **iCloud Mail** card opens the guided dialog for any address, including a custom domain. |
 | Settings | `ui/settings.rs` | An iCloud account's connection line says an app-specific password is kept in the keyring. |
 
 ### How setup behaves
 
-1. **Add iCloud account…**, or an @icloud.com, @me.com or @mac.com address in the IMAP or POP3 dialog, puts the dialog in guided mode. A POP3 setup becomes IMAP and says why.
+1. The **iCloud Mail** choice, or an @icloud.com, @me.com or @mac.com address in the IMAP or POP3 dialog, puts the dialog in guided mode. A POP3 setup becomes IMAP and says why.
 2. **Continue** fills in Apple's settings directly. A custom-domain address keeps itself as both user names, with a note telling the person to use their iCloud Mail address instead, because Overlook can't know it.
 3. **Test connection** and **Add account** try the configured IMAP user name, then the other form (name part ↔ full address, or the name at @icloud.com for a custom domain). An accepted alternative replaces the user name field, and the check counts for the settings as they then read.
 4. A refused password adds iCloud's advice: Apple wants an app-specific password, not the Apple Account password, and a revoked one stops working. If the password doesn't have the shape of one (16 letters, in four hyphenated groups or none), the hint says so first. The shape check never blocks anything.

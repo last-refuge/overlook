@@ -32,7 +32,7 @@ Ordinary verification refuses Bridge's certificate, because no public authority 
 
 ### In the setup dialog
 
-1. **Add Proton account…** fills in Bridge's usual settings and asks for the Bridge password.
+1. The **Proton Mail** choice on the add-account page fills in Bridge's usual settings and asks for the Bridge password.
 2. **Add account** or **Test connection** fails on both servers before signing in. The test then reads each certificate again without signing in, and the dialog shows a panel: what the certificate is, the addresses and the SHA-256 fingerprint (one line when both servers share it, as Bridge's do), and **Trust certificate**.
 3. **Trust certificate** pins each certificate to its `host:port` and tests again. If the test was for saving, the account is saved when it passes.
 4. Settings can't be saved without a trusted certificate. Neither **Add anyway** nor **Save anyway** is offered while an encrypted server on this computer has none, and the button stays disabled. This covers adding an account, **Server settings…** and **Update password**. It applies to a refused certificate, including one that changed, and to a server that couldn't be reached to check one before any was trusted (Bridge not running). Only **Trust certificate**, or a test that passes, saves. A server whose certificate is trusted but which is only offline (Bridge quit) can still be saved anyway.
@@ -54,7 +54,7 @@ Two related changes apply to every account. A server name that resolves to sever
 | Guide | `crates/overlook-provider/src/app_passwords.rs` | `PROTON` in `GUIDES`: Proton's four address domains, Bridge's defaults, no POP3, and wording for the Bridge password. It lists no server host, because `127.0.0.1` could be any local bridge. |
 | Presets | `crates/overlook-provider/src/autoconfig.rs` | The Proton row of the preset table gave way to the guide. |
 | Folders | `crates/overlook-provider/src/imap/folders.rs` | An `\Archive` folder is the Archive even when an `\All` view is listed before it. |
-| Setup dialog | `crates/overlook-app/src/ui/account_setup.rs` | The certificate offer and **Trust certificate** flow above. **Add Proton account…** and `OVERLOOK_SIGN_IN=proton` come from the guide list. |
+| Setup dialog | `crates/overlook-app/src/ui/account_setup.rs` | The certificate offer and **Trust certificate** flow above. The **Proton Mail** card and `OVERLOOK_SIGN_IN=proton` come from the guide list. |
 | Settings | `crates/overlook-app/src/ui/settings.rs` | The connection line names the Bridge password and the trusted certificate. |
 
 ## Folders

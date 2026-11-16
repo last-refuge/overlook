@@ -273,7 +273,8 @@ impl MailWindow {
     }
 
     pub(crate) fn focus_current_module(&self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.has_account() {
+        // The add-account page has no module showing: its choices stay reachable by keyboard.
+        if !self.has_account() || self.adding_account.is_some() {
             self.focus_handle.focus(window, cx);
             return;
         }
