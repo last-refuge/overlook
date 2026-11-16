@@ -1126,6 +1126,11 @@ pub struct ContactsConnection {
     pub default_book: Option<String>,
     #[serde(default)]
     pub credential: ContactsCredential,
+    /// When this connection was made, as the store has it (0 until saved). A sync saves its
+    /// results only into the connection it started with: not one disconnected meanwhile, nor
+    /// one made again since, even at the same address.
+    #[serde(default)]
+    pub connected_at: Timestamp,
 }
 
 /// How a contacts connection signs in.

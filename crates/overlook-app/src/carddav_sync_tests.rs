@@ -122,8 +122,10 @@ fn setup() -> (Store, Account, ContactsConnection) {
     let store = Store::open_in_memory().unwrap();
     let account = Account { id: AccountId::from("imap:fastmail-fixture"), provider: ProviderKind::Imap, display_name: "Test".into(), email: "me@example.test".into(), created_at: 0 };
     store.upsert_account(&account).unwrap();
-    let connection = ContactsConnection { account_id: account.id.clone(), server_url: "https://contacts.example.test/".into(), username: "me@example.test".into(), default_book: None, credential: ContactsCredential::IncomingMail };
+    let connection = ContactsConnection { account_id: account.id.clone(), server_url: "https://contacts.example.test/".into(), username: "me@example.test".into(), default_book: None, credential: ContactsCredential::IncomingMail, connected_at: 0 };
     store.save_contacts_connection(&connection).unwrap();
+    // As a sync has it: read back, with the time it was made.
+    let connection = store.contacts_connection(&account.id).unwrap().unwrap();
     (store, account, connection)
 }
 
@@ -274,12 +276,17 @@ fn a_create_retried_after_a_lost_reply_finds_its_first_card() {
     *server.lose_reply.borrow_mut() = true;
     assert_eq!(sync(&store, &account, &conn, &server, false).unwrap_err(), CardDavError::Network);
     assert_eq!(server.cards.borrow().len(), 1);
+    // Edited again before the retry: the card made then is brought up to date, not taken as is.
+    let mut again = store.contact_by_id(&account.id, &sophie.id).unwrap().unwrap();
+    again.title = Some("Producer".into());
+    store.save_contact_locally(&account.id, &again).unwrap();
     sync(&store, &account, &connection(&store, &account), &server, true).unwrap();
     assert_eq!(server.cards.borrow().len(), 1, "no second copy");
     let url = server.cards.borrow().keys().next().unwrap().clone();
+    assert!(server.text(&url).contains("TITLE:Producer\r\n"), "{}", server.text(&url));
     let shown = store.contacts(&account.id).unwrap();
     assert_eq!(shown.len(), 1);
-    assert_eq!((shown[0].id.clone(), shown[0].pending), (format!("carddav:{url}"), false));
+    assert_eq!((shown[0].id.clone(), shown[0].title.as_deref(), shown[0].pending), (format!("carddav:{url}"), Some("Producer"), false));
     assert!(store.pending_operations(&account.id).unwrap().iter().all(|op| op.state == OperationState::Applied));
 }
 
@@ -319,7 +326,7 @@ fn contacts_downloaded_after_disconnecting_dont_come_back() {
     sync(&store, &account, &conn, &server, true).unwrap();
     assert!(store.contacts(&account.id).unwrap().is_empty());
     assert!(store.contact_cards(&account.id).unwrap().is_empty());
-    record_status(&store, &account.id, &conn.server_url, &ContactsStatus { error: None, at: 1 });
+    record_status(&store, &conn, &ContactsStatus { error: None, at: 1 });
     assert_eq!(status(&store, &account.id), None, "no status for a connection that's gone");
 }
 

@@ -55,7 +55,7 @@ Syncing works the same way for both kinds of server:
 - **When it runs:** inside the mail sync. Queued edits go first, then a complete download every 15 minutes, or at once after **Sync contacts now** or connecting.
 - **Errors:** kept for the Settings page and never change the mail sync's state.
 - **Downloads:** a download is complete or it is an error, so a failed listing never empties an address book.
-- **Disconnect:** results are saved only while the account is still connected to the same server, checked inside the transaction that saves them. A sync that finishes after Disconnect saves nothing.
+- **Disconnect:** results are saved only into the connection the sync started with: the same server, user name and time it was made, checked inside the transaction that saves them. A sync that finishes after Disconnect, or after connecting again (every Microsoft connection has the same address), saves nothing.
 - **Contact ids:** `carddav:<card URL>` or `graph:<contact URL>`. Contacts made here are `local:` until the server has them.
 
 ### CardDAV
@@ -67,7 +67,8 @@ Syncing works the same way for both kinds of server:
 - **Edits:** the change is worked out line by line against the server's current card, and the PUT is conditional (`If-Match`, or `If-None-Match: *` for a new card).
   - Fields Overlook doesn't show are never rewritten.
   - Each name part is merged on its own.
-- **New cards:** a new card's id is the local contact's id, so a retry after a lost reply finds the card the first try made.
+- **New cards:** a new card's id is the local contact's id, so a retry after a lost reply finds the card the first try made, and brings it up to date with any edit made since.
+- **One address, once:** changing a value to one another line already has removes that other line, so nothing is listed twice.
 
 ### Microsoft Graph
 
@@ -77,13 +78,17 @@ Syncing works the same way for both kinds of server:
   - Personal accounts need no change to the registration, because consent is asked for at sign-in. Work or school directories may require an administrator's approval; the error says so.
 - **Identity:** if the ID token names neither the account's address nor its incoming user name, the person is asked before those contacts are connected.
 - **Refresh:** the access token is renewed when it is within two minutes of expiring, and the renewed sign-in is saved. A refused renewal shows **Sign in again** on the Settings row; the contacts stay.
+- **Ending the sign-in:** Disconnect, Sign out, Remove account and a new contacts sign-in each end the old one first. A renewal still under way then doesn't save it back, using the same kind of generation check the mail sessions use.
 - **Reads:**
   - the default folder and its subfolders, one level down;
+  - every reply must carry its list of contacts, or the download is an error and the saved contacts stay;
   - only the fields shown (`$select`), 250 at a time;
   - page links are followed only within Graph.
 - **Edits:**
   - A PATCH of the fields that changed, worked out against the current copy.
   - The address and phone lists are rebuilt from the server's lists, changing only the edited entry.
+  - Only the shown address is edited. Clearing it removes that one address and keeps the others, and choosing one already on the contact moves it up instead of adding it twice.
+  - A phone the server no longer has (changed elsewhere meanwhile) isn't looked for: the new number goes where it overwrites nothing, the mobile if it's free, else the business list.
   - The display name follows the merged names.
   - Changes made elsewhere to other fields survive. When the same field was edited in both places, the edit here wins.
 - **New contacts:** POSTed to the default folder with an extended property that holds the local id. A retry looks that up first, and brings an earlier copy up to date instead of adding another.
@@ -110,6 +115,19 @@ Greptile's findings on the Fastmail pull request were fixed here, each with a te
 - A multiget reply that left a card out dropped it.
 - A name edit overwrote the other name part changed elsewhere.
 - Refused edits looked successful.
+
+## Review of PR #30
+
+Greptile's findings on this work, each fixed with a test:
+
+- A CardDAV create retried after a lost reply took the earlier card as it was, losing an edit made since.
+- Clearing the shown address in a Microsoft contact removed its other addresses too.
+- Choosing an address the contact already had listed it twice (Microsoft, and CardDAV as well).
+- An edit to a phone changed elsewhere meanwhile could overwrite the mobile number.
+- A renewal in Settings hid its error, and its "signed in as someone else" question, for a connected account.
+- A contacts sign-in renewed during Disconnect, Sign out or Remove account could be saved back.
+- A download from an earlier connection at the same address could be saved into a new one.
+- A Graph reply without its list of contacts counted as an empty address book.
 
 ## Code
 

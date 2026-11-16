@@ -115,8 +115,9 @@ fn setup() -> (Store, Account, ContactsConnection) {
     let store = Store::open_in_memory().unwrap();
     let account = Account { id: AccountId::from("imap:outlook-fixture"), provider: ProviderKind::Imap, display_name: "Test".into(), email: "mara@outlook-fixture.example".into(), created_at: 0 };
     store.upsert_account(&account).unwrap();
-    let connection = ContactsConnection { account_id: account.id.clone(), server_url: graph::GRAPH_CONTACTS_URL.into(), username: account.email.clone(), default_book: None, credential: ContactsCredential::Microsoft };
+    let connection = ContactsConnection { account_id: account.id.clone(), server_url: graph::GRAPH_CONTACTS_URL.into(), username: account.email.clone(), default_book: None, credential: ContactsCredential::Microsoft, connected_at: 0 };
     store.save_contacts_connection(&connection).unwrap();
+    let connection = store.contacts_connection(&account.id).unwrap().unwrap();
     (store, account, connection)
 }
 

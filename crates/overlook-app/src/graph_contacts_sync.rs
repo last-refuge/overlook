@@ -17,7 +17,28 @@ use overlook_provider::microsoft::contacts::{self as graph, GraphContact, GraphC
 use overlook_provider::microsoft::oauth::{self, AuthError};
 use overlook_store::Store;
 use serde_json::{Map, Value};
+use std::collections::HashMap;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use tracing::{info, warn};
+
+/// Each account's contacts sign-in, counted up every time one ends or is replaced. A refresh
+/// saves its renewed sign-in only while the count is what it was when the refresh began, so a
+/// refresh that finishes after Disconnect, Sign out or Remove account can't put the deleted
+/// sign-in back in the keyring.
+fn generations() -> MutexGuard<'static, HashMap<AccountId, u64>> {
+    static GENERATIONS: OnceLock<Mutex<HashMap<AccountId, u64>>> = OnceLock::new();
+    GENERATIONS.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Ends the account's contacts sign-in before it is deleted or replaced: a refresh under way
+/// keeps its tokens to itself.
+pub fn end_sign_in(account: &AccountId) {
+    *generations().entry(account.clone()).or_default() += 1;
+}
+
+fn sign_in_generation(account: &AccountId) -> u64 {
+    generations().get(account).copied().unwrap_or(0)
+}
 
 /// What the sync needs from Graph; the real client, or a fixture in tests.
 pub(crate) trait GraphServer {
@@ -53,6 +74,7 @@ impl GraphServer for GraphContacts {
 /// An access token from the contacts sign-in, refreshed when it is about to expire; the
 /// refreshed sign-in is saved. Blocking.
 pub fn access_token(account: &AccountId) -> Result<String, GraphError> {
+    let generation = sign_in_generation(account);
     let (tokens, config) = credentials::load_microsoft_contacts_tokens(account).ok().flatten().ok_or(GraphError::SignInRequired)?;
     if !tokens.access_token.is_empty() && tokens.expires_at - 120_000 > now() {
         return Ok(tokens.access_token);
@@ -61,9 +83,16 @@ pub fn access_token(account: &AccountId) -> Result<String, GraphError> {
     match oauth::refresh(&config, &refresh_token, &graph::contacts_scopes()) {
         Ok(mut fresh) => {
             fresh.signed_in_at = tokens.signed_in_at;
+            // Held while saving, so ending the sign-in waits for this save, then deletes it.
+            let current = generations();
+            if current.get(account).copied().unwrap_or(0) != generation {
+                info!("the contacts sign-in ended while it was being renewed; the renewal isn’t kept");
+                return Err(GraphError::SignInRequired);
+            }
             if let Err(error) = credentials::save_microsoft_contacts_tokens(account, &fresh, &config) {
                 warn!("couldn’t save the refreshed contacts sign-in: {error}");
             }
+            drop(current);
             Ok(fresh.access_token)
         }
         Err(AuthError::Network(_)) => Err(GraphError::Network),
@@ -81,9 +110,11 @@ pub fn verify(access_token: &str) -> Result<(), GraphError> {
 /// Saves a Microsoft contacts connection after the person signed in to allow contacts: the
 /// sign-in to the keyring, then the connection. The first download follows at once.
 pub fn save(store: &Store, account: &Account, signed_in: &SignInResult) -> Result<ContactsConnection, String> {
+    // A renewal of the sign-in it replaces, still under way, mustn't overwrite it.
+    end_sign_in(&account.id);
     credentials::save_microsoft_contacts_tokens(&account.id, &signed_in.tokens, &signed_in.config).map_err(|e| e.to_string())?;
     let username = signed_in.claims.as_ref().and_then(|c| c.address()).unwrap_or_else(|| account.email.clone());
-    let connection = ContactsConnection { account_id: account.id.clone(), server_url: graph::GRAPH_CONTACTS_URL.into(), username, default_book: None, credential: ContactsCredential::Microsoft };
+    let connection = ContactsConnection { account_id: account.id.clone(), server_url: graph::GRAPH_CONTACTS_URL.into(), username, default_book: None, credential: ContactsCredential::Microsoft, connected_at: 0 };
     carddav_sync::save(store, account, connection, None)
 }
 
@@ -110,7 +141,7 @@ pub fn run(store: &Store, account: &Account, connection: &ContactsConnection) ->
             ContactsStatus { error: Some(error.to_string()), at: now() }
         }
     };
-    carddav_sync::record_status(store, &account.id, &connection.server_url, &status);
+    carddav_sync::record_status(store, connection, &status);
     refused
 }
 
@@ -187,7 +218,7 @@ fn card_from(account: &AccountId, item: &GraphItem) -> ContactCard {
 
 /// After a write: Microsoft's copy becomes the version later edits are made against.
 fn save_item(store: &Store, account: &Account, connection: &ContactsConnection, local_id: &str, sent: Timestamp, item: &GraphItem) -> Sent {
-    match store.save_synced_contact(&account.id, &connection.server_url, local_id, sent, &card_from(&account.id, item)) {
+    match store.save_synced_contact(connection, local_id, sent, &card_from(&account.id, item)) {
         Ok(()) => Sent::Done,
         Err(error) => Sent::Failed(error.to_string()),
     }
@@ -271,7 +302,7 @@ fn delete(store: &Store, account: &Account, server: &dyn GraphServer, contact_id
 /// Downloads every contact and replaces what was read before. Returns how many there are.
 fn pull(store: &Store, account: &Account, connection: &ContactsConnection, server: &dyn GraphServer) -> Result<usize, GraphError> {
     let cards: Vec<ContactCard> = server.list()?.iter().map(|item| card_from(&account.id, item)).collect();
-    store.apply_contact_download(&account.id, &connection.server_url, &cards).map_err(|_| GraphError::InvalidResponse)?;
+    store.apply_contact_download(connection, &cards).map_err(|_| GraphError::InvalidResponse)?;
     Ok(cards.len())
 }
 

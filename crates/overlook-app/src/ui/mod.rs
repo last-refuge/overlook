@@ -439,8 +439,10 @@ const SESSION_AGE_WORDING: &str = "Signed out because this sign-in is 180 days o
 /// every stored credential. Shared by Sign out and Remove account. Blocking; run in the
 /// background.
 fn end_session(account: &Account, id: &AccountId, gmail: Option<Arc<overlook_provider::gmail::GmailClient>>, microsoft: Option<Arc<overlook_provider::microsoft::MicrosoftSession>>) -> Result<(), String> {
-    // No session of the account may write its sign-in back once it is deleted below.
+    // No session of the account may write its sign-in back once it is deleted below, nor a
+    // renewal of its contacts sign-in.
     providers::end_microsoft_sign_ins(id);
+    crate::graph_contacts_sync::end_sign_in(id);
     if let Some(session) = microsoft {
         session.disconnect();
     }

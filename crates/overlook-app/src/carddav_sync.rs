@@ -63,7 +63,7 @@ pub fn connect(store: &Store, account: &Account, servers: &MailServers) -> Resul
         return Err("Contacts can be connected for IMAP and POP3 accounts.".into());
     }
     let service = contacts_service(servers).ok_or("This account’s mail service has no contacts server Overlook knows. Enter one in Settings → Accounts → Contacts.")?;
-    let connection = ContactsConnection { account_id: account.id.clone(), server_url: service.server_url.into(), username: user_name(service, servers), default_book: None, credential: ContactsCredential::IncomingMail };
+    let connection = ContactsConnection { account_id: account.id.clone(), server_url: service.server_url.into(), username: user_name(service, servers), default_book: None, credential: ContactsCredential::IncomingMail, connected_at: 0 };
     save(store, account, connection, None)
 }
 
@@ -105,6 +105,7 @@ pub fn save(store: &Store, account: &Account, connection: ContactsConnection, se
         (ContactsCredential::Microsoft, _) => {}
     }
     if connection.credential != ContactsCredential::Microsoft {
+        crate::graph_contacts_sync::end_sign_in(&account.id);
         let _ = credentials::delete_secret(&account.id, credentials::KIND_OAUTH_MICROSOFT_CONTACTS);
     }
     store.save_contacts_connection(&connection).map_err(|e| e.to_string())?;
@@ -119,6 +120,8 @@ pub fn save(store: &Store, account: &Account, connection: ContactsConnection, se
 pub fn disconnect(store: &Store, account: &AccountId) -> Result<(), String> {
     store.remove_contacts_connection(account).map_err(|e| e.to_string())?;
     let _ = credentials::delete_secret(account, ContactsConnection::SECRET_KIND);
+    // A contacts sign-in being renewed right now mustn't save itself back.
+    crate::graph_contacts_sync::end_sign_in(account);
     let _ = credentials::delete_secret(account, credentials::KIND_OAUTH_MICROSOFT_CONTACTS);
     let _ = store.delete_setting(&status_key(account));
     let _ = store.delete_setting(&crate::sync::contacts_synced_key(account));
@@ -183,15 +186,16 @@ pub fn run(store: &Store, account: &Account, connection: &ContactsConnection) ->
             ContactsStatus { error: Some(error.to_string()), at: now() }
         }
     };
-    record_status(store, &account.id, &connection.server_url, &status);
+    record_status(store, connection, &status);
     refused
 }
 
-/// Saves what a sync found for the settings page, unless the account was disconnected (or
-/// connected elsewhere) while it ran.
-pub(crate) fn record_status(store: &Store, account: &AccountId, server_url: &str, status: &ContactsStatus) {
-    if store.contacts_connection(account).ok().flatten().is_some_and(|c| c.server_url == server_url) {
-        let _ = store.set_setting(&status_key(account), status);
+/// Saves what a sync found for the settings page, unless the connection it ran for was
+/// disconnected or made again while it ran.
+pub(crate) fn record_status(store: &Store, connection: &ContactsConnection, status: &ContactsStatus) {
+    let current = store.contacts_connection(&connection.account_id).ok().flatten();
+    if current.is_some_and(|c| c.server_url == connection.server_url && c.username == connection.username && c.connected_at == connection.connected_at) {
+        let _ = store.set_setting(&status_key(&connection.account_id), status);
     }
 }
 
@@ -319,7 +323,7 @@ fn save_from_server(store: &Store, account: &Account, connection: &ContactsConne
     let Some(card) = read_card(&account.id, address_book, url, remote.etag, &remote.card) else {
         return Sent::Failed("The server changed the contact into something Overlook can’t read.".into());
     };
-    match store.save_synced_contact(&account.id, &connection.server_url, local_id, sent, &card) {
+    match store.save_synced_contact(connection, local_id, sent, &card) {
         Ok(()) => Sent::Done,
         Err(error) => Sent::Failed(error.to_string()),
     }
@@ -366,14 +370,43 @@ fn create(store: &Store, account: &Account, connection: &ContactsConnection, ser
     let url = card_url(&book, &uid);
     match server.put(&url, &vcard::new_card(&contact, &uid, now()), WriteCondition::Create) {
         Ok(WriteOutcome::Done) => save_from_server(store, account, connection, contact_id, contact.updated, &book, &url, server),
-        // Already there: an earlier try that went through without its reply arriving.
-        Ok(WriteOutcome::Conflict) => save_from_server(store, account, connection, contact_id, contact.updated, &book, &url, server),
+        // Already there: an earlier try that went through without its reply arriving. The
+        // contact may have been edited here since, so that card is brought up to date first.
+        Ok(WriteOutcome::Conflict) => match catch_up(server, &account.id, &url, &contact) {
+            Ok(()) => save_from_server(store, account, connection, contact_id, contact.updated, &book, &url, server),
+            Err(sent) => sent,
+        },
         Ok(WriteOutcome::Missing) => {
             // The address book is gone: find another next time.
             let _ = store.save_contacts_connection(&ContactsConnection { default_book: None, ..connection.clone() });
             Sent::Retry(CardDavError::UnexpectedStatus(404))
         }
         Err(error) => error.into(),
+    }
+}
+
+/// Brings the card an earlier try made at `url` up to date with `contact` as it is here now,
+/// changing only the fields that differ.
+fn catch_up(server: &dyn ContactsServer, account: &AccountId, url: &str, contact: &Contact) -> Result<(), Sent> {
+    let remote = match server.get(url) {
+        Ok(Some(remote)) => remote,
+        // Gone again since: the next try makes it afresh.
+        Ok(None) => return Err(Sent::Retry(CardDavError::ServiceUnavailable)),
+        Err(error) => return Err(error.into()),
+    };
+    let made = match vcard::Card::parse(&remote.card) {
+        Ok(card) => vcard::contact_from_fields(&card.fields(), String::new(), account.clone(), None, 0),
+        Err(error) => return Err(Sent::Failed(error.to_string())),
+    };
+    let text = vcard::apply_changes(&remote.card, &made, contact, now()).map_err(|e| Sent::Failed(e.to_string()))?;
+    if text == remote.card {
+        return Ok(());
+    }
+    match server.put(url, &text, WriteCondition::Replace(&remote.etag)) {
+        Ok(WriteOutcome::Done) => Ok(()),
+        // Changed again meanwhile: the next sync tries again.
+        Ok(WriteOutcome::Conflict | WriteOutcome::Missing) => Err(Sent::Retry(CardDavError::ServiceUnavailable)),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -438,7 +471,7 @@ fn pull(store: &Store, account: &Account, connection: &ContactsConnection, serve
     let snapshot = server.snapshot(&|url| saved.get(url).map(|c| c.etag.clone()))?;
     let mut cards: Vec<ContactCard> = snapshot.unchanged.iter().filter_map(|u| saved.get(&u.url).cloned()).collect();
     cards.extend(snapshot.cards.iter().filter_map(|r| read_card(&account.id, &r.address_book, &r.url, r.etag.clone(), &r.card)));
-    store.apply_contact_download(&account.id, &connection.server_url, &cards).map_err(|_| CardDavError::InvalidResponse)?;
+    store.apply_contact_download(connection, &cards).map_err(|_| CardDavError::InvalidResponse)?;
     let still_there = connection.default_book.as_ref().is_some_and(|b| snapshot.address_books.iter().any(|a| &a.url == b && a.writable));
     if !still_there {
         if let Some(book) = choose_default_book(&snapshot.address_books) {

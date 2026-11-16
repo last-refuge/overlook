@@ -228,10 +228,16 @@ impl Card {
         let position = old.filter(|o| !o.trim().is_empty()).and_then(|o| self.lines.iter().position(|l| l.is(name) && same(l, o)));
         match (position, new) {
             (Some(i), Some(v)) => {
+                // Changed to a value another line already has: that line goes, so the value
+                // isn't listed twice, and this one keeps its place as the main one.
+                let duplicate = self.lines.iter().enumerate().position(|(j, l)| j != i && l.is(name) && same(l, v));
                 let line = &mut self.lines[i];
                 let uri = line.value.trim_start().to_ascii_lowercase().starts_with(scheme) && !scheme.is_empty();
                 line.value = if uri { format!("{scheme}{}", escape(v)) } else { escape(v) };
                 line.original = None;
+                if let Some(j) = duplicate {
+                    self.lines.remove(j);
+                }
             }
             (Some(i), None) => {
                 self.lines.remove(i);
@@ -680,6 +686,17 @@ mod tests {
         let edited = apply_changes(FASTMAIL_STYLE, &before, &after, 0).unwrap();
         assert!(!edited.contains("maya@northstar.example"));
         assert!(edited.contains("maya.chen@home.example"));
+    }
+
+    #[test]
+    fn choosing_another_address_on_the_card_doesnt_list_it_twice() {
+        let before = contact(&Card::parse(FASTMAIL_STYLE).unwrap().fields());
+        let mut after = before.clone();
+        after.email = "maya.chen@home.example".into();
+        let edited = apply_changes(FASTMAIL_STYLE, &before, &after, 0).unwrap();
+        assert_eq!(edited.matches("maya.chen@home.example").count(), 1, "{edited}");
+        assert!(edited.contains("item1.EMAIL;TYPE=INTERNET;TYPE=pref:maya.chen@home.example\r\n"), "the main address keeps its place: {edited}");
+        assert!(!edited.contains("maya@northstar.example"));
     }
 
     #[test]

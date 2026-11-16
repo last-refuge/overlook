@@ -120,10 +120,11 @@ pub struct GraphItem {
     pub contact: GraphContact,
 }
 
+/// One page of a listing. `value` is required: a reply without it is incomplete, and taking
+/// it as an empty page would empty the saved contacts.
 #[derive(Deserialize)]
 struct Page<T> {
-    #[serde(default = "Option::default")]
-    value: Option<Vec<T>>,
+    value: Vec<T>,
     #[serde(rename = "@odata.nextLink", default)]
     next_link: Option<String>,
 }
@@ -280,7 +281,7 @@ impl GraphContacts {
         let (status, text) = self.send("GET", &url, None)?;
         check(status, &text)?;
         let page: Page<GraphContact> = parse(&text)?;
-        Ok(page.value.unwrap_or_default().into_iter().find(|c| !c.id.is_empty()).map(|contact| GraphItem { url: format!("{folder}/{}", segment(&contact.id)), folder, contact }))
+        Ok(page.value.into_iter().find(|c| !c.id.is_empty()).map(|contact| GraphItem { url: format!("{folder}/{}", segment(&contact.id)), folder, contact }))
     }
 
     /// Changes the fields in `patch`; `None` when the contact is gone.
@@ -316,7 +317,7 @@ impl GraphContacts {
             let (status, text) = self.send("GET", &url, None)?;
             check(status, &text)?;
             let page: Page<T> = parse(&text)?;
-            out.extend(page.value.unwrap_or_default());
+            out.extend(page.value);
             if out.len() > limit {
                 return Err(GraphError::Limit);
             }
@@ -450,38 +451,43 @@ fn all_emails(contact: &Contact) -> Vec<String> {
     out
 }
 
-/// The server's address list with the edit applied: an edited address takes the old one's
-/// place and name, a removed one goes, an added one joins (first when it's the main address).
-/// `None` when the addresses weren't edited.
+/// The server's address list with the shown address edited, the only one the form changes:
+/// the other addresses stay as the server has them, even when the form's list leaves them
+/// out (clearing the field clears that list). An edited address takes the old one's place and
+/// name; one that is already among the others moves up rather than appearing twice; a
+/// cleared one goes alone. `None` when the shown address wasn't edited.
 fn edited_emails(current: &[GraphEmail], before: &Contact, after: &Contact) -> Option<Vec<GraphEmail>> {
-    let (was, now) = (all_emails(before), all_emails(after));
-    let primary_changed = !same(&before.email, &after.email);
-    if was == now && !primary_changed {
+    let (old, new) = (before.email.trim(), after.email.trim());
+    if same(old, new) {
         return None;
     }
-    let mut added: Vec<String> = now.iter().filter(|e| !was.contains(e)).cloned().collect();
-    let removed: Vec<String> = was.iter().filter(|e| !now.contains(e)).cloned().collect();
     let mut list: Vec<GraphEmail> = current.to_vec();
-    if primary_changed && !before.email.trim().is_empty() && !after.email.trim().is_empty() {
-        if let Some(slot) = list.iter_mut().find(|e| same(&e.address, &before.email)) {
-            slot.address = after.email.trim().to_owned();
-            added.retain(|a| !same(a, &after.email));
-        }
+    let slot = if old.is_empty() { None } else { list.iter().position(|e| same(&e.address, old)) };
+    if new.is_empty() {
+        // Already gone at the server: nothing to send.
+        list.remove(slot?);
+        return Some(list);
     }
-    list.retain(|e| !removed.iter().any(|r| same(&e.address, r)));
-    for address in added {
-        if list.iter().any(|e| same(&e.address, &address)) {
-            continue;
+    match (slot, list.iter().position(|e| same(&e.address, new))) {
+        (_, Some(existing)) => {
+            let chosen = list.remove(existing);
+            if let Some(at) = list.iter().position(|e| same(&e.address, old)).filter(|_| !old.is_empty()) {
+                list.remove(at);
+            }
+            list.insert(0, chosen);
         }
-        let entry = GraphEmail { address: address.clone(), name: None };
-        if same(&address, &after.email) { list.insert(0, entry) } else { list.push(entry) }
+        (Some(at), None) => list[at].address = new.to_owned(),
+        (None, None) => list.insert(0, GraphEmail { address: new.to_owned(), name: None }),
     }
     list.truncate(MAX_EMAILS);
     Some(list)
 }
 
 /// The phone edit lands where the phone shown came from: the mobile number, or its entry in
-/// the business or home list. A phone the server no longer has (or none before) is the mobile.
+/// the business or home list. When the server no longer has that phone (changed elsewhere
+/// meanwhile), or there was none, the new one goes where it overwrites nothing: the mobile
+/// number if it's free, else the end of the business list. A number the server has isn't
+/// added twice.
 fn edit_phone(current: &GraphContact, before: Option<&str>, after: Option<&str>, patch: &mut Map<String, Value>) {
     let new = after.map(str::trim).filter(|p| !p.is_empty());
     let replace_in = |list: &[String], old: &str| -> Option<Vec<String>> {
@@ -496,18 +502,32 @@ fn edit_phone(current: &GraphContact, before: Option<&str>, after: Option<&str>,
         Some(list)
     };
     if let Some(old) = before.map(str::trim).filter(|p| !p.is_empty()) {
-        if current.mobile_phone.as_deref().map(str::trim) != Some(old) {
-            if let Some(list) = replace_in(&current.business_phones, old) {
-                patch.insert("businessPhones".into(), json!(list));
-                return;
-            }
-            if let Some(list) = replace_in(&current.home_phones, old) {
-                patch.insert("homePhones".into(), json!(list));
-                return;
-            }
+        if current.mobile_phone.as_deref().map(str::trim) == Some(old) {
+            patch.insert("mobilePhone".into(), Value::String(new.unwrap_or_default().to_owned()));
+            return;
+        }
+        if let Some(list) = replace_in(&current.business_phones, old) {
+            patch.insert("businessPhones".into(), json!(list));
+            return;
+        }
+        if let Some(list) = replace_in(&current.home_phones, old) {
+            patch.insert("homePhones".into(), json!(list));
+            return;
         }
     }
-    patch.insert("mobilePhone".into(), Value::String(new.unwrap_or_default().to_owned()));
+    // The phone it replaced is gone already, so only an added number has anywhere to go.
+    let Some(new) = new else { return };
+    let mobile = clean(&current.mobile_phone);
+    if mobile.as_deref() == Some(new) || current.business_phones.iter().chain(&current.home_phones).any(|p| p.trim() == new) {
+        return;
+    }
+    if mobile.is_none() {
+        patch.insert("mobilePhone".into(), Value::String(new.to_owned()));
+    } else {
+        let mut list = current.business_phones.clone();
+        list.push(new.to_owned());
+        patch.insert("businessPhones".into(), json!(list));
+    }
 }
 
 /// A new Outlook contact for one made here.

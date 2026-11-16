@@ -12,10 +12,19 @@ fn from_server(contact_id: &str) -> bool {
     contact_id.starts_with("carddav:") || contact_id.starts_with("graph:")
 }
 
-/// Whether `account` is still connected to `server_url`. Checked inside the transaction that
-/// saves a sync's results, so a sync that finishes after Disconnect saves nothing.
-fn connected_tx(tx: &Connection, account: &AccountId, server_url: &str) -> Result<bool> {
-    Ok(tx.query_row("SELECT 1 FROM contact_connections WHERE account_id=?1 AND server_url=?2", params![account.0, server_url], |_| Ok(())).optional()?.is_some())
+/// Whether `connection` is still the account's connection: the same server and sign-in, made
+/// at the same time. Checked inside the transaction that saves a sync's results, so a sync that
+/// finishes after Disconnect, or after connecting again (every Microsoft connection has the
+/// same address), saves nothing.
+fn connected_tx(tx: &Connection, connection: &ContactsConnection) -> Result<bool> {
+    Ok(tx
+        .query_row(
+            "SELECT 1 FROM contact_connections WHERE account_id=?1 AND server_url=?2 AND username=?3 AND created_at=?4",
+            params![connection.account_id.0, connection.server_url, connection.username, connection.connected_at],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 /// Points the queued edits of a contact added here at the id the server gave it: a later
@@ -73,20 +82,22 @@ fn queued_contact_ids(tx: &Connection, account: &AccountId) -> Result<HashSet<St
 impl Store {
     pub fn contacts_connection(&self, account: &AccountId) -> Result<Option<ContactsConnection>> {
         self.with_read(|c| {
-            Ok(c.query_row("SELECT server_url, username, default_book, credential FROM contact_connections WHERE account_id=?1", [&account.0], |r| {
+            Ok(c.query_row("SELECT server_url, username, default_book, credential, created_at FROM contact_connections WHERE account_id=?1", [&account.0], |r| {
                 Ok(ContactsConnection {
                     account_id: account.clone(),
                     server_url: r.get(0)?,
                     username: r.get(1)?,
                     default_book: r.get(2)?,
                     credential: ContactsCredential::from_key(&r.get::<_, String>(3)?),
+                    connected_at: r.get(4)?,
                 })
             })
             .optional()?)
         })
     }
 
-    /// Saves a connection the person agreed to. Saving it again keeps the cards already read.
+    /// Saves a connection the person agreed to. Saving it again keeps the cards already read
+    /// and the time it was first made.
     pub fn save_contacts_connection(&self, connection: &ContactsConnection) -> Result<()> {
         self.with_conn(|c| {
             c.execute(
@@ -142,17 +153,18 @@ impl Store {
         })
     }
 
-    /// The server at `server_url` accepted an edit made here: the card's new version, and the
+    /// The server of `connection` accepted an edit made here: the card's new version, and the
     /// contact as the server now has it. A contact added here takes the server's id. `sent` is
     /// when the edit that was sent had been saved; a newer edit made meanwhile stays queued,
     /// and so does a deletion made while a new contact was on its way. Nothing is saved once
-    /// the account is no longer connected to that server.
-    pub fn save_synced_contact(&self, account: &AccountId, server_url: &str, local_id: &str, sent: Timestamp, card: &ContactCard) -> Result<()> {
+    /// `connection` is no longer the account's.
+    pub fn save_synced_contact(&self, connection: &ContactsConnection, local_id: &str, sent: Timestamp, card: &ContactCard) -> Result<()> {
+        let account = &connection.account_id;
         ensure_same_account(&card.base.account_id, account, "contact")?;
         let mut contact = card.base.clone();
         contact.pending = false;
         self.with_tx(|tx| {
-            if !connected_tx(tx, account, server_url)? {
+            if !connected_tx(tx, connection)? {
                 return Ok(());
             }
             if local_id != contact.id {
@@ -213,16 +225,17 @@ impl Store {
         })
     }
 
-    /// Replaces what was read from the server at `server_url` with a complete download: every
+    /// Replaces what was read from the server of `connection` with a complete download: every
     /// card there, each with the contact it shows. A contact with an edit not sent yet keeps
     /// the edit and the version it was made against; one deleted here and not yet deleted
-    /// there stays deleted. Nothing is saved once the account is no longer connected there.
-    pub fn apply_contact_download(&self, account: &AccountId, server_url: &str, cards: &[ContactCard]) -> Result<()> {
+    /// there stays deleted. Nothing is saved once `connection` is no longer the account's.
+    pub fn apply_contact_download(&self, connection: &ContactsConnection, cards: &[ContactCard]) -> Result<()> {
+        let account = &connection.account_id;
         for card in cards {
             ensure_same_account(&card.base.account_id, account, "contact")?;
         }
         self.with_tx(|tx| {
-            if !connected_tx(tx, account, server_url)? {
+            if !connected_tx(tx, connection)? {
                 return Ok(());
             }
             let mut held = queued_contact_ids(tx, account)?;
@@ -260,8 +273,15 @@ mod tests {
         (store, account.id)
     }
 
-    fn connect(store: &Store, account: &AccountId) {
-        store.save_contacts_connection(&ContactsConnection { account_id: account.clone(), server_url: SERVER.into(), username: "me".into(), default_book: None, credential: ContactsCredential::IncomingMail }).unwrap();
+    /// Connects `account` and returns the connection as the store has it, which a sync uses.
+    fn connect_to(store: &Store, account: &AccountId, server: &str, credential: ContactsCredential, default_book: Option<&str>) -> ContactsConnection {
+        let connection = ContactsConnection { account_id: account.clone(), server_url: server.into(), username: "me".into(), default_book: default_book.map(str::to_owned), credential, connected_at: 0 };
+        store.save_contacts_connection(&connection).unwrap();
+        store.contacts_connection(account).unwrap().unwrap()
+    }
+
+    fn connect(store: &Store, account: &AccountId) -> ContactsConnection {
+        connect_to(store, account, SERVER, ContactsCredential::IncomingMail, None)
     }
 
     fn queued(store: &Store, account: &AccountId) -> Vec<OperationKind> {
@@ -279,8 +299,8 @@ mod tests {
     #[test]
     fn a_download_replaces_contacts_but_keeps_edits_not_yet_sent() {
         let (store, account) = store();
-        store.save_contacts_connection(&ContactsConnection { account_id: account.clone(), server_url: SERVER.into(), username: "me".into(), default_book: None, credential: ContactsCredential::IncomingMail }).unwrap();
-        store.apply_contact_download(&account, SERVER, &[card(&account, 1, "Maya"), card(&account, 2, "Alex"), card(&account, 3, "Daniel")]).unwrap();
+        let conn = connect(&store, &account);
+        store.apply_contact_download(&conn, &[card(&account, 1, "Maya"), card(&account, 2, "Alex"), card(&account, 3, "Daniel")]).unwrap();
         assert_eq!(store.contacts(&account).unwrap().len(), 3);
 
         // Maya edited here, Alex deleted here; neither is sent yet.
@@ -293,7 +313,7 @@ mod tests {
         // The server meanwhile renamed Maya and dropped Daniel.
         let mut renamed = card(&account, 1, "Maya R.");
         renamed.etag = "\"v9\"".into();
-        store.apply_contact_download(&account, SERVER, &[renamed, card(&account, 2, "Alex")]).unwrap();
+        store.apply_contact_download(&conn, &[renamed, card(&account, 2, "Alex")]).unwrap();
         let names: Vec<_> = store.contacts(&account).unwrap().into_iter().map(|c| c.display_name()).collect();
         assert_eq!(names, vec!["Maya Chen"], "the edit stays, the deletion stays, Daniel is gone");
         let kept = store.contact_card(&account, &card(&account, 1, "").contact_id).unwrap().unwrap();
@@ -305,13 +325,13 @@ mod tests {
     #[test]
     fn a_sent_contact_takes_the_server_id_and_a_newer_edit_survives() {
         let (store, account) = store();
-        connect(&store, &account);
+        let conn = connect(&store, &account);
         let mut local = Contact::new_local(account.clone(), 10);
         local.name = Some("Sophie".into());
         store.save_contact_locally(&account, &local).unwrap();
         let synced = card(&account, 4, "Sophie");
         let sent = store.contact_by_id(&account, &local.id).unwrap().unwrap().updated;
-        store.save_synced_contact(&account, SERVER, &local.id, sent, &synced).unwrap();
+        store.save_synced_contact(&conn, &local.id, sent, &synced).unwrap();
         let all = store.contacts(&account).unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!((all[0].id.as_str(), all[0].pending), (synced.contact_id.as_str(), false));
@@ -320,7 +340,7 @@ mod tests {
         let mut again = all[0].clone();
         again.name = Some("Sophie Williams".into());
         store.save_contact_locally(&account, &again).unwrap();
-        store.save_synced_contact(&account, SERVER, &synced.contact_id, 0, &synced).unwrap();
+        store.save_synced_contact(&conn, &synced.contact_id, 0, &synced).unwrap();
         let now_shown = store.contact_by_id(&account, &synced.contact_id).unwrap().unwrap();
         assert_eq!((now_shown.name.as_deref(), now_shown.pending), (Some("Sophie Williams"), true));
     }
@@ -328,7 +348,7 @@ mod tests {
     #[test]
     fn an_edit_made_while_a_new_contact_uploads_moves_to_the_servers_id() {
         let (store, account) = store();
-        connect(&store, &account);
+        let conn = connect(&store, &account);
         let mut local = Contact::new_local(account.clone(), 10);
         local.name = Some("Sophie".into());
         store.save_contact_locally(&account, &local).unwrap();
@@ -338,7 +358,7 @@ mod tests {
         store.save_contact_locally(&account, &edited).unwrap();
         let newer = store.contact_by_id(&account, &local.id).unwrap().unwrap().updated;
         let synced = card(&account, 4, "Sophie");
-        store.save_synced_contact(&account, SERVER, &local.id, newer - 1, &synced).unwrap();
+        store.save_synced_contact(&conn, &local.id, newer - 1, &synced).unwrap();
         let shown = store.contacts(&account).unwrap();
         assert_eq!(shown.len(), 1);
         assert_eq!((shown[0].id.as_str(), shown[0].title.as_deref(), shown[0].pending), (synced.contact_id.as_str(), Some("Director"), true));
@@ -349,7 +369,7 @@ mod tests {
     #[test]
     fn a_new_contact_deleted_while_it_uploads_is_deleted_there_too() {
         let (store, account) = store();
-        connect(&store, &account);
+        let conn = connect(&store, &account);
         let mut local = Contact::new_local(account.clone(), 10);
         local.name = Some("Sophie".into());
         store.save_contact_locally(&account, &local).unwrap();
@@ -357,39 +377,52 @@ mod tests {
         let row = store.contact_by_id(&account, &local.id).unwrap().unwrap();
         store.delete_contact_locally(&account, &row).unwrap();
         let synced = card(&account, 4, "Sophie");
-        store.save_synced_contact(&account, SERVER, &local.id, sent, &synced).unwrap();
+        store.save_synced_contact(&conn, &local.id, sent, &synced).unwrap();
         assert!(store.contacts(&account).unwrap().is_empty(), "it isn't shown again");
         assert!(store.contact_card(&account, &synced.contact_id).unwrap().is_some(), "the deletion has the card it needs");
         assert!(queued(&store, &account).contains(&OperationKind::DeleteContact { contact_id: synced.contact_id.clone(), resource_name: Some(synced.contact_id.clone()) }));
         // A download meanwhile doesn't bring it back either.
-        store.apply_contact_download(&account, SERVER, &[synced.clone()]).unwrap();
+        store.apply_contact_download(&conn, &[synced.clone()]).unwrap();
         assert!(store.contacts(&account).unwrap().is_empty());
     }
 
     #[test]
     fn a_sync_that_finishes_after_disconnecting_saves_nothing() {
         let (store, account) = store();
-        connect(&store, &account);
+        let conn = connect(&store, &account);
         store.remove_contacts_connection(&account).unwrap();
-        store.apply_contact_download(&account, SERVER, &[card(&account, 1, "Maya")]).unwrap();
+        store.apply_contact_download(&conn, &[card(&account, 1, "Maya")]).unwrap();
         let mut local = Contact::new_local(account.clone(), 10);
         local.name = Some("Only here".into());
         store.save_contact_locally(&account, &local).unwrap();
-        store.save_synced_contact(&account, SERVER, &local.id, 0, &card(&account, 2, "Only here")).unwrap();
+        store.save_synced_contact(&conn, &local.id, 0, &card(&account, 2, "Only here")).unwrap();
         let shown: Vec<_> = store.contacts(&account).unwrap().into_iter().map(|c| c.id).collect();
         assert_eq!(shown, vec![local.id.clone()], "nothing from the server came back");
         assert!(store.contact_cards(&account).unwrap().is_empty());
         // Connected to another server since: the old sync's results don't belong there.
-        store.save_contacts_connection(&ContactsConnection { account_id: account.clone(), server_url: "https://other.example.test/".into(), username: "me".into(), default_book: None, credential: ContactsCredential::Separate }).unwrap();
-        store.apply_contact_download(&account, SERVER, &[card(&account, 1, "Maya")]).unwrap();
+        connect_to(&store, &account, "https://other.example.test/", ContactsCredential::Separate, None);
+        store.apply_contact_download(&conn, &[card(&account, 1, "Maya")]).unwrap();
         assert!(store.contact_cards(&account).unwrap().is_empty());
+        // Nor do they belong to a connection made again at the same address (every Microsoft
+        // connection has the same one), or to another sign-in there.
+        store.remove_contacts_connection(&account).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let again = connect(&store, &account);
+        assert_ne!(again.connected_at, conn.connected_at);
+        store.apply_contact_download(&conn, &[card(&account, 1, "Maya")]).unwrap();
+        assert!(store.contact_cards(&account).unwrap().is_empty());
+        let other_sign_in = ContactsConnection { username: "someone-else".into(), ..again.clone() };
+        store.apply_contact_download(&other_sign_in, &[card(&account, 1, "Maya")]).unwrap();
+        assert!(store.contact_cards(&account).unwrap().is_empty());
+        store.apply_contact_download(&again, &[card(&account, 1, "Maya")]).unwrap();
+        assert_eq!(store.contact_cards(&account).unwrap().len(), 1, "the current connection's results are saved");
     }
 
     #[test]
     fn a_refused_edit_gives_way_to_the_servers_version() {
         let (store, account) = store();
-        connect(&store, &account);
-        store.apply_contact_download(&account, SERVER, &[card(&account, 1, "Maya")]).unwrap();
+        let conn = connect(&store, &account);
+        store.apply_contact_download(&conn, &[card(&account, 1, "Maya")]).unwrap();
         let mut maya = store.contacts(&account).unwrap().remove(0);
         maya.name = Some("Maya Chen".into());
         let op = store.save_contact_locally(&account, &maya).unwrap();
@@ -400,7 +433,7 @@ mod tests {
         // No longer held: later changes at the server arrive.
         let mut renamed = card(&account, 1, "Maya R.");
         renamed.etag = "\"v9\"".into();
-        store.apply_contact_download(&account, SERVER, &[renamed]).unwrap();
+        store.apply_contact_download(&conn, &[renamed]).unwrap();
         assert_eq!(store.contact_by_id(&account, &maya.id).unwrap().unwrap().name.as_deref(), Some("Maya R."));
         assert!(!store.restore_server_contact(&account, "carddav:https://dav.example.test/book/none.vcf").unwrap());
     }
@@ -408,8 +441,8 @@ mod tests {
     #[test]
     fn disconnecting_forgets_server_contacts_but_keeps_ones_made_here() {
         let (store, account) = store();
-        store.save_contacts_connection(&ContactsConnection { account_id: account.clone(), server_url: SERVER.into(), username: "me".into(), default_book: Some("https://dav.example.test/book/".into()), credential: ContactsCredential::Separate }).unwrap();
-        store.apply_contact_download(&account, SERVER, &[card(&account, 1, "Maya")]).unwrap();
+        let conn = connect_to(&store, &account, SERVER, ContactsCredential::Separate, Some("https://dav.example.test/book/"));
+        store.apply_contact_download(&conn, &[card(&account, 1, "Maya")]).unwrap();
         let mut maya = store.contacts(&account).unwrap().remove(0);
         maya.title = Some("Director".into());
         store.save_contact_locally(&account, &maya).unwrap();
@@ -429,8 +462,8 @@ mod tests {
     #[test]
     fn removing_the_account_removes_its_connection_and_cards() {
         let (store, account) = store();
-        store.save_contacts_connection(&ContactsConnection { account_id: account.clone(), server_url: SERVER.into(), username: "me".into(), default_book: None, credential: ContactsCredential::IncomingMail }).unwrap();
-        store.apply_contact_download(&account, SERVER, &[card(&account, 1, "Maya")]).unwrap();
+        let conn = connect(&store, &account);
+        store.apply_contact_download(&conn, &[card(&account, 1, "Maya")]).unwrap();
         store.delete_account(&account).unwrap();
         assert!(store.contacts_connection(&account).unwrap().is_none());
         assert!(store.contact_cards(&account).unwrap().is_empty());

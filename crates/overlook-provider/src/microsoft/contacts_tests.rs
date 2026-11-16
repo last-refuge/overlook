@@ -77,11 +77,26 @@ fn an_edited_address_keeps_its_place_and_name_and_the_others_stay() {
         patch["emailAddresses"],
         json!([{"address": "maya@northstar-studio.example", "name": "Maya (work)"}, {"address": "maya.chen@home.example", "name": "Maya Chen"}])
     );
-    // Cleared: only that address goes.
+    // Cleared, as the form clears it (its whole list too): only the shown address goes.
     let mut cleared = before.clone();
     cleared.email.clear();
-    cleared.emails = vec!["maya.chen@home.example".into()];
+    cleared.emails.clear();
     assert_eq!(graph_changes(&current, &before, &cleared)["emailAddresses"], json!([{"address": "maya.chen@home.example", "name": "Maya Chen"}]));
+    // Already gone at the server: nothing to send.
+    let mut gone = maya();
+    gone.email_addresses.remove(0);
+    assert!(!graph_changes(&gone, &before, &cleared).contains_key("emailAddresses"));
+}
+
+#[test]
+fn choosing_one_of_the_other_addresses_moves_it_up_without_doubling_it() {
+    let current = maya();
+    let before = shown(&current);
+    let mut after = before.clone();
+    // What the form does: the old main address leaves the list, the new one goes first.
+    after.email = "maya.chen@home.example".into();
+    after.emails = vec!["maya.chen@home.example".into(), "maya.chen@home.example".into()];
+    assert_eq!(graph_changes(&current, &before, &after)["emailAddresses"], json!([{"address": "maya.chen@home.example", "name": "Maya Chen"}]));
 }
 
 #[test]
@@ -91,6 +106,15 @@ fn a_phone_edit_lands_where_the_phone_came_from() {
     let mut after = before.clone();
     after.phone = Some("+1 555 0111".into());
     assert_eq!(Value::Object(graph_changes(&current, &before, &after)), json!({"businessPhones": ["+1 555 0111", "+1 555 0100"]}));
+    // Its number changed in Outlook meanwhile, and a mobile was added there: the edit can't
+    // replace a number it never saw, and the mobile stays.
+    let mut moved = maya();
+    moved.business_phones = vec!["+1 555 0198".into()];
+    moved.mobile_phone = Some("+1 555 0177".into());
+    assert_eq!(Value::Object(graph_changes(&moved, &before, &after)), json!({"businessPhones": ["+1 555 0198", "+1 555 0111"]}));
+    let mut cleared = before.clone();
+    cleared.phone = None;
+    assert!(graph_changes(&moved, &before, &cleared).is_empty(), "nothing left to clear");
     // A contact without phones gets a mobile number.
     let mut bare = maya();
     bare.business_phones.clear();
@@ -229,6 +253,15 @@ fn lists_every_folder_and_follows_page_links_only_to_graph() {
     ]);
     assert_eq!(server.client().list().unwrap_err(), GraphError::InvalidResponse);
     assert_eq!(server.finish().len(), 2);
+}
+
+#[test]
+fn a_listing_reply_without_its_contacts_is_an_error_not_an_empty_book() {
+    for incomplete in [json!({}), json!({"value": null})] {
+        let server = Script::new(vec![(200, json!({"value": []}).to_string()), (200, incomplete.to_string())]);
+        assert_eq!(server.client().list().unwrap_err(), GraphError::InvalidResponse);
+        server.finish();
+    }
 }
 
 #[test]

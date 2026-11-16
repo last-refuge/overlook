@@ -52,8 +52,14 @@ impl MailWindow {
         let setup = self.settings.as_ref().map(|s| &s.contacts);
         let busy = setup.is_some_and(|s| s.busy);
         let mut rows: Vec<AnyElement> = Vec::new();
+        let note = setup.and_then(|s| s.note.clone()).map(|note| div().id("contacts-setup-note").text_size(px(12.)).text_color(p.warning).whitespace_normal().child(note).into_any_element());
         if let ContactsSource::Server(name) = self.contacts_source_of(account) {
-            rows.push(self.render_contacts_status(account, name, cx));
+            rows.push(self.render_contacts_status(account, name, busy, cx));
+            // Signing in again can come back as someone else, or fail: both are shown here too.
+            if setup.is_some_and(|s| s.microsoft_other.is_some()) {
+                rows.push(self.render_microsoft_contacts(account, busy, cx));
+            }
+            rows.extend(note);
             return rows;
         }
         let microsoft = servers.is_some_and(|s| s.oauth == Some(OAuthIssuer::Microsoft));
@@ -68,6 +74,7 @@ impl MailWindow {
                 username: carddav_sync::user_name(service, servers),
                 default_book: None,
                 credential: ContactsCredential::IncomingMail,
+                connected_at: 0,
             };
             let owner = account.clone();
             rows.push(
@@ -98,9 +105,7 @@ impl MailWindow {
                 );
             }
         }
-        if let Some(note) = setup.and_then(|s| s.note.clone()) {
-            rows.push(div().id("contacts-setup-note").text_size(px(12.)).text_color(p.warning).whitespace_normal().child(note).into_any_element());
-        }
+        rows.extend(note);
         rows
     }
 
@@ -140,7 +145,7 @@ impl MailWindow {
     }
 
     /// A connected account: how many contacts, when they were last checked or why not.
-    fn render_contacts_status(&self, account: &Account, name: Option<&'static str>, cx: &mut Context<Self>) -> AnyElement {
+    fn render_contacts_status(&self, account: &Account, name: Option<&'static str>, busy: bool, cx: &mut Context<Self>) -> AnyElement {
         let count = self.store.contact_count(&account.id).unwrap_or(0);
         let counted = format!("{count} contact{}", if count == 1 { "" } else { "s" });
         let status = carddav_sync::status(&self.store, &account.id);
@@ -160,7 +165,7 @@ impl MailWindow {
             &note,
             h_flex()
                 .gap(px(6.))
-                .when(renew, |d| d.child(Button::new("contacts-renew").small().label("Sign in again").on_click(cx.listener(move |this, _, window, cx| this.connect_microsoft_contacts(renew_for.clone(), window, cx)))))
+                .when(renew, |d| d.child(Button::new("contacts-renew").small().disabled(busy).label(if busy { "Waiting for the browser…" } else { "Sign in again" }).on_click(cx.listener(move |this, _, window, cx| this.connect_microsoft_contacts(renew_for.clone(), window, cx)))))
                 .child(Button::new("contacts-sync").ghost().small().icon(icon("refresh-cw").size(px(14.))).label("Sync contacts now").on_click(cx.listener(move |this, _, window, cx| {
                     let _ = this.store.set_setting(&crate::sync::contacts_synced_key(&sync_id), &0i64);
                     this.sync_account(sync_id.clone(), window, cx);
@@ -274,6 +279,7 @@ impl MailWindow {
             username,
             default_book: None,
             credential: if reuse_mail { ContactsCredential::IncomingMail } else { ContactsCredential::Separate },
+            connected_at: 0,
         };
         self.connect_contacts(account, connection, (!reuse_mail).then_some(password), window, cx);
     }
