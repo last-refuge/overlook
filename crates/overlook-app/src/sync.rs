@@ -394,6 +394,25 @@ fn save_backlog(store: &Store, account: &AccountId, ids: &[ProviderId]) {
     save_queue(store, &backlog_key(account), ids);
 }
 
+/// Before the re-download queue existed, deliberate re-downloads waited in the backlog.
+/// Once per account, those still there (bodies already stored) move to their own queue, so
+/// the backlog's skip of downloaded bodies can't drop an unfinished refresh.
+fn split_redownloads(store: &Store, account: &AccountId) {
+    let marker = format!("redownload_split:{}", account.0);
+    if store.setting::<bool>(&marker).ok().flatten() == Some(true) {
+        return;
+    }
+    let (again, missing): (Vec<ProviderId>, Vec<ProviderId>) = backlog(store, account).into_iter().partition(|p| body_cached(store, account, p) == Some(true));
+    if !again.is_empty() {
+        info!("{} queued re-downloads for {} moved to their own queue", again.len(), account.0);
+        let mut queued = queue(store, &redownload_key(account));
+        queued.extend(again.into_iter().filter(|p| !queued.contains(p)).collect::<Vec<_>>());
+        save_queue(store, &redownload_key(account), &queued);
+        save_backlog(store, account, &missing);
+    }
+    let _ = store.set_setting(&marker, &true);
+}
+
 /// Puts `ids` at the head of a queue, in their order, ahead of what was already waiting.
 fn enqueue_front(store: &Store, key: &str, ids: &[ProviderId]) {
     if ids.is_empty() {
@@ -625,6 +644,8 @@ fn pending_moves(store: &Store, account: &AccountId) -> std::collections::BTreeS
 fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outcome: &mut SyncOutcome, deferred: &mut Vec<(MessageId, ProviderId)>, verify: bool) -> Result<usize, ProviderError> {
     let acct = &account.id;
     let deadline = Instant::now() + DOWNLOAD_SLICE;
+    // First, before anything is queued the new way.
+    split_redownloads(store, acct);
     let protected = store.pending_message_ids(acct).unwrap_or_default();
     let moving = pending_moves(store, acct);
     let checkpoint = store.checkpoint(acct).ok().flatten();
@@ -2681,6 +2702,23 @@ mod tests {
         assert!(outcome.more_to_download, "the next sync carries on");
         assert!(provider.bodies.lock().unwrap().is_empty());
         assert_eq!(backlog(&store, &account.id).len(), 1, "nothing lost");
+    }
+
+    #[test]
+    fn re_downloads_left_in_the_old_backlog_survive_the_upgrade() {
+        let refreshing = gmail_message(7, true);
+        let missing = gmail_message(8, true);
+        let (store, account) = gmail_store(&[refreshing.clone()]);
+        // An interrupted refresh under the old scheme: a stored message waits in the backlog
+        // to be downloaded again, beside one not downloaded yet.
+        save_backlog(&store, &account.id, &[pid(&refreshing), pid(&missing)]);
+        split_redownloads(&store, &account.id);
+        assert_eq!(backlog(&store, &account.id), vec![pid(&missing)]);
+        assert_eq!(queue(&store, &redownload_key(&account.id)), vec![pid(&refreshing)]);
+        // Once only: later backlog entries are left alone.
+        save_backlog(&store, &account.id, &[pid(&refreshing)]);
+        split_redownloads(&store, &account.id);
+        assert_eq!(backlog(&store, &account.id), vec![pid(&refreshing)]);
     }
 
     #[test]

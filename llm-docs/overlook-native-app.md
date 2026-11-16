@@ -385,7 +385,9 @@ downloads it at once, at normal priority (`MailWindow::fetch_missing_bodies`); m
 "Downloading this message…". The window never edits the queues, since a sync may be saving them at that
 moment. Instead the backlog skips a body already here when it takes each batch. Deliberate re-downloads of
 messages that have bodies (mapping refreshes, invitation and inline-image re-parses) use their own queue,
-`redownload_backlog:<account>`, which doesn't skip. The status bar shows "Downloading N messages…" while the queue drains, and
+`redownload_backlog:<account>`, which doesn't skip. Before this queue existed they waited in the backlog.
+The first sync after upgrading moves any still there into it, once per account (`split_redownloads`, marker
+`redownload_split:<account>`). The status bar shows "Downloading N messages…" while the queue drains, and
 "Last synced" names the day when it wasn't today.
 
 A five-day absence with a few hundred new messages costs about 2 units in history, a few hundred × 20 for
