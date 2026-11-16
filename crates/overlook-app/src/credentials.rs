@@ -32,8 +32,11 @@ pub const KIND_PASSWORD_INCOMING: &str = "password:incoming";
 /// SMTP password, UTF-8. Absent when "same as incoming" is ticked.
 pub const KIND_PASSWORD_OUTGOING: &str = "password:outgoing";
 
-/// True only when this process really runs inside a container sandbox, where the session bus
-/// and the Secret Service are out of reach and the secrets portal is the only door.
+/// True only when this process really runs inside a Flatpak or Snap sandbox, where the
+/// secrets portal is the way to the keyring. The same test `oo7` makes through `ashpd`
+/// (`/.flatpak-info`, or the process's own cgroup for a Snap) without its last clause.
+/// Environment variables such as `FLATPAK_ID` or `SNAP` aren't read: a program started from a
+/// Flatpak or Snap app's terminal inherits them without being sandboxed itself.
 ///
 /// `GTK_USE_PORTAL` is deliberately not a signal. It asks GTK to send GTK's own dialogs
 /// through the xdg-desktop-portal; it says nothing about the process being sandboxed. The
@@ -45,21 +48,44 @@ pub const KIND_PASSWORD_OUTGOING: &str = "password:outgoing";
 /// `app-ai.lastrefuge.Overlook@<id>.service`, the portal hands it a different secret, and
 /// every stored password then reads back as `IncorrectSecret`.
 fn sandboxed() -> bool {
-    sandboxed_with(|name| std::env::var_os(name).is_some(), std::path::Path::new("/"))
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    sandboxed_with(std::path::Path::new("/"), &cgroup)
 }
 
 /// [`sandboxed`] with its inputs passed in, so the rule can be checked without a container.
-fn sandboxed_with(var_set: impl Fn(&str) -> bool, root: &std::path::Path) -> bool {
-    var_set("FLATPAK_ID") || var_set("SNAP") || root.join(".flatpak-info").exists()
+fn sandboxed_with(root: &std::path::Path, cgroup: &str) -> bool {
+    root.join(".flatpak-info").exists() || in_snap(cgroup)
+}
+
+/// Whether a `/proc/self/cgroup` listing puts the process in a Snap's scope
+/// (`snap.<name>.<app>…`), as `ashpd` checks.
+fn in_snap(cgroup: &str) -> bool {
+    cgroup.lines().any(|line| {
+        let Some((number, rest)) = line.split_once(':') else { return false };
+        let unit = match rest.split_once(':') {
+            Some(("" | "freezer" | "name=systemd", unit)) if number.parse::<u32>().is_ok() => unit,
+            _ => return false,
+        };
+        std::path::Path::new(unit).file_name().and_then(|n| n.to_str()).is_some_and(|scope| scope.starts_with("snap."))
+    })
 }
 
 /// The keyring to use: the Secret Service outside a sandbox, the portal's file backend inside
 /// one. Chosen here rather than by `oo7::Keyring::new`, which asks `ashpd` whether the process
-/// is sandboxed and counts `GTK_USE_PORTAL` as proof.
+/// is sandboxed and counts `GTK_USE_PORTAL` as proof. Like `oo7`, a sandbox without the
+/// secrets portal uses the Secret Service, which the Flatpak is allowed to reach.
 async fn keyring() -> Result<oo7::Keyring, oo7::Error> {
     if sandboxed() {
-        tracing::debug!(target: "overlook::diag", "sandboxed: using the secrets portal file keyring");
-        return Ok(oo7::Keyring::File(std::sync::Arc::new(oo7::file::Keyring::load_default().await?)));
+        match oo7::file::Keyring::load_default().await {
+            Ok(file) => {
+                tracing::debug!(target: "overlook::diag", "sandboxed: using the secrets portal file keyring");
+                return Ok(oo7::Keyring::File(std::sync::Arc::new(file)));
+            }
+            Err(oo7::file::Error::Portal(oo7::ashpd::Error::PortalNotFound(_))) => {
+                tracing::debug!(target: "overlook::diag", "sandboxed without the secrets portal: using the Secret Service");
+            }
+            Err(e) => return Err(oo7::Error::File(e)),
+        }
     }
     let service = oo7::dbus::Service::<'static>::new().await?;
     Ok(oo7::Keyring::DBus(service.default_collection().await?))
@@ -341,15 +367,19 @@ mod tests {
     fn a_portal_hint_is_not_a_sandbox() {
         // GTK_USE_PORTAL=1, set session-wide, used to send every mail password to oo7's file
         // keyring: its key is the portal's per-application secret, and the portal changes the
-        // application id once a .desktop entry lets it tell how the app was launched.
+        // application id once a .desktop entry lets it tell how the app was launched. The
+        // decision reads no environment variable at all, so neither that hint nor a SNAP or
+        // FLATPAK_ID inherited from a sandboxed app's terminal can move the passwords.
         let bare = std::path::Path::new("/nonexistent-overlook-sandbox-root");
-        assert!(!sandboxed_with(|_| false, bare));
-        assert!(!sandboxed_with(|name| name == "GTK_USE_PORTAL", bare));
-        assert!(sandboxed_with(|name| name == "FLATPAK_ID", bare));
-        assert!(sandboxed_with(|name| name == "SNAP", bare));
+        let desktop = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-ai.lastrefuge.Overlook@x.service\n";
+        assert!(!sandboxed_with(bare, desktop));
+        assert!(!sandboxed_with(bare, ""));
+        assert!(sandboxed_with(bare, "0::/user.slice/user-1000.slice/user@1000.service/app.slice/snap.overlook.overlook-4b2c.scope\n"));
+        assert!(sandboxed_with(bare, "12:freezer:/snap.overlook.overlook\n0::/user.slice\n"));
+        assert!(!sandboxed_with(bare, "0::/user.slice/user-1000.slice/user@1000.service/app.slice/snap-code.scope\n"), "not a snap's own scope");
 
         let container = tempfile::tempdir().unwrap();
         std::fs::write(container.path().join(".flatpak-info"), b"[Application]\n").unwrap();
-        assert!(sandboxed_with(|_| false, container.path()));
+        assert!(sandboxed_with(container.path(), desktop));
     }
 }
