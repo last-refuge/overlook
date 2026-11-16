@@ -276,18 +276,63 @@ fn a_create_retried_after_a_lost_reply_finds_its_first_card() {
     *server.lose_reply.borrow_mut() = true;
     assert_eq!(sync(&store, &account, &conn, &server, false).unwrap_err(), CardDavError::Network);
     assert_eq!(server.cards.borrow().len(), 1);
-    // Edited again before the retry: the card made then is brought up to date, not taken as is.
+    // Meanwhile a phone adds a note to the card that try made, and the title is edited here.
+    let url = server.cards.borrow().keys().next().unwrap().clone();
+    let noted = server.text(&url).replace("END:VCARD", "NOTE:Prefers mornings\r\nEND:VCARD");
+    let etag = server.next_etag();
+    server.cards.borrow_mut().insert(url.clone(), (etag, noted));
     let mut again = store.contact_by_id(&account.id, &sophie.id).unwrap().unwrap();
     again.title = Some("Producer".into());
     store.save_contact_locally(&account.id, &again).unwrap();
     sync(&store, &account, &connection(&store, &account), &server, true).unwrap();
     assert_eq!(server.cards.borrow().len(), 1, "no second copy");
-    let url = server.cards.borrow().keys().next().unwrap().clone();
-    assert!(server.text(&url).contains("TITLE:Producer\r\n"), "{}", server.text(&url));
+    let text = server.text(&url);
+    assert!(text.contains("TITLE:Producer\r\n") && text.contains("NOTE:Prefers mornings\r\n"), "the edit made here arrives and the phone's note stays: {text}");
     let shown = store.contacts(&account.id).unwrap();
     assert_eq!(shown.len(), 1);
     assert_eq!((shown[0].id.clone(), shown[0].title.as_deref(), shown[0].pending), (format!("carddav:{url}"), Some("Producer"), false));
     assert!(store.pending_operations(&account.id).unwrap().iter().all(|op| op.state == OperationState::Applied));
+}
+
+#[test]
+fn a_new_contact_deleted_after_a_lost_reply_is_deleted_there_too() {
+    let (store, account, conn) = setup();
+    let server = Server::default();
+    let mut sophie = Contact::new_local(account.id.clone(), now());
+    sophie.name = Some("Sophie Williams".into());
+    store.save_contact_locally(&account.id, &sophie).unwrap();
+    *server.lose_reply.borrow_mut() = true;
+    assert_eq!(sync(&store, &account, &conn, &server, false).unwrap_err(), CardDavError::Network);
+    let row = store.contact_by_id(&account.id, &sophie.id).unwrap().unwrap();
+    store.delete_contact_locally(&account.id, &row).unwrap();
+    sync(&store, &account, &connection(&store, &account), &server, true).unwrap();
+    assert!(server.cards.borrow().is_empty(), "the card the lost try made is deleted too");
+    assert!(store.contacts(&account.id).unwrap().is_empty());
+    assert!(store.contact_cards(&account.id).unwrap().is_empty());
+}
+
+#[test]
+fn connecting_another_sign_in_lets_the_old_ones_contacts_and_edits_go() {
+    let (store, account, conn) = setup();
+    let server = Server::default();
+    server.store("maya", card("maya", "Maya Chen", ""));
+    sync(&store, &account, &conn, &server, true).unwrap();
+    let mut maya = store.contacts(&account.id).unwrap().remove(0);
+    maya.title = Some("Director".into());
+    store.save_contact_locally(&account.id, &maya).unwrap();
+    let mut local = Contact::new_local(account.id.clone(), now());
+    local.name = Some("Only here".into());
+    store.save_contact_locally(&account.id, &local).unwrap();
+    // Signing in again as the same person keeps everything.
+    save(&store, &account, conn.clone(), None).unwrap();
+    assert_eq!(store.contacts(&account.id).unwrap().len(), 2);
+    // As someone else: the old sign-in's contacts and its waiting edit go; nothing read from
+    // one account is sent to the other.
+    save(&store, &account, ContactsConnection { username: "someone-else@example.test".into(), ..conn.clone() }, None).unwrap();
+    let left: Vec<String> = store.contacts(&account.id).unwrap().into_iter().map(|c| c.id).collect();
+    assert_eq!(left, vec![local.id.clone()], "only the contact made here stays");
+    assert!(store.contact_cards(&account.id).unwrap().is_empty());
+    assert!(store.pending_operations(&account.id).unwrap().iter().filter(|op| op.state != OperationState::Applied).all(|op| op.kind.contact_id() == Some(local.id.as_str())));
 }
 
 #[test]

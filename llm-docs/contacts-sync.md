@@ -57,6 +57,8 @@ Syncing works the same way for both kinds of server:
 - **Downloads:** a download is complete or it is an error, so a failed listing never empties an address book.
 - **Disconnect:** results are saved only into the connection the sync started with: the same server, user name and time it was made, checked inside the transaction that saves them. A sync that finishes after Disconnect, or after connecting again (every Microsoft connection has the same address), saves nothing.
 - **Contact ids:** `carddav:<card URL>` or `graph:<contact URL>`. Contacts made here are `local:` until the server has them.
+- **New contacts:** before one is sent, a record of where it goes and what is sent is saved as its card. If the reply is lost, the retry finds the copy the first try made, and applies only what changed here since that try, so changes made elsewhere meanwhile stay. A contact deleted here after a lost reply is deleted at the server too.
+- **Another sign-in:** saving a connection to another server or sign-in first lets the earlier one's contacts, cards and waiting edits go, as Disconnect does, so nothing read from one account is sent to another. Signing in again as the same person keeps everything.
 
 ### CardDAV
 
@@ -67,7 +69,7 @@ Syncing works the same way for both kinds of server:
 - **Edits:** the change is worked out line by line against the server's current card, and the PUT is conditional (`If-Match`, or `If-None-Match: *` for a new card).
   - Fields Overlook doesn't show are never rewritten.
   - Each name part is merged on its own.
-- **New cards:** a new card's id is the local contact's id, so a retry after a lost reply finds the card the first try made, and brings it up to date with any edit made since.
+- **New cards:** a new card's id is the local contact's id, so a retry after a lost reply finds the card the first try made at the recorded address.
 - **One address, once:** changing a value to one another line already has removes that other line, so nothing is listed twice.
 
 ### Microsoft Graph
@@ -128,6 +130,11 @@ Greptile's findings on this work, each fixed with a test:
 - A contacts sign-in renewed during Disconnect, Sign out or Remove account could be saved back.
 - A download from an earlier connection at the same address could be saved into a new one.
 - A Graph reply without its list of contacts counted as an empty address book.
+
+A second review round found two more, also fixed with tests:
+
+- Bringing a retried create's copy up to date compared it with the server's current copy, so a note added on a phone before the retry was taken for a local deletion. It now compares with the record of what the first try sent.
+- "Use these contacts" could switch a Microsoft connection to another account and then send the first account's waiting edits with the second account's sign-in.
 
 ## Code
 

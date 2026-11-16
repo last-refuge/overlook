@@ -203,6 +203,14 @@ impl Store {
         })
     }
 
+    /// Records where a contact added here is being sent, and what is sent, before the request
+    /// goes: if the reply is lost, the retry knows both. Its version stays empty until the
+    /// server's copy is read.
+    pub fn save_contact_card(&self, account: &AccountId, card: &ContactCard) -> Result<()> {
+        ensure_same_account(&card.base.account_id, account, "contact")?;
+        self.with_tx(|tx| upsert_card_tx(tx, account, card))
+    }
+
     pub fn delete_contact_card(&self, account: &AccountId, contact_id: &str) -> Result<()> {
         self.with_conn(|c| {
             c.execute("DELETE FROM contact_cards WHERE account_id=?1 AND contact_id=?2", params![account.0, contact_id])?;
@@ -214,6 +222,11 @@ impl Store {
     /// last read, in place of the edit (or the deletion) it refused. Returns whether there
     /// was a version to show.
     pub fn restore_server_contact(&self, account: &AccountId, contact_id: &str) -> Result<bool> {
+        // A contact added here has no version of the server's to go back to, only the record
+        // of what was being sent.
+        if !from_server(contact_id) {
+            return Ok(false);
+        }
         self.with_tx(|tx| {
             let base: Option<String> = tx.query_row("SELECT base_json FROM contact_cards WHERE account_id=?1 AND contact_id=?2", params![account.0, contact_id], |r| r.get(0)).optional()?;
             let Some(base) = base else { return Ok(false) };

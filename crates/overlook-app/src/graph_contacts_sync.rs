@@ -225,12 +225,20 @@ fn save_item(store: &Store, account: &Account, connection: &ContactsConnection, 
 }
 
 /// Adds `contact` at Microsoft, marked with `marker`, unless an earlier try whose reply never
-/// arrived already did; that copy is then brought up to date with the contact here.
-fn create_once(server: &dyn GraphServer, marker: &str, contact: &Contact) -> Result<GraphItem, GraphError> {
+/// arrived already did. That copy then gets what changed here since the try sent
+/// `sent_then`, so changes made in Outlook meanwhile stay.
+fn create_once(server: &dyn GraphServer, marker: &str, contact: &Contact, sent_then: Option<&Contact>) -> Result<GraphItem, GraphError> {
     match server.find_created(marker)? {
         Some(found) => {
-            let made = graph::contact_from_graph(&found.contact, String::new(), contact.account_id.clone(), 0);
-            let patch = graph::graph_changes(&found.contact, &made, contact);
+            let made;
+            let base = match sent_then {
+                Some(sent) => sent,
+                None => {
+                    made = graph::contact_from_graph(&found.contact, String::new(), contact.account_id.clone(), 0);
+                    &made
+                }
+            };
+            let patch = graph::graph_changes(&found.contact, base, contact);
             if patch.is_empty() {
                 return Ok(found);
             }
@@ -246,13 +254,25 @@ fn create_once(server: &dyn GraphServer, marker: &str, contact: &Contact) -> Res
 fn create(store: &Store, account: &Account, connection: &ContactsConnection, server: &dyn GraphServer, contact_id: &str) -> Sent {
     // Sent already (the contact then has Microsoft's id), or deleted before it was sent.
     let Ok(Some(contact)) = store.contact_by_id(&account.id, contact_id) else { return Sent::Done };
-    match create_once(server, contact_id, &contact) {
+    // A try whose reply never arrived left a record of what it sent; the first try makes one.
+    let earlier = store.contact_card(&account.id, contact_id).ok().flatten();
+    if earlier.is_none() {
+        let record = ContactCard { contact_id: contact_id.to_owned(), address_book: String::new(), url: String::new(), etag: String::new(), base: contact.clone() };
+        if let Err(error) = store.save_contact_card(&account.id, &record) {
+            return Sent::Failed(error.to_string());
+        }
+    }
+    match create_once(server, contact_id, &contact, earlier.as_ref().map(|card| &card.base)) {
         Ok(item) => save_item(store, account, connection, contact_id, contact.updated, &item),
         Err(error) => error.into(),
     }
 }
 
 fn update(store: &Store, account: &Account, connection: &ContactsConnection, server: &dyn GraphServer, contact_id: &str) -> Sent {
+    // Never confirmed by Microsoft: still a new contact.
+    if contact_id.starts_with("local:") {
+        return create(store, account, connection, server, contact_id);
+    }
     let Ok(Some(desired)) = store.contact_by_id(&account.id, contact_id) else { return Sent::Done };
     let Ok(Some(card)) = store.contact_card(&account.id, contact_id) else {
         // Never sent: a contact added here, so it goes as a new one.
@@ -279,7 +299,7 @@ fn update(store: &Store, account: &Account, connection: &ContactsConnection, ser
     let item = match updated {
         Some(contact) => GraphItem { folder: card.address_book.clone(), url: card.url.clone(), contact },
         // Deleted at Microsoft since it was read: the edit brings it back, as a new contact.
-        None => match create_once(server, contact_id, &desired) {
+        None => match create_once(server, contact_id, &desired, None) {
             Ok(item) => item,
             Err(error) => return error.into(),
         },
@@ -290,7 +310,20 @@ fn update(store: &Store, account: &Account, connection: &ContactsConnection, ser
 /// Deleting here wins over a change made there since: the contact goes either way.
 fn delete(store: &Store, account: &Account, server: &dyn GraphServer, contact_id: &str) -> Sent {
     let Ok(Some(card)) = store.contact_card(&account.id, contact_id) else { return Sent::Done };
-    match server.delete(&card.url) {
+    // A contact added here whose upload was never confirmed: deleted there if it got there.
+    let url = if card.url.is_empty() {
+        match server.find_created(contact_id) {
+            Ok(Some(item)) => item.url,
+            Ok(None) => {
+                let _ = store.delete_contact_card(&account.id, contact_id);
+                return Sent::Done;
+            }
+            Err(error) => return error.into(),
+        }
+    } else {
+        card.url.clone()
+    };
+    match server.delete(&url) {
         Ok(()) => {
             let _ = store.delete_contact_card(&account.id, contact_id);
             Sent::Done

@@ -192,6 +192,9 @@ fn a_contact_added_here_is_made_once_even_after_a_lost_reply() {
     *server.lose_reply.borrow_mut() = true;
     assert_eq!(sync(&store, &account, &conn, &server, false).unwrap_err(), GraphError::Network);
     assert_eq!(server.contacts.borrow().len(), 1);
+    // Meanwhile Outlook adds a note to the copy that try made.
+    let made = server.contacts.borrow().keys().next().unwrap().clone();
+    server.contacts.borrow_mut().get_mut(&made).unwrap()["personalNotes"] = json!("Prefers mornings");
 
     // Edited again before the retry: the copy made then is brought up to date, not doubled.
     let mut again = store.contact_by_id(&account.id, &sophie.id).unwrap().unwrap();
@@ -201,10 +204,27 @@ fn a_contact_added_here_is_made_once_even_after_a_lost_reply() {
     assert_eq!(server.contacts.borrow().len(), 1, "no second copy");
     let url = server.contacts.borrow().keys().next().unwrap().clone();
     assert_eq!(server.field(&url, "jobTitle"), json!("Producer"));
+    assert_eq!(server.field(&url, "personalNotes"), json!("Prefers mornings"), "Outlook's note stays");
     assert_eq!(server.field(&url, "displayName"), json!("Sophie Williams"));
     let shown = store.contacts(&account.id).unwrap();
     assert_eq!(shown.len(), 1);
     assert_eq!((shown[0].id.clone(), shown[0].title.as_deref(), shown[0].pending), (format!("graph:{url}"), Some("Producer"), false));
+}
+
+#[test]
+fn a_new_contact_deleted_after_a_lost_reply_is_deleted_at_microsoft_too() {
+    let (store, account, conn) = setup();
+    let server = Server::default();
+    let mut sophie = Contact::new_local(account.id.clone(), now());
+    sophie.name = Some("Sophie Williams".into());
+    store.save_contact_locally(&account.id, &sophie).unwrap();
+    *server.lose_reply.borrow_mut() = true;
+    assert_eq!(sync(&store, &account, &conn, &server, false).unwrap_err(), GraphError::Network);
+    let row = store.contact_by_id(&account.id, &sophie.id).unwrap().unwrap();
+    store.delete_contact_locally(&account.id, &row).unwrap();
+    sync(&store, &account, &conn, &server, true).unwrap();
+    assert!(server.contacts.borrow().is_empty(), "the copy the lost try made is deleted too");
+    assert!(store.contacts(&account.id).unwrap().is_empty());
 }
 
 #[test]

@@ -108,6 +108,13 @@ pub fn save(store: &Store, account: &Account, connection: ContactsConnection, se
         crate::graph_contacts_sync::end_sign_in(&account.id);
         let _ = credentials::delete_secret(&account.id, credentials::KIND_OAUTH_MICROSOFT_CONTACTS);
     }
+    // Another server or sign-in: the earlier one's contacts, and the edits waiting for it, are
+    // let go first as Disconnect does, so nothing read from one account is sent to another.
+    if let Some(earlier) = store.contacts_connection(&account.id).map_err(|e| e.to_string())? {
+        if earlier.server_url != connection.server_url || earlier.username != connection.username {
+            store.remove_contacts_connection(&account.id).map_err(|e| e.to_string())?;
+        }
+    }
     store.save_contacts_connection(&connection).map_err(|e| e.to_string())?;
     // Check straight away rather than at the next interval.
     let _ = store.set_setting(&crate::sync::contacts_synced_key(&account.id), &0i64);
@@ -362,22 +369,38 @@ fn new_card_uid(contact_id: &str) -> String {
 fn create(store: &Store, account: &Account, connection: &ContactsConnection, server: &dyn ContactsServer, contact_id: &str) -> Sent {
     // Sent already (the contact then has the server's id), or deleted before it was sent.
     let Ok(Some(contact)) = store.contact_by_id(&account.id, contact_id) else { return Sent::Done };
-    let book = match default_book(store, connection, server) {
-        Ok(book) => book,
-        Err(sent) => return sent,
+    // A try whose reply never arrived left its record: where it went, and what it sent.
+    let earlier = store.contact_card(&account.id, contact_id).ok().flatten();
+    let (book, url) = match &earlier {
+        Some(card) => (card.address_book.clone(), card.url.clone()),
+        None => {
+            let book = match default_book(store, connection, server) {
+                Ok(book) => book,
+                Err(sent) => return sent,
+            };
+            let url = card_url(&book, &new_card_uid(contact_id));
+            let record = ContactCard { contact_id: contact_id.to_owned(), address_book: book.clone(), url: url.clone(), etag: String::new(), base: contact.clone() };
+            if let Err(error) = store.save_contact_card(&account.id, &record) {
+                return Sent::Failed(error.to_string());
+            }
+            (book, url)
+        }
     };
     let uid = new_card_uid(contact_id);
-    let url = card_url(&book, &uid);
     match server.put(&url, &vcard::new_card(&contact, &uid, now()), WriteCondition::Create) {
         Ok(WriteOutcome::Done) => save_from_server(store, account, connection, contact_id, contact.updated, &book, &url, server),
-        // Already there: an earlier try that went through without its reply arriving. The
-        // contact may have been edited here since, so that card is brought up to date first.
-        Ok(WriteOutcome::Conflict) => match catch_up(server, &account.id, &url, &contact) {
-            Ok(()) => save_from_server(store, account, connection, contact_id, contact.updated, &book, &url, server),
-            Err(sent) => sent,
-        },
+        // Already there: an earlier try went through without its reply arriving. Only what
+        // changed here since that try is applied, so changes made elsewhere meanwhile stay.
+        Ok(WriteOutcome::Conflict) => {
+            let sent_then = earlier.map(|card| card.base).unwrap_or_else(|| contact.clone());
+            match catch_up(server, &url, &sent_then, &contact) {
+                Ok(()) => save_from_server(store, account, connection, contact_id, contact.updated, &book, &url, server),
+                Err(sent) => sent,
+            }
+        }
         Ok(WriteOutcome::Missing) => {
             // The address book is gone: find another next time.
+            let _ = store.delete_contact_card(&account.id, contact_id);
             let _ = store.save_contacts_connection(&ContactsConnection { default_book: None, ..connection.clone() });
             Sent::Retry(CardDavError::UnexpectedStatus(404))
         }
@@ -385,20 +408,16 @@ fn create(store: &Store, account: &Account, connection: &ContactsConnection, ser
     }
 }
 
-/// Brings the card an earlier try made at `url` up to date with `contact` as it is here now,
-/// changing only the fields that differ.
-fn catch_up(server: &dyn ContactsServer, account: &AccountId, url: &str, contact: &Contact) -> Result<(), Sent> {
+/// Applies to the card an earlier try made at `url` what changed here since that try sent
+/// `sent_then`, leaving the rest as the server has it.
+fn catch_up(server: &dyn ContactsServer, url: &str, sent_then: &Contact, contact: &Contact) -> Result<(), Sent> {
     let remote = match server.get(url) {
         Ok(Some(remote)) => remote,
         // Gone again since: the next try makes it afresh.
         Ok(None) => return Err(Sent::Retry(CardDavError::ServiceUnavailable)),
         Err(error) => return Err(error.into()),
     };
-    let made = match vcard::Card::parse(&remote.card) {
-        Ok(card) => vcard::contact_from_fields(&card.fields(), String::new(), account.clone(), None, 0),
-        Err(error) => return Err(Sent::Failed(error.to_string())),
-    };
-    let text = vcard::apply_changes(&remote.card, &made, contact, now()).map_err(|e| Sent::Failed(e.to_string()))?;
+    let text = vcard::apply_changes(&remote.card, sent_then, contact, now()).map_err(|e| Sent::Failed(e.to_string()))?;
     if text == remote.card {
         return Ok(());
     }
@@ -411,6 +430,10 @@ fn catch_up(server: &dyn ContactsServer, account: &AccountId, url: &str, contact
 }
 
 fn update(store: &Store, account: &Account, connection: &ContactsConnection, server: &dyn ContactsServer, contact_id: &str) -> Sent {
+    // Never confirmed by the server: still a new contact.
+    if contact_id.starts_with("local:") {
+        return create(store, account, connection, server, contact_id);
+    }
     let Ok(Some(desired)) = store.contact_by_id(&account.id, contact_id) else { return Sent::Done };
     let Ok(Some(card)) = store.contact_card(&account.id, contact_id) else {
         // Never sent: a contact added here, so it goes as a new one.
@@ -444,6 +467,17 @@ fn update(store: &Store, account: &Account, connection: &ContactsConnection, ser
 fn delete(store: &Store, account: &Account, server: &dyn ContactsServer, contact_id: &str) -> Sent {
     let Ok(Some(card)) = store.contact_card(&account.id, contact_id) else { return Sent::Done };
     let mut etag = card.etag.clone();
+    // A contact added here whose upload was never confirmed: deleted there if it got there.
+    if etag.is_empty() {
+        match server.get(&card.url) {
+            Ok(Some(remote)) => etag = remote.etag,
+            Ok(None) => {
+                let _ = store.delete_contact_card(&account.id, contact_id);
+                return Sent::Done;
+            }
+            Err(error) => return error.into(),
+        }
+    }
     for _ in 0..3 {
         match server.delete(&card.url, &etag) {
             Ok(WriteOutcome::Done | WriteOutcome::Missing) => {
