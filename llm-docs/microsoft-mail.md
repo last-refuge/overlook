@@ -22,7 +22,7 @@ Microsoft disabled password (basic) authentication for Outlook.com IMAP, POP3 an
 | App sign-in | `crates/overlook-app/src/microsoft_signin.rs` | Registration loading (file, then built-in), the browser flow, and the code exchange. A declined consent shows a fixed message that mentions administrator approval; the redirect's own error text is never shown. |
 | Keyring | `crates/overlook-app/src/credentials.rs` | Kind `oauth-tokens:microsoft`, label "Overlook Microsoft sign-in (…)". The JSON holds the tokens plus the client id and tenant that issued them, so refreshes keep using that registration even if the built-in one or the file changes. |
 | Providers | `crates/overlook-app/src/providers.rs` | Builds the session from stored tokens: refreshed tokens are persisted, `invalid_grant` deletes the stored copy. Only an account's newest sign-in may write to the keyring (`adopt_microsoft_sign_in`, `end_microsoft_sign_ins`). A session replaced by a new sign-in, or whose account was signed out, can finish a refresh but never stores it or deletes its successor. Rebuilt providers reuse the running session. `AccountProviders.microsoft` holds the session for sign-out and session limits. |
-| UI | `ui/account_setup.rs`, `ui/mod.rs`, `ui/settings.rs`, `ui/sidebar.rs` | "Add Microsoft account…" in the sidebar account menu, Settings → Accounts → Add account, and the empty window; `OVERLOOK_SIGN_IN=microsoft`. The setup dialog's Microsoft mode, Sign in again, Sign out, account labels and the About page's registration line. |
+| UI | `ui/account_setup.rs`, `ui/mod.rs`, `ui/settings.rs`, `ui/sidebar.rs` | The **Microsoft** card on the add-account page (Settings → Accounts → Add account, the account menu's Add account…, and a new install); `OVERLOOK_SIGN_IN=microsoft`. The setup dialog's Microsoft mode, Sign in again, Sign out, account labels and the About page's registration line. |
 
 ### Signing in
 
@@ -46,7 +46,7 @@ The dialog switches to Microsoft mode by itself in three cases:
 - **Update password** on an existing password account at such an address that reads mail from Microsoft's servers. This converts the account in place and keeps its mail. **Server settings…** on such an account stays editable and only explains the switch.
 - **Server settings…** on a Microsoft account. There, **Sign in again** keeps the settings as they are (a custom user name or host may be deliberate) and waits for **Save**.
 
-POP3 is reached through **Add POP3 account…** with a Microsoft address; **Add Microsoft account…** sets up IMAP.
+POP3 is reached through the **POP3 account** choice with a Microsoft address; the **Microsoft** choice sets up IMAP.
 
 **Sign in again** from the banner, sidebar or Settings uses the browser alone. A sign-in that names the account is stored at once. A sign-in as someone else is first used to open the account's mailbox. It is stored only if that works, as it does for an alias or a delegate; otherwise nothing changes and the user is asked to choose the right account.
 
@@ -126,4 +126,4 @@ Per the roadmap's "What earns explicit support", in the order the roadmap gives:
 
 - Outlook calendar, contacts, Focused Inbox and categories, which need a Graph provider.
 - On-premises Exchange; sovereign clouds such as GCC High, DoD and 21Vianet, which have different authorities and hosts.
-- Detecting Microsoft 365 custom domains from DNS. Users choose **Add Microsoft account…**; autoconfig recognises only Microsoft's own consumer domains.
+- Detecting Microsoft 365 custom domains from DNS. Users choose **Microsoft** on the add-account page; autoconfig recognises only Microsoft's own consumer domains.

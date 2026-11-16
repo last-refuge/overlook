@@ -754,6 +754,9 @@ pub struct MailWindow {
     pub(crate) settings: Option<SettingsState>,
     /// The IMAP/POP3 account dialog, when open.
     pub(crate) account_setup: Option<AccountSetup>,
+    /// The add-account page is open over the mail window (from Settings or the account
+    /// menu), with the accounts there were when it opened: one more closes it.
+    pub(crate) adding_account: Option<BTreeSet<AccountId>>,
     pub(crate) update: UpdateState,
     /// Generation counter for delayed mark-as-read timers.
     mark_read_generation: u64,
@@ -1036,6 +1039,7 @@ impl MailWindow {
             account_prefs,
             settings: None,
             account_setup: None,
+            adding_account: None,
             mark_read_generation: 0,
             last_sync_tick: now(),
             sidebar_width,
@@ -1133,7 +1137,7 @@ impl MailWindow {
         this.refresh_idle_watchers();
         this.watch_system_time_zone(window, cx);
         // `OVERLOOK_SIGN_IN=gmail` opens the Google sign-in immediately (first-run helper).
-        // Neither it nor the sample offer belongs in a window nobody can see.
+        // It doesn't belong in a window nobody can see.
         let launch_helper = if first_start && !hidden { std::env::var("OVERLOOK_SIGN_IN") } else { Err(std::env::VarError::NotPresent) };
         // `icloud`, `yahoo`, `aol`: a guided app-password service, by its short name.
         let guided = launch_helper.as_deref().ok().and_then(|name| overlook_provider::app_passwords::GUIDES.iter().copied().find(|g| g.short_name.eq_ignore_ascii_case(name)));
@@ -1143,13 +1147,8 @@ impl MailWindow {
             Ok(_) if guided.is_some() => this.open_guided_setup(guided.expect("checked"), window, cx),
             Ok("imap") => this.open_account_setup(ProviderKind::Imap, SetupMode::New, window, cx),
             Ok("pop3") => this.open_account_setup(ProviderKind::Pop3, SetupMode::New, window, cx),
-            // Asked only here, at launch: removing the last account later leaves the window empty.
-            _ if !this.has_account() && first_start && !hidden => {
-                cx.spawn_in(window, async move |this, cx| {
-                    let _ = this.update_in(cx, |this, window, cx| this.offer_sample_mailbox(window, cx));
-                })
-                .detach();
-            }
+            // With no account, the window is the add-account page (`welcome.rs`), which also
+            // offers the sample mailbox.
             _ => {}
         }
 
@@ -1244,22 +1243,6 @@ impl MailWindow {
     /// False when the device has no accounts and the window shows "Add an account".
     pub(crate) fn has_account(&self) -> bool {
         !self.accounts.is_empty()
-    }
-
-    fn offer_sample_mailbox(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let answer = window.prompt(
-            PromptLevel::Info,
-            "Load the sample mailbox?",
-            Some("There are no accounts on this device yet."),
-            &["Load sample mailbox", "Not now"],
-            cx,
-        );
-        cx.spawn_in(window, async move |this, cx| {
-            if answer.await == Ok(0) {
-                let _ = this.update_in(cx, |this, window, cx| this.load_sample_account(window, cx));
-            }
-        })
-        .detach();
     }
 
     fn load_sample_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3571,6 +3554,8 @@ impl MailWindow {
             self.close_history(window, cx);
         } else if self.account_setup.is_some() {
             self.close_account_setup(window, cx);
+        } else if self.adding_account.is_some() {
+            self.close_add_account(window, cx);
         } else if self.quick_look.is_some() {
             self.quick_look = None;
             cx.notify();
@@ -4281,7 +4266,11 @@ impl Render for MailWindow {
             self.first_frame_logged = true;
             tracing::info!("startup: first frame after {} ms", crate::since_start_ms());
         }
-        if !self.has_account() {
+        // Adding an account ends on the page the moment a new one is connected.
+        if self.adding_account.as_ref().is_some_and(|before| self.accounts.iter().any(|a| !before.contains(&a.id))) {
+            self.adding_account = None;
+        }
+        if !self.has_account() || self.adding_account.is_some() {
             return self.render_no_account(window, cx).into_any_element();
         }
         let p: Palette = *cx.palette();

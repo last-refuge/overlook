@@ -1285,38 +1285,13 @@ impl MailWindow {
         .detach();
     }
 
-    /// "Add account" with one entry per account type.
+    /// "Add account": the add-account page, with every kind of account on it.
     fn add_account_menu(&self, cx: &mut Context<Self>) -> AnyElement {
-        let t = cx.entity().downgrade();
         Button::new("settings-add-account")
             .small()
             .icon(icon("plus").size(px(14.)))
             .label("Add account")
-            .dropdown_caret(true)
-            .dropdown_menu(move |mut menu, _window, _cx| {
-                let g = t.clone();
-                menu = menu.item(PopupMenuItem::new("Gmail…").on_click(move |_, window, cx| {
-                    let _ = g.update(cx, |this, cx| this.start_google_sign_in(None, window, cx));
-                }));
-                let m = t.clone();
-                menu = menu.item(PopupMenuItem::new("Microsoft (Outlook.com, Microsoft 365)…").on_click(move |_, window, cx| {
-                    let _ = m.update(cx, |this, cx| this.open_microsoft_setup(window, cx));
-                }));
-                for &guide in overlook_provider::app_passwords::GUIDES {
-                    let a = t.clone();
-                    menu = menu.item(PopupMenuItem::new(format!("{}…", guide.provider)).on_click(move |_, window, cx| {
-                        let _ = a.update(cx, |this, cx| this.open_guided_setup(guide, window, cx));
-                    }));
-                }
-                let i = t.clone();
-                menu = menu.item(PopupMenuItem::new("IMAP…").on_click(move |_, window, cx| {
-                    let _ = i.update(cx, |this, cx| this.open_account_setup(ProviderKind::Imap, super::SetupMode::New, window, cx));
-                }));
-                let p = t.clone();
-                menu.item(PopupMenuItem::new("POP3…").on_click(move |_, window, cx| {
-                    let _ = p.update(cx, |this, cx| this.open_account_setup(ProviderKind::Pop3, super::SetupMode::New, window, cx));
-                }))
-            })
+            .on_click(cx.listener(|this, _, window, cx| this.open_add_account(window, cx)))
             .into_any_element()
     }
 

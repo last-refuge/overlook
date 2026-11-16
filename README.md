@@ -154,8 +154,11 @@ when there is one. **Update now** downloads the release, verifies its checksum, 
 through a polkit password dialog when Overlook was installed with pacman, or by swapping the binary when it
 lives in your own prefix. Then **Restart Overlook**. Nothing about you is sent during the check.
 
-On first launch, choose to load a **sample mailbox** or start empty and connect your own account. The sample
-account's connection is a switch in the status bar; flip it to watch offline changes sync.
+On first launch, Overlook opens on its welcome page: pick where your mail lives (Gmail, Microsoft, iCloud,
+Yahoo, AOL, Fastmail, Proton, or any IMAP or POP3 server) and it walks you through connecting it. To look
+around first, choose **Look around in a sample mailbox first** at the foot of the page. The sample account's
+connection is a switch in the status bar; flip it to watch offline changes sync. Adding another account later
+(Settings → Accounts → **Add account**, or the account menu) opens the same page.
 
 ## Connect Gmail
 
@@ -169,8 +172,8 @@ client that belongs to you. Nothing passes through a Last Refuge server.
    `contacts`, `contacts.other.readonly`, `openid`, `userinfo.email`.
 3. Create an OAuth client of type **Desktop app** and download its JSON.
 4. Save it as `~/.config/overlook/google-oauth-client.json`.
-5. In Overlook, open the account menu at the bottom of the sidebar → **Add Gmail account…** and sign in in
-   your browser. Repeat for more accounts.
+5. In Overlook, choose **Add account** (Settings → Accounts, or the account menu at the bottom of the sidebar), then
+   **Gmail**, and sign in in your browser. A new install opens on that page. Repeat for more accounts.
 
 Tokens are stored in your system keyring (GNOME Keyring or KWallet through the Secret Service), never in
 files. In Google's *Testing* mode you will be asked to sign in again every seven days; publishing the app
@@ -183,8 +186,8 @@ Outlook.com, Hotmail, Live and MSN addresses and Microsoft 365 work or school ac
 POP3) and sent over SMTP. You sign in with Microsoft in your browser. Overlook never sees your password, and it
 keeps the sign-in Microsoft issues in your system keyring.
 
-1. Open the account menu at the bottom of the sidebar → **Add Microsoft account…** (or Settings → Accounts →
-   Add account → Microsoft).
+1. Choose **Add account** (Settings → Accounts, or the account menu at the bottom of the sidebar), then
+   **Microsoft**.
 2. Enter your address and choose **Sign in with Microsoft**, then approve Overlook in the browser.
 3. Overlook fills in Microsoft's server settings, checks both servers, and adds the account.
 
@@ -200,8 +203,8 @@ accounts) and save `{"client_id": "<application id>"}` as `~/.config/overlook/mi
 
 ## Connect iCloud
 
-Open the account menu at the bottom of the sidebar → **Add iCloud account…** (or Settings → Accounts → Add
-account → iCloud Mail). iCloud wants an **app-specific password**, not your Apple Account password: create one
+Choose **Add account** (Settings → Accounts, or the account menu at the bottom of the sidebar), then
+**iCloud Mail**. iCloud wants an **app-specific password**, not your Apple Account password: create one
 at [account.apple.com](https://account.apple.com) under Sign-In and Security → App-Specific Passwords (your
 account needs two-factor authentication), then paste it into Overlook, which keeps it in your system keyring.
 Overlook fills in Apple's server settings and finds which user name iCloud wants. For an iCloud+ address at your
@@ -209,7 +212,7 @@ own domain, use your iCloud Mail address as the user name. iCloud doesn't offer 
 
 ## Connect Yahoo or AOL
 
-Open the account menu → **Add Yahoo account…** or **Add AOL account…**. Both want an **app password**, not your
+Choose **Add account**, then **Yahoo Mail** or **AOL Mail**. Both want an **app password**, not your
 account password: create one in your account's Account Security settings
 ([Yahoo](https://login.yahoo.com/account/security): External connections → Create app password;
 [AOL](https://login.aol.com/account/security): Generate app password, after turning on two-step verification),
@@ -218,7 +221,7 @@ sign in to Yahoo for several days. Overlook fills in the server settings; both w
 
 ## Connect Fastmail
 
-Open the account menu → **Add Fastmail account…**. Fastmail wants its own **app password** for each mail app:
+Choose **Add account**, then **Fastmail**. Fastmail wants its own **app password** for each mail app:
 create one in Fastmail under Settings → Privacy & Security → Manage app passwords and access → New app password,
 and keep its default access (Mail, Contacts & Calendars) if you'd like Overlook to connect your calendars too.
 Fastmail's Basic plan doesn't include mail apps. Overlook fills in the server settings, for IMAP or POP3.
@@ -226,7 +229,7 @@ Fastmail's Basic plan doesn't include mail apps. Overlook fills in the server se
 ## Connect Proton Mail
 
 Proton Mail works through [Proton Mail Bridge](https://proton.me/mail/bridge), Proton's desktop app for paid plans.
-Bridge must be running and signed in on the same computer. Open the account menu → **Add Proton account…**, and use
+Bridge must be running and signed in on the same computer. Choose **Add account**, then **Proton Mail**, and use
 the password Bridge shows in the account's mailbox details, not your Proton password. Bridge encrypts the connection
 with a certificate it made itself, so the first connection test asks you to trust it, and the account can't be added
 until you do. Overlook then accepts that certificate, and no other, from Bridge on this computer. If Bridge's
