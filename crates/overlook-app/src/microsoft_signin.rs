@@ -158,20 +158,27 @@ mod tests {
             client_config_path().display()
         );
         let dir = std::env::temp_dir().join(format!("overlook-ms-config-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(CONFIG_FILE);
-        match ClientConfig::built_in() {
-            Some(built_in) => assert_eq!(load_client_config_from(&path), Ok(built_in)),
-            None => assert!(load_client_config_from(&path)
-                .unwrap_err()
-                .contains("no Microsoft app registration")),
+        // A fresh config directory signs in with the registration compiled into the build.
+        let built_in = ClientConfig::built_in().expect("every build carries a Microsoft registration");
+        if overlook_provider::microsoft::oauth::BUILD_CLIENT_ID.is_none() {
+            assert_eq!(
+                Some(&built_in),
+                ClientConfig::from_json(overlook_provider::microsoft::oauth::BUNDLED_CLIENT_JSON)
+                    .ok()
+                    .as_ref()
+            );
         }
+        assert_eq!(load_client_config_from(&path), Ok(built_in.clone()));
         std::fs::write(
             &path,
             r#"{"client_id":"11111111-2222-3333-4444-555555555555","tenant":"organizations"}"#,
         )
         .unwrap();
         let config = load_client_config_from(&path).unwrap();
+        assert_ne!(config, built_in);
         assert_eq!(
             (config.client_id.as_str(), config.tenant.as_str()),
             ("11111111-2222-3333-4444-555555555555", "organizations")

@@ -62,7 +62,9 @@ Microsoft sign-in deletes its stored passwords (`account_setup.rs:1028-1030`).
 
 Overlook signs in to Microsoft as a public client. Its application (client) id is public, as in every
 desktop mail client, and no client secret exists; PKCE protects the authorization code. The id is
-compiled in (`crates/overlook-provider/src/microsoft/oauth.rs`, `BUILT_IN_CLIENT_ID`). An optional
+compiled in from `crates/overlook-provider/src/microsoft/microsoft-oauth-client.json`, which holds only
+the client id and an optional tenant (`oauth.rs`, `BUNDLED_CLIENT_JSON`; a packager's
+`OVERLOOK_MICROSOFT_CLIENT_ID` replaces it at build time). An optional
 `microsoft-oauth-client.json` in `~/.config/overlook/` (or `$OVERLOOK_CONFIG_DIR`) can name another:
 `{"client_id": "…", "tenant": "…"}`. Overlook only reads that file, at sign-in
 (`crates/overlook-app/src/microsoft_signin.rs:25-48`). It holds nothing secret.
