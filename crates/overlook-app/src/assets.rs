@@ -2,8 +2,7 @@
 //! bundled with GPUI Kit. Paths under `overlook/` are ours; everything else is delegated.
 
 use crate::theme::Palette;
-use gpui_kit::{AssetSource, Hsla, Img, Result, Rgba, SharedString, Styled, img, px};
-use overlook_core::ResolvedTheme;
+use gpui_kit::{AssetSource, Div, ParentElement, Result, SharedString, Styled, div, px, svg};
 use std::borrow::Cow;
 
 /// Static Inter faces (instanced from the bundled variable font) so weights resolve.
@@ -56,7 +55,7 @@ const EMBEDDED: &[(&str, &[u8])] = &[
 ];
 
 
-// Original full-color SVGs. Use images, not the monochrome icon mask renderer.
+// Original two-tone SVGs. Paint the fill and outline as separate native vector masks.
 macro_rules! color_icons {
     ($($variant:ident => $file:literal),+ $(,)?) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,125 +100,59 @@ color_icons! {
     Pop3 => "pop3",
 }
 
-const ICON_THEMES: &[(&str, ResolvedTheme)] = &[
-    ("light", ResolvedTheme::Light),
-    ("dark", ResolvedTheme::Dark),
-    ("gray", ResolvedTheme::Gray),
-    ("blue", ResolvedTheme::Blue),
-    ("white", ResolvedTheme::White),
-    ("alexander", ResolvedTheme::Alexander),
-    ("pink", ResolvedTheme::Pink),
-    ("system-light", ResolvedTheme::SystemLight),
-    ("system-dark", ResolvedTheme::SystemDark),
-];
-
-fn color_icon_path(icon: ColorIcon, theme: ResolvedTheme, on_action: bool) -> SharedString {
-    let key = ICON_THEMES
-        .iter()
-        .find(|(_, value)| *value == theme)
-        .map_or("light", |(name, _)| name);
-    let tone = if on_action { "action" } else { "normal" };
-    match theme {
-        // The desktop colors change at runtime; their generation in the path keeps the
-        // image cache from serving icons tinted for the previous desktop theme.
-        ResolvedTheme::SystemLight | ResolvedTheme::SystemDark => format!("overlook/color/{key}.{}/{tone}/{}", crate::theme::desktop_generation(), icon.file()).into(),
-        _ => format!("overlook/color/{key}/{tone}/{}", icon.file()).into(),
-    }
+fn icon_layer_path(icon: ColorIcon, layer: &str) -> SharedString {
+    format!("overlook/icons/{layer}/{}", icon.file()).into()
 }
 
-pub fn color_icon(icon: ColorIcon, size: f32, palette: &Palette) -> Img {
-    img(color_icon_path(icon, palette.resolved, false))
+pub fn color_icon(icon: ColorIcon, size: f32, palette: &Palette) -> Div {
+    vector_icon(icon, size, palette.action)
+}
+
+pub fn color_icon_on_action(icon: ColorIcon, size: f32, palette: &Palette) -> Div {
+    vector_icon(icon, size, palette.on_action)
+}
+
+fn vector_icon(icon: ColorIcon, size: f32, color: gpui_kit::Hsla) -> Div {
+    // `img` rasterizes SVGs at their intrinsic size, then downsamples that texture.
+    // `svg` rasterizes its mask for the actual bounds and display scale instead.
+    // Tint at paint time: a theme switch never reuses stale colored image pixels.
+    div()
+        .relative()
         .size(px(size))
         .flex_none()
+        .child(
+            svg()
+                .path(icon_layer_path(icon, "fill"))
+                .absolute()
+                .top(px(0.))
+                .left(px(0.))
+                .size(px(size))
+                .text_color(color.opacity(0.12)),
+        )
+        .child(
+            svg()
+                .path(icon_layer_path(icon, "stroke"))
+                .absolute()
+                .top(px(0.))
+                .left(px(0.))
+                .size(px(size))
+                .text_color(color),
+        )
 }
 
-pub fn color_icon_on_action(icon: ColorIcon, size: f32, palette: &Palette) -> Img {
-    img(color_icon_path(icon, palette.resolved, true))
-        .size(px(size))
-        .flex_none()
-}
-
-/// Resolve immutable, theme-specific resources when the image loader requests them.
-/// The theme and contrast context are part of the cache key, never global mutable state.
-fn themed_icon(path: &str) -> Option<Vec<u8>> {
-    let rest = path.strip_prefix("overlook/color/")?;
-    let mut parts = rest.split('/');
-    let key = parts.next()?;
-    let tone = parts.next()?;
-    let file = parts.next()?;
-    if parts.next().is_some() || !matches!(tone, "normal" | "action") {
+/// Extract one flat group from our generated artwork, retaining the shared view box.
+/// These immutable masks are shared by every colorway and contrast context.
+fn icon_layer(path: &str) -> Option<Vec<u8>> {
+    let (layer, file) = path.strip_prefix("overlook/icons/")?.split_once('/')?;
+    if !matches!(layer, "fill" | "stroke") {
         return None;
     }
-    // A desktop theme's key carries a colors fingerprint after the dot; the colors
-    // themselves are read fresh from the current desktop palette.
-    let key = key.split_once('.').map_or(key, |(name, _)| name);
-    let (_, theme) = ICON_THEMES.iter().find(|(name, _)| *name == key)?;
     let (_, source) = COLOR_ASSETS.iter().find(|(name, _)| *name == file)?;
-    let p = Palette::for_theme(*theme);
-    let mix = |a: Hsla, b: Hsla, amount: f32| -> Hsla {
-        let a = Rgba::from(a);
-        let b = Rgba::from(b);
-        Rgba {
-            r: a.r + (b.r - a.r) * amount,
-            g: a.g + (b.g - a.g) * amount,
-            b: a.b + (b.b - a.b) * amount,
-            a: 1.,
-        }
-        .into()
-    };
-    let secondary = match theme {
-        ResolvedTheme::Light | ResolvedTheme::Alexander => p.brand_accent,
-        ResolvedTheme::Dark => p.label_plum,
-        _ => p.selection_text,
-    };
-    let colors = if tone == "action" {
-        [
-            p.on_action,
-            mix(p.on_action, p.selection, 0.2),
-            p.selection,
-            mix(p.action, p.on_action, 0.16),
-            p.action,
-            p.on_action,
-        ]
-    } else {
-        [
-            p.action,
-            mix(p.action, p.on_action, 0.35),
-            secondary,
-            p.selection,
-            p.message_surface(),
-            p.foreground,
-        ]
-    };
-    let tokens = [
-        "#3F6654", "#76A58C", "#92581D", "#DDE9E1", "#FFFFFF", "#29332E",
-    ];
-    // A single replacement pass prevents a generated hex matching a later source token.
     let source = std::str::from_utf8(source).ok()?;
-    let mut result = String::with_capacity(source.len());
-    for (i, fragment) in source.split('#').enumerate() {
-        if i == 0 {
-            result.push_str(fragment);
-            continue;
-        }
-        result.push('#');
-        if let Some(index) = tokens
-            .iter()
-            .position(|token| fragment.starts_with(&token[1..]))
-        {
-            let rgb = Rgba::from(colors[index]);
-            result.push_str(&format!(
-                "{:02X}{:02X}{:02X}",
-                (rgb.r * 255.).round() as u8,
-                (rgb.g * 255.).round() as u8,
-                (rgb.b * 255.).round() as u8
-            ));
-            result.push_str(&fragment[6..]);
-        } else {
-            result.push_str(fragment);
-        }
-    }
-    Some(result.into_bytes())
+    let header = source.split_once('>')?.0;
+    let start = source.find(&format!("<g id=\"{layer}\""))?;
+    let end = start + source[start..].find("</g>")? + "</g>".len();
+    Some(format!("{header}>{}</svg>", &source[start..end]).into_bytes())
 }
 
 pub struct Assets;
@@ -229,7 +162,7 @@ impl AssetSource for Assets {
         if let Some((_, bytes)) = EMBEDDED.iter().find(|(p, _)| *p == path) {
             return Ok(Some(Cow::Borrowed(bytes)));
         }
-        if let Some(bytes) = themed_icon(path) {
+        if let Some(bytes) = icon_layer(path) {
             return Ok(Some(Cow::Owned(bytes)));
         }
         gpui_kit::assets::AllAssets.load(path)
@@ -241,13 +174,11 @@ impl AssetSource for Assets {
             .filter(|(p, _)| p.starts_with(path))
             .map(|(p, _)| SharedString::from(*p))
             .collect();
-        for (_, theme) in ICON_THEMES {
-            for icon in ColorIcon::ALL {
-                for on_action in [false, true] {
-                    let resource = color_icon_path(*icon, *theme, on_action);
-                    if resource.starts_with(path) {
-                        ours.push(resource);
-                    }
+        for icon in ColorIcon::ALL {
+            for layer in ["fill", "stroke"] {
+                let resource = icon_layer_path(*icon, layer);
+                if resource.starts_with(path) {
+                    ours.push(resource);
                 }
             }
         }
@@ -264,7 +195,7 @@ pub fn icon(name: &str) -> gpui_kit::component::Icon {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::HashSet, sync::Arc};
+    use std::sync::Arc;
 
     #[test]
     fn provider_marks_are_embedded_and_keep_their_colors() {
@@ -285,52 +216,54 @@ mod tests {
     }
 
     #[test]
-    fn color_icons_are_embedded_renderable_and_keep_their_color() {
+    fn icon_layers_render_at_control_sizes_and_display_scales() {
         let assets = Assets;
         let renderer = gpui_kit::SvgRenderer::new(Arc::new(Assets));
         for icon in ColorIcon::ALL {
-            let mut rendered_themes = HashSet::new();
-            for (_, theme) in ICON_THEMES {
+            for layer in ["fill", "stroke"] {
                 let bytes = assets
-                    .load(&color_icon_path(*icon, *theme, false))
+                    .load(&icon_layer_path(*icon, layer))
                     .unwrap()
-                    .expect("embedded color icon");
-                let image = renderer.render_single_frame(&bytes, 1.).unwrap();
-                assert!(
-                    image.size(0).width.0 >= 128 && image.size(0).height.0 >= 128,
-                    "{icon:?}"
-                );
-                let colors: HashSet<_> = image
-                    .as_bytes(0)
-                    .unwrap()
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .filter(|pixel| pixel[3] >= 250)
-                    .map(|pixel| [pixel[0], pixel[1], pixel[2]])
-                    .collect();
-                assert!(colors.len() > 16, "{icon:?} lost its full-color shading");
-                assert!(
-                    colors.iter().any(|[r, g, b]| r != g || g != b),
-                    "{icon:?} became monochrome"
-                );
-                // Without desktop colors, the desktop themes fall back to Light and Dark.
-                let built_in = !matches!(theme, ResolvedTheme::SystemLight | ResolvedTheme::SystemDark);
-                assert!(
-                    !built_in || rendered_themes.insert(image.as_bytes(0).unwrap().to_vec()),
-                    "{icon:?}: {theme:?} reused another theme's colors"
-                );
-                let on_action = assets
-                    .load(&color_icon_path(*icon, *theme, true))
-                    .unwrap()
-                    .unwrap();
-                let action_image = renderer.render_single_frame(&on_action, 1.).unwrap();
-                assert_ne!(
-                    image.as_bytes(0).unwrap(),
-                    action_image.as_bytes(0).unwrap(),
-                    "{icon:?}: primary button needs its own contrast colors"
-                );
+                    .expect("embedded icon layer");
+                let parsed = renderer.parse_svg(&bytes).unwrap();
+                // GPUI's vector path supersamples the actual device-pixel bounds by 2.
+                // Include the tiny server badges, reader actions, toolbar, rail and welcome.
+                for logical_size in [11_f32, 15., 16., 20., 21., 28.] {
+                    for scale in [1_f32, 1.25, 1.5, 2.] {
+                        let edge = (logical_size * scale * 2.).ceil() as i32;
+                        let size = gpui_kit::size(gpui_kit::DevicePixels(edge), gpui_kit::DevicePixels(edge));
+                        let image = renderer.render_parsed(&parsed, gpui_kit::SvgSize::ExactSize(size)).unwrap();
+                        assert_eq!(image.size(0), size, "{icon:?}/{layer} at {logical_size} × {scale}");
+                        let pixels = image.as_bytes(0).unwrap();
+                        assert!(pixels.chunks_exact(4).any(|pixel| pixel[3] > 200), "{icon:?}/{layer} is empty");
+                        // Keep a transparent safety margin: no strokes should be cut off.
+                        let edge = edge as usize;
+                        for i in 0..edge {
+                            for pixel in [i, (edge - 1) * edge + i, i * edge, i * edge + edge - 1] {
+                                assert_eq!(pixels[pixel * 4 + 3], 0, "{icon:?}/{layer} clips at {logical_size} × {scale}");
+                            }
+                        }
+                    }
+                }
             }
+        }
+    }
+
+    #[test]
+    fn icon_layer_paths_are_complete_and_reject_unknown_resources() {
+        let assets = Assets;
+        let paths = assets.list("overlook/icons/").unwrap();
+        assert_eq!(paths.len(), ColorIcon::ALL.len() * 2);
+        for path in paths {
+            assert!(assets.load(&path).unwrap().is_some(), "{path}");
+        }
+        for path in [
+            "overlook/icons/unknown/mail.svg",
+            "overlook/icons/fill/missing.svg",
+            "overlook/icons/fill/mail.svg/extra",
+            "overlook/icons/fill/../mail.svg",
+        ] {
+            assert!(icon_layer(path).is_none(), "{path}");
         }
     }
 }

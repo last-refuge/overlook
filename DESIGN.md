@@ -289,7 +289,7 @@ Other colorways supply their own action: Gray `#374151`, Blue `#245A96`, White `
 ### Tertiary
 - **Beacon** (#FF9D32): the signature amber inherited from Last Refuge. In the app it appears in the horizon mark's beacon and the welcome choice-card beacon dot, and as Dark's brand accent. Alexander uses a golden-orange variant (`#FF9F0A`) as its message accent.
 - **Message accent** (`Palette::message_accent()`): the theme's action colour everywhere except Alexander, where it is that golden orange. It paints the list's unread and selected edge bars and the Inbox unread pill, whose ink is chosen by luminance (`#1F2A33` on a fill brighter than 0.4, white otherwise).
-- **Deep Amber** (#92581D): Light's restrained amber; serves as Light's focus ring and brand accent, and as the secondary tone in Overlook's colour icons.
+- **Deep Amber** (#92581D): Light's restrained amber; serves as Light's focus ring and brand accent.
 - **Lantern Focus** (#FFBA6B): Dark's focus ring.
 
 ### Neutral
@@ -420,7 +420,7 @@ The services a person can connect, each a focusable button with an accessible na
 - **Beacon:** a 7px amber light, ringed 1px by the hovered card's fill, top-right of the plate; lights on hover or keyboard focus only.
 
 ### Colour icons
-Overlook's own 32-unit drawings (rounded strokes, soft fills, restrained two-tone accents) in `branding/icons/`. They are drawn in Light's tokens and retinted per theme and per contrast context (normal or on-action) by `assets.rs`. Lucide line icons are used for small glyphs such as arrows and the lock.
+Overlook's own 24-unit drawings in `branding/icons/` use consistent 1.8-unit rounded outlines and a subtle fill. No gradients, contrasting highlight edges, or tiny multicolor details. `assets.rs` paints the outline and fill as separate native SVG masks at the actual control size and display scale. The outline uses the theme's action color (on-action inside a primary button); the fill uses the same color at 12% opacity. Theme colors are applied at paint time, independently of the cached geometry. Lucide line icons are used for small glyphs such as arrows and the lock. The native `icon_gallery` example is the size, theme and state reference.
 
 ### Horizon banner (welcome)
 The alpine-dawn photograph, cover-fit on a midnight base, with a midnight gradient from 82% opacity at the left to clear at 68% across so the words never rely on the photograph for legibility. Display headline and lead in ivory. A midnight veil at 60% lifts once over 1.4s with an exponential ease-out as the window opens; the words never wait for it.

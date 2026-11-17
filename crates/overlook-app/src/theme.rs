@@ -484,14 +484,6 @@ pub fn apply_preference(pref: AppearancePreference, system: SystemAppearance, cx
 /// The desktop theme's palette and the file text it came from.
 static DESKTOP: std::sync::RwLock<Option<(String, Palette)>> = std::sync::RwLock::new(None);
 
-/// Bumped whenever the desktop colors change, for caches keyed on them (tinted icons).
-static DESKTOP_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// The current desktop colors' generation; see [`DESKTOP_GENERATION`].
-pub fn desktop_generation() -> u64 {
-    DESKTOP_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// Omarchy's current theme: `~/.local/state/omarchy/current/theme` (older releases kept it
 /// under `~/.config/omarchy/current/theme`).
 fn omarchy_theme_dirs() -> Vec<std::path::PathBuf> {
@@ -548,7 +540,6 @@ fn refresh_desktop_colors() -> bool {
         return false;
     }
     *slot = source.and_then(|text| desktop_palette(&text).map(|p| (text, p)));
-    DESKTOP_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     true
 }
 
