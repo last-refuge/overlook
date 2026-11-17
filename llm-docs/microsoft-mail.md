@@ -76,7 +76,7 @@ When Microsoft serves both the mailbox and SMTP (`ImapProvider::server_files_sen
 
 ## The app registration
 
-Builds use `LAST_REFUGE_CLIENT_ID` in `crates/overlook-provider/src/microsoft/oauth.rs`, which is `None` until the registration exists. Packagers can set `OVERLOOK_MICROSOFT_CLIENT_ID` at build time. `~/.config/overlook/microsoft-oauth-client.json` (or `$OVERLOOK_CONFIG_DIR`) overrides both:
+Builds embed Last Refuge's registration from `crates/overlook-provider/src/microsoft/microsoft-oauth-client.json` (`BUNDLED_CLIENT_JSON`, read with `include_str!`, so every source build and release package carries it). The committed file holds only the public `client_id` and, optionally, `tenant`; a test fails if any other field appears. Packagers can replace it with `OVERLOOK_MICROSOFT_CLIENT_ID` at build time (tenant `common`). `~/.config/overlook/microsoft-oauth-client.json` (or `$OVERLOOK_CONFIG_DIR`) overrides both. Precedence: local file, then the build-time id, then the bundled file:
 
 ```json
 {"client_id": "00000000-0000-0000-0000-000000000000", "tenant": "common"}
@@ -92,7 +92,7 @@ Only Last Refuge can do this, from an Entra tenant in its own organization:
 2. Copy the **Application (client) ID**. There is no client secret to create.
 3. **API permissions** → add the delegated permissions `IMAP.AccessAsUser.All`, `POP.AccessAsUser.All` and `SMTP.Send`, plus `offline_access`, `openid`, `profile` and `email`. Overlook requests them dynamically anyway, but administrators approving it for an organization see this list.
 4. **Branding & properties**: name, logo, home page, terms and privacy statement URLs. Verify the publisher domain, then complete publisher verification as the roadmap describes. Publisher verification is free and has no license requirement.
-5. Put the id in `LAST_REFUGE_CLIENT_ID`. It is public, as Thunderbird's is. Until then, test with the JSON file above.
+5. Put the id in `crates/overlook-provider/src/microsoft/microsoft-oauth-client.json`. It is public, as Thunderbird's is. Never add a secret or any other field to that file.
 
 Microsoft 365 organizations with Microsoft's default consent policies need an administrator to approve Overlook before their users can sign in; see the roadmap's administrator consent section. Personal accounts consent for themselves.
 
@@ -112,7 +112,7 @@ Automated coverage, all offline (synthetic tokens, fake servers on loopback):
 - App: `loopback::tests` (Google and Microsoft redirect shapes, forgery, pollution, wrong origin, and a redirect answered on `::1`), `microsoft_signin::tests`, and `credentials::tests::microsoft_sign_ins_keep_their_registration_beside_the_tokens`.
 - An independent review on 12 November 2026 covered secrets, loopback validation, session concurrency, the protocol exchanges and the dialog. It found no high-severity defects; its nine medium and low findings are fixed above.
 
-Live, 13 November 2026: the user tested a real personal Microsoft account through the setup dialog and marked it done. They used a test app registration supplied through `microsoft-oauth-client.json`; the Last Refuge registration is not compiled in yet. An earlier attempt the same day got through sign-in, consent and the token exchange, but couldn't reach the mail servers during an Outlook outage that affected everyone. Microsoft 365 work or school accounts have not been tested.
+Live, 13 November 2026: the user tested a real personal Microsoft account through the setup dialog and marked it done. They used an app registration supplied through `microsoft-oauth-client.json`. On 17 November 2026 that working registration was bundled into the build (`microsoft/microsoft-oauth-client.json`), so fresh installs use it without a local file. An earlier attempt the same day got through sign-in, consent and the token exchange, but couldn't reach the mail servers during an Outlook outage that affected everyone. Microsoft 365 work or school accounts have not been tested.
 
 ## Qualification still to do
 

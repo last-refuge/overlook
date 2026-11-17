@@ -196,10 +196,13 @@ no longer accepts passwords from mail apps. Microsoft 365 organizations may need
 Overlook first, and some turn off IMAP, POP or SMTP sign-in for mail apps; Overlook tells you which. Outlook.com
 accounts set up as POP3 need POP turned on in Outlook.com's settings.
 
-Overlook will ship with Last Refuge's Microsoft app registration built in, but current builds don't have one yet.
-Until then, register a public client in Microsoft Entra (redirect URI `http://localhost`, personal and work
-accounts) and save `{"client_id": "<application id>"}` as `~/.config/overlook/microsoft-oauth-client.json`. The
-[Microsoft account notes](llm-docs/microsoft-mail.md#the-app-registration) walk through it.
+There's nothing to set up first: Overlook comes with Last Refuge's Microsoft app registration built in, so a fresh
+install can sign in straight away. To use your own registration instead, register a public client in Microsoft
+Entra (redirect URI `http://localhost`, personal and work accounts) and save
+`{"client_id": "<application id>"}` as `~/.config/overlook/microsoft-oauth-client.json` (add `"tenant"` to limit
+sign-in to one directory; it defaults to `common`). That file takes priority over the built-in registration, and
+Settings → About shows which one is in use. Packagers can build in their own with `OVERLOOK_MICROSOFT_CLIENT_ID`.
+The [Microsoft account notes](llm-docs/microsoft-mail.md#the-app-registration) have the details.
 
 ## Connect iCloud
 

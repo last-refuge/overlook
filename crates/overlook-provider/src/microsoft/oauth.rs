@@ -6,8 +6,8 @@
 //! desktop applications", redirect URI `http://localhost`, personal and work or school
 //! accounts). A public client has no secret: its id is public, as in every desktop mail
 //! client, and PKCE protects the authorization code. Builds carry Last Refuge's registration
-//! ([`BUILT_IN_CLIENT_ID`]); a `microsoft-oauth-client.json` file overrides it (see
-//! [`ClientConfig::from_json`]).
+//! ([`BUNDLED_CLIENT_JSON`]) unless a packager supplies one ([`BUILD_CLIENT_ID`]); a local
+//! `microsoft-oauth-client.json` file overrides both (see [`ClientConfig::built_in`]).
 
 use crate::oauth::{form, OAuthTokens, Pkce};
 use overlook_core::ServerProtocol;
@@ -27,16 +27,14 @@ pub const SMTP_SCOPE: &str = "https://outlook.office.com/SMTP.Send";
 /// A refresh token (`offline_access`) and an ID token naming the account and its tenant.
 pub const SIGN_IN_SCOPES: &[&str] = &["offline_access", "openid", "profile", "email"];
 
-/// Last Refuge's Entra registration, compiled into every build. `None` until the
-/// registration exists; then its public application (client) id goes here.
-const LAST_REFUGE_CLIENT_ID: Option<&str> = None;
+/// Last Refuge's Entra registration, committed beside this file and compiled into every
+/// build: `{"client_id": "…"}` with an optional `tenant`, in the same form as a local
+/// `microsoft-oauth-client.json`. Nothing in it is secret.
+pub const BUNDLED_CLIENT_JSON: &str = include_str!("microsoft-oauth-client.json");
 
-/// The client id builds use when no `microsoft-oauth-client.json` overrides it. Packagers can
-/// supply their own registration with `OVERLOOK_MICROSOFT_CLIENT_ID` at build time.
-pub const BUILT_IN_CLIENT_ID: Option<&str> = match option_env!("OVERLOOK_MICROSOFT_CLIENT_ID") {
-    Some(id) => Some(id),
-    None => LAST_REFUGE_CLIENT_ID,
-};
+/// A packager's own registration, set with `OVERLOOK_MICROSOFT_CLIENT_ID` at build time. It
+/// takes the place of the bundled one and signs in through [`DEFAULT_TENANT`].
+pub const BUILD_CLIENT_ID: Option<&str> = option_env!("OVERLOOK_MICROSOFT_CLIENT_ID");
 
 /// The tenant a sign-in goes through when the configuration names none: personal and work
 /// or school accounts alike.
@@ -111,11 +109,18 @@ impl ClientConfig {
         Self::new(client_id, tenant)
     }
 
-    /// The registration compiled into this build, if there is one.
+    /// The registration compiled into this build: the packager's [`BUILD_CLIENT_ID`] when set,
+    /// else Last Refuge's [`BUNDLED_CLIENT_JSON`]. A local `microsoft-oauth-client.json`
+    /// overrides both; the app checks for it first.
     pub fn built_in() -> Option<Self> {
-        BUILT_IN_CLIENT_ID
-            .filter(|id| !id.trim().is_empty())
-            .and_then(|id| Self::new(id, DEFAULT_TENANT).ok())
+        Self::built_in_from(BUILD_CLIENT_ID, BUNDLED_CLIENT_JSON)
+    }
+
+    fn built_in_from(build_client_id: Option<&str>, bundled_json: &str) -> Option<Self> {
+        match build_client_id.map(str::trim).filter(|id| !id.is_empty()) {
+            Some(id) => Self::new(id, DEFAULT_TENANT).ok(),
+            None => Self::from_json(bundled_json).ok(),
+        }
     }
 
     pub fn authorize_endpoint(&self) -> String {
@@ -525,6 +530,50 @@ mod tests {
         );
         assert!(ClientConfig::from_json(r#"{"client_id":"a b"}"#).is_err());
         assert!(ClientConfig::new("", "common").is_err());
+    }
+
+    #[test]
+    fn bundled_registration_is_public_and_valid() {
+        let value: serde_json::Value = serde_json::from_str(BUNDLED_CLIENT_JSON).unwrap();
+        let keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert!(
+            keys.iter().all(|k| ["client_id", "tenant"].contains(k)),
+            "the bundled registration may hold only client_id and tenant: {keys:?}"
+        );
+        let bundled = ClientConfig::from_json(BUNDLED_CLIENT_JSON).unwrap();
+        assert_eq!(
+            ClientConfig::built_in_from(None, BUNDLED_CLIENT_JSON),
+            Some(bundled.clone())
+        );
+        assert_eq!(
+            ClientConfig::built_in_from(Some("  "), BUNDLED_CLIENT_JSON),
+            Some(bundled)
+        );
+        if BUILD_CLIENT_ID.is_none() {
+            assert_eq!(
+                ClientConfig::built_in(),
+                ClientConfig::from_json(BUNDLED_CLIENT_JSON).ok()
+            );
+        }
+    }
+
+    #[test]
+    fn build_time_client_id_takes_the_place_of_the_bundled_one() {
+        let bundled = r#"{"client_id":"00000000-1111-2222-3333-444444444444","tenant":"consumers"}"#;
+        assert_eq!(
+            ClientConfig::built_in_from(None, bundled).map(|c| c.tenant),
+            Some("consumers".into())
+        );
+        assert_eq!(
+            ClientConfig::built_in_from(Some("packager-id"), bundled),
+            Some(ClientConfig::new("packager-id", "common").unwrap())
+        );
+        assert_eq!(ClientConfig::built_in_from(None, "{}"), None);
     }
 
     #[test]
