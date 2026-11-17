@@ -808,7 +808,14 @@ impl ImapProvider {
 
     /// Full messages for `uids` in the examined folder. Large messages take the
     /// `BODYSTRUCTURE` path. UIDs the server no longer has are skipped.
-    fn fetch_bodies(conn: &mut Conn, account: &Account, path: &str, uidvalidity: u32, uids: &BTreeSet<u32>) -> Result<Vec<Message>, ProviderError> {
+    ///
+    /// One large message whose fetch fails is stored from its headers and the
+    /// batch continues. A quoted filename with a byte above 0x7F (Proton Bridge
+    /// sends UTF-8; imap-proto's `quoted()` accepts only 0x01–0x7F) makes that
+    /// FETCH fail or drops the connection. Failing the batch would mark the
+    /// account offline and stop every other download. The account is offline
+    /// only when the server itself cannot be reached again.
+    fn fetch_bodies(&self, conn: &mut Conn, account: &Account, path: &str, uidvalidity: u32, uids: &BTreeSet<u32>) -> Result<Vec<Message>, ProviderError> {
         let label = folders::label_id(&account.id, path);
         let mut out = Vec::new();
         let mut sizes: HashMap<u32, u32> = HashMap::new();
@@ -822,7 +829,9 @@ impl ImapProvider {
             }
         }
         let small: BTreeSet<u32> = sizes.iter().filter(|(_, s)| **s < structure::LARGE_MESSAGE_BYTES).map(|(u, _)| *u).collect();
-        let large: Vec<u32> = sizes.iter().filter(|(_, s)| **s >= structure::LARGE_MESSAGE_BYTES).map(|(u, _)| *u).collect();
+        // Lowest UID first, so a message after one that cannot be read is still fetched.
+        let mut large: Vec<u32> = sizes.iter().filter(|(_, s)| **s >= structure::LARGE_MESSAGE_BYTES).map(|(u, _)| *u).collect();
+        large.sort_unstable();
         for chunk in uidset::chunks(&small, 20) {
             let fetches = conn.session().uid_fetch(&chunk, "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[])").map_err(|e| map_error(&e))?;
             for f in fetches.iter() {
@@ -833,8 +842,28 @@ impl ImapProvider {
             }
         }
         for uid in large {
-            if let Some(m) = Self::fetch_large(conn, account, path, uidvalidity, uid, &label)? {
-                out.push(m);
+            match Self::fetch_large(conn, account, path, uidvalidity, uid, &label) {
+                Ok(Some(m)) => out.push(m),
+                Ok(None) => {}
+                Err(err) if matches!(err, ProviderError::Offline | ProviderError::Temporary(_) | ProviderError::Rejected(_)) => {
+                    warn!("imap: {path} uid {uid} could not be read ({err}); keeping its headers");
+                    // The failed FETCH can leave unread bytes. Drop the socket.
+                    // LOGOUT would wait out the read timeout on a desynced stream.
+                    conn.session = None;
+                    conn.selected = None;
+                    self.ensure_connected(conn)?;
+                    if !conn.examine_for(path, uidvalidity)? {
+                        // The folder changed while reconnecting. The rest of this
+                        // batch is the old UIDVALIDITY; the next sync re-queues it.
+                        break;
+                    }
+                    match Self::fetch_header_only(conn, account, path, uidvalidity, uid, &label) {
+                        Ok(Some(m)) => out.push(m),
+                        Ok(None) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(e) => return Err(e),
             }
         }
         Ok(out)
@@ -893,6 +922,16 @@ impl ImapProvider {
             })
             .collect();
         Ok(Some(message))
+    }
+
+    /// Headers for one large message whose `BODYSTRUCTURE` fetch failed. The
+    /// structure is left out: that is the response that could not be read.
+    fn fetch_header_only(conn: &mut Conn, account: &Account, path: &str, uidvalidity: u32, uid: u32, label: &LabelId) -> Result<Option<Message>, ProviderError> {
+        let fetches = conn.session().uid_fetch(uid.to_string(), "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER])").map_err(|e| map_error(&e))?;
+        let Some(f) = fetches.iter().find(|f| f.uid == Some(uid)) else { return Ok(None) };
+        if f.flags().contains(&Flag::Draft) { return Ok(None); }
+        let flags = Self::flags_of(f, label, MessageRef::provider_id(path, uidvalidity, uid));
+        Ok(Some(headers_from_rfc822(account, f.header().unwrap_or_default(), Self::local_id(account), &flags)))
     }
 
     /// Lists folders, builds labels and resets `cp.folders` to match (keeping cursors of
@@ -1241,7 +1280,7 @@ impl ImapProvider {
                     info!("imap: {path} changed under us; {} queued messages skipped until the next sync", uids.len());
                     continue;
                 }
-                out.extend(Self::fetch_bodies(conn, account, path, *uidvalidity, uids)?);
+                out.extend(self.fetch_bodies(conn, account, path, *uidvalidity, uids)?);
             }
             Ok(out)
         })
