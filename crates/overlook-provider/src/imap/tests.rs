@@ -288,6 +288,54 @@ fn large_messages_take_the_bodystructure_path() {
 }
 
 #[test]
+fn a_large_message_with_a_non_ascii_filename_does_not_stop_the_batch() {
+    // U+2019 inside a quoted filename. imap-proto 0.16 `quoted()` accepts only
+    // bytes 0x01–0x7F, so this BODYSTRUCTURE cannot be read and the connection
+    // may drop. The other messages in the batch must still be stored.
+    let filename = "quarterly-notes\u{2019}.pdf";
+    let ascii = r#"((("TEXT" "PLAIN" ("CHARSET" "utf-8") NIL NIL "7BIT" 12 1 NIL NIL NIL NIL)("TEXT" "HTML" ("CHARSET" "utf-8") NIL NIL "7BIT" 40 1 NIL NIL NIL NIL) "ALTERNATIVE" ("BOUNDARY" "inner") NIL NIL NIL)("IMAGE" "PNG" ("NAME" "logo.png") "<logo>" NIL "BASE64" 12 NIL ("INLINE" ("FILENAME" "logo.png")) NIL NIL)("APPLICATION" "PDF" ("NAME" "report.pdf") NIL NIL "BASE64" 3000000 NIL ("ATTACHMENT" ("FILENAME" "report.pdf")) NIL NIL) "MIXED" ("BOUNDARY" "outer") NIL NIL NIL)"#;
+    let broken = ascii.replace("report.pdf", filename);
+    let mut state = mailbox();
+    let inbox = state.folder_mut("INBOX");
+    let small = inbox.add(FakeMessage::new(
+        &[],
+        "15-Oct-2026 09:00:00 +0000",
+        msg(&["From: small@example.com", "To: jason@example.com", "Subject: Still here", "Message-ID: <still@example.com>", "Date: Thu, 15 Oct 2026 09:00:00 +0000", "Content-Type: text/plain; charset=utf-8"], "The neighbour downloaded.\r\n"),
+    ));
+    let mut bad = FakeMessage::new(
+        &[],
+        "15-Oct-2026 10:00:00 +0000",
+        msg(&["From: notes@example.com", "To: jason@example.com", "Subject: Quarterly notes", "Message-ID: <notes@example.com>", "Date: Thu, 15 Oct 2026 10:00:00 +0000", "MIME-Version: 1.0", "Content-Type: multipart/mixed; boundary=\"outer\""], MULTIPART_BODY),
+    );
+    bad.size_override = Some(3 * 1024 * 1024);
+    bad.bodystructure = Some(broken);
+    let bad_uid = inbox.add(bad);
+    let mut later = FakeMessage::new(
+        &[],
+        "15-Oct-2026 11:00:00 +0000",
+        msg(&["From: later@example.com", "To: jason@example.com", "Subject: After the notes", "Message-ID: <after@example.com>", "Date: Thu, 15 Oct 2026 11:00:00 +0000", "MIME-Version: 1.0", "Content-Type: multipart/mixed; boundary=\"outer\""], MULTIPART_BODY),
+    );
+    later.size_override = Some(3 * 1024 * 1024);
+    later.bodystructure = Some(ascii.into());
+    let later_uid = inbox.add(later);
+    let server = serve(state);
+    let p = provider(&server);
+    let ids = [pid("INBOX", 1760400000, small), pid("INBOX", 1760400000, bad_uid), pid("INBOX", 1760400000, later_uid)];
+    let messages = block(p.fetch_messages(&account(), &ids, &[])).unwrap_or_else(|e| panic!("the batch must succeed, got {e}"));
+    assert_eq!(messages.len(), 3, "the unreadable message stays in the batch: {:?}", messages.iter().map(|m| m.subject.as_str()).collect::<Vec<_>>());
+
+    let small_msg = messages.iter().find(|m| m.subject == "Still here").unwrap();
+    assert_eq!(small_msg.body.text.as_deref().map(str::trim), Some("The neighbour downloaded."));
+
+    let bad_msg = messages.iter().find(|m| m.subject == "Quarterly notes").unwrap();
+    assert_eq!(bad_msg.rfc_message_id.as_deref(), Some("<notes@example.com>"));
+
+    let later_msg = messages.iter().find(|m| m.subject == "After the notes").unwrap();
+    assert_eq!(later_msg.body.text.as_deref().map(str::trim), Some("Text part."), "a message after the failed fetch must still download");
+    assert_eq!(later_msg.rfc_message_id.as_deref(), Some("<after@example.com>"));
+}
+
+#[test]
 fn changes_report_new_mail_flags_and_deletions() {
     let server = serve(mailbox());
     let p = provider(&server);
