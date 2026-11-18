@@ -1236,7 +1236,7 @@ impl MailWindow {
             ))
             .child(setting_row("Google OAuth client", &config, div().into_any_element()))
             .child(setting_row("Microsoft app registration", &microsoft_config, div().into_any_element()))
-            .child(setting_row("Sign-in tokens", "Stored in the system keyring (Secret Service), never in files.", div().into_any_element()))
+            .child(setting_row("Sign-in tokens", if cfg!(target_os = "macos") { "Stored in Apple Keychain." } else { "Stored in the system keyring." }, div().into_any_element()))
             .child(section("Keyboard", None))
             .child(div().text_size(px(12.)).text_color(p.muted).line_height(px(20.)).child(
                 "Ctrl N new message · Ctrl E search · Ctrl R reply · Ctrl Shift R reply all · Ctrl F forward · Ctrl Enter send · Ctrl U toggle read · J/K move · E archive or move to Inbox · Delete · S star · Ctrl 1 Mail · Ctrl 2 Calendar · Ctrl Shift A new event · Ctrl , settings · Ctrl Q quit · in settings: Ctrl F or F3 search · in the calendar: ← → T D W M A",

@@ -1,19 +1,20 @@
 # Secrets access policy
 
 This policy covers Overlook 1.6.1, plus the Microsoft sign-in added for 1.6.22. Line references in the
-Microsoft rows and paragraphs are to 1.6.22; the rest are to 1.6.1. It lists every secret Overlook
-keeps, which parts of Overlook may read, write or delete it, which users and processes the operating
+Microsoft rows and paragraphs are to 1.6.22. The storage backend description also covers the
+macOS preview. The policy lists each secret Overlook keeps, which parts of Overlook may read,
+write or delete it, which users and processes the operating
 system lets reach it, and how that access is logged. All statements are checked against the source;
 paths are relative to the repository root.
 
 ## Where secrets live
 
-Overlook keeps secrets only in the system keyring, through the `oo7` crate (0.4). Outside a sandbox,
-`oo7` talks to the freedesktop Secret Service (GNOME Keyring, KWallet) and uses its default collection.
-If the keyring is missing or locked, Overlook shows an error and stops; it never falls back to a file
-(`crates/overlook-app/src/credentials.rs:1-5`).
+Overlook keeps secrets only in the operating system's credential store. On macOS the
+`security-framework` crate stores generic passwords in Apple Keychain. On Linux `oo7` uses
+the freedesktop Secret Service (GNOME Keyring, KWallet) by default. A missing or inaccessible
+credential store produces an error in Overlook.
 
-Overlook decides which of `oo7`'s two backends to use itself (`credentials.rs`, `sandboxed` and
+On Linux, Overlook decides which of `oo7`'s two backends to use (`credentials/secret_service.rs`, `sandboxed` and
 `keyring`). A sandbox is `/.flatpak-info` (Flatpak) or a `snap.*` scope in the process's own cgroup
 (Snap), the test `oo7` makes, and nothing else. No environment variable counts: `GTK_USE_PORTAL`
 only asks GTK to send GTK's dialogs through the portals, yet `oo7`'s own test counts it as proof of a
@@ -21,7 +22,7 @@ sandbox, which put mail passwords in `~/.local/share/keyrings/default.keyring` f
 session-wide; and `FLATPAK_ID` or `SNAP` reach programs started from a sandboxed app's terminal.
 Inside a sandbox without the secrets portal, Overlook uses the Secret Service, as `oo7` does.
 
-Every secret is one keyring item with exactly three attributes (`credentials.rs:99-101`):
+On Linux, every secret is one keyring item with three attributes.
 
 | Attribute     | Value                                                                     |
 |---------------|---------------------------------------------------------------------------|
@@ -29,9 +30,10 @@ Every secret is one keyring item with exactly three attributes (`credentials.rs:
 | `account`     | the Overlook account id: `gmail:<address>`, `imap:<address>` or `pop3:<address>` (Microsoft accounts are `imap:` or `pop3:` accounts) |
 | `kind`        | one of the values in the table below                                      |
 
-The item label shown in keyring managers is `Overlook <what> (<account id>)` (`credentials.rs:113-121`).
-Because the account id contains the mail address, the address appears in the label and the `account`
-attribute. The secret value never does.
+On Linux, keyring managers show the label `Overlook <what> (<account id>)`. On macOS, Overlook
+uses `ai.lastrefuge.Overlook:<account id>` as the Keychain service and the secret kind as the
+Keychain account attribute. The mail address is part of the Overlook account ID on both platforms.
+The secret value lives in the item's protected data.
 
 ## Secrets
 
@@ -82,6 +84,8 @@ the secret (`oauth.rs:48-52`). File permissions are whatever the user saved it w
 
 ## Who can access the keyring items
 
+The Secret Service on Linux uses the following access rules.
+
 | Party | Access |
 |---|---|
 | The desktop user who owns the session, while the keyring is unlocked | All items, through Overlook or any keyring manager (Seahorse, KWalletManager, `secret-tool`). |
@@ -95,26 +99,29 @@ shipped. In a sandbox `oo7` would use its file backend, encrypted with a key obt
 portal, so only Overlook could open its own items; the draft also allows `org.freedesktop.secrets`,
 which `oo7` uses when the portal is missing. That path will be documented when a Flatpak ships.
 
+The macOS preview uses the default local Keychain. macOS applies the keychain's lock state and
+item access controls when a process reads, updates, or deletes an item. Source builds use the
+file-based Keychain so they can store items under the current user's login without provisioning.
+
 ## Least privilege in the code
 
-All keyring access goes through one module, `crates/overlook-app/src/credentials.rs`. It is the only
-Overlook code that calls `oo7` (declared only in `crates/overlook-app/Cargo.toml`), and every other
-module reaches the keyring through it. Its public functions:
+All credential access goes through `crates/overlook-app/src/credentials.rs`. The private backends
+in `credentials/secret_service.rs` and `credentials/keychain.rs` call the platform APIs. Other
+modules use the public functions below.
 
-| Function | Line | Scope |
-|---|---|---|
-| `save_secret(account, kind, secret)` | 124 | one item: exact `application`, `account`, `kind` |
-| `load_secret(account, kind)` | 136 | one item: exact three attributes |
-| `delete_secret(account, kind)` | 151 | one item: exact three attributes |
-| `delete_all_secrets(account)` | 162 | every item of one account: `application` and `account`, any `kind` |
-| `save_tokens` / `load_tokens` / `delete_tokens` | 175, 181, 189 | wrappers over the above with `kind = oauth-tokens` |
-| `save_password` / `load_password` | 195, 201 | wrappers with a password `kind` |
-| `save_microsoft_tokens` / `load_microsoft_tokens` (1.6.22) | 211, 219 | wrappers with `kind = oauth-tokens:microsoft` |
+| Function | Scope |
+|---|---|
+| `save_secret(account, kind, secret)` | One secret kind for one Overlook account |
+| `load_secret(account, kind)` | One secret kind for one Overlook account |
+| `delete_secret(account, kind)` | One secret kind for one Overlook account |
+| `delete_all_secrets(account)` | All secret kinds for one Overlook account |
+| `save_tokens` / `load_tokens` / `delete_tokens` | Wrapper with `kind = oauth-tokens` |
+| `save_password` / `load_password` | Wrapper with a password kind |
+| `save_microsoft_tokens` / `load_microsoft_tokens` | Wrapper with `kind = oauth-tokens:microsoft` |
 
-There is no wildcard search across accounts or applications. The only broader query is
-`delete_all_secrets`, used by sign-out and account removal (`ui/mod.rs:319`): it matches on
-`application` and `account` together, so it removes every kind for that one account, including CalDAV
-passwords, and nothing else.
+`delete_all_secrets` is used by sign-out and account removal. The Linux query matches
+`application` and `account` together. The macOS query matches the exact service for that
+Overlook account. Both remove every secret kind for that account, including CalDAV passwords.
 
 ## Never stored elsewhere
 

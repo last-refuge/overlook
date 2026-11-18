@@ -172,8 +172,8 @@ cargo build --release --locked -p overlook
 ./target/release/overlook
 ```
 
-Choose **Look around in a sample mailbox first** on the welcome screen. Account
-credential storage and system tray integration still use Linux desktop services.
+On macOS, Overlook keeps passwords and sign-in tokens in Apple Keychain. System
+tray integration uses Linux desktop services.
 
 ## Connect Gmail
 
@@ -190,8 +190,8 @@ client that belongs to you. Nothing passes through a Last Refuge server.
 5. In Overlook, choose **Add account** (Settings → Accounts, or the account menu at the bottom of the sidebar), then
    **Gmail**, and sign in in your browser. A new install opens on that page. Repeat for more accounts.
 
-Tokens are stored in your system keyring (GNOME Keyring or KWallet through the Secret Service), never in
-files. In Google's *Testing* mode you will be asked to sign in again every seven days; publishing the app
+Tokens are stored in Apple Keychain on macOS or in the system keyring on Linux. In Google's *Testing*
+mode you will be asked to sign in again every seven days; publishing the app
 in Google Cloud lifts that. The [native app guide](llm-docs/overlook-native-app.md#gmail) has the details.
 The [secrets access policy](docs/secrets-policy.md) lists every stored secret, who can reach it, and how access is logged.
 
