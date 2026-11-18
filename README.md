@@ -3,8 +3,8 @@
 </p>
 
 <p align="center">
-  <strong>A calmer place for your mail.</strong> A native Gmail and Google Calendar client for Linux, written in Rust.<br>
-  Thoughtfully made for Linux, Arch, and Omarchy. By <a href="https://lastrefuge.ai/">Last Refuge</a>.
+  <strong>A calmer place for your mail.</strong> A native mail and calendar client for Linux and macOS, written in Rust.<br>
+  By <a href="https://lastrefuge.ai/">Last Refuge</a>.
 </p>
 
 <p align="center">
@@ -17,7 +17,31 @@
 
 ---
 
-Overlook is for people who liked the way **New Outlook** works and want that on Linux: a spacious three-pane
+## Install
+
+**[macOS](#install-on-macos) (Apple Silicon and Intel)**
+
+```bash
+(set -eu; url=https://github.com/last-refuge/overlook/releases/latest/download; tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT; cd "$tmp"; curl -fsSLO "$url/SHA256SUMS"; archive=$(awk -v arch="$(uname -m)" '$2 ~ ("-" arch "-macos[.]zip$") {print $2; exit}' SHA256SUMS); test -n "$archive"; curl -fsSLO "$url/$archive"; awk -v name="$archive" '$2 == name' SHA256SUMS | shasum -a 256 -c -; ditto -x -k "$archive" .; mkdir -p "$HOME/Applications"; mv -n Overlook.app "$HOME/Applications/")
+```
+
+**Arch Linux, Omarchy, and [compatible x86-64 Linux](#linux-tarball)**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/last-refuge/overlook/main/install.sh | bash
+```
+
+**Ubuntu and other Linux source builds** · [Install the build prerequisites first](#ubuntu-and-other-linux-source-builds).
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/last-refuge/overlook/main/install.sh | bash -s -- --source
+```
+
+[Latest downloads](https://github.com/last-refuge/overlook/releases/latest) · [Installation details](#installation-details) · [Updates](#updates)
+
+---
+
+Overlook brings the familiar **New Outlook** layout to Linux and macOS with a spacious three-pane
 workspace, a Focused Inbox, a real calendar, and a composer that feels finished. It is **local-first**: your
 mail and events live in a database on your machine, every change is saved on this device before it is sent,
 and you can read, search, write, and file mail with no connection at all.
@@ -112,77 +136,86 @@ and you can read, search, write, and file mail with no connection at all.
   </tr>
 </table>
 
-## Install
+## Installation details
 
-Message bodies require sandboxed Chromium. The Arch package installs this dependency;
-other systems need a compatible Chromium on PATH (or `OVERLOOK_BROWSER_BIN` pointing
-to its executable). See [message rendering and isolation](docs/message-formatting.md).
+Download packages and checksums from the [latest release](https://github.com/last-refuge/overlook/releases/latest).
+Overlook uses sandboxed Chromium to display message bodies. The Arch package installs Chromium.
+On other systems, install Chrome or a compatible Chromium, or set `OVERLOOK_BROWSER_BIN` to
+its executable. See [message rendering and isolation](docs/message-formatting.md).
 
-**Arch Linux and Omarchy.** One command:
+### Arch Linux and Omarchy
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/last-refuge/overlook/main/install.sh | bash
-```
+The installer verifies the x86-64 package against the release checksum and installs it with
+`pacman`. On other supported Arch architectures it builds from source. On Omarchy, press
+<kbd>Super</kbd>+<kbd>Space</kbd> and type **Overlook**.
 
-It downloads the [latest release](https://github.com/last-refuge/overlook/releases/latest), verifies its
-SHA-256 checksum, and installs the package with `pacman`, so `pacman` can update and remove it. It asks for
-your password only for `pacman`. On Omarchy, press <kbd>Super</kbd>+<kbd>Space</kbd> and type "Overlook".
-If no prebuilt package exists for your machine it builds one from source instead, which takes a few minutes.
+### Linux tarball
 
-Prefer to read it first? [`install.sh`](install.sh) is short. Options: `--dry-run` shows the plan and changes
-nothing, `--prefix DIR` installs into a directory without administrator access, `--ref REF` builds a branch
-or tag, `--uninstall` removes it, `--yes` skips confirmations.
+On compatible x86-64 Linux distributions, install the verified release tarball to `~/.local`.
+The 2.0.0 tarball requires glibc 2.44 or newer. Run `getconf GNU_LIBC_VERSION` to check your version.
 
-**Any other Linux.** The same command builds from source into `~/.local` with no administrator access. You
-need Rust (via [rustup](https://rustup.rs)), git, and development packages for Wayland, libxkbcommon,
-fontconfig, FreeType, and a Vulkan driver. Or by hand:
+### Ubuntu and other Linux source builds
+
+On Ubuntu, install the native dependencies first.
 
 ```bash
-make install PREFIX=~/.local
+sudo apt update && sudo apt install ca-certificates curl git build-essential pkg-config libssl-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libfontconfig1-dev libfreetype-dev libvulkan1 mesa-vulkan-drivers gnome-keyring desktop-file-utils
 ```
 
-`--source` forces a build from source even when a release exists.
+On other distributions, install the equivalent packages. Then install [Rust via rustup](https://rustup.rs)
+and open a new terminal. The [source install command](#install) builds current `main` and installs it for your user.
 
-**Remove it:** `sudo pacman -Rns overlook` on Arch, or `./install.sh --uninstall`. Your mail and settings in
-`~/.local/share/overlook` stay until you delete them. If Overlook starts at login, switch that off in
-Settings first (`./install.sh --uninstall` does it for you).
+If you already have a source checkout, run `make install PREFIX="$HOME/.local"` from its root.
+Start Overlook from your application menu or run `"$HOME/.local/bin/overlook"`.
+For Gmail on a source build, [set up your own Google OAuth client](#using-your-own-google-cloud-project-optional).
 
-### Updates
-
-Overlook checks GitHub for a new release once a day (switch it off in Settings → About) and shows a banner
-when there is one. On Linux, **Update now** downloads the release, verifies its checksum, and installs it in place:
-through a polkit password dialog when Overlook was installed with pacman, or by swapping the binary when it
-lives in your own prefix. Then **Restart Overlook**. Nothing about you is sent during the check.
-
-On first launch, Overlook opens on its welcome page: pick where your mail lives (Gmail, Microsoft, iCloud,
-Yahoo, AOL, Fastmail, Proton, or any IMAP or POP3 server) and it walks you through connecting it. To look
-around first, choose **Look around in a sample mailbox first** at the foot of the page. The sample account's
-connection is a switch in the status bar; flip it to watch offline changes sync. Adding another account later
-(Settings → Accounts → **Add account**, or the account menu) opens the same page.
+Linux installer options include `--dry-run` to preview the install, `--prefix DIR` to choose a
+directory, `--source --ref REF` to build a branch or tag, and `--yes` to skip prompts. See [the installer](install.sh).
 
 ### Install on macOS
 
-Download the Mac ZIP for Apple Silicon (`arm64`) or Intel (`x86_64`) from the
-[latest release](https://github.com/last-refuge/overlook/releases/latest).
-Unzip it, move **Overlook.app** to Applications, and open it. The archives use ad-hoc
-signing, so macOS may [ask you to approve the app](https://support.apple.com/en-us/102445)
-on first launch. Install Google Chrome or Chromium in `/Applications` for HTML message rendering.
-To update, replace the app with the one from a newer release.
+The [macOS install command](#install) selects the ZIP for your Mac, verifies the published SHA-256 checksum,
+and installs Overlook to `~/Applications`. For an existing install, follow [Updates](#updates).
+
+Open **Overlook.app** from that folder or run `open "$HOME/Applications/Overlook.app"`. You can also
+download the `arm64-macos.zip` (Apple Silicon) or `x86_64-macos.zip` (Intel) archive from the
+[latest release](https://github.com/last-refuge/overlook/releases/latest) and drag **Overlook.app** from the
+unzipped folder to Applications. The app uses ad-hoc signing, so macOS may ask you to approve it on first launch.
+See [Apple's instructions for opening the app](https://support.apple.com/en-us/102445). Install Chrome or Chromium
+in `/Applications` for message rendering. Overlook keeps passwords and sign-in tokens in Apple Keychain.
 
 #### Build from source
 
-With Rust installed through rustup and Xcode's Metal toolchain available, run these
-commands from the Overlook checkout. Install Google Chrome or Chromium in
-`/Applications` for HTML message rendering, or set `OVERLOOK_BROWSER_BIN` to a
-compatible executable.
+With [Rust via rustup](https://rustup.rs) and Xcode's Metal toolchain installed, clone, build,
+and run Overlook in one command.
 
 ```bash
-cargo build --release --locked -p overlook
-./target/release/overlook
+git clone https://github.com/last-refuge/overlook.git && cd overlook && cargo run --release --locked -p overlook
 ```
 
-On macOS, Overlook keeps passwords and sign-in tokens in Apple Keychain. System
-tray integration uses Linux desktop services.
+If you already have a checkout, run `cargo run --release --locked -p overlook` from its root.
+
+### First launch
+
+On first launch, Overlook opens on its welcome page. Choose a mail provider or select
+**Look around in a sample mailbox first**. The sample account's connection is a switch
+in the status bar. Flip it to watch offline changes sync. To add another account later,
+choose **Add account** in Settings → Accounts or in the account menu.
+
+### Updates
+
+Overlook checks GitHub for a new release once a day and shows a banner when one is available.
+You can turn off this check in Settings → About. On Arch and on Linux systems that use the
+release tarball, **Update now** verifies and installs the new package. Choose
+**Restart Overlook** to finish. For a Linux source install, rerun the source command.
+On macOS, quit Overlook and replace **Overlook.app** with the app from the new ZIP.
+
+### Uninstall
+
+On Arch, turn off **Start Overlook when you log in** in Settings if you enabled it, then run
+`sudo pacman -Rns overlook`. For other Linux installs, run `bash install.sh --uninstall` from a checkout.
+On macOS, move **Overlook.app** to the Trash.
+Uninstalling leaves your local mail and settings in your profile.
 
 ## Connect Gmail
 
