@@ -1,4 +1,4 @@
-//! Linux private-pipe Chromium renderer. No UI work or mail access happens here.
+//! Private-pipe Chromium renderer. No UI work or mail access happens here.
 //!
 //! One sandboxed process per document (at most six live: open documents, a pre-render
 //! and one warm spare), rather than a shared browser: this keeps failures and lifetime
@@ -19,7 +19,7 @@ use std::{
     net::IpAddr,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::{fs::DirBuilderExt, net::UnixStream, process::{CommandExt, ExitStatusExt}},
+        unix::{fs::PermissionsExt, net::UnixStream, process::{CommandExt, ExitStatusExt}},
     },
     path::PathBuf,
     process::{Child, Command, Stdio},
@@ -38,7 +38,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 static WORKERS: AtomicUsize = AtomicUsize::new(0);
 /// Live Chromium processes: up to four open documents, one pre-render and one warm spare.
 const MAX_WORKERS: usize = 6;
-static SERIAL: AtomicUsize = AtomicUsize::new(0);
+const MAX_PROCESSES: usize = 32;
 type Result<T> = std::result::Result<T, String>;
 
 // Explicit opt-in on the synthetic test's thread only; never an environment
@@ -99,8 +99,16 @@ pub fn set_prewarm(on: bool) {
     }
 }
 
+/// Gives detached workers time to reap Chromium after GPUI releases their handles.
+pub fn drain_workers() {
+    let pool = POOL.lock().unwrap();
+    drop(POOL_WAKE.wait_timeout_while(pool, Duration::from_millis(150), |_| {
+        WORKERS.load(Ordering::Acquire) != 0
+    }).unwrap());
+}
+
 /// Starts keeping one spare Chromium ready. The launcher thread lives as long as the
-/// app: Chromium's parent-death signal follows the thread that started it.
+/// app. On Linux the parent-death signal follows the thread that started Chromium.
 pub fn prewarm() {
     POOL_STARTED.call_once(|| {
         let _ = thread::Builder::new().name("browser-pool".into()).spawn(|| loop {
@@ -117,8 +125,12 @@ pub fn prewarm() {
             };
             let stop = Arc::new(AtomicBool::new(false));
             match Actor::start(stop.clone(), false) {
-                Ok(actor) if !pool_paused() => *POOL.lock().unwrap() = Some(Warm { actor, stop, slot }),
-                Ok(_) => {}
+                Ok(actor) => {
+                    let mut pool = POOL.lock().unwrap();
+                    if !pool_paused() {
+                        *pool = Some(Warm { actor, stop, slot });
+                    }
+                }
                 // No Chromium (or it cannot start): documents report that themselves.
                 Err(_) => {
                     drop(slot);
@@ -173,6 +185,8 @@ const CHROMIUM_FLAGS: &[&str] = &[
     "--disable-features=MediaRouter,OptimizationHints,AutofillServerCommunication,SpeculationRulesPrefetch",
     "--host-resolver-rules=MAP * ~NOTFOUND", "--proxy-server=http://127.0.0.1:9",
     "--js-flags=--max-old-space-size=128", "--renderer-process-limit=2", "--password-store=basic",
+    #[cfg(target_os = "macos")]
+    "--use-mock-keychain",
 ];
 
 #[derive(Clone)]
@@ -216,6 +230,13 @@ fn chromium_executable() -> Option<PathBuf> {
                     return Some(path);
                 }
             }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    for bundle in ["Chromium", "Google Chrome"] {
+        let path = PathBuf::from(format!("/Applications/{bundle}.app/Contents/MacOS/{bundle}"));
+        if path.is_file() {
+            return Some(path);
         }
     }
     None
@@ -458,7 +479,7 @@ fn push_event(inner: &Inner, event: BrowserEvent) {
 /// Owns all OS resources, including partially initialized startup failures.
 struct Cdp {
     child: Child,
-    profile: PathBuf,
+    profile: tempfile::TempDir,
     read: UnixStream,
     write: UnixStream,
     buffer: Vec<u8>,
@@ -476,103 +497,97 @@ impl Drop for Cdp {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = fs::remove_dir_all(&self.profile);
     }
 }
 impl Cdp {
     fn start(stop: Arc<AtomicBool>) -> Result<Self> {
-        // Do not put Chrome's font/shared-memory buffers on the user's /tmp:
-        // tmpfs user quotas can be exhausted despite `df` reporting free space.
-        // A short private runtime path also avoids Chromium's AF_UNIX socket
-        // length abort when inherited TMPDIR points deep inside a project.
-        let profile = PathBuf::from("/dev/shm").join(format!(
-            "overlook-browser-{}-{}",
-            std::process::id(),
-            SERIAL.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&profile)
+        // Use a short path to leave room for Chromium's Unix socket. On Linux, use
+        // /dev/shm so Chromium's buffers don't exhaust the user's /tmp quota.
+        #[cfg(target_os = "linux")]
+        let runtime = "/dev/shm";
+        #[cfg(not(target_os = "linux"))]
+        let runtime = "/tmp";
+        let profile = tempfile::Builder::new()
+            .prefix("overlook-browser-")
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in(runtime)
             .map_err(|_| "Cannot create private browser profile")?;
-        let result = (|| {
-            let (write, child_read) = UnixStream::pair().map_err(|_| "Cannot create CDP pipe")?;
-            let (child_write, read) = UnixStream::pair().map_err(|_| "Cannot create CDP pipe")?;
-            // Move both source fds above 4 before dup2: no aliasing with fd3/4.
-            fn high_fd(fd: i32) -> Result<OwnedFd> {
-                let fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10) };
-                if fd < 0 {
-                    Err("Cannot duplicate CDP pipe".into())
-                } else {
-                    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-                }
+        let path = profile.path();
+        let (write, child_read) = UnixStream::pair().map_err(|_| "Cannot create CDP pipe")?;
+        let (child_write, read) = UnixStream::pair().map_err(|_| "Cannot create CDP pipe")?;
+        // Move both source fds above 4 before dup2: no aliasing with fd3/4.
+        fn high_fd(fd: i32) -> Result<OwnedFd> {
+            let fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10) };
+            if fd < 0 {
+                Err("Cannot duplicate CDP pipe".into())
+            } else {
+                Ok(unsafe { OwnedFd::from_raw_fd(fd) })
             }
-            let input = high_fd(child_read.as_raw_fd())?;
-            let output = high_fd(child_write.as_raw_fd())?;
-            let parent = unsafe { libc::getpid() };
-            let executable = chromium_executable()
-                .ok_or("Chromium is not installed; configure OVERLOOK_BROWSER_BIN")?;
-            let mut cmd = Command::new(executable);
-            cmd.args(CHROMIUM_FLAGS)
-                .arg(format!("--user-data-dir={}", profile.display()))
-                // Isolate distro-wrapper flags, crash metadata, NSS state and
-                // caches from the user's ordinary browser configuration too.
-                .env("TMPDIR", &profile)
-                .env("HOME", &profile)
-                .env("XDG_CONFIG_HOME", profile.join("config"))
-                .env("XDG_CACHE_HOME", profile.join("cache"))
-                .env("XDG_DATA_HOME", profile.join("data"))
-                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-            #[cfg(test)]
-            SYNTHETIC_STDERR.with(|p| -> Result<()> {
-                if let Some(dir) = p.borrow().as_ref() {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    let path = dir.join(format!("chromium-{}.stderr", profile.file_name().unwrap().to_string_lossy()));
-                    let file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
-                        .open(&path).map_err(|e| format!("Synthetic stderr: {e}"))?;
-                    eprintln!("synthetic stderr {}", path.display());
-                    cmd.stderr(Stdio::from(file));
+        }
+        let input = high_fd(child_read.as_raw_fd())?;
+        let output = high_fd(child_write.as_raw_fd())?;
+        #[cfg(target_os = "linux")]
+        let parent = unsafe { libc::getpid() };
+        let executable = chromium_executable()
+            .ok_or("Chromium is not installed; configure OVERLOOK_BROWSER_BIN")?;
+        let mut cmd = Command::new(executable);
+        cmd.args(CHROMIUM_FLAGS)
+            .arg(format!("--user-data-dir={}", path.display()))
+            // Isolate distro-wrapper flags, crash metadata, NSS state and
+            // caches from the user's ordinary browser configuration too.
+            .env("TMPDIR", path)
+            .env("HOME", path)
+            .env("XDG_CONFIG_HOME", path.join("config"))
+            .env("XDG_CACHE_HOME", path.join("cache"))
+            .env("XDG_DATA_HOME", path.join("data"))
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        #[cfg(test)]
+        SYNTHETIC_STDERR.with(|p| -> Result<()> {
+            if let Some(dir) = p.borrow().as_ref() {
+                use std::os::unix::fs::OpenOptionsExt;
+                let path = dir.join(format!("chromium-{}.stderr", path.file_name().unwrap().to_string_lossy()));
+                let file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+                    .open(&path).map_err(|e| format!("Synthetic stderr: {e}"))?;
+                eprintln!("synthetic stderr {}", path.display());
+                cmd.stderr(Stdio::from(file));
+            }
+            Ok(())
+        })?;
+        unsafe {
+            cmd.pre_exec(move || {
+                #[cfg(target_os = "linux")]
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0
+                    || libc::getppid() != parent
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setsid() < 0
+                    || libc::dup2(input.as_raw_fd(), 3) < 0
+                    || libc::dup2(output.as_raw_fd(), 4) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
-            })?;
-            unsafe {
-                cmd.pre_exec(move || {
-                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0
-                        || libc::getppid() != parent
-                    {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    if libc::setsid() < 0
-                        || libc::dup2(input.as_raw_fd(), 3) < 0
-                        || libc::dup2(output.as_raw_fd(), 4) < 0
-                    {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-            write
-                .set_nonblocking(true)
-                .map_err(|_| "Cannot configure CDP pipe")?;
-            read.set_nonblocking(true)
-                .map_err(|_| "Cannot configure CDP pipe")?;
-            let child = cmd.spawn().map_err(|_| "Cannot start sandboxed Chromium")?;
-            Ok(Self {
-                child,
-                profile: profile.clone(),
-                read,
-                write,
-                buffer: Vec::new(),
-                events: VecDeque::new(),
-                id: 0,
-                session: None,
-                stop,
-                memory_checked: Instant::now() - Duration::from_secs(1),
-            })
-        })();
-        if result.is_err() {
-            let _ = fs::remove_dir_all(profile);
+            });
         }
-        result
+        write
+            .set_nonblocking(true)
+            .map_err(|_| "Cannot configure CDP pipe")?;
+        read.set_nonblocking(true)
+            .map_err(|_| "Cannot configure CDP pipe")?;
+        let child = cmd.spawn().map_err(|_| "Cannot start sandboxed Chromium")?;
+        Ok(Self {
+            child,
+            profile,
+            read,
+            write,
+            buffer: Vec::new(),
+            events: VecDeque::new(),
+            id: 0,
+            session: None,
+            stop,
+            memory_checked: Instant::now() - Duration::from_secs(1),
+        })
     }
     fn check(&mut self, deadline: Instant) -> Result<()> {
         if self.stop.load(Ordering::Acquire) {
@@ -715,7 +730,6 @@ fn cancelled_resource_reply(method: &str, error: &Value) -> bool {
 /// Count only our child tree; never inspect process arguments or unrelated
 /// application data. RSS double-counts shared pages, deliberately conservative.
 fn check_process_budget(root: u32) -> Result<()> {
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as u64;
     let mut pending = vec![root];
     let mut seen = Vec::new();
     let mut rss = 0u64;
@@ -724,34 +738,51 @@ fn check_process_budget(root: u32) -> Result<()> {
             continue;
         }
         seen.push(pid);
-        if seen.len() > 32 {
+        if seen.len() > MAX_PROCESSES {
             return Err("Chromium process-tree limit exceeded".into());
         }
-        if let Ok(statm) = fs::read_to_string(format!("/proc/{pid}/statm")) {
-            rss = rss.saturating_add(
-                statm
-                    .split_whitespace()
-                    .nth(1)
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0)
-                    .saturating_mul(page_size),
-            );
-        }
+        rss = rss.saturating_add(process_resources(pid, &mut pending));
         if rss > 2 * 1024 * 1024 * 1024 {
             return Err(format!(
                 "Chromium resident-memory budget exceeded ({rss} bytes across {} processes)",
                 seen.len()
             ));
         }
-        if let Ok(children) = fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")) {
-            pending.extend(
-                children
-                    .split_whitespace()
-                    .filter_map(|s| s.parse::<u32>().ok()),
-            );
-        }
     }
     Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_resources(pid: u32, pending: &mut Vec<u32>) -> u64 {
+    if let Ok(children) = fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")) {
+        pending.extend(children.split_whitespace().filter_map(|s| s.parse::<u32>().ok()));
+    }
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as u64;
+    fs::read_to_string(format!("/proc/{pid}/statm")).ok()
+        .and_then(|statm| statm.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_mul(page_size)
+}
+
+#[cfg(target_os = "macos")]
+fn process_resources(pid: u32, pending: &mut Vec<u32>) -> u64 {
+    let mut children = [0i32; MAX_PROCESSES];
+    let mut task = std::mem::MaybeUninit::<libc::proc_taskinfo>::uninit();
+    let task_size = std::mem::size_of::<libc::proc_taskinfo>() as i32;
+    // Both buffers stay valid for the calls. libproc returns a PID count for the
+    // first call and the number of bytes written for the second.
+    let (count, bytes) = unsafe {
+        (
+            libc::proc_listchildpids(pid as i32, children.as_mut_ptr().cast(), std::mem::size_of_val(&children) as i32),
+            libc::proc_pidinfo(pid as i32, libc::PROC_PIDTASKINFO, 0, task.as_mut_ptr().cast(), task_size),
+        )
+    };
+    pending.extend(children.into_iter().take(count.max(0) as usize).filter(|&pid| pid > 0).map(|pid| pid as u32));
+    if bytes == task_size {
+        unsafe { task.assume_init().pti_resident_size }
+    } else {
+        0 // The process may have exited during the sample.
+    }
 }
 
 const MAX_PENDING_RESOURCES: usize = 4;
@@ -1507,14 +1538,18 @@ mod cancelled_resource_tests {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let mut actor = Actor::start(Arc::new(AtomicBool::new(false)), false).unwrap();
         actor.load("<p>Fictional private runtime</p>", false).unwrap();
-        let profile = actor.cdp.profile.clone();
+        let profile = actor.cdp.profile.path().to_path_buf();
+        #[cfg(target_os = "linux")]
         assert_eq!(profile.parent(), Some(std::path::Path::new("/dev/shm")));
         let metadata = fs::metadata(&profile).unwrap();
         assert_eq!(metadata.uid(), unsafe { libc::getuid() });
         assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
-        let socket = fs::read_link(profile.join("SingletonSocket")).unwrap();
-        assert!(socket.starts_with(&profile), "Chrome temporary socket must stay in its private runtime directory");
-        assert!(socket.as_os_str().as_encoded_bytes().len() < 108);
+        #[cfg(target_os = "linux")]
+        {
+            let socket = fs::read_link(profile.join("SingletonSocket")).unwrap();
+            assert!(socket.starts_with(&profile), "Chrome temporary socket must stay in its private runtime directory");
+            assert!(socket.as_os_str().as_encoded_bytes().len() < 108);
+        }
         drop(actor);
         assert!(!profile.exists());
     }
@@ -1542,6 +1577,8 @@ mod tests {
         assert!(CHROMIUM_FLAGS.contains(&"--remote-debugging-pipe"));
         assert!(CHROMIUM_FLAGS.contains(&"--disable-crash-reporter"));
         assert!(CHROMIUM_FLAGS.contains(&"--password-store=basic"), "Chromium must not use the system keyring");
+        #[cfg(target_os = "macos")]
+        assert!(CHROMIUM_FLAGS.contains(&"--use-mock-keychain"));
         for flag in CHROMIUM_FLAGS {
             for forbidden in ["--remote-debugging-port", "--remote-debugging-address", "--remote-allow-origins", "--enable-logging", "--v=", "--vmodule", "--auto-open-devtools"] {
                 assert!(!flag.starts_with(forbidden), "{flag}");
@@ -1797,6 +1834,7 @@ mod tests {
     #[test]
     #[ignore = "synthetic-only 4 live BrowserHandles, unique stderr files; run alone"]
     fn chromium_repro_concurrent_replace_stderr() {
+        use std::os::unix::fs::DirBuilderExt;
         assert_eq!(WORKERS.load(Ordering::Acquire), 0, "run this diagnostic alone");
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
         fs::create_dir_all(&root).unwrap();
@@ -2275,7 +2313,7 @@ mod tests {
     fn chromium_private_pipe_live_dom() {
         let stop = Arc::new(AtomicBool::new(false));
         let mut actor = Actor::start(stop, false).unwrap();
-        let profile = actor.cdp.profile.clone();
+        let profile = actor.cdp.profile.path().to_path_buf();
         let pid = actor.cdp.child.id();
         // Prove host evaluation still works while an actual (not sanitized)
         // inline script, even without CSP, cannot execute.

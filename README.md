@@ -160,6 +160,21 @@ around first, choose **Look around in a sample mailbox first** at the foot of th
 connection is a switch in the status bar; flip it to watch offline changes sync. Adding another account later
 (Settings → Accounts → **Add account**, or the account menu) opens the same page.
 
+### Build a macOS preview from source
+
+With Rust installed through rustup and Xcode's Metal toolchain available, run these
+commands from the Overlook checkout. Install Google Chrome or Chromium in
+`/Applications` for HTML message rendering, or set `OVERLOOK_BROWSER_BIN` to a
+compatible executable.
+
+```bash
+cargo build --release --locked -p overlook
+./target/release/overlook
+```
+
+Choose **Look around in a sample mailbox first** on the welcome screen. Account
+credential storage and system tray integration still use Linux desktop services.
+
 ## Connect Gmail
 
 Overlook talks to Gmail and Google Calendar directly through Google's APIs, from your machine, with an OAuth

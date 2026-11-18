@@ -79,6 +79,10 @@ pub fn start(store: Arc<Store>, sample: SampleProvider, hidden: bool, cx: &mut A
         tray_failed: false,
     });
     cx.on_window_closed(window_closed).detach();
+    cx.on_app_quit(|cx| {
+        crate::browser_engine::set_prewarm(false);
+        cx.background_executor().spawn(async { crate::browser_engine::drain_workers() })
+    }).detach();
     if hidden {
         crate::browser_engine::set_prewarm(false);
         tracing::info!("starting in the background");
@@ -204,13 +208,18 @@ pub fn show(env: LaunchEnv, cx: &mut App) {
     if let Some(main) = l.main.take() {
         let _ = main.window.update(cx, |_, window, _| window.remove_window());
     }
-    let mut desktop = GraphicalEnvironment::detect();
-    for (name, slot) in [("WAYLAND_DISPLAY", &mut desktop.wayland_display), ("DISPLAY", &mut desktop.x11_display), ("XDG_RUNTIME_DIR", &mut desktop.xdg_runtime_dir)] {
-        if let Some(value) = env.get(name) {
-            *slot = Some(value.into());
+    let desktop = GraphicalEnvironment::detect();
+    #[cfg(target_os = "linux")]
+    let desktop = {
+        let mut desktop = desktop;
+        for (name, slot) in [("WAYLAND_DISPLAY", &mut desktop.wayland_display), ("DISPLAY", &mut desktop.x11_display), ("XDG_RUNTIME_DIR", &mut desktop.xdg_runtime_dir)] {
+            if let Some(value) = env.get(name) {
+                *slot = Some(value.into());
+            }
         }
-    }
-    desktop.activation_token = env.get("XDG_ACTIVATION_TOKEN").map(str::to_owned);
+        desktop.activation_token = env.get("XDG_ACTIVATION_TOKEN").map(str::to_owned);
+        desktop
+    };
     cx.spawn(async move |cx| {
         let switched = cx.update(|cx| cx.request_windowing(WindowingRequest::Windowed(desktop))).await;
         cx.update(|cx| {

@@ -152,11 +152,7 @@ mod tests {
 
     #[test]
     fn config_file_overrides_the_built_in_registration() {
-        assert!(
-            client_config_path().ends_with("overlook/microsoft-oauth-client.json"),
-            "{}",
-            client_config_path().display()
-        );
+        assert_eq!(client_config_path(), crate::google_signin::client_config_path().with_file_name(CONFIG_FILE));
         let dir = std::env::temp_dir().join(format!("overlook-ms-config-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

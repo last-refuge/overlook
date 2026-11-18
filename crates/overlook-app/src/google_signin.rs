@@ -93,8 +93,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_path_is_under_dot_config_overlook() {
+    fn config_path_uses_the_overlook_config_directory() {
         let path = client_config_path();
-        assert!(path.ends_with(".config/overlook/google-oauth-client.json") || path.ends_with("overlook/google-oauth-client.json"), "{}", path.display());
+        if let Ok(dir) = std::env::var("OVERLOOK_CONFIG_DIR") {
+            assert_eq!(path, PathBuf::from(dir).join("google-oauth-client.json"));
+        } else {
+            let expected = if cfg!(target_os = "macos") {
+                "Library/Application Support/ai.Last-Refuge.Overlook/google-oauth-client.json"
+            } else {
+                "overlook/google-oauth-client.json"
+            };
+            assert!(path.ends_with(expected), "{}", path.display());
+        }
     }
 }
