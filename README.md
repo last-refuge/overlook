@@ -150,7 +150,7 @@ Settings first (`./install.sh --uninstall` does it for you).
 ### Updates
 
 Overlook checks GitHub for a new release once a day (switch it off in Settings → About) and shows a banner
-when there is one. **Update now** downloads the release, verifies its checksum, and installs it in place:
+when there is one. On Linux, **Update now** downloads the release, verifies its checksum, and installs it in place:
 through a polkit password dialog when Overlook was installed with pacman, or by swapping the binary when it
 lives in your own prefix. Then **Restart Overlook**. Nothing about you is sent during the check.
 

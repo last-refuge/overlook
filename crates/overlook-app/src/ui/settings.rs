@@ -1187,6 +1187,7 @@ impl MailWindow {
             Some(_) if !crate::microsoft_signin::client_config_path().exists() => "Built into Overlook".to_owned(),
             _ => crate::microsoft_signin::client_config_path().display().to_string(),
         };
+        let update_label = if self.update.install == super::InstallKind::Mac { "Download update" } else { "Update now" };
         v_flex()
             .gap(px(22.))
             .child(
@@ -1209,7 +1210,7 @@ impl MailWindow {
                     .gap(px(6.))
                     .child(Button::new("check-updates").small().icon(icon("refresh-cw").size(px(14.))).label("Check for updates").loading(self.update.phase == super::UpdatePhase::Checking).on_click(cx.listener(|this, _, window, cx| this.check_for_updates(true, window, cx))))
                     .when(self.update.latest.is_some() && matches!(self.update.phase, super::UpdatePhase::Idle | super::UpdatePhase::Failed(_)), |r| {
-                        r.child(Button::new("install-update").primary().small().label("Update now").on_click(cx.listener(|this, _, window, cx| {
+                        r.child(Button::new("install-update").primary().small().label(update_label).on_click(cx.listener(|this, _, window, cx| {
                             this.close_settings(window, cx);
                             this.start_update(window, cx);
                         })))

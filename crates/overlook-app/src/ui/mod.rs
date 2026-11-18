@@ -1616,13 +1616,17 @@ impl MailWindow {
         }
     }
 
-    /// Downloads, verifies, and applies the latest release for this installation.
+    /// Applies an update on Linux or opens the release page for a Mac download.
     pub(crate) fn start_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(release) = self.update.latest.clone() else { return };
         let install = self.update.install.clone();
         let asset = match &install {
             InstallKind::Pacman => release.package().cloned(),
             InstallKind::Prefix { .. } => release.tarball().cloned(),
+            InstallKind::Mac => {
+                cx.open_url(&release.html_url);
+                return;
+            }
             InstallKind::Development | InstallKind::Unknown(_) => None,
         };
         let Some(asset) = asset else {
@@ -4085,6 +4089,13 @@ impl MailWindow {
             UpdatePhase::Failed(e) => (e.clone(), p.warning),
         };
         let phase = self.update.phase.clone();
+        let update_label = if self.update.install == InstallKind::Mac {
+            "Download update"
+        } else if matches!(phase, UpdatePhase::Failed(_)) {
+            "Try again"
+        } else {
+            "Update now"
+        };
         Some(
             h_flex()
                 .items_center()
@@ -4099,7 +4110,7 @@ impl MailWindow {
                 .child(div().flex_1().truncate().child(text))
                 .child(Button::new("update-notes").ghost().small().label("What’s new").on_click(move |_, _, cx| cx.open_url(&url)))
                 .when(matches!(phase, UpdatePhase::Idle | UpdatePhase::Failed(_)), |row| {
-                    row.child(Button::new("update-now").primary().small().label(if matches!(phase, UpdatePhase::Failed(_)) { "Try again" } else { "Update now" }).on_click(cx.listener(|this, _, window, cx| this.start_update(window, cx))))
+                    row.child(Button::new("update-now").primary().small().label(update_label).on_click(cx.listener(|this, _, window, cx| this.start_update(window, cx))))
                         .child(Button::new("update-later").ghost().small().label("Later").on_click(cx.listener(|this, _, _w, cx| this.dismiss_update(cx))))
                 })
                 .when(matches!(phase, UpdatePhase::ReadyToRestart | UpdatePhase::TerminalOpened), |row| {

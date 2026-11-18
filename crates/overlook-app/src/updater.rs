@@ -65,6 +65,8 @@ pub enum InstallKind {
     Pacman,
     /// Installed into a prefix the user can write to.
     Prefix { bin: PathBuf, prefix: PathBuf },
+    /// Updated by replacing the macOS app.
+    Mac,
     /// Running from a cargo target directory.
     Development,
     /// Somewhere we cannot write and not a package.
@@ -75,9 +77,16 @@ impl InstallKind {
     pub fn detect() -> Self {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("overlook"));
         let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+        Self::detect_at(exe)
+    }
+
+    fn detect_at(exe: PathBuf) -> Self {
         let text = exe.to_string_lossy();
         if text.contains("/target/debug/") || text.contains("/target/release/") {
             return InstallKind::Development;
+        }
+        if cfg!(target_os = "macos") {
+            return InstallKind::Mac;
         }
         if exe == Path::new("/usr/bin/overlook") {
             let packaged = Command::new("pacman").args(["-Qi", "overlook"]).output().map(|o| o.status.success()).unwrap_or(false);
@@ -99,6 +108,7 @@ impl InstallKind {
         match self {
             InstallKind::Pacman => "Installed with pacman".into(),
             InstallKind::Prefix { prefix, .. } => format!("Installed in {}", prefix.display()),
+            InstallKind::Mac => "Installed on macOS".into(),
             InstallKind::Development => "Development build".into(),
             InstallKind::Unknown(p) => format!("Running from {}", p.display()),
         }
@@ -455,5 +465,12 @@ mod tests {
     #[test]
     fn detects_development_build() {
         assert_eq!(InstallKind::detect(), InstallKind::Development);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_mac_bundle_uses_manual_updates() {
+        let exe = PathBuf::from("/Applications/Overlook.app/Contents/MacOS/overlook");
+        assert_eq!(InstallKind::detect_at(exe), InstallKind::Mac);
     }
 }
