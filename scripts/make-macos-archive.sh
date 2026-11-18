@@ -8,7 +8,7 @@ binary=${3:-target/release/overlook}
 root=$(cd "$(dirname "$0")/.." && pwd)
 arch=$(uname -m)
 [[ "$(uname -s)" == Darwin ]]
-lipo -verify_arch "$arch" "$binary"
+lipo "$binary" -verify_arch "$arch"
 [[ "$("$binary" --version)" == "overlook $version" ]]
 
 stage=$(mktemp -d)
