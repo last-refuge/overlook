@@ -1,5 +1,10 @@
 # Google OAuth verification
 
+Status (2026-11-17): **approved.** The client is built into release builds from the repository's Actions
+secrets (`OVERLOOK_GOOGLE_CLIENT_ID`, `OVERLOOK_GOOGLE_CLIENT_SECRET`); see `docs/secrets-policy.md`. The
+yearly CASA reassessment for the restricted scopes still applies. The rest of this page is the submission
+record.
+
 Status (2026-10-12): preparing the submission for project `overlook-511415` (Desktop app client).
 Sensitive scopes: `gmail.send`, `calendar.events`, `calendar.readonly`, `contacts` (read-write, 2026-10-13:
 the Contacts module adds, edits and deletes address-book entries through the People API; it replaced

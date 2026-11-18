@@ -71,16 +71,23 @@ the client id and an optional tenant (`oauth.rs`, `BUNDLED_CLIENT_JSON`; a packa
 `{"client_id": "…", "tenant": "…"}`. Overlook only reads that file, at sign-in
 (`crates/overlook-app/src/microsoft_signin.rs:25-48`). It holds nothing secret.
 
-### The Google OAuth client file
+### The Google OAuth client
 
-`google-oauth-client.json` is not stored in the keyring. The user downloads it from their own Google
-Cloud project and saves it in `~/.config/overlook/` (or `$OVERLOOK_CONFIG_DIR`); see
-`crates/overlook-app/src/google_signin.rs:19-28`. Overlook only reads it (`google_signin.rs:31-40`), at
-sign-in and when it creates a Gmail client (`providers.rs:41`); it never writes, copies or deletes it.
-It holds the client id and the "Desktop app" client secret, which Google documents as
-non-confidential for installed apps; PKCE protects the authorization code. Its `Debug` output redacts
-the secret (`oauth.rs:48-52`). File permissions are whatever the user saved it with; owner-only
-(`chmod 600`) is recommended.
+Release builds sign in to Google with Last Refuge's OAuth client ("Desktop app" type, Cloud project
+`overlook-511415`, verified by Google). Its client id and the secret Google issues with it are compiled
+in from `OVERLOOK_GOOGLE_CLIENT_ID` and `OVERLOOK_GOOGLE_CLIENT_SECRET`
+(`crates/overlook-provider/src/gmail/oauth.rs`, `ClientConfig::built_in`). The release workflow
+(`.github/workflows/release.yml`) supplies them from the repository's Actions secrets, so they are not
+in the source, and it stops when they are missing. Google documents the desktop client's secret as
+non-confidential for installed apps: it ships inside every copy of the binary, and PKCE protects the
+authorization code. Its `Debug` output redacts it all the same.
+
+A `google-oauth-client.json` downloaded from the user's own Google Cloud project, saved in
+`~/.config/overlook/` (or `$OVERLOOK_CONFIG_DIR`), takes the built-in client's place
+(`crates/overlook-app/src/google_signin.rs`, `load_client_config`). Overlook only reads it, at sign-in
+and when it creates a Gmail client (`providers.rs`, `gmail_providers`); it never writes, copies or
+deletes it. File permissions are whatever the user saved it with; owner-only (`chmod 600`) is
+recommended. It is not stored in the keyring.
 
 ## Who can access the keyring items
 

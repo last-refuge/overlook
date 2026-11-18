@@ -26,6 +26,18 @@ jobs:
           echo "tag=$TAG cargo=$CARGO"
           [ "$TAG" = "$CARGO" ] || { echo "Tag v$TAG does not match Cargo.toml version $CARGO"; exit 1; }
           echo "VERSION=$TAG" >> "$GITHUB_ENV"
+      # Releases carry Last Refuge's Google-verified OAuth client, so Gmail sign-in works without a
+      # Google Cloud project of the user's own. The id and the desktop client's secret (which Google
+      # documents as non-confidential) come from the repository's Actions secrets, not the source.
+      - name: Check that the Google sign-in secrets are set
+        env:
+          OVERLOOK_GOOGLE_CLIENT_ID: ${{ secrets.OVERLOOK_GOOGLE_CLIENT_ID }}
+          OVERLOOK_GOOGLE_CLIENT_SECRET: ${{ secrets.OVERLOOK_GOOGLE_CLIENT_SECRET }}
+        run: |
+          [ -n "$OVERLOOK_GOOGLE_CLIENT_ID" ] && [ -n "$OVERLOOK_GOOGLE_CLIENT_SECRET" ] || {
+            echo "Set the OVERLOOK_GOOGLE_CLIENT_ID and OVERLOOK_GOOGLE_CLIENT_SECRET repository secrets; without them the release can't sign in to Gmail."
+            exit 1
+          }
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit
@@ -38,7 +50,12 @@ jobs:
           cargo audit
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
-        run: cargo build --release --locked -p overlook
+        env:
+          OVERLOOK_GOOGLE_CLIENT_ID: ${{ secrets.OVERLOOK_GOOGLE_CLIENT_ID }}
+          OVERLOOK_GOOGLE_CLIENT_SECRET: ${{ secrets.OVERLOOK_GOOGLE_CLIENT_SECRET }}
+        run: |
+          cargo build --release --locked -p overlook
+          grep -qF -- "$OVERLOOK_GOOGLE_CLIENT_ID" target/release/overlook || { echo "The release binary is missing the built-in Google client."; exit 1; }
       - name: Build the pacman package
         run: |
           useradd -m builder
