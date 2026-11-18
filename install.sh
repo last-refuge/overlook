@@ -320,6 +320,12 @@ fi
 printf '\n  %sAdd your accounts%s\n' "$BOLD" "$RESET"
 note "Overlook opens on its add-account page: choose Gmail or another service and sign in."
 note "To look around first, open the sample mailbox from the foot of that page."
+if [[ -z "$ASSET_URL" ]]; then
+  # Only release builds carry Overlook's Google sign-in; a source build needs the user's own client.
+  note "This copy was built from source, so Gmail needs a Google OAuth client of your own: see"
+  note "\"Using your own Google Cloud project\" in the README, then save the client's JSON as"
+  note "~/.config/overlook/google-oauth-client.json."
+fi
 printf '\n'
 
 }
