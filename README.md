@@ -177,23 +177,34 @@ tray integration uses Linux desktop services.
 
 ## Connect Gmail
 
-Overlook talks to Gmail and Google Calendar directly through Google's APIs, from your machine, with an OAuth
-client that belongs to you. Nothing passes through a Last Refuge server.
+Overlook talks to Gmail, Google Calendar and Google Contacts directly through Google's APIs, from your machine.
+Nothing passes through a Last Refuge server.
 
-1. In [Google Cloud](https://console.cloud.google.com), create a project, enable the **Gmail API** and the
-   **Google Calendar API**.
+1. Choose **Add account** (Settings → Accounts, or the account menu at the bottom of the sidebar), then
+   **Gmail**. A new install opens on that page.
+2. Sign in with Google in your browser and approve Overlook's access.
+
+Repeat for more accounts. Overlook is verified by Google for the Gmail, Calendar and Contacts access it asks for.
+Tokens are stored in Apple Keychain on macOS or in the system keyring on Linux (GNOME Keyring or KWallet through
+the Secret Service), never in files. The [native app guide](llm-docs/overlook-native-app.md#gmail) has the details, and the
+[secrets access policy](docs/secrets-policy.md) lists every stored secret, who can reach it, and how access is logged.
+
+### Using your own Google Cloud project (optional)
+
+Release builds carry Overlook's own Google sign-in. Builds compiled from source don't, and anyone who prefers
+their own Google Cloud project can use it instead:
+
+1. In [Google Cloud](https://console.cloud.google.com), create a project and enable the **Gmail API**, the
+   **Google Calendar API** and the **People API**.
 2. Configure the consent screen (External, Testing), add yourself as a test user, and add these scopes:
    `gmail.modify`, `gmail.send`, `gmail.settings.basic`, `calendar.events`, `calendar.readonly`,
    `contacts`, `contacts.other.readonly`, `openid`, `userinfo.email`.
-3. Create an OAuth client of type **Desktop app** and download its JSON.
-4. Save it as `~/.config/overlook/google-oauth-client.json`.
-5. In Overlook, choose **Add account** (Settings → Accounts, or the account menu at the bottom of the sidebar), then
-   **Gmail**, and sign in in your browser. A new install opens on that page. Repeat for more accounts.
+3. Create an OAuth client of type **Desktop app**, download its JSON, and save it as
+   `~/.config/overlook/google-oauth-client.json`. When that file exists, Overlook signs in with it.
 
-Tokens are stored in Apple Keychain on macOS or in the system keyring on Linux. In Google's *Testing*
-mode you will be asked to sign in again every seven days; publishing the app
-in Google Cloud lifts that. The [native app guide](llm-docs/overlook-native-app.md#gmail) has the details.
-The [secrets access policy](docs/secrets-policy.md) lists every stored secret, who can reach it, and how access is logged.
+In Google's *Testing* mode you will be asked to sign in again every seven days. Accounts signed in with one client
+need to sign in again after switching to the other, because Google only refreshes a sign-in through the client
+that issued it.
 
 ## Connect Microsoft
 

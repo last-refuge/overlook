@@ -1,7 +1,13 @@
 //! OAuth 2.0 for installed applications: PKCE, loopback redirect, token exchange and refresh.
 //!
-//! The client id comes from the Google Cloud OAuth client the user created; it is read from
-//! `~/.config/overlook/google-oauth-client.json` by the app and never embedded in the binary.
+//! Release builds carry Last Refuge's Google-verified OAuth client ("Desktop app" type, project
+//! `overlook-511415`), compiled in from `OVERLOOK_GOOGLE_CLIENT_ID` and
+//! `OVERLOOK_GOOGLE_CLIENT_SECRET` ([`ClientConfig::built_in`]). The release workflow supplies
+//! them from the repository's Actions secrets, so they stay out of the source. A
+//! `google-oauth-client.json` downloaded from the user's own Google Cloud project overrides it
+//! (the app reads that file; see [`ClientConfig::from_google_json`]). Google documents the
+//! desktop client's "secret" as non-confidential: anyone can read it out of the binary, and PKCE
+//! protects the authorization code.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -10,7 +16,13 @@ use std::time::Duration;
 // Provider-neutral pieces that started out here; Microsoft's sign-in shares them.
 pub use crate::oauth::{base64_url, url_decode, url_encode, CallbackError, OAuthTokens, Pkce};
 
-/// The OAuth client created in Google Cloud ("Desktop app" type).
+/// Last Refuge's verified client id, compiled into release builds. `None` in a build made
+/// without `OVERLOOK_GOOGLE_CLIENT_ID`, such as a plain `cargo build` from source.
+pub const BUILT_IN_CLIENT_ID: Option<&str> = option_env!("OVERLOOK_GOOGLE_CLIENT_ID");
+/// The secret Google issued with [`BUILT_IN_CLIENT_ID`], from `OVERLOOK_GOOGLE_CLIENT_SECRET`.
+const BUILT_IN_CLIENT_SECRET: Option<&str> = option_env!("OVERLOOK_GOOGLE_CLIENT_SECRET");
+
+/// An OAuth client created in Google Cloud ("Desktop app" type).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientConfig {
     pub client_id: String,
@@ -19,6 +31,17 @@ pub struct ClientConfig {
 }
 
 impl ClientConfig {
+    /// The client compiled into this build, if there is one.
+    pub fn built_in() -> Option<Self> {
+        Self::from_parts(BUILT_IN_CLIENT_ID, BUILT_IN_CLIENT_SECRET)
+    }
+
+    fn from_parts(id: Option<&str>, secret: Option<&str>) -> Option<Self> {
+        let client_id = id.map(str::trim).filter(|id| !id.is_empty())?.to_owned();
+        let client_secret = secret.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+        Some(Self { client_id, client_secret })
+    }
+
     /// Parses the JSON file downloaded from Google Cloud (`{"installed": {...}}`).
     pub fn from_google_json(json: &str) -> Result<Self, String> {
         let value: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
@@ -314,6 +337,19 @@ mod tests {
         assert!(log.contains("token response: accepted") && log.contains("token response: rejected"));
         assert!(log.contains("error=\"invalid_grant\""));
         assert!(!log.contains("-secret"), "{log}");
+    }
+
+    #[test]
+    fn a_built_in_client_needs_an_id() {
+        assert_eq!(ClientConfig::from_parts(None, Some("GOCSPX-x")), None);
+        assert_eq!(ClientConfig::from_parts(Some("  "), Some("GOCSPX-x")), None);
+        let config = ClientConfig::from_parts(Some(" 123-abc.apps.googleusercontent.com\n"), Some(" GOCSPX-x ")).unwrap();
+        assert_eq!(config.client_id, "123-abc.apps.googleusercontent.com");
+        assert_eq!(config.client_secret.as_deref(), Some("GOCSPX-x"));
+        assert_eq!(ClientConfig::from_parts(Some("id"), Some("")).unwrap().client_secret, None);
+        if let Some(built_in) = ClientConfig::built_in() {
+            assert!(built_in.client_id.ends_with(".apps.googleusercontent.com"), "the built-in id is a Google client id");
+        }
     }
 
     #[test]

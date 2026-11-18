@@ -317,10 +317,9 @@ if (( IS_OMARCHY )); then
 else
   note "Find Overlook in your application menu, or run \`overlook\`."
 fi
-printf '\n  %sConnect Gmail%s\n' "$BOLD" "$RESET"
-note "Overlook starts with a sample mailbox. To add your Gmail account you need a Google OAuth client"
-note "(type \"Desktop app\") saved as ~/.config/overlook/google-oauth-client.json. The README has the"
-note "five-minute walkthrough; then use the account menu at the bottom of the sidebar → Add Gmail account."
+printf '\n  %sAdd your accounts%s\n' "$BOLD" "$RESET"
+note "Overlook opens on its add-account page: choose Gmail or another service and sign in."
+note "To look around first, open the sample mailbox from the foot of that page."
 printf '\n'
 
 }

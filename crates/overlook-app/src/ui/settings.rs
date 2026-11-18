@@ -1178,7 +1178,11 @@ impl MailWindow {
         let p = *cx.palette();
         let data_dir = crate::data_dir();
         let data_dir_text = data_dir.display().to_string();
-        let config = crate::google_signin::client_config_path().display().to_string();
+        let config = if crate::google_signin::uses_built_in_client() {
+            "Built into Overlook".to_owned()
+        } else {
+            crate::google_signin::client_config_path().display().to_string()
+        };
         let microsoft_config = match overlook_provider::microsoft::ClientConfig::built_in() {
             Some(_) if !crate::microsoft_signin::client_config_path().exists() => "Built into Overlook".to_owned(),
             _ => crate::microsoft_signin::client_config_path().display().to_string(),
