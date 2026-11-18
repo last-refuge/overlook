@@ -170,9 +170,11 @@ impl MailWindow {
             root.on_action(cx.listener(|this, _: &NewMailMessage, window, cx| {
                 this.start_new_item(NewItem::Message, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &NewContactAction, window, cx| {
-                this.start_new_item(NewItem::Contact, window, cx);
-            }))
+            .when(self.contact_form.is_none(), |root| {
+                root.on_action(cx.listener(|this, _: &NewContactAction, window, cx| {
+                    this.start_new_item(NewItem::Contact, window, cx);
+                }))
+            })
             .on_action(cx.listener(|this, _: &AddAccountAction, window, cx| {
                 this.open_add_account(window, cx);
             }))

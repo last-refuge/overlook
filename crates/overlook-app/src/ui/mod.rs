@@ -4287,13 +4287,14 @@ impl Render for MailWindow {
         }
         let p: Palette = *cx.palette();
         let macos = cfg!(target_os = "macos");
-        let menu_can_act = self.settings.is_none()
+        let no_modal = self.settings.is_none()
             && self.account_setup.is_none()
-            && self.composer.is_none()
             && self.palette.is_none()
             && self.folder_prompt.is_none();
-        let message_selected = menu_can_act
+        let menu_can_act = no_modal && self.composer.is_none();
+        let message_selected = no_modal
             && self.module == Module::Mail
+            && (self.composer.is_none() || self.composer_is_inline())
             && self.outbox_selected.is_none()
             && (self.multi_selected() || !self.thread.is_empty());
         let root = v_flex()
@@ -4358,7 +4359,9 @@ impl Render for MailWindow {
             .on_action(cx.listener(Self::on_cal_month))
             .on_action(cx.listener(Self::on_cal_delete_selected))
             .on_action(cx.listener(Self::on_cal_edit_selected))
-            .when(!macos || menu_can_act, |root| root.on_action(cx.listener(Self::on_new_event)))
+            .when(!macos || (menu_can_act && self.new_event.is_none()), |root| {
+                root.on_action(cx.listener(Self::on_new_event))
+            })
             .on_action(cx.listener(Self::on_cal_select_next))
             .on_action(cx.listener(Self::on_cal_select_previous))
             .on_action(cx.listener(Self::on_save_calendar_event))
