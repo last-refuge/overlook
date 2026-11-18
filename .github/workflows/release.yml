@@ -3,10 +3,10 @@ on:
   push:
     tags: ['v*']
 permissions:
-  contents: write
+  contents: read
 jobs:
-  release:
-    name: Build packages and publish
+  linux:
+    name: Build Linux release packages
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     steps:
@@ -55,7 +55,7 @@ jobs:
           OVERLOOK_GOOGLE_CLIENT_SECRET: ${{ secrets.OVERLOOK_GOOGLE_CLIENT_SECRET }}
         run: |
           cargo build --release --locked -p overlook
-          grep -qF -- "$OVERLOOK_GOOGLE_CLIENT_ID" target/release/overlook || { echo "The release binary is missing the built-in Google client."; exit 1; }
+          bash scripts/check-release-binary.sh target/release/overlook
       - name: Build the pacman package
         run: |
           useradd -m builder
@@ -67,20 +67,94 @@ jobs:
           cp /tmp/pkg/*.pkg.tar.* dist/
       - name: Build the generic tarball
         run: scripts/make-release-tarball.sh "$VERSION" dist
-      - name: Checksums and installer
+      - name: Verify packaged binaries
+        env:
+          OVERLOOK_GOOGLE_CLIENT_ID: ${{ secrets.OVERLOOK_GOOGLE_CLIENT_ID }}
+          OVERLOOK_GOOGLE_CLIENT_SECRET: ${{ secrets.OVERLOOK_GOOGLE_CLIENT_SECRET }}
         run: |
-          cp install.sh dist/
-          cd dist && sha256sum *.pkg.tar.* *.tar.gz > SHA256SUMS && cat SHA256SUMS
+          extracted=$(mktemp)
+          trap 'rm -f "$extracted"' EXIT
+          bsdtar -xOf "dist/overlook-$VERSION-1-x86_64.pkg.tar.zst" usr/bin/overlook > "$extracted"
+          bash scripts/check-release-binary.sh "$extracted"
+          tar -xOf "dist/overlook-$VERSION-x86_64-linux.tar.gz" "overlook-$VERSION-x86_64-linux/overlook" > "$extracted"
+          bash scripts/check-release-binary.sh "$extracted"
+      - name: Include the installer
+        run: cp install.sh dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: overlook-release-linux
+          path: dist/
+          if-no-files-found: error
+
+  macos:
+    name: Build Mac release package (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - { runner: macos-15, arch: arm64 }
+          - { runner: macos-15-intel, arch: x86_64 }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up the Metal compiler
+        run: |
+          if ! xcrun metal --version; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun metal --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
+      - name: Build and package Overlook
+        env:
+          OVERLOOK_GOOGLE_CLIENT_ID: ${{ secrets.OVERLOOK_GOOGLE_CLIENT_ID }}
+          OVERLOOK_GOOGLE_CLIENT_SECRET: ${{ secrets.OVERLOOK_GOOGLE_CLIENT_SECRET }}
+        run: |
+          [ "$(uname -m)" = "${{ matrix.arch }}" ]
+          cargo build --release --locked -p overlook
+          version="${GITHUB_REF_NAME#v}"
+          bash scripts/make-macos-archive.sh "$version" dist
+          extracted=$(mktemp -d)
+          trap 'rm -rf "$extracted"' EXIT
+          ditto -x -k "dist/overlook-$version-${{ matrix.arch }}-macos.zip" "$extracted"
+          bash scripts/check-release-binary.sh "$extracted/Overlook.app/Contents/MacOS/overlook"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: overlook-release-macos-${{ matrix.arch }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish release and checksums
+    needs: [linux, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: overlook-release-*
+          merge-multiple: true
+          path: dist
+      - name: Generate checksums
+        run: |
+          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          cd dist
+          sha256sum -- *.pkg.tar.* *.tar.gz *.zip > SHA256SUMS
+          cat SHA256SUMS
       - name: Publish the release
         uses: softprops/action-gh-release@v2
         with:
           name: Overlook ${{ env.VERSION }}
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: |
             dist/*
   supply-chain:
     name: Supply-chain scan
-    needs: release
+    needs: publish
+    permissions:
+      contents: write
     uses: ./.github/workflows/supply-chain.yml
     with:
       tag: ${{ github.ref_name }}
