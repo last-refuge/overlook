@@ -182,6 +182,22 @@ fn go_hidden(cx: &mut App) {
     .detach();
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn show_settings(page: crate::ui::SettingsPage, cx: &mut App) {
+    show(LaunchEnv::default(), cx);
+    let lifecycle = cx.global::<Lifecycle>();
+    if lifecycle.hidden || lifecycle.switching {
+        return;
+    }
+    if let Some((window, view)) = lifecycle.main.as_ref().and_then(|main| {
+        main.view.upgrade().map(|view| (main.window, view))
+    }) {
+        let _ = window.update(cx, |_, window, cx| {
+            view.update(cx, |this, cx| this.open_settings(page, window, cx));
+        });
+    }
+}
+
 /// Brings Overlook forward on the launch's desktop: the main window, opened again if it was
 /// hidden or closed.
 pub fn show(env: LaunchEnv, cx: &mut App) {

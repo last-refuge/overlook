@@ -27,16 +27,18 @@ impl MailWindow {
             .bg(p.chrome())
             .border_r_1()
             .border_color(p.divider.opacity(0.6))
-            .child(
-                div().h(px(header_height(self.density))).w_full().flex_none().child(
+            .when(!cfg!(target_os = "macos"), |rail| {
+                rail.child(
                     div()
-                        .size_full()
+                        .h(px(header_height(self.density)))
+                        .w_full()
+                        .flex_none()
                         .flex()
                         .items_center()
                         .justify_center()
                         .child(brand_tile(24.)),
-                ),
-            )
+                )
+            })
             .child(
                 v_flex().gap(px(4.)).pt(px(8.)).children(
                     [
@@ -168,16 +170,18 @@ impl MailWindow {
                 .gap(px(24.))
                 .pl(px(12.))
                 .pr(px(20.))
-                .child(
-                    div()
-                        .w(px(152.))
-                        .flex_none()
-                        .font_family("Source Serif 4 Display")
-                        .text_size(px(23.))
-                        .line_height(px(30.))
-                        .child("Overlook"),
-                )
-                // Search sits centred in the room between the wordmark and the account.
+                .when(!cfg!(target_os = "macos"), |bar| {
+                    bar.child(
+                        div()
+                            .w(px(152.))
+                            .flex_none()
+                            .font_family("Source Serif 4 Display")
+                            .text_size(px(23.))
+                            .line_height(px(30.))
+                            .child("Overlook"),
+                    )
+                })
+                // Centre search in the space the title and account leave for it.
                 .child(
                     div()
                         .flex_1()

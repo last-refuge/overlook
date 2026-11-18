@@ -309,11 +309,13 @@ impl MailWindow {
     pub(super) fn render_composer_window(&self, cx: &mut Context<Self>) -> impl IntoElement {
         self.prune_browser_bodies();
         let p = *cx.palette();
-        v_flex()
+        let root = v_flex()
             .id("composer-window")
             .key_context(WINDOW_CONTEXT)
-            .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|_, _: &QuitOverlook, _window, cx| cx.defer(crate::lifecycle::quit)))
+            .track_focus(&self.focus_handle);
+        #[cfg(target_os = "macos")]
+        let root = self.native_window_menu_actions(root, cx);
+        root.on_action(cx.listener(|_, _: &QuitOverlook, _window, cx| cx.defer(crate::lifecycle::quit)))
             .on_action(cx.listener(Self::on_escape))
             .on_action(cx.listener(Self::on_send))
             .on_action(cx.listener(Self::on_command_palette))
