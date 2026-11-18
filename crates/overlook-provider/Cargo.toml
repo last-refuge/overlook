@@ -18,7 +18,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 ureq = { version = "3", features = ["json"] }
-lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
+lettre = { version = "0.11.24", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
 # IMAP/POP3 (phase 2/3): raw message parsing and the IMAP client. The imap crate's own TLS
 # features pin an older rustls, so TLS streams are built here with the rustls ureq already uses.
 mail-parser = "0.11"

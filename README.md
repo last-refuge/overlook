@@ -150,7 +150,7 @@ Settings first (`./install.sh --uninstall` does it for you).
 ### Updates
 
 Overlook checks GitHub for a new release once a day (switch it off in Settings → About) and shows a banner
-when there is one. **Update now** downloads the release, verifies its checksum, and installs it in place:
+when there is one. On Linux, **Update now** downloads the release, verifies its checksum, and installs it in place:
 through a polkit password dialog when Overlook was installed with pacman, or by swapping the binary when it
 lives in your own prefix. Then **Restart Overlook**. Nothing about you is sent during the check.
 
@@ -160,7 +160,16 @@ around first, choose **Look around in a sample mailbox first** at the foot of th
 connection is a switch in the status bar; flip it to watch offline changes sync. Adding another account later
 (Settings → Accounts → **Add account**, or the account menu) opens the same page.
 
-### Build a macOS preview from source
+### Install on macOS
+
+Download the Mac ZIP for Apple Silicon (`arm64`) or Intel (`x86_64`) from the
+[latest release](https://github.com/last-refuge/overlook/releases/latest).
+Unzip it, move **Overlook.app** to Applications, and open it. The archives use ad-hoc
+signing, so macOS may [ask you to approve the app](https://support.apple.com/en-us/102445)
+on first launch. Install Google Chrome or Chromium in `/Applications` for HTML message rendering.
+To update, replace the app with the one from a newer release.
+
+#### Build from source
 
 With Rust installed through rustup and Xcode's Metal toolchain available, run these
 commands from the Overlook checkout. Install Google Chrome or Chromium in
