@@ -13,10 +13,12 @@ use overlook_core::toolbar::{
 const SEPARATOR_WIDTH: f32 = 13.;
 /// The menu half of the split New button.
 const SPLIT_WIDTH: f32 = 26.;
+const TOOLBAR_GAP: f32 = 2.;
+const MAC_BRAND_WIDTH: f32 = 132.;
 
 /// The other things the split New button can make, beside the module's own.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum NewItem {
+pub(super) enum NewItem {
     Message,
     Event,
     Contact,
@@ -458,7 +460,7 @@ impl MailWindow {
     }
 
     /// Opens the module a new item belongs to and starts it there.
-    fn start_new_item(&mut self, item: NewItem, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn start_new_item(&mut self, item: NewItem, window: &mut Window, cx: &mut Context<Self>) {
         self.toolbar_more_open = false;
         match item {
             NewItem::Message => {
@@ -574,7 +576,13 @@ impl MailWindow {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let p = *cx.palette();
-        let compact = width < px(1160.);
+        let macos = cfg!(target_os = "macos");
+        let command_width = if macos {
+            width - px(MAC_BRAND_WIDTH + TOOLBAR_GAP)
+        } else {
+            width
+        };
+        let compact = command_width < px(1160.);
         let layout = self.toolbar_layouts.layout(self.module.into());
         // Labels are measured in the buttons' own font, so the strip shows every command
         // that fits and overflows only what doesn't.
@@ -600,7 +608,7 @@ impl MailWindow {
         const LABELLED: f32 = 2. + 16. + 20. + 6. + 2. + 1.;
         const ICON_ONLY: f32 = 2. + 16. + 20. + 2. - 3.;
         let visible = layout.visible_count(
-            f32::from(width) - 90.,
+            f32::from(command_width) - 90.,
             |action| {
                 let command = self.toolbar_command(action);
                 if command.primary {
@@ -650,11 +658,25 @@ impl MailWindow {
             .flex_none()
             .h(px(header_height(self.density)))
             .items_center()
-            .gap(px(2.))
+            .gap(px(TOOLBAR_GAP))
             .px(px(8.))
             .rounded(px(8.))
             .bg(p.message_surface())
             .shadow_sm()
+            .when(macos, |toolbar| {
+                toolbar.child(
+                    h_flex()
+                        .w(px(MAC_BRAND_WIDTH))
+                        .flex_none()
+                        .items_center()
+                        .gap(px(8.))
+                        .font_family("Source Serif 4 Display")
+                        .text_size(px(23.))
+                        .line_height(px(30.))
+                        .child(brand_tile(24.))
+                        .child("Overlook"),
+                )
+            })
             .children(items)
             .child(
                 div()

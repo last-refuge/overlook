@@ -341,11 +341,13 @@ impl MailWindow {
                         .on_click(cx.listener(|this, _, window, cx| this.close_add_account(window, cx))),
                 )
             });
-        v_flex()
+        let root = v_flex()
             .id("mail-window")
             .key_context(WINDOW_CONTEXT)
-            .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|_, _: &QuitOverlook, _window, cx| cx.defer(crate::lifecycle::quit)))
+            .track_focus(&self.focus_handle);
+        #[cfg(target_os = "macos")]
+        let root = self.native_window_menu_actions(root, cx);
+        root.on_action(cx.listener(|_, _: &QuitOverlook, _window, cx| cx.defer(crate::lifecycle::quit)))
             .on_action(cx.listener(Self::on_escape))
             .size_full()
             .bg(tones.ground)
@@ -364,6 +366,7 @@ impl MailWindow {
                     .overflow_y_scrollbar(),
             )
             .when(self.account_setup.is_some(), |d| d.child(self.render_account_setup(cx)))
+            .when(cfg!(target_os = "macos") && self.settings.is_some(), |d| d.child(self.render_settings(cx)))
     }
 
     /// "Connect your mail": the featured services, the others, then any server. A new install

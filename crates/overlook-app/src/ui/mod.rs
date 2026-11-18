@@ -18,6 +18,8 @@ mod palette;
 mod prompt;
 mod list;
 mod list_menu;
+#[cfg(target_os = "macos")]
+mod macos_menu;
 mod settings;
 mod signature;
 mod reader;
@@ -246,6 +248,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-f", FocusSettingsSearch, Some(SETTINGS_CONTEXT)),
         KeyBinding::new("f3", FocusSettingsSearch, Some(SETTINGS_CONTEXT)),
     ]);
+    #[cfg(target_os = "macos")]
+    macos_menu::init(cx);
 }
 
 pub struct Nav {
@@ -810,6 +814,14 @@ impl MailWindow {
             WindowSetup::Composer { appearance, owner, providers } => (appearance, Some(owner), None, Some(providers), None),
             WindowSetup::Folder { appearance, owner, providers, account, view } => (appearance, None, Some(owner), Some(providers), Some((account, view))),
         };
+        #[cfg(target_os = "macos")]
+        window.set_window_title(if composer_owner.is_some() {
+            "Compose"
+        } else if folder_owner.is_some() {
+            "Mail Folder"
+        } else {
+            "Overlook"
+        });
         let detached = composer_owner.is_some() || folder_owner.is_some();
         // A folder window opens on its own account, whatever the main window shows.
         let account = match &folder {
@@ -4274,11 +4286,29 @@ impl Render for MailWindow {
             return self.render_no_account(window, cx).into_any_element();
         }
         let p: Palette = *cx.palette();
-        v_flex()
+        let macos = cfg!(target_os = "macos");
+        let menu_can_act = self.settings.is_none()
+            && self.account_setup.is_none()
+            && self.composer.is_none()
+            && self.palette.is_none()
+            && self.folder_prompt.is_none();
+        let message_selected = menu_can_act
+            && self.module == Module::Mail
+            && self.outbox_selected.is_none()
+            && (self.multi_selected() || !self.thread.is_empty());
+        let root = v_flex()
             .id("mail-window")
             .key_context(WINDOW_CONTEXT)
-            .track_focus(&self.focus_handle)
-            .on_action(cx.listener(Self::on_compose))
+            .track_focus(&self.focus_handle);
+        #[cfg(target_os = "macos")]
+        let root = self.native_mail_menu_actions(
+            self.native_window_menu_actions(root, cx),
+            menu_can_act,
+            message_selected,
+            window,
+            cx,
+        );
+        root.on_action(cx.listener(Self::on_compose))
             .on_action(cx.listener(Self::on_focus_search))
             .on_action(cx.listener(Self::on_command_palette))
             .on_action(cx.listener(Self::on_format_bold))
@@ -4294,19 +4324,25 @@ impl Render for MailWindow {
             .on_action(cx.listener(Self::on_toggle_message_history))
             .on_action(cx.listener(Self::on_pop_out_composer))
             .on_action(cx.listener(Self::on_reply))
-            .on_action(cx.listener(Self::on_reply_all))
-            .on_action(cx.listener(Self::on_forward))
+            .when(!macos || (message_selected && !self.multi_selected()), |root| {
+                root.on_action(cx.listener(Self::on_reply_all))
+                    .on_action(cx.listener(Self::on_forward))
+            })
             .on_action(cx.listener(Self::on_next))
             .on_action(cx.listener(Self::on_prev))
             .on_action(cx.listener(Self::on_archive))
-            .on_action(cx.listener(Self::on_trash))
-            .on_action(cx.listener(Self::on_toggle_star))
-            .on_action(cx.listener(Self::on_toggle_read))
+            .when(!macos || (message_selected && !self.removal_state().0), |root| {
+                root.on_action(cx.listener(Self::on_trash))
+            })
+            .when(!macos || message_selected, |root| {
+                root.on_action(cx.listener(Self::on_toggle_star))
+                    .on_action(cx.listener(Self::on_toggle_read))
+                    .on_action(cx.listener(Self::on_move_selected))
+            })
             .on_action(cx.listener(Self::on_extend_next))
             .on_action(cx.listener(Self::on_extend_prev))
             .on_action(cx.listener(Self::on_select_all))
             .on_action(cx.listener(Self::on_delete_forever))
-            .on_action(cx.listener(Self::on_move_selected))
             .on_action(cx.listener(Self::on_open_selected))
             .on_action(cx.listener(Self::on_sync_now))
             .on_action(cx.listener(Self::on_rename_folder))
@@ -4322,7 +4358,7 @@ impl Render for MailWindow {
             .on_action(cx.listener(Self::on_cal_month))
             .on_action(cx.listener(Self::on_cal_delete_selected))
             .on_action(cx.listener(Self::on_cal_edit_selected))
-            .on_action(cx.listener(Self::on_new_event))
+            .when(!macos || menu_can_act, |root| root.on_action(cx.listener(Self::on_new_event)))
             .on_action(cx.listener(Self::on_cal_select_next))
             .on_action(cx.listener(Self::on_cal_select_previous))
             .on_action(cx.listener(Self::on_save_calendar_event))
@@ -4337,16 +4373,21 @@ impl Render for MailWindow {
             .font_family("Inter")
             .text_size(px(13.))
             .relative()
-            .child(h_flex().size_full().min_h_0()
-                .child(self.render_app_rail(cx))
-                .child(v_flex().flex_1().min_w_0().h_full()
-                    .child(self.render_header(cx))
-                    .child(self.render_app_toolbar(window.viewport_size().width - px(shell::RAIL_WIDTH), window, cx))
-                    .children(self.render_update_banner(cx))
-                    .children(self.render_banner(cx))
-                    .children(self.render_time_zone_prompt(cx))
-                    .child(div().flex_1().min_h_0().child(self.render_body(cx)))
-                    .child(self.render_status_bar(cx))))
+            .child(
+                v_flex().size_full().min_h_0()
+                    // Span the native buttons on macOS. The brand leads the toolbar below.
+                    .when(macos, |shell| shell.child(self.render_header(cx)))
+                    .child(h_flex().flex_1().w_full().min_h_0()
+                        .child(self.render_app_rail(cx))
+                        .child(v_flex().flex_1().min_w_0().h_full()
+                            .when(!macos, |pane| pane.child(self.render_header(cx)))
+                            .child(self.render_app_toolbar(window.viewport_size().width - px(shell::RAIL_WIDTH), window, cx))
+                            .children(self.render_update_banner(cx))
+                            .children(self.render_banner(cx))
+                            .children(self.render_time_zone_prompt(cx))
+                            .child(div().flex_1().min_h_0().child(self.render_body(cx)))
+                            .child(self.render_status_bar(cx)))),
+            )
             .when(self.settings.is_some(), |d| d.child(self.render_settings(cx)))
             .when(self.account_setup.is_some(), |d| d.child(self.render_account_setup(cx)))
             .when(self.module == Module::Calendar && self.new_event.as_ref().is_some_and(|f| f.dragged.is_some()), |d| d.child(self.render_event_modal(cx)))

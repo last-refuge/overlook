@@ -514,7 +514,7 @@ impl MailWindow {
     }
 
     /// Ctrl F / F3: put the cursor in the search box with any earlier query selected.
-    fn focus_settings_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn focus_settings_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(search) = self.settings.as_ref().map(|s| s.search.clone()) else { return };
         search.update(cx, |s, cx| {
             s.focus(window, cx);
