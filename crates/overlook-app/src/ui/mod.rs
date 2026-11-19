@@ -62,6 +62,7 @@ use overlook_provider::sample::SampleProvider;
 use overlook_store::{LocalChange, ListFilter, MailIndex, MailboxView, Store};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -593,7 +594,9 @@ pub struct MailWindow {
     /// Bumped whenever the index changes; a background rebuild started earlier is dropped.
     mail_index_generation: u64,
     /// Local changes waiting to be written, in order, and the batch being written now.
-    local_writes: VecDeque<(AccountId, LocalWrite)>,
+    /// Shared with the in-flight writer task so changes queued right before a detached
+    /// window closes are still flushed in order rather than dropped.
+    local_writes: Arc<Mutex<VecDeque<(AccountId, LocalWrite)>>>,
     local_in_flight: Vec<(AccountId, LocalWrite)>,
     /// Off-screen renders of the conversations next to the open one; replaced (and so
     /// cancelled) whenever the selection moves.
@@ -956,7 +959,7 @@ impl MailWindow {
             mail_index_account: None,
             other_indexes: HashMap::new(),
             mail_index_generation: 0,
-            local_writes: VecDeque::new(),
+            local_writes: Arc::new(Mutex::new(VecDeque::new())),
             local_in_flight: Vec::new(),
             prerender: None,
             prefetching: false,
@@ -2015,7 +2018,7 @@ impl MailWindow {
             })
             .await;
             let _ = this.update(cx, |this, cx| {
-                let current = this.mail_index_generation == generation && this.account.id == acct && this.local_writes.is_empty() && this.local_in_flight.is_empty();
+                let current = this.mail_index_generation == generation && this.account.id == acct && this.local_writes.lock().unwrap().is_empty() && this.local_in_flight.is_empty();
                 if let (true, Ok(index)) = (current, index) {
                     this.replace_mail_index(index);
                     this.refresh_mail();
@@ -2165,11 +2168,11 @@ impl MailWindow {
         }
         let sender = self.thread.iter().filter(|m| !m.is_outgoing).max_by_key(|m| m.date).map(|m| m.from.clone());
         self.mail_index.set_focus_override(&ids, Some(focused));
-        self.local_writes.push_back((self.account.id.clone(), LocalWrite::FocusOverride { ids, focused: Some(focused) }));
+        self.queue_local_write(self.account.id.clone(), LocalWrite::FocusOverride { ids, focused: Some(focused) });
         if always {
             if let Some(sender) = &sender {
                 self.mail_index.set_focus_rule(&sender.email, Some(focused));
-                self.local_writes.push_back((self.account.id.clone(), LocalWrite::FocusRule { email: sender.email.clone(), focused: Some(focused) }));
+                self.queue_local_write(self.account.id.clone(), LocalWrite::FocusRule { email: sender.email.clone(), focused: Some(focused) });
             }
         }
         self.mail_index_generation += 1;
@@ -2793,6 +2796,10 @@ impl MailWindow {
 
     // --------------------------------------------------------- local changes
 
+    fn queue_local_write(&self, account: AccountId, write: LocalWrite) {
+        self.local_writes.lock().unwrap().push_back((account, write));
+    }
+
     /// Applies a mailbox change: the list, counts and open conversation update at once in
     /// memory, then the store write (with its pending operation) and the sync to the
     /// provider run in the background, in the order the changes were made.
@@ -2801,7 +2808,7 @@ impl MailWindow {
         self.mail_index_generation += 1;
         self.apply_to_thread(std::slice::from_ref(&change));
         self.refresh_mail();
-        self.local_writes.push_back((self.account.id.clone(), LocalWrite::Change(change)));
+        self.queue_local_write(self.account.id.clone(), LocalWrite::Change(change));
         self.write_local_changes(window, cx);
         cx.notify();
     }
@@ -2824,9 +2831,10 @@ impl MailWindow {
 
     /// Mailbox changes made in the window that the store does not have yet.
     fn unwritten_changes(&self) -> Vec<LocalChange> {
+        let queued = self.local_writes.lock().unwrap();
         self.local_in_flight
             .iter()
-            .chain(self.local_writes.iter())
+            .chain(queued.iter())
             .filter_map(|(_, w)| match w {
                 LocalWrite::Change(c) => Some(c.clone()),
                 _ => None,
@@ -2837,33 +2845,28 @@ impl MailWindow {
     /// Writes queued local changes on a background thread, then reads a fresh index and
     /// syncs. Only one write runs at a time, so changes reach the store in order.
     fn write_local_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.local_in_flight.is_empty() || self.local_writes.is_empty() {
+        if !self.local_in_flight.is_empty() {
             return;
         }
-        self.local_in_flight = self.local_writes.drain(..).collect();
+        let batch: Vec<(AccountId, LocalWrite)> = self.local_writes.lock().unwrap().drain(..).collect();
+        if batch.is_empty() {
+            return;
+        }
+        self.local_in_flight = batch;
         let writes = self.local_in_flight.clone();
         let store = self.store.clone();
-        let accounts: BTreeSet<AccountId> = writes.iter().map(|(a, _)| a.clone()).collect();
+        let pending_writes = self.local_writes.clone();
+        let mut accounts: BTreeSet<AccountId> = writes.iter().map(|(a, _)| a.clone()).collect();
         let acct = self.account.id.clone();
         let window_handle = window.window_handle();
         let owner = self.window_owner();
         cx.spawn(async move |this, cx| {
             let (errors, index) = cx
                 .background_spawn({
+                    let store = store.clone();
                     let acct = acct.clone();
                     async move {
-                        let errors: Vec<String> = writes
-                            .into_iter()
-                            .filter_map(|(acct, w)| {
-                                match w {
-                                    LocalWrite::Change(c) => store.apply_change(&acct, c).map(|_| ()),
-                                    LocalWrite::FocusOverride { ids, focused } => store.set_focus_override(&acct, &ids, focused),
-                                    LocalWrite::FocusRule { email, focused } => store.set_focus_rule(&acct, &email, focused),
-                                }
-                                .err()
-                                .map(|e| e.to_string())
-                            })
-                            .collect();
+                        let errors = apply_local_writes(&store, writes);
                         (errors, store.mail_index(&acct))
                     }
                 })
@@ -2875,7 +2878,7 @@ impl MailWindow {
                         for e in &errors {
                             crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t save that change: {e}"));
                         }
-                        if !this.local_writes.is_empty() {
+                        if !this.local_writes.lock().unwrap().is_empty() {
                             // More changes arrived while writing; this index is already behind them.
                             this.write_local_changes(window, cx);
                             return;
@@ -2905,8 +2908,22 @@ impl MailWindow {
                 })
                 .unwrap_or(false);
             if !updated {
-                // If a detached window closed while its store write was in flight, still
-                // reload and sync through the main window so the change isn't stranded.
+                // The window closed while a write was in flight: drain any follow-up changes
+                // that queued behind it in strict order, then reload and sync via the main window.
+                loop {
+                    let remaining: Vec<(AccountId, LocalWrite)> = pending_writes.lock().unwrap().drain(..).collect();
+                    if remaining.is_empty() {
+                        break;
+                    }
+                    accounts.extend(remaining.iter().map(|(a, _)| a.clone()));
+                    let store = store.clone();
+                    let more_errors = cx
+                        .background_spawn(async move { apply_local_writes(&store, remaining) })
+                        .await;
+                    for e in more_errors {
+                        tracing::warn!("could not save queued change after window close: {e}");
+                    }
+                }
                 if let Some(owner) = owner {
                     let _ = cx.update(|cx| {
                         owner.parent.update(cx, |main, cx| {
@@ -3916,11 +3933,15 @@ impl MailWindow {
             return;
         }
         let targets = self.target_conversations();
-        let ids: Vec<MessageId> = if self.is_message_window() {
-            self.selected_message_ids()
+        let delete_view = if self.is_message_window() {
+            email_modal::delete_forever_view(&self.view, &self.thread, &self.labels)
         } else {
-            targets.iter().flat_map(|c| self.mail_index.visible_message_ids_in(c, &self.view)).collect()
+            self.view.clone()
         };
+        let ids: Vec<MessageId> = targets
+            .iter()
+            .flat_map(|c| self.mail_index.visible_message_ids_in(c, &delete_view))
+            .collect();
         if ids.is_empty() {
             return;
         }
@@ -4370,6 +4391,21 @@ impl MailWindow {
             }))
             .into_any_element()
     }
+}
+
+fn apply_local_writes(store: &Store, writes: Vec<(AccountId, LocalWrite)>) -> Vec<String> {
+    writes
+        .into_iter()
+        .filter_map(|(acct, w)| {
+            match w {
+                LocalWrite::Change(c) => store.apply_change(&acct, c).map(|_| ()),
+                LocalWrite::FocusOverride { ids, focused } => store.set_focus_override(&acct, &ids, focused),
+                LocalWrite::FocusRule { email, focused } => store.set_focus_rule(&acct, &email, focused),
+            }
+            .err()
+            .map(|e| e.to_string())
+        })
+        .collect()
 }
 
 /// Expands a leading `~` to the home directory.

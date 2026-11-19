@@ -121,7 +121,7 @@ impl MailWindow {
         if account == &self.account.id {
             self.apply_local(change, window, cx);
         } else {
-            self.local_writes.push_back((account.clone(), LocalWrite::Change(change)));
+            self.queue_local_write(account.clone(), LocalWrite::Change(change));
             self.write_local_changes(window, cx);
         }
     }

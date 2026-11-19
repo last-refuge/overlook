@@ -34,6 +34,32 @@ pub(super) fn keep_modal_selection_after_refresh(
     is_message_window && remaining_in_index > 0
 }
 
+/// Effective view used for permanent deletion inside a standalone message window.
+///
+/// Preserves the Trash boundary for mixed conversations (messages both in Trash and
+/// outside Trash) by keeping the originating `view`, while still allowing permanent
+/// deletion after an entire conversation is moved to Trash or restored from Trash while
+/// staying open in this window.
+pub(super) fn delete_forever_view(
+    view: &MailboxView,
+    thread: &[Message],
+    labels: &[Label],
+) -> MailboxView {
+    if thread.is_empty() {
+        return view.clone();
+    }
+    let trash = labels.iter().find(|l| l.kind == LabelKind::Trash).map(|l| &l.id);
+    let all_in_trash = trash.is_some_and(|t| thread.iter().all(|m| m.has_label(t)));
+    if all_in_trash {
+        return MailboxView::Kind(LabelKind::Trash);
+    }
+    let none_in_trash = trash.is_none_or(|t| thread.iter().all(|m| !m.has_label(t)));
+    if none_in_trash {
+        return MailboxView::Kind(LabelKind::Inbox);
+    }
+    view.clone()
+}
+
 /// Title shown in the message window's native title bar.
 pub(super) fn message_window_title(subject: Option<&str>, is_outbox: bool) -> String {
     let clean = subject.map(str::trim).filter(|s| !s.is_empty());
@@ -631,6 +657,18 @@ impl MailWindow {
             })
             .on_action(cx.listener(Self::on_delete_forever))
             .on_action(cx.listener(Self::on_sync_now))
+            .on_action(cx.listener(Self::on_switch_mail))
+            .on_action(cx.listener(Self::on_switch_calendar))
+            .on_action(cx.listener(Self::on_switch_contacts))
+            .on_action(cx.listener(Self::on_open_settings))
+            .on_action(cx.listener(|this, _: &NewEventAction, _window, cx| {
+                this.in_main_window(cx, |main, window, cx| {
+                    main.on_new_event(&NewEventAction, window, cx);
+                });
+            }))
+            .on_action(cx.listener(|this, _: &ShowHistory, _window, cx| {
+                this.in_main_window(cx, |main, window, cx| main.open_history(window, cx));
+            }))
             .on_action(cx.listener(|this, _: &UndoLast, window, cx| this.undo_last(window, cx)))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.composer.is_some() || this.palette.is_some() || this.quick_look.is_some() {
@@ -773,6 +811,39 @@ mod tests {
 
         assert_eq!(os_window_title("Q3 Plan"), "Q3 Plan — Overlook");
         assert_eq!(os_window_title("Overlook · Message"), "Overlook · Message");
+    }
+
+    #[test]
+    fn delete_forever_view_keeps_trash_boundary_for_mixed_conversations() {
+        let labels = vec![
+            label(LabelKind::Inbox, "inbox", "Inbox"),
+            label(LabelKind::Trash, "trash", "Trash"),
+        ];
+        let mut trashed = message_with_labels(&["trash"]);
+        trashed.id = MessageId::from("m-trash");
+        let mut in_inbox = message_with_labels(&["inbox"]);
+        in_inbox.id = MessageId::from("m-inbox");
+        let mixed = vec![trashed.clone(), in_inbox.clone()];
+
+        // Mixed conversation preserves the originating Trash boundary.
+        assert_eq!(
+            delete_forever_view(&MailboxView::Kind(LabelKind::Trash), &mixed, &labels),
+            MailboxView::Kind(LabelKind::Trash)
+        );
+        assert_eq!(
+            delete_forever_view(&MailboxView::Kind(LabelKind::Inbox), &mixed, &labels),
+            MailboxView::Kind(LabelKind::Inbox)
+        );
+        // Conversation opened in Inbox then moved entirely to Trash can still be deleted forever.
+        assert_eq!(
+            delete_forever_view(&MailboxView::Kind(LabelKind::Inbox), &[trashed], &labels),
+            MailboxView::Kind(LabelKind::Trash)
+        );
+        // Conversation opened in Trash then restored entirely out of Trash targets non-trash messages.
+        assert_eq!(
+            delete_forever_view(&MailboxView::Kind(LabelKind::Trash), &[in_inbox], &labels),
+            MailboxView::Kind(LabelKind::Inbox)
+        );
     }
 
     #[test]

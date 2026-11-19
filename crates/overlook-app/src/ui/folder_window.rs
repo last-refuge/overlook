@@ -9,8 +9,8 @@ use super::composer_window::{WindowOwner, WindowSetup};
 use super::*;
 
 pub(super) struct FolderWindow {
-    window: AnyWindowHandle,
-    editor: WeakEntity<MailWindow>,
+    pub(super) window: AnyWindowHandle,
+    pub(super) editor: WeakEntity<MailWindow>,
     account: AccountId,
     view: MailboxView,
     _closed: Subscription,

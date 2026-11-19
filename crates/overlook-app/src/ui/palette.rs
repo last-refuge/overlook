@@ -97,7 +97,7 @@ impl MailWindow {
             entry("Go to Contacts", Some("Ctrl+3"), PaletteCommand::Module(Module::Contacts)),
             entry("Quit Overlook", Some("Ctrl+Q"), action(Box::new(QuitOverlook))),
         ];
-        if self.renamable_open_folder().is_some() {
+        if !self.is_message_window() && self.renamable_open_folder().is_some() {
             out.push(entry("Rename folder", Some("F2"), action(Box::new(RenameFolder))));
         }
         for (name, kind) in [
