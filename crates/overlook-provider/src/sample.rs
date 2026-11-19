@@ -104,6 +104,12 @@ impl MailProvider for SampleProvider {
         ProviderKind::Sample
     }
 
+    /// The fictional mailbox has no originals: its messages are their stored text.
+    fn fetch_original(&self, _account: &Account, message: &Message) -> BoxFuture<'_, Result<Vec<u8>, ProviderError>> {
+        let bytes = crate::message_to_raw(message);
+        Box::pin(async move { Ok(bytes) })
+    }
+
     fn probe(&self) -> BoxFuture<'_, Result<(), ProviderError>> {
         Box::pin(async move { self.require_online() })
     }

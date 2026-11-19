@@ -214,6 +214,17 @@ pub fn raw_dir_for(account: &AccountId) -> std::path::PathBuf {
     crate::data_dir().join("raw").join(account.as_str().replace([':', '/'], "_"))
 }
 
+/// Offline folders: the saved originals live in `<data dir>/raw/local_offline/`, beside the
+/// POP3 accounts' mail, so "Back up mail" includes them.
+pub fn offline_providers() -> AccountProviders {
+    AccountProviders::new(Arc::new(overlook_provider::local::LocalProvider::new(offline_dir())), None)
+}
+
+/// Where offline mail is saved.
+pub fn offline_dir() -> std::path::PathBuf {
+    raw_dir_for(&AccountId::from(OFFLINE_ACCOUNT_ID))
+}
+
 /// A POP3 account: one session per sync, SMTP for sending, no calendar. The local store
 /// and `raw/` hold the only copy of its mail.
 pub fn pop3_providers(account: &AccountId, servers: MailServers, credential: impl Into<Credential>, outgoing_password: Option<String>) -> AccountProviders {
@@ -243,6 +254,7 @@ fn stored_passwords(account: &Account) -> Result<(String, Option<String>), Provi
 pub fn providers_for(account: &Account, sample: &SampleProvider, store: &Store) -> Result<AccountProviders, ProviderIssue> {
     match account.provider {
         ProviderKind::Sample => Ok(AccountProviders::new(Arc::new(sample.clone()), Some(Arc::new(sample.clone())))),
+        ProviderKind::Local => Ok(offline_providers()),
         ProviderKind::Gmail => match credentials::load_tokens(&account.id) {
             Ok(Some(tokens)) => gmail_providers(account, tokens).map_err(ProviderIssue::SignInRequired),
             Ok(None) => Err(ProviderIssue::SignInRequired("Sign in again to continue syncing. Your local drafts are safe.".into())),

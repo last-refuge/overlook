@@ -552,6 +552,15 @@ impl MailProvider for GmailProvider {
         })
     }
 
+    fn fetch_original(&self, _account: &Account, message: &Message) -> BoxFuture<'_, Result<Vec<u8>, ProviderError>> {
+        let id = message.provider_id.clone();
+        Box::pin(async move {
+            let id = id.ok_or_else(|| ProviderError::Rejected("this message has no Gmail copy".into()))?;
+            let v = self.client.get(&format!("messages/{}", id.0), &[("format", "raw")])?;
+            v.get("raw").and_then(|r| r.as_str()).map(mapping::base64url_decode).filter(|b| !b.is_empty()).ok_or_else(|| ProviderError::Rejected("Gmail didn’t send the message".into()))
+        })
+    }
+
     fn search(&self, _account: &Account, query: &str, limit: usize) -> BoxFuture<'_, Result<Vec<ProviderId>, ProviderError>> {
         let query = query.to_owned();
         Box::pin(async move {

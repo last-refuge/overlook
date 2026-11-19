@@ -29,7 +29,7 @@ impl AccountMark {
     /// accounts: they say whether it signs in with Microsoft and which host it uses.
     pub(crate) fn of(account: &Account, servers: Option<&MailServers>) -> Self {
         match account.provider {
-            ProviderKind::Sample => Self::Overlook,
+            ProviderKind::Sample | ProviderKind::Local => Self::Overlook,
             ProviderKind::Gmail => GOOGLE,
             ProviderKind::Imap | ProviderKind::Pop3 => {
                 if servers.is_some_and(|s| s.oauth == Some(OAuthIssuer::Microsoft)) {

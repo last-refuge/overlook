@@ -255,6 +255,10 @@ impl MailWindow {
             self.focus_current_module(window, cx);
             return;
         }
+        if module != Module::Mail {
+            // Calendar and Contacts belong to a mail account, not to offline folders.
+            self.leave_offline(window, cx);
+        }
         self.module = module;
         self.toolbar_more_open = false;
         self.toolbar_editing = false;

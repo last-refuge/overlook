@@ -2124,6 +2124,11 @@ impl MailProvider for ImapProvider {
         })
     }
 
+    fn fetch_original(&self, _account: &Account, message: &Message) -> BoxFuture<'_, Result<Vec<u8>, ProviderError>> {
+        let message = message.clone();
+        Box::pin(async move { self.raw(&message) })
+    }
+
     fn fetch_attachment(&self, _account: &Account, message: &Message, attachment: &Attachment) -> BoxFuture<'_, Result<Vec<u8>, ProviderError>> {
         let message = message.clone();
         let attachment = attachment.clone();

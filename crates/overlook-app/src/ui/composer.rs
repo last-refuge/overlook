@@ -261,7 +261,7 @@ impl MailWindow {
             && (c.draft.kind == kind || (replies(c.draft.kind) && replies(kind)))) else { return false };
         if current.draft.kind != kind {
             self.sync_composer_fields(cx);
-            let targets = Draft::in_response_to_with(self.account.id.clone(), kind, source, &self.owner(), now(), self.prefs.quote_on_reply);
+            let targets = Draft::in_response_to_with(self.writing_account().id, kind, source, &self.writing_owner(), now(), self.prefs.quote_on_reply);
             let join = |list: &[Address]| list.iter().map(Address::to_header).collect::<Vec<_>>().join(", ");
             let c = self.composer.as_mut().expect("the existing draft is being reused");
             c.draft.kind = kind;
@@ -418,6 +418,7 @@ impl MailWindow {
         if query == c.recipient_query { return; }
         let suggestions = if let Some(query) = &query {
             let token = query.text();
+            let writer_email = self.writing_account().email;
             // Address book first, then people written to before, without duplicates.
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             // Both from memory: no database read per keystroke.
@@ -425,7 +426,7 @@ impl MailWindow {
             let known = self.mail_index.known_recipients(token, 5).into_iter();
             contacts
                 .chain(known)
-                .filter(|a| !a.email.eq_ignore_ascii_case(&self.account.email))
+                .filter(|a| !a.email.eq_ignore_ascii_case(&writer_email))
                 .filter(|a| !token.eq_ignore_ascii_case(&a.email) && !token.eq_ignore_ascii_case(&a.to_header()))
                 .filter(|a| seen.insert(a.email.to_ascii_lowercase()))
                 .take(6)
@@ -589,8 +590,9 @@ impl MailWindow {
     /// Wait for a pause in typing before syncing saved drafts. The account's normal
     /// rate-limit/offline backoff and single-flight sync still apply.
     pub(super) fn schedule_draft_sync(&self, window: &mut Window, cx: &mut Context<Self>) {
-        if !matches!(self.account.provider, ProviderKind::Gmail | ProviderKind::Imap) { return; }
-        let account = self.account.id.clone();
+        let writer = self.writing_account();
+        if !matches!(writer.provider, ProviderKind::Gmail | ProviderKind::Imap) { return; }
+        let account = writer.id;
         if self.sync_through_owner(&account, Duration::from_millis(1500), window, cx) { return; }
         let editor = self.composer.as_ref().map(|c| (c.draft.id.clone(), c.save_generation));
         cx.spawn_in(window, async move |this, cx| {
@@ -718,8 +720,10 @@ impl MailWindow {
         }
         let Some(c) = self.composer.as_mut().filter(|c| c.draft.id == draft_id) else { return };
         c.attaching = true;
-        let provider = self.providers.get(&self.account.id).map(|p| p.mail.clone());
-        let account = self.account.clone();
+        // The files come from wherever the forwarded message is kept: its own account, or
+        // an offline folder.
+        let provider = self.providers.get(&source.account_id).map(|p| p.mail.clone());
+        let account = self.known_account(&source.account_id).unwrap_or_else(|| self.account.clone());
         let outgoing_dir = self.outgoing_dir.join(draft_id.as_str());
         cx.spawn_in(window, async move |this, cx| {
             let (added, skipped) = cx
@@ -796,7 +800,7 @@ impl MailWindow {
             }
             (false, None) => "Not saved yet".to_owned(),
         };
-        let owner = self.owner();
+        let owner = self.writing_owner();
 
         let field_label = |text: &'static str| {
             div().w(px(56.)).flex_none().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(text)
@@ -1059,7 +1063,7 @@ impl MailWindow {
             .child(tool("fmt-quote", "text-quote", "Quote (Ctrl Shift 9)", cx, |t, w, cx| t.format_lines(LinePrefix::Quote, w, cx)))
             .child(div().flex_1())
             .child({
-                let ap = self.account_prefs_for(&self.account.id);
+                let ap = self.account_prefs_for(&self.writing_account().id);
                 let current = c.draft.signature_id.clone();
                 let choices: Vec<(Option<String>, String)> = std::iter::once((None, "None".to_string())).chain(ap.signatures.iter().map(|s| (Some(s.id.clone()), s.name.clone()))).collect();
                 let label = current.as_deref().and_then(|id| ap.signature_by_id(id)).map(|s| s.name.clone()).unwrap_or_else(|| "No signature".into());

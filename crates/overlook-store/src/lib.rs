@@ -255,9 +255,11 @@ impl Store {
         })
     }
 
+    /// The user's mail accounts, oldest first. The offline-folders account is not one of
+    /// them: see [`Store::offline_account`].
     pub fn accounts(&self) -> Result<Vec<Account>> {
         self.with_read(|c| {
-            let mut stmt = c.prepare("SELECT id, provider, display_name, email, created_at FROM accounts ORDER BY created_at")?;
+            let mut stmt = c.prepare("SELECT id, provider, display_name, email, created_at FROM accounts WHERE provider != 'local' ORDER BY created_at")?;
             let rows = stmt.query_map([], |r| {
                 Ok(Account {
                     id: AccountId(r.get(0)?),
@@ -268,6 +270,31 @@ impl Store {
                 })
             })?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    /// The account that holds offline folders, created the first time it is asked for.
+    pub fn offline_account(&self) -> Result<Account> {
+        let account = Account::offline();
+        let exists: bool = self.with_read(|c| Ok(c.query_row("SELECT 1 FROM accounts WHERE id=?1", [&account.id.0], |_| Ok(())).optional()?.is_some()))?;
+        if !exists {
+            self.with_conn(|c| {
+                c.execute(
+                    "INSERT OR IGNORE INTO accounts(id, provider, display_name, email, created_at) VALUES(?1,?2,?3,?4,?5)",
+                    params![account.id.0, account.provider.as_key(), account.display_name, account.email, now()],
+                )?;
+                Ok(())
+            })?;
+        }
+        Ok(account)
+    }
+
+    /// Every message id of an account, for housekeeping of files kept beside the rows.
+    pub fn message_ids_of(&self, account: &AccountId) -> Result<HashSet<MessageId>> {
+        self.with_read(|c| {
+            let mut stmt = c.prepare("SELECT id FROM messages WHERE account_id=?1")?;
+            let rows = stmt.query_map([&account.0], |r| Ok(MessageId(r.get(0)?)))?;
+            Ok(rows.collect::<std::result::Result<_, _>>()?)
         })
     }
 
@@ -2071,12 +2098,16 @@ fn insert_operation_tx(tx: &Connection, account: &AccountId, kind: OperationKind
         [&account.0],
         |r| r.get(0),
     )?;
+    // Offline folders live only here: their changes are complete once written, and nothing
+    // is ever replayed to a server.
+    let provider: Option<String> = tx.query_row("SELECT provider FROM accounts WHERE id=?1", [&account.0], |r| r.get(0)).optional()?;
+    let local = provider.as_deref() == Some(ProviderKind::Local.as_key());
     let op = PendingOperation {
         id: OperationId::generate(),
         account_id: account.clone(),
         seq,
         kind,
-        state: OperationState::Pending,
+        state: if local { OperationState::Applied } else { OperationState::Pending },
         attempts: 0,
         last_error: None,
         created_at: ts,
@@ -2865,6 +2896,32 @@ mod tests {
         store.delete_account(&acct).unwrap();
         assert!(store.accounts().unwrap().is_empty());
         assert_eq!(store.message_count(&acct).unwrap(), 0);
+    }
+
+    #[test]
+    fn offline_folders_are_hidden_from_accounts_and_never_wait_to_sync() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let offline = store.offline_account().unwrap();
+        assert_eq!(store.offline_account().unwrap(), offline, "asking again finds the same account");
+        assert_eq!(store.accounts().unwrap().iter().map(|a| a.id.clone()).collect::<Vec<_>>(), vec![AccountId::from("acct-1")]);
+
+        let folder = Label { id: LabelId::from("offline-folder:taxes"), account_id: offline.id.clone(), kind: LabelKind::User, name: "Taxes".into(), provider_id: None, color: None, sort_order: 0 };
+        store.upsert_label(&folder).unwrap();
+        let mut kept = message("offline:1", "2025 return", "Attached", &["offline-folder:taxes"]);
+        kept.account_id = offline.id.clone();
+        store.upsert_messages(&[kept]).unwrap();
+        let op = store.apply_change(&offline.id, LocalChange::SetRead { message_ids: vec![MessageId::from("offline:1")], read: true }).unwrap();
+        assert_eq!(op.state, OperationState::Applied);
+        assert_eq!(store.pending_count(&offline.id).unwrap(), 0);
+        assert!(store.message(&MessageId::from("offline:1")).unwrap().unwrap().is_read);
+        store.apply_change(&offline.id, LocalChange::DeleteForever { message_ids: vec![MessageId::from("offline:1")], folder: None }).unwrap();
+        assert_eq!(store.pending_count(&offline.id).unwrap(), 0);
+        assert!(store.message_ids_of(&offline.id).unwrap().is_empty());
+
+        // A real account's change still waits for its server.
+        store.apply_change(&AccountId::from("acct-1"), LocalChange::SetRead { message_ids: vec![MessageId::from("m1")], read: true }).unwrap();
+        assert_eq!(store.pending_count(&AccountId::from("acct-1")).unwrap(), 1);
     }
 
     #[test]

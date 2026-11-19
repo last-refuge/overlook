@@ -511,6 +511,13 @@ impl MailProvider for Pop3Provider {
         })
     }
 
+    /// Only a message whose download finished has an original; one still waiting for its
+    /// body has only headers here.
+    fn fetch_original(&self, _account: &Account, message: &Message) -> BoxFuture<'_, Result<Vec<u8>, ProviderError>> {
+        let message = message.clone();
+        Box::pin(async move { self.raw(&message).map_err(|_| ProviderError::Rejected("it hasn’t finished downloading yet".into())) })
+    }
+
     fn fetch_attachment(&self, _account: &Account, message: &Message, attachment: &Attachment) -> BoxFuture<'_, Result<Vec<u8>, ProviderError>> {
         let message = message.clone();
         let attachment = attachment.clone();
