@@ -214,13 +214,13 @@ pub fn raw_dir_for(account: &AccountId) -> std::path::PathBuf {
     crate::data_dir().join("raw").join(account.as_str().replace([':', '/'], "_"))
 }
 
-/// Offline folders: the saved originals live in `<data dir>/raw/local_offline/`, beside the
-/// POP3 accounts' mail, so "Back up mail" includes them.
+/// Offline folders: each message is a file in its folder's directory (see `offline_disk`).
 pub fn offline_providers() -> AccountProviders {
     AccountProviders::new(Arc::new(overlook_provider::local::LocalProvider::new(offline_dir())), None)
 }
 
-/// Where offline mail is saved.
+/// Where the first version of offline folders saved every message, until startup moves
+/// them into their folders' directories.
 pub fn offline_dir() -> std::path::PathBuf {
     raw_dir_for(&AccountId::from(OFFLINE_ACCOUNT_ID))
 }

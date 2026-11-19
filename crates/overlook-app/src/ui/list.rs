@@ -115,6 +115,11 @@ impl MailWindow {
             self.view_title().into()
         };
         self.refresh_list_rows(compact);
+        // An open offline folder and where it is on disk.
+        let offline_place: Option<(LabelId, String)> = match &self.view {
+            MailboxView::Label(id) if self.offline_active() && self.search_query.is_empty() => self.offline_dir(id).map(|d| (id.clone(), crate::offline_disk::shown_path(&d))),
+            _ => None,
+        };
         let no_rows = self.shown_rows.borrow().is_empty();
         let total = self.rows_total.get();
         let unread = self.rows_unread.get();
@@ -160,11 +165,17 @@ impl MailWindow {
                             .text_color(p.muted)
                             .child(if unread > 0 { format!("{unread} unread · {total}") } else { total.to_string() }),
                     )
-                    // An offline folder says where its mail is.
-                    .when(self.offline_active(), |row| {
+                    // An offline folder says where its mail is, and opens it in the file manager.
+                    .when_some(offline_place, |row, (label_id, place)| {
                         row.child(
                             h_flex()
+                                .id("offline-place")
                                 .flex_none()
+                                .max_w(px(260.))
+                                .cursor_pointer()
+                                .hover(|d| d.text_color(p.foreground))
+                                .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new(super::sidebar::REVEAL_LABEL).build(window, cx))
+                                .on_click(cx.listener(move |this, _, window, cx| this.reveal_offline_folder(&label_id, window, cx)))
                                 .mt(px(3.))
                                 .gap(px(4.))
                                 .items_center()
@@ -176,8 +187,8 @@ impl MailWindow {
                                 .border_color(p.divider)
                                 .text_size(crate::ui::ui_px(11.))
                                 .text_color(p.muted)
-                                .child(icon("hard-drive").size(px(12.)).text_color(p.muted))
-                                .child("On this computer"),
+                                .child(icon("hard-drive").flex_none().size(px(12.)).text_color(p.muted))
+                                .child(div().min_w_0().truncate().child(place)),
                         )
                     })
                     .child(div().flex_1())

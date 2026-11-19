@@ -117,6 +117,17 @@ pub enum MailboxView {
     Label(LabelId),
 }
 
+/// Where a message is kept, from [`Store::message_places`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessagePlace {
+    pub id: MessageId,
+    pub provider_id: Option<ProviderId>,
+    pub conversation_id: ConversationId,
+    pub is_read: bool,
+    pub is_starred: bool,
+    pub label_ids: Vec<LabelId>,
+}
+
 /// Secondary filter tabs above the message list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum ListFilter {
@@ -295,6 +306,40 @@ impl Store {
             let mut stmt = c.prepare("SELECT id FROM messages WHERE account_id=?1")?;
             let rows = stmt.query_map([&account.0], |r| Ok(MessageId(r.get(0)?)))?;
             Ok(rows.collect::<std::result::Result<_, _>>()?)
+        })
+    }
+
+    /// Where each message of an account is kept and what Overlook knows about it beyond
+    /// its bytes: for offline folders, which file, folder and state to keep in step.
+    pub fn message_places(&self, account: &AccountId) -> Result<Vec<MessagePlace>> {
+        self.with_read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT m.id, m.provider_id, m.conversation_id, m.is_read, m.is_starred,
+                        (SELECT group_concat(label_id, char(31)) FROM message_labels WHERE message_id=m.id)
+                 FROM messages m WHERE m.account_id=?1",
+            )?;
+            let rows = stmt.query_map([&account.0], |r| {
+                let labels: Option<String> = r.get(5)?;
+                Ok(MessagePlace {
+                    id: MessageId(r.get(0)?),
+                    provider_id: r.get::<_, Option<String>>(1)?.map(ProviderId),
+                    conversation_id: ConversationId(r.get(2)?),
+                    is_read: r.get(3)?,
+                    is_starred: r.get(4)?,
+                    label_ids: labels.map(|l| l.split('\u{1f}').map(LabelId::from).collect()).unwrap_or_default(),
+                })
+            })?;
+            Ok(rows.collect::<std::result::Result<_, _>>()?)
+        })
+    }
+
+    /// Records where messages are kept (offline folders: each message's file).
+    pub fn set_provider_ids(&self, ids: &[(MessageId, Option<ProviderId>)]) -> Result<()> {
+        self.with_tx(|tx| {
+            for (id, pid) in ids {
+                tx.execute("UPDATE messages SET provider_id=?2 WHERE id=?1", params![id.0, pid.as_ref().map(|p| &p.0)])?;
+            }
+            Ok(())
         })
     }
 
@@ -2911,6 +2956,11 @@ mod tests {
         let mut kept = message("offline:1", "2025 return", "Attached", &["offline-folder:taxes"]);
         kept.account_id = offline.id.clone();
         store.upsert_messages(&[kept]).unwrap();
+        store.set_provider_ids(&[(MessageId::from("offline:1"), Some(ProviderId::from("/archive/Taxes/a.eml")))]).unwrap();
+        let places = store.message_places(&offline.id).unwrap();
+        assert_eq!(places.len(), 1);
+        assert_eq!(places[0].provider_id.as_ref().map(|p| p.0.as_str()), Some("/archive/Taxes/a.eml"));
+        assert_eq!(places[0].label_ids, vec![LabelId::from("offline-folder:taxes")]);
         let op = store.apply_change(&offline.id, LocalChange::SetRead { message_ids: vec![MessageId::from("offline:1")], read: true }).unwrap();
         assert_eq!(op.state, OperationState::Applied);
         assert_eq!(store.pending_count(&offline.id).unwrap(), 0);
