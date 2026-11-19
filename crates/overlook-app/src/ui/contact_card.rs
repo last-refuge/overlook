@@ -80,6 +80,7 @@ fn notes_excerpt(notes: &str) -> Option<String> {
 struct CardData {
     who: Address,
     contact: Option<Contact>,
+    contact_account: Option<AccountId>,
     is_me: bool,
 }
 
@@ -122,7 +123,7 @@ impl CardData {
 /// The card itself, without a frame: the hover card and the pinned card each supply their
 /// own. `scope` keeps the button ids of cards on screen together apart, and the actions
 /// reach the window through `t` because a hover card is not drawn by the window's own view.
-fn card_body(data: &CardData, p: &Palette, t: &WeakEntity<MailWindow>, scope: &str) -> Div {
+fn card_body(data: &CardData, p: &Palette, t: &WeakEntity<MailWindow>, scope: &str, fill_width: bool) -> Div {
     let who = &data.who;
     let contact = data.contact.as_ref();
     let id = |part: &str| SharedString::from(format!("{scope}-{part}"));
@@ -155,7 +156,11 @@ fn card_body(data: &CardData, p: &Palette, t: &WeakEntity<MailWindow>, scope: &s
 
     let in_book = contact.is_some_and(|c| c.in_address_book);
     let (write_to, write_t) = (who.clone(), t.clone());
-    let (book_who, book_t) = (who.clone(), t.clone());
+    let (book_who, book_account, book_t) = (
+        who.clone(),
+        in_book.then(|| data.contact_account.clone()).flatten(),
+        t.clone(),
+    );
     let (search_email, search_t) = (who.email.clone(), t.clone());
     let actions = h_flex()
         .flex_wrap()
@@ -165,7 +170,7 @@ fn card_body(data: &CardData, p: &Palette, t: &WeakEntity<MailWindow>, scope: &s
         }))
         .child(
             Button::new(id("book")).ghost().small().icon(icon(if in_book { "book-user" } else { "user-plus" }).size(px(14.))).label(if in_book { "Open in Contacts" } else { "Add to contacts" }).on_click(move |_, window, cx| {
-                let _ = book_t.update(cx, |this, cx| this.show_in_contacts(book_who.clone(), window, cx));
+                let _ = book_t.update(cx, |this, cx| this.show_in_contacts_for(book_account.clone(), book_who.clone(), window, cx));
             }),
         )
         .child(Button::new(id("search")).ghost().small().icon(icon("search").size(px(14.))).label("Mail from them").on_click(move |_, window, cx| {
@@ -173,7 +178,8 @@ fn card_body(data: &CardData, p: &Palette, t: &WeakEntity<MailWindow>, scope: &s
         }));
 
     v_flex()
-        .w(px(320.))
+        .when(fill_width, |d| d.w_full().min_w_0())
+        .when(!fill_width, |d| d.w(px(320.)))
         .gap(px(12.))
         .child(
             h_flex()
@@ -194,18 +200,53 @@ fn card_body(data: &CardData, p: &Palette, t: &WeakEntity<MailWindow>, scope: &s
 }
 
 impl MailWindow {
-    /// The contact with this address, in memory: an address-book entry before one only
-    /// inferred from correspondence.
+    /// The contact with this address and its owning account, in memory: an address-book
+    /// entry before one only inferred from correspondence, preferring the active account
+    /// and falling back to other accounts loaded in the background.
+    pub(super) fn contact_with_account_for(&self, email: &str) -> Option<(&AccountId, &Contact)> {
+        let key = email.trim().to_ascii_lowercase();
+        let active = self
+            .contact_index
+            .get(&key)
+            .and_then(|&i| self.contacts.get(i))
+            .map(|c| (&self.account.id, c));
+        let other = self
+            .other_contact_index
+            .get(&key)
+            .and_then(|&i| self.other_contacts.get(i))
+            .map(|(acct, c)| (acct, c));
+        match (active, other) {
+            (Some((_, a)), Some((acct, o))) if !a.in_address_book && o.in_address_book => Some((acct, o)),
+            (Some(a), _) => Some(a),
+            (None, other) => other,
+        }
+    }
+
     pub(super) fn contact_for(&self, email: &str) -> Option<&Contact> {
-        self.contact_index.get(&email.trim().to_ascii_lowercase()).and_then(|&i| self.contacts.get(i))
+        self.contact_with_account_for(email).map(|(_, c)| c)
     }
 
     fn card_data(&self, who: &Address) -> CardData {
-        let is_me = who.email.eq_ignore_ascii_case(&self.account.email);
-        CardData { who: if is_me { self.owner() } else { who.clone() }, contact: self.contact_for(&who.email).cloned(), is_me }
+        let is_me = self.accounts.iter().any(|a| a.email.eq_ignore_ascii_case(&who.email));
+        let resolved_who = if who.email.eq_ignore_ascii_case(&self.account.email) {
+            self.owner()
+        } else if let Some(acct) = self.accounts.iter().find(|a| a.email.eq_ignore_ascii_case(&who.email)) {
+            Address::named(&acct.display_name, &acct.email)
+        } else {
+            who.clone()
+        };
+        let (contact_account, contact) = match self.contact_with_account_for(&who.email) {
+            Some((acct, c)) => (Some(acct.clone()), Some(c.clone())),
+            None => (None, None),
+        };
+        CardData { who: resolved_who, contact, contact_account, is_me }
     }
 
     pub(super) fn search_from(&mut self, email: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.module != super::calendar::Module::Mail {
+            self.cal_event_modal = None;
+            self.set_module(super::calendar::Module::Mail, window, cx);
+        }
         let query = format!("from:{email}");
         let input = self.search_input.clone();
         input.update(cx, |s, cx| s.set_value(query.clone(), window, cx));
@@ -234,8 +275,85 @@ impl MailWindow {
             .anchor(Anchor::TopLeft)
             .open_delay(Duration::from_millis(350))
             .trigger(label)
-            .content(move |_state, _window, _cx| card_body(&data, &p, &t, &scope))
+            .content(move |_state, _window, _cx| card_body(&data, &p, &t, &scope, false))
             .into_any_element()
+    }
+
+    /// Makes a calendar guest row open the contact card for `who`: hovering shows the
+    /// floating contact details card (aligned inward from the right sidebar), and clicking
+    /// pins the card inline under the guest row until clicked again.
+    pub(super) fn calendar_contact_trigger(
+        &self,
+        key: &str,
+        event: &EventId,
+        who: &Address,
+        row: Stateful<Div>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let p = *cx.palette();
+        let target = (event.clone(), who.email.to_ascii_lowercase());
+        let pinned = self.cal_contact_card.as_ref() == Some(&target);
+        let row = row.cursor_pointer().on_click(cx.listener(move |this, _, _window, cx| {
+            cx.stop_propagation();
+            this.cal_contact_card = if this.cal_contact_card.as_ref() == Some(&target) {
+                None
+            } else {
+                Some(target.clone())
+            };
+            cx.notify();
+        }));
+        if pinned {
+            return row.into_any_element();
+        }
+        let data = self.card_data(who);
+        let t = cx.entity().downgrade();
+        let scope = format!("cal-card-{event}-{key}");
+        HoverCard::new(SharedString::from(scope.clone()))
+            .anchor(Anchor::TopRight)
+            .open_delay(Duration::from_millis(300))
+            .trigger(row)
+            .content(move |_state, _window, _cx| card_body(&data, &p, &t, &scope, false))
+            .into_any_element()
+    }
+
+    /// The contact card pinned inline beneath a clicked guest row in calendar event details.
+    pub(super) fn pinned_calendar_contact_card(
+        &self,
+        event: &EventId,
+        who: &Address,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let (pinned_event, email) = self.cal_contact_card.as_ref()?;
+        if pinned_event != event || !email.eq_ignore_ascii_case(&who.email) {
+            return None;
+        }
+        let p = *cx.palette();
+        let t = cx.entity().downgrade();
+        let body = card_body(&self.card_data(who), &p, &t, &format!("cal-pinned-{event}"), true);
+        Some(
+            div()
+                .relative()
+                .flex_none()
+                .w_full()
+                .p(px(12.))
+                .rounded(px(10.))
+                .bg(p.chip)
+                .border_1()
+                .border_color(p.divider)
+                .child(body)
+                .child(div().absolute().top(px(6.)).right(px(6.)).child(
+                    Button::new(SharedString::from(format!("cal-pinned-close-{event}")))
+                        .ghost()
+                        .xsmall()
+                        .icon(icon("x").size(px(12.)))
+                        .tooltip("Close")
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.cal_contact_card = None;
+                            cx.notify();
+                        })),
+                ))
+                .into_any_element(),
+        )
     }
 
     /// The To and Cc line of a message header: each name opens its card. Past a handful of
@@ -296,7 +414,7 @@ impl MailWindow {
             .or_else(|| email.eq_ignore_ascii_case(&self.account.email).then(|| self.owner()))?;
         let p = *cx.palette();
         let t = cx.entity().downgrade();
-        let body = card_body(&self.card_data(&who), &p, &t, &format!("pinned-{}", m.id));
+        let body = card_body(&self.card_data(&who), &p, &t, &format!("pinned-{}", m.id), false);
         Some(
             div()
                 .relative()
@@ -388,17 +506,18 @@ mod tests {
         let data = |opened_for: &str| CardData {
             who: Address::new(None, opened_for),
             contact: Some(contact("a", "maya@northstar.example", &["Maya.Chen@home.example", "MAYA@northstar.example", "work@northstar.example"], true)),
+            contact_account: None,
             is_me: false,
         };
         assert_eq!(data("maya@northstar.example").other_emails(), vec!["Maya.Chen@home.example", "work@northstar.example"]);
         assert_eq!(data("work@northstar.example").other_emails(), vec!["maya@northstar.example", "Maya.Chen@home.example"]);
-        assert!(CardData { who: Address::new(None, "x@example.com"), contact: None, is_me: false }.other_emails().is_empty());
+        assert!(CardData { who: Address::new(None, "x@example.com"), contact: None, contact_account: None, is_me: false }.other_emails().is_empty());
     }
 
     #[test]
     fn a_card_says_where_it_knows_the_person_from() {
         let who = Address::named("Sam", "sam@example.com");
-        let source = |contact: Option<Contact>, is_me| CardData { who: who.clone(), contact, is_me }.source();
+        let source = |contact: Option<Contact>, is_me| CardData { who: who.clone(), contact, contact_account: None, is_me }.source();
         assert_eq!(source(None, false), "Not in your contacts");
         assert_eq!(source(Some(contact("o", "sam@example.com", &[], false)), false), "Someone you have corresponded with");
         assert_eq!(source(Some(contact("b", "sam@example.com", &[], true)), false), "In your Google Contacts");
@@ -409,9 +528,24 @@ mod tests {
     fn a_card_prefers_the_address_book_name_to_the_one_in_the_header() {
         let who = Address::named("sam via list", "sam@example.com");
         let mut c = contact("b", "sam@example.com", &[], true);
-        assert_eq!(CardData { who: who.clone(), contact: Some(c.clone()), is_me: false }.name(), "sam via list", "a contact without a name defers to the header");
+        assert_eq!(CardData { who: who.clone(), contact: Some(c.clone()), contact_account: None, is_me: false }.name(), "sam via list", "a contact without a name defers to the header");
         c.name = Some("Sam Okafor".into());
-        assert_eq!(CardData { who: who.clone(), contact: Some(c), is_me: false }.name(), "Sam Okafor");
-        assert_eq!(CardData { who: Address::new(None, "sam@example.com"), contact: None, is_me: false }.name(), "sam@example.com");
+        assert_eq!(CardData { who: who.clone(), contact: Some(c), contact_account: None, is_me: false }.name(), "Sam Okafor");
+        assert_eq!(CardData { who: Address::new(None, "sam@example.com"), contact: None, contact_account: None, is_me: false }.name(), "sam@example.com");
+    }
+
+    #[test]
+    fn other_account_contact_index_handles_repeated_primary_email_and_prefers_address_book() {
+        let mut repeated = contact("g1", "Maya@Northstar.example", &["maya@northstar.example", "maya.chen@home.example"], true);
+        repeated.name = Some("Maya Chen".into());
+        let inferred = contact("c1", "maya@northstar.example", &["maya@northstar.example"], false);
+        let (entries, index) = MailWindow::index_other_contacts(vec![
+            (AccountId::from("acct-a"), vec![inferred]),
+            (AccountId::from("acct-b"), vec![repeated]),
+        ]);
+        let idx = *index.get("maya@northstar.example").expect("primary email indexed");
+        assert_eq!(entries[idx].0, AccountId::from("acct-b"));
+        assert_eq!(entries[idx].1.name.as_deref(), Some("Maya Chen"));
+        assert_eq!(index.get("maya.chen@home.example"), Some(&idx));
     }
 }

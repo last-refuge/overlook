@@ -656,6 +656,13 @@ pub struct MailWindow {
     recipients_expanded: BTreeSet<MessageId>,
     /// Lower-cased address → position in `contacts`.
     contact_index: HashMap<String, usize>,
+    /// Contacts loaded in the background from other accounts, cached per account so syncing
+    /// one account refreshes only that account without re-reading unchanged address books or
+    /// blocking the UI thread.
+    other_contacts_by_account: HashMap<AccountId, Vec<Contact>>,
+    other_contacts: Vec<(AccountId, Contact)>,
+    other_contact_index: HashMap<String, usize>,
+    other_contacts_generation: u64,
     // Contacts module state.
     pub(crate) contacts: Vec<Contact>,
     /// Where the open account's contacts live; set with the contacts.
@@ -732,6 +739,8 @@ pub struct MailWindow {
     pub(crate) cal_selected: Option<EventId>,
     /// The event whose details list all of its guests.
     pub(crate) cal_guests_expanded: Option<EventId>,
+    /// Event and lower-cased email whose guest contact card is pinned open in event details.
+    pub(crate) cal_contact_card: Option<(EventId, String)>,
     /// The event whose details are open in a modal, after a double click.
     pub(crate) cal_event_modal: Option<EventId>,
     /// Holds the modal's keyboard focus, which keeps the calendar's keys from acting behind it.
@@ -986,6 +995,10 @@ impl MailWindow {
             contact_card: None,
             recipients_expanded: BTreeSet::new(),
             contact_index: HashMap::new(),
+            other_contacts_by_account: HashMap::new(),
+            other_contacts: Vec::new(),
+            other_contact_index: HashMap::new(),
+            other_contacts_generation: 0,
             contacts_source: Default::default(),
             contacts: Vec::new(),
             contact_selected: None,
@@ -1033,6 +1046,7 @@ impl MailWindow {
             calendars: Vec::new(),
             cal_selected: None,
             cal_guests_expanded: None,
+            cal_contact_card: None,
             cal_event_modal: None,
             cal_modal_focus: cx.focus_handle(),
             cal_modal_size: calendar::EventModalSize::default(),
@@ -1144,6 +1158,7 @@ impl MailWindow {
         // Keep a Chromium started so the first message opens without its launch (paused while
         // hidden: see `browser_engine::set_prewarm`).
         crate::browser_engine::prewarm();
+        this.refresh_other_contacts(cx);
         // A fresh process has not reached any provider yet: say so until a probe succeeds.
         for a in this.accounts.clone().into_iter().filter(|_| first_start) {
             if this.provider_issues.contains_key(&a.id) {
@@ -1398,6 +1413,12 @@ impl MailWindow {
         if self.composer.is_some() {
             self.close_composer(window, cx);
         }
+        let previous_id = self.account.id.clone();
+        let previous_contacts = std::mem::take(&mut self.contacts);
+        if !previous_contacts.is_empty() && previous_id != account.id {
+            self.other_contacts_by_account.insert(previous_id, previous_contacts);
+        }
+        self.other_contacts_by_account.remove(&account.id);
         self.account = account;
         self.load_recent_moves();
         // The account a folder window shows is not the one the app opens with next time.
@@ -1417,6 +1438,7 @@ impl MailWindow {
             input.update(cx, |s, cx| s.set_value("", window, cx));
         }
         self.reload(cx);
+        self.refresh_other_contacts(cx);
         self.selected = self.conversations.first().map(|c| c.id.clone());
         self.marked.clear();
         self.load_thread(cx);
@@ -3549,6 +3571,9 @@ impl MailWindow {
                 }
                 this.mark_counts_stale([account.id.clone()]);
                 this.reload(cx);
+                if account.id != this.account.id {
+                    this.refresh_other_contacts_for(account.id.clone(), cx);
+                }
                 this.reload_folder_windows([account.id.clone()], cx);
                 if verify && !outcome.verified {
                     // Offline or failed before the check ran: check on the next sync instead.
