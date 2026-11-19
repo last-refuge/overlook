@@ -16,6 +16,7 @@ mod contact_card;
 mod contacts;
 mod contacts_setup;
 mod mail_highlight;
+mod offline;
 mod palette;
 mod prompt;
 mod list;
@@ -564,8 +565,18 @@ pub struct MailWindow {
     idle_watchers: HashMap<AccountId, overlook_provider::imap::idle::IdleWatcher>,
     idle_events: tokio::sync::mpsc::UnboundedSender<AccountId>,
     signin: Option<SignIn>,
-    /// The account whose mail the window shows.
+    /// The account whose mail the window shows. Opening an offline folder makes it the
+    /// offline account (see `offline.rs`).
     account: Account,
+    /// The account that holds offline folders. Not in `accounts`: it has no server, is
+    /// never synchronized, and is never what mail is written from.
+    offline: Account,
+    /// The mail account shown before an offline folder was opened: new messages and replies
+    /// are written from it, and Calendar and Contacts show it.
+    last_mail_account: Option<AccountId>,
+    /// Messages being copied into offline folders right now, so a second drag of the same
+    /// mail does not copy it twice.
+    offline_moving: HashSet<MessageId>,
     time_zone: overlook_core::tz::TimeZone,
     time_zone_revision: u64,
     time_zone_pending: bool,
@@ -852,8 +863,14 @@ impl MailWindow {
             "Overlook"
         });
         let detached = composer_owner.is_some() || folder_owner.is_some() || message_owner.is_some();
+        let offline = store.offline_account().unwrap_or_else(|e| {
+            tracing::warn!("could not set up offline folders: {e}");
+            Account::offline()
+        });
+        let last_mail_account = Some(account.id.clone()).filter(|id| !id.0.is_empty());
         // A folder or message window opens on its own account, whatever the main window shows.
         let account = match folder.as_ref().or(message_view.as_ref()) {
+            Some((id, _)) if id == &offline.id => offline.clone(),
             Some((id, _)) => accounts.iter().find(|a| &a.id == id).cloned().unwrap_or(account),
             None => account,
         };
@@ -868,6 +885,9 @@ impl MailWindow {
                     provider_issues.insert(a.id.clone(), reason);
                 }
             }
+        }
+        if !detached {
+            providers.insert(offline.id.clone(), providers::offline_providers());
         }
         if !detached { cx.set_global(AppearanceGlobal(appearance)); }
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search mail"));
@@ -940,6 +960,9 @@ impl MailWindow {
             removing_accounts: HashSet::new(),
             signin: None,
             account,
+            offline,
+            last_mail_account,
+            offline_moving: HashSet::new(),
             time_zone: overlook_core::tz::current_zone(),
             time_zone_revision: overlook_core::tz::revision(),
             time_zone_pending: false,
@@ -1188,6 +1211,10 @@ impl MailWindow {
             this.verify_pending = this.accounts.iter().map(|a| a.id.clone()).collect();
         }
         this.sync_all(window, cx);
+        if first_start {
+            // Saved originals left by offline mail deleted in an earlier session.
+            this.clean_offline_files(cx);
+        }
         // IMAP IDLE: one thread per account asks for a sync the moment the Inbox changes.
         this.watch_idle_events(idle_rx, window, cx);
         this.refresh_idle_watchers();
@@ -1412,7 +1439,10 @@ impl MailWindow {
     // ---------------------------------------------------------------- accounts
 
     pub(crate) fn switch_account(&mut self, id: AccountId, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(account) = self.accounts.iter().find(|a| a.id == id).cloned() else { return };
+        let Some(account) = self.known_account(&id) else { return };
+        if !account.is_offline() {
+            self.last_mail_account = Some(account.id.clone());
+        }
         if self.composer.is_some() {
             self.close_composer(window, cx);
         }
@@ -1424,8 +1454,9 @@ impl MailWindow {
         self.other_contacts_by_account.remove(&account.id);
         self.account = account;
         self.load_recent_moves();
-        // The account a folder window shows is not the one the app opens with next time.
-        if self.folder_owner.is_none() {
+        // The account a folder window shows is not the one the app opens with next time, and
+        // neither are offline folders.
+        if self.folder_owner.is_none() && !self.offline_active() {
             self.save_setting("active_account", &id);
         }
         self.view = MailboxView::Kind(LabelKind::Inbox);
@@ -1869,6 +1900,7 @@ impl MailWindow {
                 LabelKind::Container => "Folder",
             }
             .to_owned(),
+            MailboxView::Label(id) if self.offline_active() => self.labels.iter().find(|l| &l.id == id).map(|l| l.name.rsplit('/').next().unwrap_or(&l.name).to_owned()).unwrap_or_default(),
             MailboxView::Label(id) => self.labels.iter().find(|l| &l.id == id).map(|l| overlook_core::sidebar::folder_title(&l.name).to_owned()).unwrap_or_default(),
         }
     }
@@ -2890,6 +2922,10 @@ impl MailWindow {
                                 this.refresh_mail();
                             }
                         }
+                        if accounts.contains(&this.offline.id) {
+                            // A message deleted from an offline folder leaves its saved original behind.
+                            this.clean_offline_files(cx);
+                        }
                         for acct in accounts.iter().cloned() {
                             this.next_retry.remove(&acct);
                             if this.connected(&acct) {
@@ -3208,6 +3244,9 @@ impl MailWindow {
         if ids.is_empty() {
             return;
         }
+        if self.offline_active() {
+            return self.move_offline(ids, label_id, window, cx);
+        }
         let name = self.labels.iter().find(|l| l.id == label_id).map(|l| l.name.clone()).unwrap_or_default();
         let inbox = self.labels.iter().find(|l| l.kind == LabelKind::Inbox).map(|l| l.id.clone());
         let was_in_inbox: Vec<MessageId> = ids.iter().filter(|id| self.mail_index.message(id).is_some_and(|m| inbox.as_ref().is_some_and(|i| m.has_label(i)))).cloned().collect();
@@ -3229,6 +3268,12 @@ impl MailWindow {
             return;
         }
         let spam = self.labels.iter().find(|l| l.kind == LabelKind::Spam).map(|l| l.id.clone());
+        if self.offline_active() {
+            if let MailboxView::Label(label_id) = view {
+                self.move_offline(ids, label_id, window, cx);
+            }
+            return;
+        }
         match view.clone() {
             MailboxView::Kind(LabelKind::Inbox) => self.move_to_inbox(ids, window, cx),
             MailboxView::Kind(LabelKind::Archive) => self.archive(ids, window, cx),
@@ -3244,6 +3289,13 @@ impl MailWindow {
     /// The destinations the Move picker can offer: Inbox, Archive, Junk (when the account
     /// has one), Trash and the user labels, without the mailbox being shown.
     pub(crate) fn move_destinations(&self) -> Vec<(MailboxView, String)> {
+        if self.offline_active() {
+            // Offline mail moves between offline folders only.
+            let mut out: Vec<(MailboxView, String)> = self.labels.iter().filter(|l| l.kind == LabelKind::User).map(|l| (MailboxView::Label(l.id.clone()), Self::offline_folder_name(&l.name))).collect();
+            out.sort_by_cached_key(|(_, name)| name.to_lowercase());
+            out.retain(|(v, _)| v != &self.view);
+            return out;
+        }
         let mut out = vec![
             (MailboxView::Kind(LabelKind::Inbox), "Inbox".to_owned()),
             (MailboxView::Kind(LabelKind::Archive), "Archive".to_owned()),
@@ -3329,7 +3381,7 @@ impl MailWindow {
         if self.is_message_window() && self.in_main_window(cx, |this, window, cx| this.compose_new(window, cx)) {
             return;
         }
-        let mut draft = Draft::new(self.account.id.clone(), DraftKind::New, now());
+        let mut draft = Draft::new(self.writing_account().id, DraftKind::New, now());
         self.apply_signature(&mut draft, self.default_signature_id(false).as_deref());
         self.outbox_selected = None;
         self.open_composer(draft, window, cx);
@@ -3349,7 +3401,10 @@ impl MailWindow {
     /// Replies to or forwards one particular message of the conversation.
     pub(crate) fn reply_to(&mut self, kind: DraftKind, source: Message, window: &mut Window, cx: &mut Context<Self>) {
         if self.reuse_reply(kind, &source, window, cx) { return; }
-        let mut draft = Draft::in_response_to_with(self.account.id.clone(), kind, &source, &self.owner(), now(), self.prefs.quote_on_reply);
+        // Mail in an offline folder is answered from the mail account shown before it.
+        let from = self.writing_account();
+        let owner = if self.offline_active() { Address::named(&from.display_name, &from.email) } else { self.owner() };
+        let mut draft = Draft::in_response_to_with(from.id, kind, &source, &owner, now(), self.prefs.quote_on_reply);
         // The quoted original is appended at send time and shown collapsed under the editor, and
         // the signature goes between what is written and the quote.
         self.apply_signature(&mut draft, self.default_signature_id(true).as_deref());
@@ -3370,7 +3425,7 @@ impl MailWindow {
             crate::ui::toast(window, cx, crate::notify::Level::Warning, "This message hasn’t been downloaded yet.");
             return;
         }
-        let draft = Draft::resend_of(self.account.id.clone(), &source, now());
+        let draft = Draft::resend_of(self.writing_account().id, &source, now());
         let to_save = draft.clone();
         self.open_composer(draft, window, cx);
         self.attach_forwarded(to_save.id.clone(), source, window, cx);
@@ -3878,6 +3933,9 @@ impl MailWindow {
         self.move_selection(-1, window, cx);
     }
     fn on_archive(&mut self, _: &ArchiveSelected, window: &mut Window, cx: &mut Context<Self>) {
+        if self.offline_active() {
+            return; // Offline folders have no Inbox or Archive.
+        }
         let ids = self.target_message_ids();
         let (in_trash, in_inbox) = self.removal_state();
         if in_trash || !in_inbox {
@@ -3887,6 +3945,10 @@ impl MailWindow {
         }
     }
     fn on_trash(&mut self, _: &TrashSelected, window: &mut Window, cx: &mut Context<Self>) {
+        if self.offline_active() {
+            // No Trash on this computer: deleting is for good, after asking.
+            return self.on_delete_forever(&DeleteForeverSelected, window, cx);
+        }
         if self.removal_state().0 {
             return; // Already in Trash: the toolbar and menu say Restore instead.
         }
@@ -3953,7 +4015,11 @@ impl MailWindow {
         let answer = window.prompt(
             PromptLevel::Warning,
             &format!("Permanently delete {what}?"),
-            Some("They are removed from the server now, not moved to Trash. This can’t be undone."),
+            Some(if self.offline_active() {
+                "They are deleted from this computer, the only place they are kept. This can’t be undone."
+            } else {
+                "They are removed from the server now, not moved to Trash. This can’t be undone."
+            }),
             &["Delete", "Cancel"],
             cx,
         );
@@ -4138,6 +4204,7 @@ impl MailWindow {
         let queued = self.queued_downloads;
         let catching_up = |text: &str| if queued > 0 { format!("{text} {} left to download.", messages_phrase(queued)) } else { text.to_owned() };
         let (dot, state_text) = match &status.state {
+            _ if self.offline_active() => (p.muted, "Offline folders · kept only on this computer".to_owned()),
             SyncState::UpToDate if queued > 0 => (p.accent, format!("Downloading {}…", messages_phrase(queued))),
             SyncState::UpToDate => (p.success, "Up to date".to_owned()),
             SyncState::Syncing if queued > 0 => (p.accent, format!("Downloading {}…", messages_phrase(queued))),
@@ -4147,7 +4214,7 @@ impl MailWindow {
             SyncState::SignInRequired => (p.warning, status.state.sentence(0)),
             SyncState::SyncFailed(reason) => (p.warning, format!("Sync failed: {reason}")),
         };
-        let last = status.last_successful_sync.map(|ts| {
+        let last = status.last_successful_sync.filter(|_| !self.offline_active()).map(|ts| {
             let (date, t, _) = overlook_core::time::civil_in_zone(ts, &self.time_zone);
             let (today, _, _) = overlook_core::time::civil_in_zone(now(), &self.time_zone);
             // A sync from another day says which day, so an old one doesn't pass for today's.

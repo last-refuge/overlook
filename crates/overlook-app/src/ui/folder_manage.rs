@@ -69,6 +69,7 @@ impl MailWindow {
     }
 
     fn submit_folder_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let known = self.folder_prompt.as_ref().and_then(|p| self.known_account(&p.account));
         let Some(prompt) = self.folder_prompt.as_mut() else { return };
         if prompt.busy {
             return;
@@ -80,7 +81,7 @@ impl MailWindow {
             return;
         }
         let account_id = prompt.account.clone();
-        let (Some(account), Some(bundle)) = (self.accounts.iter().find(|a| a.id == account_id).cloned(), self.providers.get(&account_id).cloned()) else {
+        let (Some(account), Some(bundle)) = (known, self.providers.get(&account_id).cloned()) else {
             prompt.error = Some("Sign in to this account again to change its folders.".into());
             cx.notify();
             return;
@@ -216,12 +217,12 @@ impl MailWindow {
             return;
         }
         let (account_id, label) = (drag.account, drag.label);
-        let Some(account) = self.accounts.iter().find(|a| a.id == account_id).cloned() else { return };
+        let Some(account) = self.known_account(&account_id) else { return };
         let title = match &parent {
             Some(p) => format!("Move “{}” into “{}”?", label.name, p.name),
             None => format!("Move “{}” to the top level?", label.name),
         };
-        let detail = if account.provider == ProviderKind::Imap { "Its messages and the folders inside it move with it." } else { "Its messages and the labels inside it move with it." };
+        let detail = if matches!(account.provider, ProviderKind::Imap | ProviderKind::Local) { "Its messages and the folders inside it move with it." } else { "Its messages and the labels inside it move with it." };
         let answer = window.prompt(PromptLevel::Info, &title, Some(detail), &["Move", "Cancel"], cx);
         cx.spawn_in(window, async move |this, cx| {
             if answer.await != Ok(0) {
@@ -255,6 +256,9 @@ impl MailWindow {
     /// (or on a server that won't take folders in Trash) is deleted for good after asking.
     /// Gmail keeps the messages and only removes the label, which Undo puts back.
     pub(crate) fn delete_folder(&mut self, account_id: AccountId, label: Label, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_offline(&account_id) {
+            return self.delete_offline_folder(label, window, cx);
+        }
         let Some(account) = self.accounts.iter().find(|a| a.id == account_id).cloned() else { return };
         if account.provider == ProviderKind::Imap {
             let trash = self.labels_of(&account_id).iter().find(|l| l.kind == LabelKind::Trash).cloned();
@@ -416,7 +420,7 @@ impl MailWindow {
     }
 
     /// Drops a folder the server no longer has from this device, its pin and the open view.
-    fn forget_deleted_folder(&mut self, account_id: &AccountId, label: &Label, with_messages: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn forget_deleted_folder(&mut self, account_id: &AccountId, label: &Label, with_messages: bool, window: &mut Window, cx: &mut Context<Self>) {
         if let Err(e) = self.store.delete_label(account_id, &label.id, with_messages) {
             tracing::warn!("could not record the deleted folder: {e}");
         }
@@ -513,12 +517,13 @@ impl MailWindow {
     pub(crate) fn render_folder_prompt(&self, cx: &mut Context<Self>) -> AnyElement {
         let p = *cx.palette();
         let Some(prompt) = self.folder_prompt.as_ref() else { return div().into_any_element() };
+        let noun = if self.is_offline(&prompt.account) { "offline folder" } else { "folder" };
         let (title, action) = match &prompt.mode {
-            FolderPromptMode::New { parent: None } => ("New folder".to_owned(), "Create"),
-            FolderPromptMode::New { parent: Some(parent) } => (format!("New folder in “{}”", parent.name), "Create"),
+            FolderPromptMode::New { parent: None } => (format!("New {noun}"), "Create"),
+            FolderPromptMode::New { parent: Some(parent) } => (format!("New {noun} in “{}”", parent.name), "Create"),
             FolderPromptMode::Rename { label } => (format!("Rename “{}”", label.name), "Rename"),
         };
-        let account = self.account_name(&prompt.account);
+        let account = if self.is_offline(&prompt.account) { "Offline folders · on this computer only".to_owned() } else { self.account_name(&prompt.account) };
         div()
             .id("folder-prompt-overlay")
             .absolute()

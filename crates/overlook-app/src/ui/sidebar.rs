@@ -15,6 +15,10 @@ use gpui_kit::base::{h_flex, v_flex};
 use overlook_core::*;
 use overlook_store::MailboxView;
 
+/// The icon of an offline folder, wherever it is shown, so it is never mistaken for a
+/// folder on a server.
+pub(super) const OFFLINE_FOLDER_ICON: &str = "folder-down";
+
 /// How far each level of the folder tree is indented: a child's arrow sits under its parent's
 /// icon.
 const DEPTH_STEP: f32 = 16.;
@@ -105,12 +109,13 @@ impl MailWindow {
         }
     }
 
-    /// Re-reads the other accounts' folders for the account tree.
+    /// Re-reads the other accounts' folders (and the offline folders) for the account tree.
     pub(crate) fn reload_account_labels(&mut self) {
         let active = self.account.id.clone();
         let labels: HashMap<AccountId, Vec<Label>> = self
             .accounts
             .iter()
+            .chain(std::iter::once(&self.offline))
             .filter(|a| a.id != active)
             .map(|a| (a.id.clone(), self.store.labels(&a.id).unwrap_or_default()))
             .collect();
@@ -126,7 +131,7 @@ impl MailWindow {
     /// Every account's badges are recounted at the next `reload` (the Focused Inbox switch
     /// changes what the Inbox badge counts).
     pub(crate) fn mark_all_counts_stale(&mut self) {
-        let ids: Vec<AccountId> = self.accounts.iter().map(|a| a.id.clone()).collect();
+        let ids: Vec<AccountId> = self.accounts.iter().chain(std::iter::once(&self.offline)).map(|a| a.id.clone()).collect();
         self.mark_counts_stale(ids);
     }
 
@@ -138,7 +143,7 @@ impl MailWindow {
             return;
         }
         let stale = std::mem::take(&mut self.account_counts_stale);
-        let others: Vec<(AccountId, String)> = self.accounts.iter().filter(|a| a.id != self.account.id && stale.contains(&a.id)).map(|a| (a.id.clone(), a.email.clone())).collect();
+        let others: Vec<(AccountId, String)> = self.accounts.iter().chain(std::iter::once(&self.offline)).filter(|a| a.id != self.account.id && stale.contains(&a.id)).map(|a| (a.id.clone(), a.email.clone())).collect();
         if others.is_empty() {
             return;
         }
@@ -409,12 +414,12 @@ impl MailWindow {
     fn favorite_rows(&self, favorites: &[Favorite], p: &crate::theme::Palette) -> Vec<(AccountId, Nav)> {
         let mut rows: Vec<(AccountId, Nav)> = Vec::new();
         for f in favorites.iter().cloned() {
-            if !self.accounts.iter().any(|a| a.id == f.account) {
+            if self.known_account(&f.account).is_none() || (self.is_offline(&f.account) && !self.offers_offline()) {
                 continue;
             }
             let nav = match (f.kind, &f.label) {
                 (LabelKind::User, Some(id)) => match self.labels_of(&f.account).iter().find(|l| &l.id == id && l.kind == LabelKind::User) {
-                    Some(l) => Nav { label: overlook_core::sidebar::folder_title(&l.name).to_owned().into(), icon: "folder", view: MailboxView::Label(id.clone()), color: p.label_color(l.color.as_deref()), depth: 0, expander: None, container: false },
+                    Some(l) => Nav { label: overlook_core::sidebar::folder_title(&l.name).to_owned().into(), icon: if self.is_offline(&f.account) { OFFLINE_FOLDER_ICON } else { "folder" }, view: MailboxView::Label(id.clone()), color: p.label_color(l.color.as_deref()), depth: 0, expander: None, container: false },
                     None => continue,
                 },
                 (kind, _) => match system_folder(kind) {
@@ -462,6 +467,12 @@ impl MailWindow {
             let container = nav.container;
             // The same set `drop_on_view` accepts.
             let droppable = in_active && !container && matches!(nav.view, MailboxView::Kind(LabelKind::Inbox | LabelKind::Archive | LabelKind::Trash | LabelKind::Starred | LabelKind::Spam) | MailboxView::Label(_));
+            // Mail of the open account dropped on an offline folder leaves the server for this
+            // computer.
+            let offline_target = match &nav.view {
+                MailboxView::Label(id) if !in_active && !container && this.is_offline(account) && !this.offline_active() => Some(id.clone()),
+                _ => None,
+            };
             let color = nav.color;
             let target = account.clone();
             let favorite = favorite_for(account, &nav.view);
@@ -506,6 +517,10 @@ impl MailWindow {
                 .when(droppable, |d| {
                     d.drag_over::<super::ConversationDrag>(move |style, _, _, _| style.bg(p.selection).border_1().border_color(p.accent))
                         .on_drop(cx.listener(move |this, drag: &super::ConversationDrag, window, cx| this.drop_on_view(drag.clone(), drop_view.clone(), window, cx)))
+                })
+                .when_some(offline_target, |d, target| {
+                    d.drag_over::<super::ConversationDrag>(move |style, _, _, _| style.bg(p.selection).border_1().border_color(p.accent))
+                        .on_drop(cx.listener(move |this, drag: &super::ConversationDrag, window, cx| this.drop_on_offline(drag.clone(), target.clone(), window, cx)))
                 })
                 .when_some(folder_drag, |d, drag| d.on_drag(drag, |d: &super::FolderDrag, _pos, _window, cx| cx.new(|_| super::DragPreview { label: d.label.name.clone() })))
                 .when_some(folder_target, |d, target| {
@@ -762,7 +777,9 @@ impl MailWindow {
         let shown: Vec<Account> = if all_accounts {
             ordered_accounts
         } else {
-            self.accounts.iter().filter(|a| a.id == self.account.id).cloned().collect()
+            // While an offline folder is open, the account shown before it stays in view.
+            let shown_id = self.writing_account().id;
+            self.accounts.iter().filter(|a| a.id == shown_id).cloned().collect()
         };
         let reorderable = all_accounts && shown.len() > 1;
         let order: std::rc::Rc<Vec<AccountId>> = std::rc::Rc::new(shown.iter().map(|a| a.id.clone()).collect());
@@ -826,6 +843,61 @@ impl MailWindow {
             account_blocks.push(block.into_any_element());
         }
 
+        // Offline folders: after the accounts, set apart by their own mark and caption.
+        let offline_block: Option<AnyElement> = self.offers_offline().then(|| {
+            let offline = self.offline.id.clone();
+            let key = "offline".to_owned();
+            let collapsed = self.collapsed_sections.contains(&key);
+            let mark = div().size(px(16.)).flex().items_center().justify_center().child(icon("hard-drive").size(px(15.)).text_color(p.muted)).into_any_element();
+            let header = section_header(key, "Offline Folders".into(), collapsed, m.header_top, Some(mark), cx)
+                .font_weight(FontWeight::SEMIBOLD)
+                .when(self.offline_active(), |d| d.text_color(p.foreground))
+                .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Mail kept only on this computer. Drag messages onto a folder to remove them from the server and keep them here.").build(window, cx));
+            let header = top_level_target(header, &offline, cx);
+            let mut column = v_flex().child(header);
+            if !collapsed {
+                let (_, folders) = self.account_folders(&offline, &p);
+                column = column.child(
+                    div()
+                        .pl(px(ICON_INSET + 25.))
+                        .pr(px(10.))
+                        .mb(px(m.row_gap + 2.))
+                        .text_size(crate::ui::ui_px(11.))
+                        .text_color(p.muted)
+                        .child("On this computer only"),
+                );
+                if folders.is_empty() {
+                    column = column.child(
+                        div()
+                            .id("offline-new-folder")
+                            .h_flex()
+                            .items_center()
+                            .gap(px(9.))
+                            .min_h(px(m.row_height))
+                            .pl(px(ICON_INSET))
+                            .pr(px(10.))
+                            .rounded(px(7.))
+                            .cursor_pointer()
+                            .text_size(crate::ui::ui_px(13.))
+                            .text_color(p.muted)
+                            .hover(|d| d.bg(p.hover))
+                            .child(icon("folder-plus").flex_none().size(px(16.)).text_color(p.muted))
+                            .child(div().flex_1().truncate().child("New Offline Folder…"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                let account = this.offline.id.clone();
+                                this.open_folder_prompt(account, super::folder_manage::FolderPromptMode::New { parent: None }, window, cx);
+                            })),
+                    );
+                } else {
+                    column = column.child(v_flex().gap(px(m.row_gap)).children(folders.into_iter().map(|mut nav| {
+                        nav.icon = OFFLINE_FOLDER_ICON;
+                        nav_button(self, "offline", &offline, nav, &pinned_list, cx)
+                    })));
+                }
+            }
+            div().id("offline-block").flex().flex_col().my(px(INSERT_LINE)).child(column).into_any_element()
+        });
+
         let nav = v_flex()
             .id("sidebar-nav")
             .flex_1()
@@ -837,6 +909,7 @@ impl MailWindow {
             // with the same gap above and below.
             .child(div().flex_none().h(px(1.)).my(px(m.divider_gap)).mx(px(8.)).bg(p.divider))
             .children(account_blocks)
+            .children(offline_block)
             .child(div().h(px(m.bottom)))
             .overflow_y_scrollbar();
 

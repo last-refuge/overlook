@@ -373,6 +373,7 @@ impl MailWindow {
             .then(|| modal_location_badge(&self.view, &self.thread, &self.labels))
             .flatten();
         let title = self.current_message_window_title();
+        let offline = self.offline_active();
 
         let (archive_label, archive_icon, archive_tip) = if in_trash {
             ("Restore", C::Move, "Restore to Inbox")
@@ -441,7 +442,8 @@ impl MailWindow {
                         })),
                 )
                 .child(div().w(px(1.)).h(px(18.)).mx(px(4.)).bg(p.divider))
-                .child(
+                // Offline folders have no Archive.
+                .when(!offline, |bar| bar.child(
                     Button::new("msg-win-archive")
                         .ghost()
                         .small()
@@ -456,7 +458,7 @@ impl MailWindow {
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.on_archive(&ArchiveSelected, window, cx);
                         })),
-                )
+                ))
                 .when(!in_trash, |bar| {
                     bar.child(
                         Button::new("msg-win-delete")
@@ -469,7 +471,7 @@ impl MailWindow {
                                     .child(color_icon(C::Delete, 16., &p))
                                     .child("Delete"),
                             )
-                            .tooltip("Move to Trash")
+                            .tooltip(if offline { "Delete from this computer" } else { "Move to Trash" })
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.on_trash(&TrashSelected, window, cx);
                             })),

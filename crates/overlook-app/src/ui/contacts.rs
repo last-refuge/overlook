@@ -70,6 +70,7 @@ impl MailWindow {
         match account.provider {
             ProviderKind::Gmail => ContactsSource::Google,
             ProviderKind::Sample => ContactsSource::Sample,
+            ProviderKind::Local => ContactsSource::Device,
             ProviderKind::Imap | ProviderKind::Pop3 => match self.store.contacts_connection(&account.id).ok().flatten() {
                 Some(connection) if connection.credential == ContactsCredential::Microsoft => ContactsSource::Server(Some(MICROSOFT)),
                 Some(connection) => ContactsSource::Server(overlook_provider::caldav::carddav::service_for_url(&connection.server_url).map(|s| s.name)),

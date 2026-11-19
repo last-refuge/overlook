@@ -12,6 +12,7 @@ pub mod caldav;
 pub mod credential;
 pub mod gmail;
 pub mod imap;
+pub mod local;
 pub mod microsoft;
 pub mod mime;
 pub mod oauth;

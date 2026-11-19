@@ -160,6 +160,26 @@ impl MailWindow {
                             .text_color(p.muted)
                             .child(if unread > 0 { format!("{unread} unread · {total}") } else { total.to_string() }),
                     )
+                    // An offline folder says where its mail is.
+                    .when(self.offline_active(), |row| {
+                        row.child(
+                            h_flex()
+                                .flex_none()
+                                .mt(px(3.))
+                                .gap(px(4.))
+                                .items_center()
+                                .px(px(7.))
+                                .py(px(1.))
+                                .rounded(px(5.))
+                                .bg(p.chip)
+                                .border_1()
+                                .border_color(p.divider)
+                                .text_size(crate::ui::ui_px(11.))
+                                .text_color(p.muted)
+                                .child(icon("hard-drive").size(px(12.)).text_color(p.muted))
+                                .child("On this computer"),
+                        )
+                    })
                     .child(div().flex_1())
                     .when(focus_split, |row| {
                         let t = this.clone();
@@ -637,8 +657,14 @@ impl MailWindow {
         } else {
             ("Archive", C::Archive)
         };
-        let mut actions = vec![(RowAction::Archive, archive_label, archive_icon)];
-        if !state.all_in_trash {
+        // Offline mail has no Archive, and deleting it is for good: that asks first, from the
+        // menu or the Delete key, not from a button under the pointer.
+        let offline = self.offline_active();
+        let mut actions = Vec::new();
+        if !offline {
+            actions.push((RowAction::Archive, archive_label, archive_icon));
+        }
+        if !state.all_in_trash && !offline {
             actions.push((RowAction::Delete, "Delete", C::Delete));
         }
         actions.push(if state.any_unread { (RowAction::ToggleRead, "Mark read", C::Read) } else { (RowAction::ToggleRead, "Mark unread", C::Mail) });
@@ -677,6 +703,9 @@ impl MailWindow {
     /// A row's own command. The open conversation acts as the toolbar would, moving on to
     /// the next one after archiving; any other row changes alone and the selection stays.
     pub(super) fn row_action(&mut self, id: &ConversationId, action: RowAction, window: &mut Window, cx: &mut Context<Self>) {
+        if self.offline_active() && matches!(action, RowAction::Archive | RowAction::Delete) {
+            return;
+        }
         if self.marked.is_empty() && self.selected.as_ref() == Some(id) {
             match action {
                 RowAction::Archive => self.on_archive(&super::ArchiveSelected, window, cx),
@@ -819,9 +848,16 @@ impl MailWindow {
     ) -> PopupMenu {
         let state = me.update(cx, |this, cx| {
             this.mark_for_menu(id, window, cx);
-            (this.selection_state(), this.view == MailboxView::Kind(LabelKind::Sent))
+            // Offline folders to move server mail into, by name.
+            let mut offline_folders: Vec<(LabelId, String)> = if this.offers_offline() && !this.offline_active() {
+                this.labels_of(&this.offline.id).iter().filter(|l| l.kind == LabelKind::User).map(|l| (l.id.clone(), Self::offline_folder_name(&l.name))).collect()
+            } else {
+                Vec::new()
+            };
+            offline_folders.sort_by_cached_key(|(_, name)| name.to_lowercase());
+            (this.selection_state(), this.view == MailboxView::Kind(LabelKind::Sent), this.offline_active(), this.offers_offline(), offline_folders)
         });
-        let Ok((state, in_sent)) = state else { return menu };
+        let Ok((state, in_sent, offline, offers_offline, offline_folders)) = state else { return menu };
         let multi = state.count > 1;
         let act = |me: &WeakEntity<Self>, f: fn(&mut Self, &mut Window, &mut Context<Self>)| {
             let me = me.clone();
@@ -876,6 +912,30 @@ impl MailWindow {
         menu = menu.item(PopupMenuItem::new("Move to…").icon(icon("folder-input")).action(Box::new(super::MoveSelected)).on_click(act(&me, |this, window, cx| {
             this.open_move_palette(window, cx);
         })));
+        if offers_offline && !offline {
+            let folders = offline_folders.clone();
+            let me = me.clone();
+            menu = menu.submenu_with_icon(Some(icon(super::sidebar::OFFLINE_FOLDER_ICON)), "Move to Offline Folder", window, cx, move |mut sub, _window, _cx| {
+                for (label_id, name) in &folders {
+                    let (me, label_id) = (me.clone(), label_id.clone());
+                    sub = sub.item(PopupMenuItem::new(name.clone()).on_click(move |_, window, cx| {
+                        let drag = super::ConversationDrag { mail: super::DraggedMail::Selection, title: String::new(), count: 0 };
+                        me.update(cx, |this, cx| this.drop_on_offline(drag, label_id.clone(), window, cx)).ok();
+                    }));
+                }
+                if !folders.is_empty() {
+                    sub = sub.separator();
+                }
+                let me = me.clone();
+                sub.item(PopupMenuItem::new("New Offline Folder…").on_click(move |_, window, cx| {
+                    me.update(cx, |this, cx| {
+                        let account = this.offline.id.clone();
+                        this.open_folder_prompt(account, super::folder_manage::FolderPromptMode::New { parent: None }, window, cx);
+                    })
+                    .ok();
+                }))
+            });
+        }
         let (archive_label, archive_icon) = if state.all_in_trash {
             ("Restore", "archive-restore")
         } else if !state.any_in_inbox {
@@ -883,9 +943,11 @@ impl MailWindow {
         } else {
             ("Archive", "archive")
         };
-        menu = menu.item(PopupMenuItem::new(archive_label).icon(icon(archive_icon)).action(Box::new(super::ArchiveSelected)).on_click(act(&me, |this, window, cx| {
-            this.on_archive(&super::ArchiveSelected, window, cx);
-        })));
+        if !offline {
+            menu = menu.item(PopupMenuItem::new(archive_label).icon(icon(archive_icon)).action(Box::new(super::ArchiveSelected)).on_click(act(&me, |this, window, cx| {
+                this.on_archive(&super::ArchiveSelected, window, cx);
+            })));
+        }
         if has_junk {
             if state.all_in_junk {
                 menu = menu.item(PopupMenuItem::new("Not Junk").icon(icon("shield-check")).on_click(act(&me, |this, window, cx| {
@@ -899,7 +961,8 @@ impl MailWindow {
                 })));
             }
         }
-        if !state.all_in_trash {
+        // Offline mail has no Trash: Delete Permanently is the one way to delete it.
+        if !state.all_in_trash && !offline {
             menu = menu.item(PopupMenuItem::new("Delete").icon(icon("trash")).action(Box::new(super::TrashSelected)).on_click(act(&me, |this, window, cx| {
                 this.on_trash(&super::TrashSelected, window, cx);
             })));

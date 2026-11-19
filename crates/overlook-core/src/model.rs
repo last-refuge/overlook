@@ -14,7 +14,13 @@ pub enum ProviderKind {
     Gmail,
     Imap,
     Pop3,
+    /// Offline folders: mail kept only on this device, never synchronized. There is one such
+    /// account ([`OFFLINE_ACCOUNT_ID`]); it is not listed with the user's accounts.
+    Local,
 }
+
+/// The id of the account that holds offline folders.
+pub const OFFLINE_ACCOUNT_ID: &str = "local:offline";
 
 impl ProviderKind {
     pub fn label(self) -> &'static str {
@@ -23,6 +29,7 @@ impl ProviderKind {
             ProviderKind::Gmail => "Gmail",
             ProviderKind::Imap => "IMAP",
             ProviderKind::Pop3 => "POP3",
+            ProviderKind::Local => "On this computer",
         }
     }
 
@@ -32,6 +39,7 @@ impl ProviderKind {
             ProviderKind::Gmail => "gmail",
             ProviderKind::Imap => "imap",
             ProviderKind::Pop3 => "pop3",
+            ProviderKind::Local => "local",
         }
     }
 
@@ -41,6 +49,7 @@ impl ProviderKind {
             "gmail" => Some(ProviderKind::Gmail),
             "imap" => Some(ProviderKind::Imap),
             "pop3" => Some(ProviderKind::Pop3),
+            "local" => Some(ProviderKind::Local),
             _ => None,
         }
     }
@@ -53,6 +62,17 @@ pub struct Account {
     pub display_name: String,
     pub email: String,
     pub created_at: Timestamp,
+}
+
+impl Account {
+    /// The account that holds offline folders.
+    pub fn offline() -> Self {
+        Account { id: AccountId::from(OFFLINE_ACCOUNT_ID), provider: ProviderKind::Local, display_name: "Offline Folders".into(), email: String::new(), created_at: 0 }
+    }
+
+    pub fn is_offline(&self) -> bool {
+        self.provider == ProviderKind::Local
+    }
 }
 
 /// An email address with an optional display name.

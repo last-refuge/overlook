@@ -149,7 +149,8 @@ impl MailWindow {
         let (trash, inbox) = self.removal_state();
         match action {
             A::Archive => {
-                command.enabled = active;
+                // Offline folders have no Inbox or Archive.
+                command.enabled = active && !self.offline_active();
                 if trash || !inbox {
                     command.label = if trash { "Restore" } else { "To Inbox" }.into();
                     command.glyph = Color(C::Move);

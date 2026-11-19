@@ -999,6 +999,7 @@ impl MailWindow {
         let connection_line = match (account.provider, &servers) {
             (ProviderKind::Gmail, _) => "Connected through the Gmail and Google Calendar APIs.".to_owned(),
             (ProviderKind::Sample, _) => "Sample account with fictional mail; nothing leaves this device.".to_owned(),
+            (ProviderKind::Local, _) => "Offline folders, kept only on this computer.".to_owned(),
             (ProviderKind::Imap, Some(s)) if s.oauth.is_some() => format!("Mail is read over IMAP from {} and sent through {}. Signed in with Microsoft; the sign-in is kept in the system keyring.", s.incoming.address(), s.outgoing.address()),
             (ProviderKind::Imap, Some(s)) => {
                 // An app-password service names what is stored ("App-specific password").
