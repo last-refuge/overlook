@@ -352,8 +352,8 @@ impl MailWindow {
             .size_full()
             .bg(tones.ground)
             .text_color(p.foreground)
-            .font_family("Inter")
-            .text_size(px(13.))
+            .font_family(SharedString::from(crate::theme::current_fonts(cx).effective_ui_family().to_owned()))
+            .text_size(crate::ui::ui_px(13.))
             .relative()
             .child(TitleBar::new().h(px(52.)).bg(p.surface).child(title))
             .children(self.render_banner(cx))
@@ -390,12 +390,12 @@ impl MailWindow {
                 .child(
                     v_flex()
                         .gap(px(4.))
-                        .child(div().text_size(px(18.)).line_height(px(24.)).font_weight(FontWeight::SEMIBOLD).child(if adding { "Add an account" } else { "Connect your mail" }))
-                        .child(div().text_size(px(13.)).line_height(px(19.)).text_color(p.muted).child("Choose where your mail lives. Overlook fills in the settings and shows you how to sign in.")),
+                        .child(div().text_size(crate::ui::ui_px(18.)).line_height(crate::ui::ui_px(24.)).font_weight(FontWeight::SEMIBOLD).child(if adding { "Add an account" } else { "Connect your mail" }))
+                        .child(div().text_size(crate::ui::ui_px(13.)).line_height(crate::ui::ui_px(19.)).text_color(p.muted).child("Choose where your mail lives. Overlook fills in the settings and shows you how to sign in.")),
                 )
                 .child(h_flex().flex_wrap().items_stretch().gap(px(16.)).mt(px(20.)).children(featured))
                 .child(h_flex().flex_wrap().items_stretch().gap(px(12.)).mt(px(12.)).children(others))
-                .child(div().mt(px(32.)).text_size(px(12.)).line_height(px(16.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child("Another provider, or your own server"))
+                .child(div().mt(px(32.)).text_size(crate::ui::ui_px(12.)).line_height(crate::ui::ui_px(16.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child("Another provider, or your own server"))
                 // Lighter than the cards above: their own width, no fill until pointed at.
                 .child(h_flex().flex_wrap().gap(px(8.)).mt(px(6.)).ml(px(-12.)).children(servers))
                 .child(
@@ -403,8 +403,8 @@ impl MailWindow {
                         .mt(px(28.))
                         .gap(px(8.))
                         .items_center()
-                        .text_size(px(12.))
-                        .line_height(px(16.))
+                        .text_size(crate::ui::ui_px(12.))
+                        .line_height(crate::ui::ui_px(16.))
                         .text_color(p.muted)
                         .child(icon("lock-keyhole").size(px(14.)))
                         .child("Passwords and sign-ins are kept in your system keyring, never in files."),
@@ -464,7 +464,7 @@ fn horizon(height: f32, adding: bool) -> impl IntoElement {
                     .justify_center()
                     .gap(px(12.))
                     .child(div().max_w(px(640.)).font_family("Source Serif 4 Display").text_size(px(48.)).line_height(px(56.)).text_color(ivory).child("A calmer place for your mail."))
-                    .child(div().max_w(px(520.)).text_size(px(15.)).line_height(px(22.)).text_color(ivory.opacity(0.84)).child(if adding {
+                    .child(div().max_w(px(520.)).text_size(crate::ui::ui_px(15.)).line_height(px(22.)).text_color(ivory.opacity(0.84)).child(if adding {
                         "Connect another account. Its mail, calendar and contacts join the rest."
                     } else {
                         "Welcome to Overlook. Connect an account to bring your mail in."
@@ -480,5 +480,5 @@ fn endorsed_lockup(p: &Palette) -> impl IntoElement {
         .gap(px(10.))
         .child(brand_tile(30.))
         .child(div().font_family("Source Serif 4 Display").text_size(px(22.)).line_height(px(30.)).text_color(p.foreground).child("Overlook"))
-        .child(div().pt(px(3.)).text_size(px(12.)).text_color(p.muted).child("by Last Refuge"))
+        .child(div().pt(px(3.)).text_size(crate::ui::ui_px(12.)).text_color(p.muted).child("by Last Refuge"))
 }

@@ -256,6 +256,7 @@ impl MailProvider for SampleProvider {
         let draft = draft.clone();
         let sent_label = context.sent_label;
         let in_reply_to = context.in_reply_to;
+        let outgoing_font = context.outgoing_font;
         Box::pin(async move {
             self.require_online()?;
             self.sleep().await;
@@ -266,7 +267,7 @@ impl MailProvider for SampleProvider {
                 return Err(ProviderError::Uncertain);
             }
             let provider_id = self.next_id("sent");
-            let message = sent_message(&account, &draft, in_reply_to.as_ref(), &provider_id, &rfc_id, sent_label.as_ref(), overlook_core::time::now());
+            let message = sent_message_with_font(&account, &draft, in_reply_to.as_ref(), &provider_id, &rfc_id, sent_label.as_ref(), overlook_core::time::now(), outgoing_font.as_ref());
             Ok(SentReceipt { provider_id, rfc_message_id: Some(rfc_id), message })
         })
     }
@@ -458,7 +459,22 @@ pub fn sent_message(
     sent_label: Option<&LabelId>,
     now: Timestamp,
 ) -> Message {
-    let bodies = overlook_core::compose::outgoing_bodies(draft, in_reply_to);
+    sent_message_with_font(account, draft, in_reply_to, provider_id, rfc_id, sent_label, now, None)
+}
+
+/// Builds the Sent copy of a draft, optionally wrapping the authored HTML body in `font`.
+#[allow(clippy::too_many_arguments)]
+pub fn sent_message_with_font(
+    account: &Account,
+    draft: &Draft,
+    in_reply_to: Option<&Message>,
+    provider_id: &ProviderId,
+    rfc_id: &str,
+    sent_label: Option<&LabelId>,
+    now: Timestamp,
+    font: Option<&OutgoingFont>,
+) -> Message {
+    let bodies = overlook_core::compose::outgoing_bodies_with_font(draft, in_reply_to, font);
     let mut label_ids = BTreeSet::new();
     if let Some(l) = sent_label {
         label_ids.insert(l.clone());

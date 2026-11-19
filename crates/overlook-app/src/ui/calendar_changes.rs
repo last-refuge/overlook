@@ -67,12 +67,12 @@ impl MailWindow {
                 let details=local.map(|e|format!("Your version: {} · {} – {}{}",tz::format_day(e.start),tz::format_clock(e.start),tz::format_clock(e.end),e.location.as_ref().map(|l|format!(" · {l}")).unwrap_or_default())).unwrap_or_else(||"Your change: delete this event".into());
                 v_flex().gap(px(6.)).p(px(10.)).border_1().border_color(p.divider).rounded(px(8.))
                     .child(div().font_weight(FontWeight::MEDIUM).child(change.title()))
-                    .child(div().text_size(px(12.)).child(details))
-                    .children(local.and_then(|e|e.description.as_ref()).map(|s|div().text_size(px(12.)).child(s.chars().take(500).collect::<String>())))
-                    .child(div().text_size(px(12.)).text_color(p.muted).child(change.note.clone().unwrap_or_else(||match change.state {CalDavChangeState::Pending=>"Saved on this device. Waiting to upload.".into(),_=>"Checking the provider before retrying this upload. Your changes are saved.".into()})))
+                    .child(div().text_size(crate::ui::ui_px(12.)).child(details))
+                    .children(local.and_then(|e|e.description.as_ref()).map(|s|div().text_size(crate::ui::ui_px(12.)).child(s.chars().take(500).collect::<String>())))
+                    .child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(change.note.clone().unwrap_or_else(||match change.state {CalDavChangeState::Pending=>"Saved on this device. Waiting to upload.".into(),_=>"Checking the provider before retrying this upload. Your changes are saved.".into()})))
                     .when(change.state==CalDavChangeState::Conflict,|d| d
-                        .child(div().text_size(px(12.)).child(self.caldav_previews.get(&change.id).cloned().unwrap_or_else(||"Provider version: this event was deleted.".into())))
-                        .when(change.remote.is_none(), |d| d.child(div().text_size(px(12.)).text_color(p.muted).child("Recreating restores the saved event resource, including the full series for a repeating event.")))
+                        .child(div().text_size(crate::ui::ui_px(12.)).child(self.caldav_previews.get(&change.id).cloned().unwrap_or_else(||"Provider version: this event was deleted.".into())))
+                        .when(change.remote.is_none(), |d| d.child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child("Recreating restores the saved event resource, including the full series for a repeating event.")))
                         .child(h_flex().gap(px(8.)).flex_wrap()
                             .child(Button::new(SharedString::from(format!("caldav-mine-{}",change.id))).small().primary().label(if change.remote.is_none(){"Recreate my version"}else{"Keep my changes"}).on_click(cx.listener(move |this,_,w,cx|this.resolve_caldav(mine.clone(),true,w,cx))))
                             .child(Button::new(SharedString::from(format!("caldav-server-{}",change.id))).small().label("Use provider version").on_click(cx.listener(move |this,_,w,cx|this.resolve_caldav(server.clone(),false,w,cx))))))
@@ -80,7 +80,7 @@ impl MailWindow {
                         if let Err(e)=this.store.mark_caldav_change(&retry,CalDavChangeState::Checking,None,"Checking this saved change again…".into()){super::toast(w,cx,crate::notify::Level::Error,e.to_string());}
                         this.reload_calendar(); this.cal_focus.focus(w,cx); this.sync_caldav_account(retry.account_id.clone(),true,cx);
                     })))
-                    .child(div().text_size(px(12.)).text_color(p.muted).child("Discarding removes the saved local change. Sync again to restore any provider copy."))
+                    .child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child("Discarding removes the saved local change. Sync again to restore any provider copy."))
                     .child(Button::new(SharedString::from(format!("caldav-discard-{}",change.id))).small().label("Discard local changes").on_click(cx.listener(move |this,_,w,cx|this.resolve_caldav(discard.clone(),false,w,cx)))))
             })).overflow_y_scrollbar().into_any_element()
     }

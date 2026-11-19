@@ -360,6 +360,7 @@ fn main() {
         if let Some(prefs) = &prefs {
             set_inbox_limit(prefs.inbox_messages as usize);
             overlook_core::tz::set_clock_24h(prefs.clock_24h);
+            theme::apply_fonts(&prefs.fonts, cx);
         }
         let preference: AppearancePreference = store
             .setting(SETTING_APPEARANCE)

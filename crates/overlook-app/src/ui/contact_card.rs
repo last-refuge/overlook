@@ -132,7 +132,7 @@ fn card_body(data: &CardData, p: &Palette, t: &WeakEntity<MailWindow>, scope: &s
         None => avatar(who, 44., p).into_any_element(),
     };
     let row = |name: &'static str, content: AnyElement| {
-        h_flex().items_start().gap(px(8.)).text_size(px(12.)).child(icon(name).size(px(13.)).text_color(p.muted).mt(px(2.))).child(div().flex_1().min_w_0().child(content))
+        h_flex().items_start().gap(px(8.)).text_size(crate::ui::ui_px(12.)).child(icon(name).size(px(13.)).text_color(p.muted).mt(px(2.))).child(div().flex_1().min_w_0().child(content))
     };
 
     let email = who.email.clone();
@@ -184,9 +184,9 @@ fn card_body(data: &CardData, p: &Palette, t: &WeakEntity<MailWindow>, scope: &s
                     v_flex()
                         .flex_1()
                         .min_w_0()
-                        .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child(data.name()))
-                        .children(contact.and_then(role_line).map(|r| div().text_size(px(12.)).child(r)))
-                        .child(div().text_size(px(11.)).text_color(p.muted).child(data.source())),
+                        .child(div().text_size(crate::ui::ui_px(14.)).font_weight(FontWeight::SEMIBOLD).child(data.name()))
+                        .children(contact.and_then(role_line).map(|r| div().text_size(crate::ui::ui_px(12.)).child(r)))
+                        .child(div().text_size(crate::ui::ui_px(11.)).text_color(p.muted).child(data.source())),
                 ),
         )
         .child(details)
@@ -247,7 +247,7 @@ impl MailWindow {
         let total = to.len() + m.cc.len();
         let expanded = self.recipients_expanded.contains(&m.id);
         let shown = visible_recipients(total, expanded);
-        let mut line = h_flex().flex_wrap().items_baseline().gap_x(px(5.)).gap_y(px(1.)).text_size(px(12.)).text_color(p.muted).child("to");
+        let mut line = h_flex().flex_wrap().items_baseline().gap_x(px(5.)).gap_y(px(1.)).text_size(crate::ui::ui_px(12.)).text_color(p.muted).child("to");
         let mut previous_was_to = true;
         for (i, who) in to.iter().chain(&m.cc).take(shown).enumerate() {
             let is_to = i < to.len();

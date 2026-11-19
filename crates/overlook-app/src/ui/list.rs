@@ -87,7 +87,7 @@ fn file_chip(name: &str, p: &crate::theme::Palette) -> Div {
         .bg(p.message_surface())
         .border_1()
         .border_color(p.divider)
-        .text_size(px(11.5))
+        .text_size(crate::ui::ui_px(11.5))
         .font_weight(FontWeight::MEDIUM)
         .text_color(p.foreground)
         .child(
@@ -97,8 +97,8 @@ fn file_chip(name: &str, p: &crate::theme::Palette) -> Div {
                 .rounded(px(3.))
                 .bg(fill)
                 .text_color(ink)
-                .text_size(px(8.5))
-                .line_height(px(15.))
+                .text_size(crate::ui::ui_px(8.5))
+                .line_height(crate::ui::ui_px(15.))
                 .font_weight(FontWeight::BOLD)
                 .child(overlook_core::file_badge(name)),
         )
@@ -130,7 +130,7 @@ impl MailWindow {
                 .pb(px(10.))
                 .border_b_2()
                 .border_color(if active { p.accent } else { gpui_kit::transparent_black() })
-                .text_size(px(13.))
+                .text_size(crate::ui::ui_px(13.))
                 .text_color(if active { p.accent } else { p.muted })
                 .font_weight(if active { FontWeight::MEDIUM } else { FontWeight::NORMAL })
                 .cursor_pointer()
@@ -147,16 +147,16 @@ impl MailWindow {
                     .gap(px(9.))
                     .child(
                         div()
-                            .text_size(px(22.))
+                            .text_size(crate::ui::ui_px(22.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .line_height(px(30.))
+                            .line_height(crate::ui::ui_px(30.))
                             .child(title),
                     )
                     // How much is here, and how much of it is unread.
                     .child(
                         div()
                             .pt(px(3.))
-                            .text_size(px(12.))
+                            .text_size(crate::ui::ui_px(12.))
                             .text_color(p.muted)
                             .child(if unread > 0 { format!("{unread} unread · {total}") } else { total.to_string() }),
                     )
@@ -214,12 +214,12 @@ impl MailWindow {
                                 .pb(px(10.))
                                 .border_b_2()
                                 .border_color(if active { p.accent } else { gpui_kit::transparent_black() })
-                                .text_size(px(13.))
+                                .text_size(crate::ui::ui_px(13.))
                                 .text_color(if active { p.accent } else { p.muted })
                                 .font_weight(if active { FontWeight::MEDIUM } else { FontWeight::NORMAL })
                                 .cursor_pointer()
                                 .child(label)
-                                .when(!active && waiting > 0, |d| d.child(div().text_size(px(12.)).child(format!("· {waiting}"))))
+                                .when(!active && waiting > 0, |d| d.child(div().text_size(crate::ui::ui_px(12.)).child(format!("· {waiting}"))))
                                 .on_click(cx.listener(move |this, _, window, cx| this.set_inbox_tab(tab, window, cx)))
                         };
                         row.child(focus_tab("Focused", FocusTab::Focused, cx)).child(focus_tab("Other", FocusTab::Other, cx))
@@ -238,7 +238,7 @@ impl MailWindow {
                 div()
                     .px(px(18.))
                     .pt(px(10.))
-                    .text_size(px(11.))
+                    .text_size(crate::ui::ui_px(11.))
                     .text_color(p.muted)
                     .child(self.search_coverage.clone()),
             )
@@ -270,8 +270,8 @@ impl MailWindow {
                 .gap(px(6.))
                 .text_color(p.muted)
                 .child(icon(if container { "folder" } else { "inbox" }).size(px(28.)).text_color(p.divider))
-                .child(div().text_size(px(14.)).font_weight(FontWeight::MEDIUM).text_color(p.foreground).child(title))
-                .child(div().text_size(px(12.)).child(hint))
+                .child(div().text_size(crate::ui::ui_px(14.)).font_weight(FontWeight::MEDIUM).text_color(p.foreground).child(title))
+                .child(div().text_size(crate::ui::ui_px(12.)).child(hint))
                 .when(container, |d| {
                     d.child(
                         Button::new("folder-only-help")
@@ -335,10 +335,17 @@ impl MailWindow {
             self.sync_list_state(&rows);
             *self.rows_key.borrow_mut() = Some(key);
         }
-        // Density and the sender-picture and preview settings change every row's height, and
-        // the list keeps the heights it measured for rows that are out of view.
-        let layout = RowLayout { compact, avatars: self.prefs.show_avatars, previews: self.prefs.show_previews };
-        if self.row_layout.replace(Some(layout)).is_some_and(|before| before != layout) {
+        // Density, sender-picture, preview, and typography settings change every row's height,
+        // and the list keeps the heights it measured for rows that are out of view.
+        let layout = RowLayout {
+            compact,
+            avatars: self.prefs.show_avatars,
+            previews: self.prefs.show_previews,
+            ui_size: self.prefs.fonts.clamped_ui_size(),
+            list_family: self.prefs.fonts.list_family.clone(),
+            list_size: self.prefs.fonts.list_size,
+        };
+        if self.row_layout.borrow_mut().replace(layout.clone()).is_some_and(|before| before != layout) {
             self.list_state.remeasure();
         }
     }
@@ -353,8 +360,17 @@ impl MailWindow {
         }
     }
 
+    fn list_text_px(&self, base: f32) -> Pixels {
+        px((base * self.prefs.fonts.list_scale() * 2.).round() / 2.)
+    }
+
+    fn list_font_family(&self) -> SharedString {
+        SharedString::from(self.prefs.fonts.effective_list_family().to_owned())
+    }
+
     fn render_list_row(&mut self, row: ListRow, compact: bool, cx: &mut Context<Self>) -> AnyElement {
         let p = *cx.palette();
+        let list_font = self.list_font_family();
         match row {
             ListRow::Group(label, n) => h_flex()
                 .items_center()
@@ -362,7 +378,8 @@ impl MailWindow {
                 .px(px(11.))
                 .pt(px(13.))
                 .pb(px(5.))
-                .text_size(px(11.))
+                .font_family(list_font)
+                .text_size(self.list_text_px(11.))
                 .text_color(p.muted)
                 .child(label)
                 .child(n.to_string())
@@ -472,6 +489,7 @@ impl MailWindow {
                     .flex_1()
                     .min_w_0()
                     .gap(px(2.))
+                    .font_family(self.list_font_family())
                     .child(
                         h_flex()
                             .items_center()
@@ -481,7 +499,7 @@ impl MailWindow {
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .text_size(px(13.))
+                                    .text_size(self.list_text_px(13.))
                                     .font_weight(if unread { FontWeight::BOLD } else { FontWeight::NORMAL })
                                     .text_color(p.foreground)
                                     .child(c.participant_line()),
@@ -494,8 +512,8 @@ impl MailWindow {
                                         .px(px(6.))
                                         .rounded(px(8.))
                                         .bg(if highlighted { p.message_surface().opacity(0.55) } else { p.chip })
-                                        .text_size(px(11.))
-                                        .line_height(px(16.))
+                                        .text_size(self.list_text_px(11.))
+                                        .line_height(self.list_text_px(16.))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(if highlighted { p.selection_text } else { p.muted })
                                         .child(c.message_count.to_string()),
@@ -511,7 +529,7 @@ impl MailWindow {
                             .child(
                                 div()
                                     .flex_none()
-                                    .text_size(px(11.))
+                                    .text_size(self.list_text_px(11.))
                                     .font_weight(if unread { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
                                     .text_color(if unread { p.accent } else { p.muted })
                                     .child(time),
@@ -520,7 +538,7 @@ impl MailWindow {
                     .child(
                         div()
                             .truncate()
-                            .text_size(px(13.))
+                            .text_size(self.list_text_px(13.))
                             .font_weight(if unread { FontWeight::BOLD } else { FontWeight::NORMAL })
                             .text_color(p.foreground)
                             .child(c.subject.clone()),
@@ -529,7 +547,7 @@ impl MailWindow {
                         d.child(
                             div()
                                 .truncate()
-                                .text_size(px(12.))
+                                .text_size(self.list_text_px(12.))
                                 .text_color(p.muted)
                                 .child(c.snippet.clone()),
                         )
@@ -546,7 +564,7 @@ impl MailWindow {
                                 .gap_y(px(4.))
                                 .mt(px(4.))
                                 .min_w_0()
-                                .text_size(px(11.))
+                                .text_size(self.list_text_px(11.))
                                 .text_color(p.muted)
                                 .children(invitation)
                                 // The files by name and type; a message whose only parts are
@@ -710,7 +728,7 @@ impl MailWindow {
             .px(px(6.))
             .rounded(px(6.))
             .bg(p.chip)
-            .text_size(px(11.5))
+            .text_size(crate::ui::ui_px(11.5))
             .font_weight(FontWeight::MEDIUM)
             .text_color(if cancelled { p.error } else { p.foreground })
             .child(icon(if cancelled { "calendar-x" } else { "calendar" }).size(px(12.)).text_color(if cancelled { p.error } else { p.accent }))
@@ -732,7 +750,7 @@ impl MailWindow {
                                 .px(px(6.))
                                 .border_1()
                                 .border_color(p.control_border.opacity(0.45))
-                                .child(div().text_size(px(11.5)).map(|d| if response == ResponseStatus::Accepted {
+                                .child(div().text_size(crate::ui::ui_px(11.5)).map(|d| if response == ResponseStatus::Accepted {
                                     d.font_weight(FontWeight::SEMIBOLD).text_color(p.accent)
                                 } else {
                                     d.font_weight(FontWeight::MEDIUM).text_color(p.muted)
@@ -753,7 +771,7 @@ impl MailWindow {
                         h_flex()
                             .items_center()
                             .gap(px(4.))
-                            .text_size(px(11.5))
+                            .text_size(crate::ui::ui_px(11.5))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(if accepted { p.success } else { p.muted })
                             .when(accepted, |d| d.child(icon("check").size(px(12.)).text_color(p.success)))
@@ -943,21 +961,22 @@ impl MailWindow {
                     .flex_1()
                     .min_w_0()
                     .gap(px(2.))
+                    .font_family(self.list_font_family())
                     .child(
                         h_flex()
                             .items_center()
                             .gap(px(8.))
-                            .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child(recipients))
-                            .child(div().text_size(px(11.)).text_color(p.muted).child(relative_label(d.updated_at, now, &self.time_zone))),
+                            .child(div().flex_1().min_w_0().truncate().text_size(self.list_text_px(13.)).font_weight(FontWeight::MEDIUM).child(recipients))
+                            .child(div().text_size(self.list_text_px(11.)).text_color(p.muted).child(relative_label(d.updated_at, now, &self.time_zone))),
                     )
-                    .child(div().truncate().text_size(px(13.)).child(d.display_subject()))
-                    .child(div().truncate().text_size(px(12.)).text_color(p.muted).child(if preview.is_empty() { "Draft in progress".to_owned() } else { preview }))
+                    .child(div().truncate().text_size(self.list_text_px(13.)).child(d.display_subject()))
+                    .child(div().truncate().text_size(self.list_text_px(12.)).text_color(p.muted).child(if preview.is_empty() { "Draft in progress".to_owned() } else { preview }))
                     .child(
                         h_flex()
                             .items_center()
                             .gap(px(6.))
                             .mt(px(4.))
-                            .text_size(px(11.))
+                            .text_size(self.list_text_px(11.))
                             .text_color(state_color)
                             .child(icon(if outbox { "clock" } else { "check" }).size(px(12.)).text_color(state_color))
                             // The state wording can be long ("Delivery uncertain: …"); it

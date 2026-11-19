@@ -44,6 +44,38 @@ pub fn prepare_document(source: &str) -> BrowserDocument {
     prepare_document_with_defaults(source, "body { background: white; color: black; }")
 }
 
+/// Display-only typography preferences applied when preparing a browser email document.
+/// These never alter stored or sent mail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserTypography {
+    pub font_family: Option<String>,
+    pub font_size_px: u8,
+    pub mono_family: Option<String>,
+    pub override_sender: bool,
+}
+
+impl Default for BrowserTypography {
+    fn default() -> Self {
+        Self {
+            font_family: None,
+            font_size_px: crate::prefs::FontPrefs::DEFAULT_READING_SIZE,
+            mono_family: None,
+            override_sender: false,
+        }
+    }
+}
+
+impl BrowserTypography {
+    pub fn from_prefs(prefs: &crate::prefs::FontPrefs) -> Self {
+        Self {
+            font_family: prefs.browser_reading_family(),
+            font_size_px: prefs.clamped_reading_size(),
+            mono_family: prefs.effective_mono_family().map(str::to_owned),
+            override_sender: prefs.override_email_fonts,
+        }
+    }
+}
+
 /// Apply display-only RGB defaults at zero CSS specificity so sender styles and
 /// legacy body color attributes win. These colors never enter stored/sent mail.
 pub fn prepare_document_with_colors(
@@ -51,18 +83,36 @@ pub fn prepare_document_with_colors(
     background: u32,
     foreground: u32,
 ) -> BrowserDocument {
+    prepare_document_with_options(source, background, foreground, &BrowserTypography::default())
+}
+
+/// Apply display-only RGB defaults and user reading typography to a prepared browser document.
+pub fn prepare_document_with_options(
+    source: &str,
+    background: u32,
+    foreground: u32,
+    typography: &BrowserTypography,
+) -> BrowserDocument {
     let defaults = format!(
         ":where(body:not([bgcolor]):not([background])) {{ background-color: #{:06X}; }} :where(body:not([text])) {{ color: #{:06X}; }}",
         background & 0xFFFFFF, foreground & 0xFFFFFF,
     );
-    prepare_document_with_defaults(source, &defaults)
+    prepare_document_with_defaults_and_typography(source, &defaults, typography)
 }
 
 fn prepare_document_with_defaults(source: &str, defaults: &str) -> BrowserDocument {
+    prepare_document_with_defaults_and_typography(source, defaults, &BrowserTypography::default())
+}
+
+fn prepare_document_with_defaults_and_typography(
+    source: &str,
+    defaults: &str,
+    typography: &BrowserTypography,
+) -> BrowserDocument {
     let Some(dom) = parse_bounded_document(source) else {
         return preparation_error(defaults);
     };
-    prepare_dom(dom, defaults)
+    prepare_dom(dom, defaults, typography)
 }
 
 /// Shared with display-only thread history folding. Every parser entry point
@@ -87,7 +137,7 @@ pub(crate) fn parse_bounded_document(source: &str) -> Option<RcDom> {
     Some(dom)
 }
 
-fn prepare_dom(dom: RcDom, defaults: &str) -> BrowserDocument {
+fn prepare_dom(dom: RcDom, defaults: &str, typography: &BrowserTypography) -> BrowserDocument {
     let mut styles = String::new();
     prepare_nodes(&dom.document, false, &mut styles);
     // Only the parser's actual document roots may supply root attributes. No
@@ -138,7 +188,22 @@ fn prepare_dom(dom: RcDom, defaults: &str) -> BrowserDocument {
     let styles = cleaner.clean(&styles).to_string();
     let html_attrs = clean_root_attributes(&html_root, &cleaner, false);
     let body_attrs = clean_root_attributes(&body_root, &cleaner, true);
-    let html = format!("<!doctype html><html{html_attrs}><head><meta http-equiv=\"Content-Security-Policy\" content=\"{CSP}\"><style>body {{ margin: 0; font-family: Arial, sans-serif; font-size: 16px; }} {defaults}</style>{styles}</head><body{body_attrs}>{body}</body></html>");
+    let body_font = crate::prefs::css_sans_font_stack(typography.font_family.as_deref());
+    let body_size = typography.font_size_px.clamp(12, crate::prefs::FontPrefs::MAX_EMAIL_SIZE);
+    let mono_rule = crate::prefs::css_mono_font_stack(typography.mono_family.as_deref())
+        .map(|mono| format!(" pre, code, kbd, samp, tt {{ font-family: {mono}; }}"))
+        .unwrap_or_default();
+    let override_styles = if typography.override_sender {
+        let mono_override = crate::prefs::css_mono_font_stack(typography.mono_family.as_deref())
+            .map(|mono| format!(" pre, code, kbd, samp, tt {{ font-family: {mono} !important; }}"))
+            .unwrap_or_default();
+        format!(
+            "<style>body, p, div, td, th, li, span, a, blockquote, font, h1, h2, h3, h4, h5, h6, dd, dt, address, cite, em, strong, b, i, u, s, small, label {{ font-family: {body_font} !important; }} body, p, div, td, th, li, font, blockquote {{ font-size: {body_size}px !important; line-height: 1.5 !important; }} span, a, b, i, em, strong, u, s {{ font-size: inherit !important; }}{mono_override}</style>"
+        )
+    } else {
+        String::new()
+    };
+    let html = format!("<!doctype html><html{html_attrs}><head><meta http-equiv=\"Content-Security-Policy\" content=\"{CSP}\"><style>body {{ margin: 0; font-family: {body_font}; font-size: {body_size}px; }}{mono_rule} {defaults}</style>{styles}{override_styles}</head><body{body_attrs}>{body}</body></html>");
     let counted = parse_document(RcDom::default(), ParseOpts::default()).one(html.as_str());
     if !dom_within_limits(&counted.document) {
         return preparation_error(defaults);
@@ -555,4 +620,42 @@ fn count_resources(node: &Handle) -> usize {
             .iter()
             .map(count_resources)
             .sum::<usize>()
+}
+
+#[cfg(test)]
+mod typography_tests {
+    use super::*;
+
+    #[test]
+    fn default_typography_matches_prepare_document_with_colors() {
+        let source = "<p>Hello</p>";
+        assert_eq!(
+            prepare_document_with_colors(source, 0xFFFFFF, 0x20242B),
+            prepare_document_with_options(source, 0xFFFFFF, 0x20242B, &BrowserTypography::default())
+        );
+    }
+
+    #[test]
+    fn custom_typography_and_sender_override_emit_expected_styles() {
+        let source = "<style>p { font-family: Comic Sans MS; font-size: 10px; }</style><p>Hello</p>";
+        let doc = prepare_document_with_options(
+            source,
+            0xFFFFFF,
+            0x20242B,
+            &BrowserTypography {
+                font_family: Some("Georgia".into()),
+                font_size_px: 19,
+                mono_family: Some("JetBrains Mono".into()),
+                override_sender: true,
+            },
+        );
+        assert!(doc.html.contains("font-family: 'Georgia'"), "{}", doc.html);
+        assert!(doc.html.contains("font-size: 19px"), "{}", doc.html);
+        assert!(doc.html.contains("font-family: 'JetBrains Mono'"), "{}", doc.html);
+        assert!(doc.html.contains("!important"), "{}", doc.html);
+        // Override block must come after sender styles so it wins the cascade.
+        let sender_pos = doc.html.find("Comic Sans MS").unwrap();
+        let override_pos = doc.html.rfind("!important").unwrap();
+        assert!(override_pos > sender_pos);
+    }
 }

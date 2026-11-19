@@ -15,7 +15,7 @@ use gpui_kit::component::combobox::{Combobox, ComboboxEvent, ComboboxState};
 use gpui_kit::component::searchable_list::{SearchableListItem, SearchableVec};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{Disableable, Sizable, IndexPath};
+use gpui_kit::component::{ActiveTheme, Disableable, IndexPath, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use overlook_core::*;
@@ -24,18 +24,27 @@ use overlook_core::*;
 pub enum SettingsPage {
     Accounts,
     General,
+    Fonts,
     Mail,
     Calendar,
     About,
 }
 
 impl SettingsPage {
-    pub(crate) const ALL: [SettingsPage; 5] = [SettingsPage::Accounts, SettingsPage::General, SettingsPage::Mail, SettingsPage::Calendar, SettingsPage::About];
+    pub(crate) const ALL: [SettingsPage; 6] = [
+        SettingsPage::Accounts,
+        SettingsPage::General,
+        SettingsPage::Fonts,
+        SettingsPage::Mail,
+        SettingsPage::Calendar,
+        SettingsPage::About,
+    ];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
             SettingsPage::Accounts => "Accounts",
             SettingsPage::General => "General",
+            SettingsPage::Fonts => "Fonts",
             SettingsPage::Mail => "Mail",
             SettingsPage::Calendar => "Calendar",
             SettingsPage::About => "About",
@@ -46,6 +55,7 @@ impl SettingsPage {
         match self {
             SettingsPage::Accounts => "user-round",
             SettingsPage::General => "settings-2",
+            SettingsPage::Fonts => "type",
             SettingsPage::Mail => "mail",
             SettingsPage::Calendar => "calendar",
             SettingsPage::About => "info",
@@ -78,6 +88,11 @@ pub struct SettingsState {
     pub work_start: Entity<InputState>,
     pub work_end: Entity<InputState>,
     pub time_zone: Entity<ComboboxState<SearchableVec<ZoneChoice>>>,
+    pub ui_font: Entity<ComboboxState<SearchableVec<FontChoice>>>,
+    pub mono_font: Entity<ComboboxState<SearchableVec<FontChoice>>>,
+    pub list_font: Entity<ComboboxState<SearchableVec<FontChoice>>>,
+    pub reading_font: Entity<ComboboxState<SearchableVec<FontChoice>>>,
+    pub compose_font: Entity<ComboboxState<SearchableVec<FontChoice>>>,
     pub caldav: Option<super::calendar_setup::CalendarSetup>,
     /// Connecting contacts for an IMAP or POP3 account.
     pub contacts: super::contacts_setup::ContactsSetup,
@@ -150,6 +165,145 @@ pub(super) fn time_zone_choices(selected: &Option<overlook_core::tz::ZoneDefinit
     }).collect()
 }
 
+#[derive(Clone)]
+pub struct FontChoice {
+    family: Option<String>,
+    title: SharedString,
+}
+
+impl SearchableListItem for FontChoice {
+    type Value = Option<String>;
+    fn title(&self) -> SharedString { self.title.clone() }
+    fn value(&self) -> &Self::Value { &self.family }
+}
+
+const PREFERRED_MONO_FONTS: &[&str] = &[
+    "SF Mono",
+    "Menlo",
+    "JetBrains Mono",
+    "Fira Code",
+    "Cascadia Code",
+    "Source Code Pro",
+    "Consolas",
+    "Monaco",
+    "DejaVu Sans Mono",
+    "Liberation Mono",
+    "Ubuntu Mono",
+    "Courier New",
+];
+
+fn installed_font_families(cx: &App) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut names: Vec<String> = cx
+        .text_system()
+        .all_font_names()
+        .into_iter()
+        .filter_map(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || trimmed.starts_with('.') {
+                return None;
+            }
+            if seen.insert(trimmed.to_ascii_lowercase()) {
+                Some(trimmed.to_owned())
+            } else {
+                None
+            }
+        })
+        .collect();
+    names.sort_by_key(|a| a.to_ascii_lowercase());
+    names
+}
+
+fn font_choices(
+    installed: &[String],
+    default_label: &str,
+    include_system_ui: bool,
+    include_inter: bool,
+    preferred_top: &[&str],
+    selected: &Option<String>,
+) -> Vec<FontChoice> {
+    let mut choices = vec![FontChoice {
+        family: None,
+        title: SharedString::from(default_label.to_owned()),
+    }];
+    let mut seen = std::collections::HashSet::new();
+    if include_system_ui {
+        choices.push(FontChoice {
+            family: Some(overlook_core::SYSTEM_UI_FONT.to_owned()),
+            title: "System UI".into(),
+        });
+        seen.insert(overlook_core::SYSTEM_UI_FONT.to_ascii_lowercase());
+    }
+    if include_inter {
+        choices.push(FontChoice {
+            family: Some(overlook_core::DEFAULT_UI_FONT.to_owned()),
+            title: overlook_core::DEFAULT_UI_FONT.into(),
+        });
+        seen.insert(overlook_core::DEFAULT_UI_FONT.to_ascii_lowercase());
+    }
+    for &wanted in preferred_top {
+        if let Some(actual) = installed.iter().find(|n| n.eq_ignore_ascii_case(wanted)) {
+            if seen.insert(actual.to_ascii_lowercase()) {
+                choices.push(FontChoice {
+                    family: Some(actual.clone()),
+                    title: SharedString::from(actual.clone()),
+                });
+            }
+        }
+    }
+    for name in installed {
+        if seen.insert(name.to_ascii_lowercase()) {
+            choices.push(FontChoice {
+                family: Some(name.clone()),
+                title: SharedString::from(name.clone()),
+            });
+        }
+    }
+    if let Some(sel) = selected.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if !choices.iter().any(|c| c.family.as_deref() == Some(sel)) {
+            let label = if sel == overlook_core::SYSTEM_UI_FONT {
+                "System UI".to_owned()
+            } else {
+                format!("{sel} (kept)")
+            };
+            choices.push(FontChoice {
+                family: Some(sel.to_owned()),
+                title: SharedString::from(label),
+            });
+        }
+    }
+    choices
+}
+
+fn font_display_name(family: Option<&str>, default_label: &str) -> String {
+    match family.map(str::trim).filter(|s| !s.is_empty()) {
+        None => default_label.to_owned(),
+        Some(overlook_core::SYSTEM_UI_FONT) => "System UI".to_owned(),
+        Some(name) => name.to_owned(),
+    }
+}
+
+fn build_font_combobox(
+    choices: Vec<FontChoice>,
+    selected: &Option<String>,
+    window: &mut Window,
+    cx: &mut Context<MailWindow>,
+) -> Entity<ComboboxState<SearchableVec<FontChoice>>> {
+    let idx = choices
+        .iter()
+        .position(|c| c.family == *selected)
+        .unwrap_or(0);
+    cx.new(|cx| {
+        ComboboxState::new(
+            SearchableVec::new(choices),
+            vec![IndexPath::default().row(idx)],
+            window,
+            cx,
+        )
+        .searchable(true)
+    })
+}
+
 impl MailWindow {
     pub(crate) fn save_prefs(&mut self, cx: &mut Context<Self>) {
         let (store, prefs) = (self.store.clone(), self.prefs.clone());
@@ -159,6 +313,9 @@ impl MailWindow {
         overlook_core::tz::set_clock_24h(self.prefs.clock_24h);
         crate::notify::set_mirror(self.prefs.omarchy_notifications);
         crate::lifecycle::set_keep_running(self.prefs.keep_running);
+        if crate::theme::current_fonts(cx) != self.prefs.fonts {
+            crate::theme::apply_fonts(&self.prefs.fonts, cx);
+        }
         self.reminders_enabled = self.prefs.event_reminders;
         self.reload(cx);
         self.share_prefs(cx);
@@ -358,6 +515,38 @@ impl MailWindow {
         let selected = zones.iter().position(|choice| choice.definition == self.prefs.time_zone).unwrap_or(0);
         let time_zone = cx.new(|cx| ComboboxState::new(SearchableVec::new(zones), vec![IndexPath::default().row(selected)], window, cx).searchable(true));
 
+        let installed_fonts = installed_font_families(cx);
+        let ui_font = build_font_combobox(
+            font_choices(&installed_fonts, "Inter (Default)", true, false, &[], &self.prefs.fonts.ui_family),
+            &self.prefs.fonts.ui_family,
+            window,
+            cx,
+        );
+        let mono_font = build_font_combobox(
+            font_choices(&installed_fonts, "System default", false, false, PREFERRED_MONO_FONTS, &self.prefs.fonts.mono_family),
+            &self.prefs.fonts.mono_family,
+            window,
+            cx,
+        );
+        let list_font = build_font_combobox(
+            font_choices(&installed_fonts, "Follow interface", true, true, &[], &self.prefs.fonts.list_family),
+            &self.prefs.fonts.list_family,
+            window,
+            cx,
+        );
+        let reading_font = build_font_combobox(
+            font_choices(&installed_fonts, "Default (Sans-serif)", true, true, &["Georgia", "Helvetica Neue", "Avenir", "Verdana"], &self.prefs.fonts.reading_family),
+            &self.prefs.fonts.reading_family,
+            window,
+            cx,
+        );
+        let compose_font = build_font_combobox(
+            font_choices(&installed_fonts, "Follow interface", true, true, &[], &self.prefs.fonts.compose_family),
+            &self.prefs.fonts.compose_family,
+            window,
+            cx,
+        );
+
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search settings"));
 
         let mut subs = Vec::new();
@@ -375,6 +564,46 @@ impl MailWindow {
         subs.push(cx.subscribe_in(&time_zone, window, |this, _, event: &ComboboxEvent<SearchableVec<ZoneChoice>>, window, cx| {
             if let ComboboxEvent::Confirm(values) = event {
                 if let Some(name) = values.first().filter(|name| **name != this.prefs.time_zone) { this.change_time_zone(name.clone(), window, cx); }
+            }
+        }));
+        subs.push(cx.subscribe_in(&ui_font, window, |this, _, event: &ComboboxEvent<SearchableVec<FontChoice>>, _window, cx| {
+            if let ComboboxEvent::Confirm(values) = event {
+                if let Some(family) = values.first().filter(|f| **f != this.prefs.fonts.ui_family) {
+                    this.prefs.fonts.ui_family = family.clone();
+                    this.save_prefs(cx);
+                }
+            }
+        }));
+        subs.push(cx.subscribe_in(&mono_font, window, |this, _, event: &ComboboxEvent<SearchableVec<FontChoice>>, _window, cx| {
+            if let ComboboxEvent::Confirm(values) = event {
+                if let Some(family) = values.first().filter(|f| **f != this.prefs.fonts.mono_family) {
+                    this.prefs.fonts.mono_family = family.clone();
+                    this.save_prefs(cx);
+                }
+            }
+        }));
+        subs.push(cx.subscribe_in(&list_font, window, |this, _, event: &ComboboxEvent<SearchableVec<FontChoice>>, _window, cx| {
+            if let ComboboxEvent::Confirm(values) = event {
+                if let Some(family) = values.first().filter(|f| **f != this.prefs.fonts.list_family) {
+                    this.prefs.fonts.list_family = family.clone();
+                    this.save_prefs(cx);
+                }
+            }
+        }));
+        subs.push(cx.subscribe_in(&reading_font, window, |this, _, event: &ComboboxEvent<SearchableVec<FontChoice>>, _window, cx| {
+            if let ComboboxEvent::Confirm(values) = event {
+                if let Some(family) = values.first().filter(|f| **f != this.prefs.fonts.reading_family) {
+                    this.prefs.fonts.reading_family = family.clone();
+                    this.save_prefs(cx);
+                }
+            }
+        }));
+        subs.push(cx.subscribe_in(&compose_font, window, |this, _, event: &ComboboxEvent<SearchableVec<FontChoice>>, _window, cx| {
+            if let ComboboxEvent::Confirm(values) = event {
+                if let Some(family) = values.first().filter(|f| **f != this.prefs.fonts.compose_family) {
+                    this.prefs.fonts.compose_family = family.clone();
+                    this.save_prefs(cx);
+                }
             }
         }));
         let for_account = acct.id.clone();
@@ -468,6 +697,11 @@ impl MailWindow {
             work_start,
             work_end,
             time_zone,
+            ui_font,
+            mono_font,
+            list_font,
+            reading_font,
+            compose_font,
             caldav,
             contacts: Default::default(),
             search,
@@ -584,7 +818,7 @@ impl MailWindow {
             .border_color(p.divider)
             .p(px(12.))
             .gap(px(2.))
-            .child(div().px(px(10.)).pt(px(6.)).pb(px(10.)).text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).child("Settings"))
+            .child(div().px(px(10.)).pt(px(6.)).pb(px(10.)).text_size(crate::ui::ui_px(18.)).font_weight(FontWeight::SEMIBOLD).child("Settings"))
             .child(div().pb(px(10.)).child(Input::new(&state.search).small().prefix(icon("search").size(px(14.)).text_color(p.muted)).cleanable(true)))
             .children(SettingsPage::ALL.iter().map(|&pg| {
                 let active = pg == page && !searching;
@@ -601,7 +835,7 @@ impl MailWindow {
                     .h(px(34.))
                     .rounded(px(7.))
                     .cursor_pointer()
-                    .text_size(px(13.))
+                    .text_size(crate::ui::ui_px(13.))
                     .text_color(if active { p.accent } else { p.foreground })
                     .font_weight(if active { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
                     .when(active, |d| d.bg(p.selection))
@@ -609,7 +843,7 @@ impl MailWindow {
                     .focus_visible(|d| d.bg(p.selection).border_1().border_color(p.accent))
                     .child(icon(pg.icon()).size(px(16.)).text_color(if active { p.accent } else { p.muted }))
                     .child(div().flex_1().child(pg.label()))
-                    .when(searching, |d| d.when(matches == 0, |d| d.opacity(0.45)).when(matches > 0, |d| d.child(div().text_size(px(11.)).text_color(p.muted).child(matches.to_string()))))
+                    .when(searching, |d| d.when(matches == 0, |d| d.opacity(0.45)).when(matches > 0, |d| d.child(div().text_size(crate::ui::ui_px(11.)).text_color(p.muted).child(matches.to_string()))))
                     .on_click(cx.listener(move |this, _, window, cx| this.open_settings_result(pg, None, window, cx)))
                     .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                         if matches!(event.keystroke.key.as_str(), "enter" | "space") && !event.keystroke.modifiers.control && !event.keystroke.modifiers.alt && !event.keystroke.modifiers.platform {
@@ -624,6 +858,7 @@ impl MailWindow {
         let content: AnyElement = if searching { self.render_settings_results(&query, &results, cx) } else { match page {
             SettingsPage::Accounts => self.render_settings_accounts(state, cx).into_any_element(),
             SettingsPage::General => self.render_settings_general(cx).into_any_element(),
+            SettingsPage::Fonts => self.render_settings_fonts(state, cx).into_any_element(),
             SettingsPage::Mail => self.render_settings_mail(state, cx).into_any_element(),
             SettingsPage::Calendar => self.render_settings_calendar(state, cx).into_any_element(),
             SettingsPage::About => self.render_settings_about(cx).into_any_element(),
@@ -690,7 +925,7 @@ impl MailWindow {
                                     .px(px(24.))
                                     .border_b_1()
                                     .border_color(p.divider)
-                                    .child(div().flex_1().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).truncate().child(title))
+                                    .child(div().flex_1().text_size(crate::ui::ui_px(16.)).font_weight(FontWeight::SEMIBOLD).truncate().child(title))
                                     .child(kbd("Esc", &p))
                                     .child(Button::new("settings-close").ghost().small().icon(icon("x").size(px(16.))).ml(px(8.)).on_click(cx.listener(|this, _, window, cx| this.close_settings(window, cx)))),
                             )
@@ -706,8 +941,8 @@ impl MailWindow {
         if results.is_empty() {
             return v_flex()
                 .gap(px(4.))
-                .child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child(format!("No settings match “{query}”.")))
-                .child(div().text_size(px(12.)).text_color(p.muted).child("Try a shorter word, such as “theme”, “signature” or “reminder”."))
+                .child(div().text_size(crate::ui::ui_px(13.)).font_weight(FontWeight::MEDIUM).child(format!("No settings match “{query}”.")))
+                .child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child("Try a shorter word, such as “theme”, “signature” or “reminder”."))
                 .into_any_element();
         }
         v_flex()
@@ -732,10 +967,10 @@ impl MailWindow {
                             .items_center()
                             .gap(px(8.))
                             .child(icon(pg.icon()).size(px(14.)).text_color(p.muted))
-                            .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child(entry.label))
-                            .child(div().flex_none().text_size(px(11.)).text_color(p.muted).child(format!("{} › {}", pg.label(), entry.section))),
+                            .child(div().flex_1().min_w_0().truncate().text_size(crate::ui::ui_px(13.)).font_weight(FontWeight::MEDIUM).child(entry.label))
+                            .child(div().flex_none().text_size(crate::ui::ui_px(11.)).text_color(p.muted).child(format!("{} › {}", pg.label(), entry.section))),
                     )
-                    .when(!entry.description.is_empty(), |d| d.child(div().pl(px(22.)).text_size(px(12.)).text_color(p.muted).truncate().child(entry.description)))
+                    .when(!entry.description.is_empty(), |d| d.child(div().pl(px(22.)).text_size(crate::ui::ui_px(12.)).text_color(p.muted).truncate().child(entry.description)))
                     .on_click(cx.listener(move |this, _, window, cx| this.open_settings_result(pg, Some(entry), window, cx)))
                     .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                         if matches!(event.keystroke.key.as_str(), "enter" | "space") && !event.keystroke.modifiers.control && !event.keystroke.modifiers.alt && !event.keystroke.modifiers.platform {
@@ -800,7 +1035,7 @@ impl MailWindow {
                 .when(active, |d| d.bg(p.selection))
                 .when(!active, |d| d.hover(|d| d.bg(p.hover)))
                 .child(owner_avatar(&Address::named(&a.display_name, &a.email), 28., &p))
-                .child(v_flex().flex_1().min_w_0().child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).truncate().child(self.account_name(&a.id))).child(div().text_size(px(11.)).text_color(p.muted).truncate().child(format!("{} · {}", a.email, self.account_kind_label(a)))))
+                .child(v_flex().flex_1().min_w_0().child(div().text_size(crate::ui::ui_px(13.)).font_weight(FontWeight::MEDIUM).truncate().child(self.account_name(&a.id))).child(div().text_size(crate::ui::ui_px(11.)).text_color(p.muted).truncate().child(format!("{} · {}", a.email, self.account_kind_label(a)))))
                 .on_click(cx.listener(move |this, _, window, cx| this.set_settings_account(id.clone(), window, cx)))
         }));
 
@@ -950,6 +1185,21 @@ impl MailWindow {
                 "",
                 choice(&[("On the right", ReadingPane::Right), ("Below the list", ReadingPane::Bottom)], self.reading_pane, cx, |this, v, _w, cx| this.set_reading_pane(v, cx)),
             ))
+            .child(setting_row(
+                "Fonts and text size",
+                &format!(
+                    "{} · {} px interface, {} px reading",
+                    font_display_name(prefs.fonts.ui_family.as_deref(), "Inter"),
+                    prefs.fonts.clamped_ui_size(),
+                    prefs.fonts.clamped_reading_size(),
+                ),
+                Button::new("settings-open-fonts")
+                    .small()
+                    .icon(icon("type").size(px(14.)))
+                    .label("Customize…")
+                    .on_click(cx.listener(|this, _, window, cx| this.open_settings_result(SettingsPage::Fonts, None, window, cx)))
+                    .into_any_element(),
+            ))
             .child(section("Start-up and time", None))
             .child(setting_row(
                 "Time zone",
@@ -1039,6 +1289,305 @@ impl MailWindow {
                     this.prefs.sync_interval_secs = v;
                     this.save_prefs(cx);
                 }),
+            ))
+    }
+
+    fn reset_fonts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.prefs.fonts = FontPrefs::default();
+        if let Some(state) = self.settings.as_ref() {
+            let pickers = [
+                state.ui_font.clone(),
+                state.mono_font.clone(),
+                state.list_font.clone(),
+                state.reading_font.clone(),
+                state.compose_font.clone(),
+            ];
+            for picker in pickers {
+                picker.update(cx, |cb, cx| {
+                    cb.set_selected_indices(vec![IndexPath::default().row(0)], window, cx);
+                });
+            }
+        }
+        self.save_prefs(cx);
+    }
+
+    fn render_settings_fonts(&self, state: &SettingsState, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = *cx.palette();
+        let fonts = self.prefs.fonts.clone();
+        let is_default = fonts == FontPrefs::default();
+        let font_combo = |picker: &Entity<ComboboxState<SearchableVec<FontChoice>>>, placeholder: &'static str| {
+            Combobox::new(picker)
+                .small()
+                .w(px(260.))
+                .placeholder(placeholder)
+                .menu_width(px(300.))
+                .menu_max_h(px(280.))
+                .search_placeholder("Search installed fonts")
+                .into_any_element()
+        };
+
+        let ui_size = fonts.clamped_ui_size();
+        let mono_size = fonts.clamped_mono_size();
+        let reading_size = fonts.clamped_reading_size();
+        let compose_size = fonts.clamped_compose_size();
+        let list_family = SharedString::from(fonts.effective_list_family().to_owned());
+        let list_scale = fonts.list_scale();
+        let reading_family = SharedString::from(fonts.effective_native_reading_family().to_owned());
+        let reading_preview_px = fonts.native_reading_size();
+        let compose_family = SharedString::from(fonts.effective_compose_family().to_owned());
+        let mono_family = cx.theme().mono_font_family.clone();
+
+        let preview = v_flex()
+            .gap(px(10.))
+            .p(px(14.))
+            .rounded(px(10.))
+            .border_1()
+            .border_color(p.divider)
+            .bg(p.surface)
+            .child(
+                v_flex()
+                    .gap(px(3.))
+                    .p(px(10.))
+                    .rounded(px(7.))
+                    .bg(p.list_surface())
+                    .border_1()
+                    .border_color(p.divider)
+                    .font_family(list_family)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px((13. * list_scale * 2.).round() / 2.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.foreground)
+                                    .child("Maya Chen"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px((11. * list_scale * 2.).round() / 2.))
+                                    .text_color(p.accent)
+                                    .child("10:42 AM"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px((13. * list_scale * 2.).round() / 2.))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(p.foreground)
+                            .child("Quarterly design review notes"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px((12. * list_scale * 2.).round() / 2.))
+                            .text_color(p.muted)
+                            .child("Message list preview — scales with your interface or message list font."),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap(px(6.))
+                    .p(px(12.))
+                    .rounded(px(7.))
+                    .bg(rgb(crate::theme::EMAIL_PAPER))
+                    .text_color(rgb(crate::theme::EMAIL_INK))
+                    .border_1()
+                    .border_color(p.divider)
+                    .child(
+                        div()
+                            .font_family(reading_family)
+                            .text_size(px(reading_preview_px))
+                            .line_height(px((reading_preview_px * 1.45).round()))
+                            .child("Reading email preview: The quick brown fox jumps over the lazy dog — 0123456789."),
+                    )
+                    .child(
+                        div()
+                            .font_family(mono_family)
+                            .text_size(px(f32::from(mono_size)))
+                            .px(px(6.))
+                            .py(px(3.))
+                            .rounded(px(4.))
+                            .bg(rgb(0xF2F4F7))
+                            .child("Monospace: git commit -m \"Update typography\""),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap(px(4.))
+                    .p(px(10.))
+                    .rounded(px(7.))
+                    .bg(p.message_surface())
+                    .border_1()
+                    .border_color(p.divider)
+                    .child(
+                        div()
+                            .text_size(crate::ui::ui_px(11.))
+                            .text_color(p.muted)
+                            .child("Compose editor"),
+                    )
+                    .child(
+                        div()
+                            .font_family(compose_family)
+                            .text_size(px(f32::from(compose_size)))
+                            .line_height(px((f32::from(compose_size) * 1.45).round()))
+                            .text_color(p.foreground)
+                            .child("Hi Maya, thanks for sending those notes over — everything looks great."),
+                    ),
+            );
+
+        v_flex()
+            .gap(px(22.))
+            .child(section("Preview", Some("Changes apply across every window immediately.")))
+            .child(preview)
+            .child(section("Interface", Some("Controls the sidebar, toolbars, calendar, contacts, dialogs, and controls throughout Overlook.")))
+            .child(setting_row(
+                "Interface font",
+                "Typeface used across the application interface.",
+                font_combo(&state.ui_font, "Inter (Default)"),
+            ))
+            .child(setting_row(
+                "Interface text size",
+                "Scales text throughout menus, sidebars, headers, calendar, and settings.",
+                size_stepper(
+                    "font-ui-size",
+                    ui_size,
+                    FontPrefs::MIN_UI_SIZE,
+                    FontPrefs::MAX_UI_SIZE,
+                    FontPrefs::DEFAULT_UI_SIZE,
+                    &[11, 12, 13, 14, 15, 16, 18, 20],
+                    cx,
+                    |this, v, cx| {
+                        this.prefs.fonts.ui_size = v;
+                        this.save_prefs(cx);
+                    },
+                ),
+            ))
+            .child(setting_row(
+                "Monospace font",
+                "Used for code blocks, inline code, and the HTML signature editor.",
+                font_combo(&state.mono_font, "System default"),
+            ))
+            .child(setting_row(
+                "Monospace text size",
+                "Base size for fixed-width text and HTML source.",
+                size_stepper(
+                    "font-mono-size",
+                    mono_size,
+                    FontPrefs::MIN_MONO_SIZE,
+                    FontPrefs::MAX_MONO_SIZE,
+                    FontPrefs::DEFAULT_MONO_SIZE,
+                    &[10, 11, 12, 13, 14, 15, 16, 18, 20],
+                    cx,
+                    |this, v, cx| {
+                        this.prefs.fonts.mono_size = v;
+                        this.save_prefs(cx);
+                    },
+                ),
+            ))
+            .child(section("Message list", Some("Customize the conversation list independently, or let it follow your interface settings.")))
+            .child(setting_row(
+                "Message list font",
+                "Typeface for sender names, subjects, and snippets in the list.",
+                font_combo(&state.list_font, "Follow interface"),
+            ))
+            .child(setting_row(
+                "Message list text size",
+                "Leave on Follow interface to scale with the rest of the app, or pick a dedicated size.",
+                optional_size_stepper(
+                    "font-list-size",
+                    fonts.list_size,
+                    ((f32::from(FontPrefs::DEFAULT_LIST_SIZE) * f32::from(ui_size) / f32::from(FontPrefs::DEFAULT_UI_SIZE)).round() as u8)
+                        .clamp(FontPrefs::MIN_LIST_SIZE, FontPrefs::MAX_LIST_SIZE),
+                    FontPrefs::MIN_LIST_SIZE,
+                    FontPrefs::MAX_LIST_SIZE,
+                    &[11, 12, 13, 14, 15, 16, 18, 20],
+                    cx,
+                    |this, v, cx| {
+                        this.prefs.fonts.list_size = v;
+                        this.save_prefs(cx);
+                    },
+                ),
+            ))
+            .child(section("Reading emails", Some("Applies to both HTML messages and plain-text messages in the reading pane and email modal.")))
+            .child(setting_row(
+                "Reading font",
+                "Default typeface for opening messages.",
+                font_combo(&state.reading_font, "Default (Sans-serif)"),
+            ))
+            .child(setting_row(
+                "Reading text size",
+                "Base text size for reading emails.",
+                size_stepper(
+                    "font-reading-size",
+                    reading_size,
+                    12,
+                    FontPrefs::MAX_EMAIL_SIZE,
+                    FontPrefs::DEFAULT_READING_SIZE,
+                    &[12, 13, 14, 15, 16, 18, 20, 22, 24, 28],
+                    cx,
+                    |this, v, cx| {
+                        this.prefs.fonts.reading_size = v;
+                        this.save_prefs(cx);
+                    },
+                ),
+            ))
+            .child(setting_row(
+                "Use my reading font for all emails",
+                "Override sender-specified font families and enforce your reading size inside HTML emails too.",
+                Switch::new("pref-override-email-fonts")
+                    .checked(fonts.override_email_fonts)
+                    .on_click(cx.listener(|this, checked: &bool, _w, cx| {
+                        this.prefs.fonts.override_email_fonts = *checked;
+                        this.save_prefs(cx);
+                    }))
+                    .into_any_element(),
+            ))
+            .child(section("Composing emails", Some("Controls the composer editor and, optionally, the font sent in outgoing HTML mail.")))
+            .child(setting_row(
+                "Compose font",
+                "Typeface while writing new messages and replies.",
+                font_combo(&state.compose_font, "Follow interface"),
+            ))
+            .child(setting_row(
+                "Compose text size",
+                "Text size in the compose editor.",
+                size_stepper(
+                    "font-compose-size",
+                    compose_size,
+                    FontPrefs::MIN_EMAIL_SIZE,
+                    FontPrefs::MAX_EMAIL_SIZE,
+                    FontPrefs::DEFAULT_COMPOSE_SIZE,
+                    &[11, 12, 13, 14, 15, 16, 18, 20, 22, 24],
+                    cx,
+                    |this, v, cx| {
+                        this.prefs.fonts.compose_size = v;
+                        this.save_prefs(cx);
+                    },
+                ),
+            ))
+            .child(setting_row(
+                "Include font in sent emails",
+                "Wrap outgoing HTML messages in your chosen compose font and size so recipients see them too.",
+                Switch::new("pref-style-outgoing-mail")
+                    .checked(fonts.style_outgoing_mail)
+                    .on_click(cx.listener(|this, checked: &bool, _w, cx| {
+                        this.prefs.fonts.style_outgoing_mail = *checked;
+                        this.save_prefs(cx);
+                    }))
+                    .into_any_element(),
+            ))
+            .child(section("Reset", None))
+            .child(setting_row(
+                "Reset fonts to defaults",
+                "Restore Inter (14 px) for the interface and default email reading and compose typography.",
+                Button::new("settings-reset-fonts")
+                    .small()
+                    .icon(icon("rotate-ccw").size(px(14.)))
+                    .label("Reset to defaults")
+                    .disabled(is_default)
+                    .on_click(cx.listener(|this, _, window, cx| this.reset_fonts(window, cx)))
+                    .into_any_element(),
             ))
     }
 
@@ -1198,8 +1747,8 @@ impl MailWindow {
                     .child(
                         v_flex()
                             .child(div().font_family("Source Serif 4 Display").text_size(px(26.)).child("Overlook"))
-                            .child(div().text_size(px(13.)).text_color(p.muted).child("A clear view of what matters. Thoughtfully made for Linux."))
-                            .child(div().text_size(px(12.)).text_color(p.muted).child(format!("Version {} · by Last Refuge", env!("CARGO_PKG_VERSION")))),
+                            .child(div().text_size(crate::ui::ui_px(13.)).text_color(p.muted).child("A clear view of what matters. Thoughtfully made for Linux."))
+                            .child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(format!("Version {} · by Last Refuge", env!("CARGO_PKG_VERSION")))),
                     ),
             )
             .child(section("Updates", None))
@@ -1243,7 +1792,7 @@ impl MailWindow {
             .child(setting_row("Microsoft app registration", &microsoft_config, div().into_any_element()))
             .child(setting_row("Sign-in tokens", if cfg!(target_os = "macos") { "Stored in Apple Keychain." } else { "Stored in the system keyring." }, div().into_any_element()))
             .child(section("Keyboard", None))
-            .child(div().text_size(px(12.)).text_color(p.muted).line_height(px(20.)).child(
+            .child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).line_height(crate::ui::ui_px(20.)).child(
                 "Ctrl N new message · Ctrl E search · Ctrl R reply · Ctrl Shift R reply all · Ctrl F forward · Ctrl Enter send · Ctrl U toggle read · J/K move · E archive or move to Inbox · Delete · S star · Ctrl 1 Mail · Ctrl 2 Calendar · Ctrl Shift A new event · Ctrl , settings · Ctrl Q quit · in settings: Ctrl F or F3 search · in the calendar: ← → T D W M A",
             ))
     }
@@ -1343,10 +1892,10 @@ impl MailWindow {
             .into_any_element()];
         }
         if state.vacation_loading {
-            return vec![div().text_size(px(12.)).text_color(p.muted).child("Loading…").into_any_element()];
+            return vec![div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child("Loading…").into_any_element()];
         }
         let Some(v) = state.vacation.clone() else {
-            return vec![div().text_size(px(12.)).text_color(p.muted).child(state.vacation_note.clone().unwrap_or_else(|| "Automatic replies could not be loaded.".into())).into_any_element()];
+            return vec![div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(state.vacation_note.clone().unwrap_or_else(|| "Automatic replies could not be loaded.".into())).into_any_element()];
         };
         let acct_id = account.id.clone();
         vec![
@@ -1383,7 +1932,7 @@ impl MailWindow {
                 .items_center()
                 .gap(px(10.))
                 .child(Button::new("vacation-save").primary().small().label("Save automatic replies").on_click(cx.listener(move |this, _, window, cx| this.save_vacation(acct_id.clone(), window, cx))))
-                .children(state.vacation_note.clone().map(|n| div().text_size(px(12.)).text_color(p.muted).child(n)))
+                .children(state.vacation_note.clone().map(|n| div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(n)))
                 .into_any_element(),
         ]
     }
@@ -1393,8 +1942,8 @@ pub(super) fn section(title: &str, description: Option<&str>) -> Div {
     div().child(scroll_target(title, v_flex()
         .gap(px(2.))
         .pt(px(6.))
-        .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child(title.to_owned()))
-        .children(description.map(|d| div().text_size(px(12.)).child(d.to_owned()).opacity(0.7)))))
+        .child(div().text_size(crate::ui::ui_px(14.)).font_weight(FontWeight::SEMIBOLD).child(title.to_owned()))
+        .children(description.map(|d| div().text_size(crate::ui::ui_px(12.)).child(d.to_owned()).opacity(0.7)))))
 }
 
 pub(super) fn setting_row(label: &str, description: &str, control: AnyElement) -> Div {
@@ -1406,8 +1955,8 @@ pub(super) fn setting_row(label: &str, description: &str, control: AnyElement) -
                 .flex_1()
                 .min_w_0()
                 .gap(px(2.))
-                .child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child(label.to_owned()))
-                .when(!description.is_empty(), |d| d.child(div().text_size(px(12.)).opacity(0.7).child(description.to_owned()))),
+                .child(div().text_size(crate::ui::ui_px(13.)).font_weight(FontWeight::MEDIUM).child(label.to_owned()))
+                .when(!description.is_empty(), |d| d.child(div().text_size(crate::ui::ui_px(12.)).opacity(0.7).child(description.to_owned()))),
         )
         .child(div().flex_none().child(control))))
 }
@@ -1430,6 +1979,153 @@ fn choice<T: Copy + PartialEq + 'static>(
             segment(SharedString::from(format!("choice-{label}")), *label, value == current, &p)
                 .on_click(cx.listener(move |this, _, window, cx| on_select(this, value, window, cx)))
         }))
+        .into_any_element()
+}
+
+/// Compact `−` / dropdown / `+` pixel size stepper for font size controls.
+#[allow(clippy::too_many_arguments)]
+fn size_stepper(
+    id: &'static str,
+    current: u8,
+    min: u8,
+    max: u8,
+    default: u8,
+    presets: &'static [u8],
+    cx: &mut Context<MailWindow>,
+    on_change: impl Fn(&mut MailWindow, u8, &mut Context<MailWindow>) + 'static,
+) -> AnyElement {
+    let on_change = std::rc::Rc::new(on_change);
+    let me = cx.entity().downgrade();
+    let dec = on_change.clone();
+    let inc = on_change.clone();
+    let menu_cb = on_change;
+    h_flex()
+        .items_center()
+        .gap(px(4.))
+        .child(
+            Button::new(SharedString::from(format!("{id}-dec")))
+                .small()
+                .icon(icon("minus").size(px(13.)))
+                .tooltip("Decrease text size")
+                .disabled(current <= min)
+                .on_click(cx.listener(move |this, _, _w, cx| {
+                    dec(this, current.saturating_sub(1).max(min), cx);
+                })),
+        )
+        .child(
+            Button::new(SharedString::from(format!("{id}-val")))
+                .small()
+                .label(format!("{current} px"))
+                .dropdown_caret(true)
+                .dropdown_menu(move |mut menu, _window, _cx| {
+                    for &size in presets {
+                        let me = me.clone();
+                        let cb = menu_cb.clone();
+                        let label = if size == default {
+                            format!("{size} px (Default)")
+                        } else {
+                            format!("{size} px")
+                        };
+                        menu = menu.item(
+                            PopupMenuItem::new(label)
+                                .checked(size == current)
+                                .on_click(move |_, _w, cx| {
+                                    me.update(cx, |this, cx| cb(this, size, cx)).ok();
+                                }),
+                        );
+                    }
+                    menu
+                }),
+        )
+        .child(
+            Button::new(SharedString::from(format!("{id}-inc")))
+                .small()
+                .icon(icon("plus").size(px(13.)))
+                .tooltip("Increase text size")
+                .disabled(current >= max)
+                .on_click(cx.listener(move |this, _, _w, cx| {
+                    inc(this, current.saturating_add(1).min(max), cx);
+                })),
+        )
+        .into_any_element()
+}
+
+/// Optional size stepper where `None` means "Follow interface".
+#[allow(clippy::too_many_arguments)]
+fn optional_size_stepper(
+    id: &'static str,
+    current: Option<u8>,
+    inherited: u8,
+    min: u8,
+    max: u8,
+    presets: &'static [u8],
+    cx: &mut Context<MailWindow>,
+    on_change: impl Fn(&mut MailWindow, Option<u8>, &mut Context<MailWindow>) + 'static,
+) -> AnyElement {
+    let effective = current.unwrap_or(inherited).clamp(min, max);
+    let label = match current {
+        Some(size) => format!("{size} px"),
+        None => format!("Follow interface ({effective} px)"),
+    };
+    let on_change = std::rc::Rc::new(on_change);
+    let me = cx.entity().downgrade();
+    let dec = on_change.clone();
+    let inc = on_change.clone();
+    let menu_cb = on_change;
+    h_flex()
+        .items_center()
+        .gap(px(4.))
+        .child(
+            Button::new(SharedString::from(format!("{id}-dec")))
+                .small()
+                .icon(icon("minus").size(px(13.)))
+                .tooltip("Decrease text size")
+                .disabled(effective <= min)
+                .on_click(cx.listener(move |this, _, _w, cx| {
+                    dec(this, Some(effective.saturating_sub(1).max(min)), cx);
+                })),
+        )
+        .child(
+            Button::new(SharedString::from(format!("{id}-val")))
+                .small()
+                .label(label)
+                .dropdown_caret(true)
+                .dropdown_menu(move |mut menu, _window, _cx| {
+                    let me_auto = me.clone();
+                    let cb_auto = menu_cb.clone();
+                    menu = menu
+                        .item(
+                            PopupMenuItem::new(format!("Follow interface ({inherited} px)"))
+                                .checked(current.is_none())
+                                .on_click(move |_, _w, cx| {
+                                    me_auto.update(cx, |this, cx| cb_auto(this, None, cx)).ok();
+                                }),
+                        )
+                        .separator();
+                    for &size in presets {
+                        let me = me.clone();
+                        let cb = menu_cb.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(format!("{size} px"))
+                                .checked(current == Some(size))
+                                .on_click(move |_, _w, cx| {
+                                    me.update(cx, |this, cx| cb(this, Some(size), cx)).ok();
+                                }),
+                        );
+                    }
+                    menu
+                }),
+        )
+        .child(
+            Button::new(SharedString::from(format!("{id}-inc")))
+                .small()
+                .icon(icon("plus").size(px(13.)))
+                .tooltip("Increase text size")
+                .disabled(effective >= max)
+                .on_click(cx.listener(move |this, _, _w, cx| {
+                    inc(this, Some(effective.saturating_add(1).min(max)), cx);
+                })),
+        )
         .into_any_element()
 }
 
@@ -1463,7 +2159,7 @@ const fn entry(page: SettingsPage, section: &'static str, label: &'static str, d
     SettingEntry { page, section, label, description, keywords }
 }
 
-use SettingsPage::{About as AB, Accounts as AC, Calendar as CA, General as GE, Mail as MA};
+use SettingsPage::{About as AB, Accounts as AC, Calendar as CA, Fonts as FO, General as GE, Mail as MA};
 
 pub(crate) static SETTINGS_INDEX: &[SettingEntry] = &[
     entry(AC, "Your accounts", "Add account", "Mail and calendar accounts on this device.", "gmail imap pop3 new"),
@@ -1482,6 +2178,20 @@ pub(crate) static SETTINGS_INDEX: &[SettingEntry] = &[
     entry(GE, "Appearance", "Theme", "Follow system picks Light or Dark from your desktop setting.", "dark light mode appearance colors omarchy"),
     entry(GE, "Appearance", "Density", "Compact fits more messages on screen.", "compact comfortable spacing"),
     entry(GE, "Appearance", "Reading pane", "On the right or below the list.", "layout preview pane bottom right"),
+    entry(GE, "Appearance", "Fonts and text size", "Customize fonts and text sizes across Overlook.", "typography typeface font size zoom scale"),
+    entry(FO, "Interface", "Interface font", "Typeface used across the application interface.", "typography ui app family font"),
+    entry(FO, "Interface", "Interface text size", "Scales text throughout menus, sidebars, headers, calendar, and settings.", "font size zoom scale ui app larger smaller"),
+    entry(FO, "Interface", "Monospace font", "Used for code blocks, inline code, and the HTML signature editor.", "fixed width code font family"),
+    entry(FO, "Interface", "Monospace text size", "Base size for fixed-width text and HTML source.", "code font size"),
+    entry(FO, "Message list", "Message list font", "Typeface for sender names, subjects, and snippets in the list.", "inbox list font family"),
+    entry(FO, "Message list", "Message list text size", "Scale with the interface or pick a dedicated size for the list.", "inbox list font size"),
+    entry(FO, "Reading emails", "Reading font", "Default typeface for opening messages.", "email body message font family"),
+    entry(FO, "Reading emails", "Reading text size", "Base text size for reading emails.", "email body message font size zoom larger smaller"),
+    entry(FO, "Reading emails", "Use my reading font for all emails", "Override sender-specified font families and enforce your reading size inside HTML emails.", "override force html sender font size"),
+    entry(FO, "Composing emails", "Compose font", "Typeface while writing new messages and replies.", "editor write reply font family"),
+    entry(FO, "Composing emails", "Compose text size", "Text size in the compose editor.", "editor write reply font size"),
+    entry(FO, "Composing emails", "Include font in sent emails", "Wrap outgoing HTML messages in your chosen compose font and size.", "outgoing html style font send"),
+    entry(FO, "Reset", "Reset fonts to defaults", "Restore default fonts and text sizes.", "reset typography defaults"),
     entry(GE, "Start-up and time", "Time zone", "Follow the system or choose a zone.", "timezone tz city"),
     entry(GE, "Start-up and time", "Open Overlook in", "Mail, Calendar, or the last used module.", "startup launch start"),
     entry(GE, "Start-up and time", "Time format", "12-hour or 24-hour clock.", "clock 24h 12h am pm"),
@@ -1570,5 +2280,27 @@ mod search_tests {
     fn label_matches_rank_first() {
         let hits = search_settings("reminder");
         assert!(hits[0].label.to_lowercase().contains("reminder"));
+    }
+
+    #[test]
+    fn font_settings_are_searchable_and_font_choices_keep_unknown_selection() {
+        let hits = search_settings("reading font");
+        assert!(hits.iter().any(|e| e.page == SettingsPage::Fonts && e.label == "Reading font"));
+        assert!(search_settings("monospace").iter().any(|e| e.page == SettingsPage::Fonts && e.label == "Monospace font"));
+        assert!(search_settings("compose size").iter().any(|e| e.page == SettingsPage::Fonts && e.label == "Compose text size"));
+
+        let installed = vec!["Arial".to_owned(), "Georgia".to_owned(), "Menlo".to_owned()];
+        let choices = super::font_choices(
+            &installed,
+            "Inter (Default)",
+            true,
+            false,
+            &[],
+            &Some("CustomFont".to_owned()),
+        );
+        assert_eq!(choices[0].family, None);
+        assert_eq!(choices[1].family.as_deref(), Some(overlook_core::SYSTEM_UI_FONT));
+        assert!(choices.iter().any(|c| c.family.as_deref() == Some("Georgia")));
+        assert!(choices.iter().any(|c| c.family.as_deref() == Some("CustomFont") && c.title.contains("(kept)")));
     }
 }

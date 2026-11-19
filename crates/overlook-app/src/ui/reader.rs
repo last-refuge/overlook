@@ -88,6 +88,10 @@ impl MailWindow {
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         source.hash(&mut hash);
         allow_remote.hash(&mut hash);
+        self.prefs.fonts.reading_family.hash(&mut hash);
+        self.prefs.fonts.reading_size.hash(&mut hash);
+        self.prefs.fonts.mono_family.hash(&mut hash);
+        self.prefs.fonts.override_email_fonts.hash(&mut hash);
         // App-theme switches do not change the document or invalidate its light-paper tiles.
         if source.as_bytes().windows(4).any(|chunk| chunk.eq_ignore_ascii_case(b"cid:")) {
             if let Some(m) = original {
@@ -172,7 +176,7 @@ impl MailWindow {
     /// The document Chromium renders for a body: prepared, with inline images resolved.
     /// Opening and pre-rendering must agree on it exactly to share a finished render.
     pub(super) fn browser_document(&self, source: &str, original: Option<&Message>, palette: &crate::theme::Palette) -> (String, usize) {
-        let mut doc = palette.prepare_browser_document(source);
+        let mut doc = palette.prepare_browser_document_with_fonts(source, &self.prefs.fonts);
         if let Some(m) = original { doc.html = self.resolve_inline_images(m, doc.html); }
         (doc.html, doc.remote_resources)
     }
@@ -193,6 +197,8 @@ impl MailWindow {
             id: SharedString::from(format!("text-{}", m.id)),
             html: plain_text_html(text).into(),
             has_content: !text.trim().is_empty(),
+            font_family: SharedString::from(self.prefs.fonts.effective_native_reading_family().to_owned()),
+            font_size: self.prefs.fonts.native_reading_size(),
         })
         .into_any_element()
     }
@@ -226,12 +232,12 @@ impl MailWindow {
                         .justify_center()
                         .gap(px(8.))
                         .child(svg().path("overlook/symbolic.svg").size(px(44.)).text_color(p.divider))
-                        .child(div().text_size(px(15.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child(format!("{n} conversations selected")))
+                        .child(div().text_size(crate::ui::ui_px(15.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child(format!("{n} conversations selected")))
                         .child(
                             h_flex()
                                 .gap(px(6.))
                                 .items_center()
-                                .text_size(px(12.))
+                                .text_size(crate::ui::ui_px(12.))
                                 .text_color(p.muted)
                                 .child(kbd("E", &p))
                                 .child("archive")
@@ -255,12 +261,12 @@ impl MailWindow {
                         .justify_center()
                         .gap(px(8.))
                         .child(svg().path("overlook/symbolic.svg").size(px(44.)).text_color(p.divider))
-                        .child(div().text_size(px(15.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child("Select a conversation to read it here."))
+                        .child(div().text_size(crate::ui::ui_px(15.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child("Select a conversation to read it here."))
                         .child(
                             h_flex()
                                 .gap(px(6.))
                                 .items_center()
-                                .text_size(px(12.))
+                                .text_size(crate::ui::ui_px(12.))
                                 .text_color(p.muted)
                                 .child(kbd("J", &p))
                                 .child(kbd("K", &p))
@@ -296,8 +302,8 @@ impl MailWindow {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .text_size(px(24.))
-                            .line_height(px(32.))
+                            .text_size(crate::ui::ui_px(24.))
+                            .line_height(crate::ui::ui_px(32.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(summary.subject.clone()),
                     )
@@ -320,7 +326,7 @@ impl MailWindow {
                     .items_center()
                     .flex_wrap()
                     .gap(px(8.))
-                    .text_size(px(12.))
+                    .text_size(crate::ui::ui_px(12.))
                     .text_color(p.muted)
                     .children(labels.into_iter().map(|(name, color)| {
                         h_flex()
@@ -494,7 +500,7 @@ impl MailWindow {
                     .bg(p.message_surface())
                     .shadow_xs()
                     .cursor_text()
-                    .text_size(px(14.))
+                    .text_size(crate::ui::ui_px(14.))
                     .text_color(p.muted)
                     .hover(|d| d.border_color(p.control_border))
                     .child(icon(if all { "reply-all" } else { "reply" }).size(px(16.)).text_color(p.accent))
@@ -535,14 +541,14 @@ impl MailWindow {
                     .flex_none()
                     .w(px(130.))
                     .truncate()
-                    .text_size(px(13.))
+                    .text_size(crate::ui::ui_px(13.))
                     .font_weight(if m.is_read { FontWeight::MEDIUM } else { FontWeight::BOLD })
                     .child(who.display_name()),
             )
-            .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).text_color(p.muted).child(m.snippet.clone()))
+            .child(div().flex_1().min_w_0().truncate().text_size(crate::ui::ui_px(13.)).text_color(p.muted).child(m.snippet.clone()))
             .when(m.attachments.iter().any(|a| !embedded_in_body(a, &m.body)), |d| d.child(icon("paperclip").size(px(13.)).text_color(p.muted)))
             .when(m.is_starred, |d| d.child(icon("star").size(px(13.)).text_color(p.warning)))
-            .child(div().id(SharedString::from(format!("message-date-{}", m.id))).flex_none().text_size(px(11.)).text_color(p.muted).child(format!("{} · {}", overlook_core::tz::zoned(m.date).strftime("%b %-d"), overlook_core::tz::format_clock(m.date))).tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(full_date.clone()).build(window, cx)))
+            .child(div().id(SharedString::from(format!("message-date-{}", m.id))).flex_none().text_size(crate::ui::ui_px(11.)).text_color(p.muted).child(format!("{} · {}", overlook_core::tz::zoned(m.date).strftime("%b %-d"), overlook_core::tz::format_clock(m.date))).tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(full_date.clone()).build(window, cx)))
             .on_click(cx.listener(move |this, _, _window, cx| {
                 if !this.expanded.insert(id.clone()) {
                     this.expanded.remove(&id);
@@ -604,11 +610,11 @@ impl MailWindow {
                                     .flex_wrap()
                                     .items_baseline()
                                     .gap(px(6.))
-                                    .text_size(px(14.))
+                                    .text_size(crate::ui::ui_px(14.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .hover(|d| d.text_color(p.accent))
                                     .child(who.display_name())
-                                    .when(!sender_email.eq_ignore_ascii_case(&who.display_name()), |d| d.child(div().text_size(px(12.)).font_weight(FontWeight::NORMAL).text_color(p.muted).child(format!("<{sender_email}>"))));
+                                    .when(!sender_email.eq_ignore_ascii_case(&who.display_name()), |d| d.child(div().text_size(crate::ui::ui_px(12.)).font_weight(FontWeight::NORMAL).text_color(p.muted).child(format!("<{sender_email}>"))));
                                 self.contact_trigger("from", &m.id, &who, sender, cx)
                             })
                             .child(self.render_recipients(m, cx)),
@@ -616,7 +622,7 @@ impl MailWindow {
                     // When it was sent, over the message's own commands: reply, reply all,
                     // forward, and the rest in a menu, joined in one segmented group.
                     .child(v_flex().items_end().gap(px(6.))
-                        .child(div().text_size(px(12.)).text_color(p.muted).child(format!("{} · {}", overlook_core::tz::zoned(m.date).strftime("%b %-d, %Y"), overlook_core::tz::format_clock(m.date))))
+                        .child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(format!("{} · {}", overlook_core::tz::zoned(m.date).strftime("%b %-d, %Y"), overlook_core::tz::format_clock(m.date))))
                         .child(h_flex()
                             .items_center()
                             .rounded(px(8.))
@@ -666,7 +672,7 @@ impl MailWindow {
                         .py(px(10.))
                         .rounded(px(8.))
                         .bg(p.chip)
-                        .text_size(px(12.))
+                        .text_size(crate::ui::ui_px(12.))
                         .text_color(p.muted)
                         .child(if self.bodies_loading.contains(&m.id) {
                             "Downloading this message…"
@@ -687,7 +693,7 @@ impl MailWindow {
                         .py(px(8.))
                         .rounded(px(8.))
                         .bg(p.chip)
-                        .text_size(px(12.))
+                        .text_size(crate::ui::ui_px(12.))
                         .text_color(p.muted)
                         .child(icon("image-off").size(px(14.)).text_color(p.muted))
                         .child(format!(
@@ -721,7 +727,7 @@ impl MailWindow {
                             h_flex()
                                 .items_center()
                                 .gap(px(10.))
-                                .text_size(px(12.))
+                                .text_size(crate::ui::ui_px(12.))
                                 .text_color(p.muted)
                                 .child(div().font_weight(FontWeight::MEDIUM).text_color(p.foreground).child(format!("{} attachment{}", attachments.len(), if attachments.len() == 1 { "" } else { "s" })))
                                 .child(human_size(total))
@@ -836,9 +842,9 @@ impl MailWindow {
         let is_pdf = a.is_pdf();
         let page_count = ql.pages.len();
         let content: AnyElement = if ql.rendering {
-            div().text_color(gpui_kit::white()).text_size(px(14.)).child("Rendering pages…").into_any_element()
+            div().text_color(gpui_kit::white()).text_size(crate::ui::ui_px(14.)).child("Rendering pages…").into_any_element()
         } else if let Some(e) = &ql.error {
-            div().text_color(gpui_kit::white()).text_size(px(14.)).child(e.clone()).into_any_element()
+            div().text_color(gpui_kit::white()).text_size(crate::ui::ui_px(14.)).child(e.clone()).into_any_element()
         } else if is_pdf {
             div()
                 .id("quick-look-pages")
@@ -858,7 +864,7 @@ impl MailWindow {
                         .child(img(page.clone()).w_full().object_fit(ObjectFit::Contain))
                         .id(SharedString::from(format!("pdf-page-{i}")))
                 }))
-                .when(page_count >= crate::pdf_preview::MAX_PAGES, |d| d.child(div().text_color(gpui_kit::white()).text_size(px(12.)).opacity(0.7).child(format!("Showing the first {page_count} pages. Open the file for the rest."))))
+                .when(page_count >= crate::pdf_preview::MAX_PAGES, |d| d.child(div().text_color(gpui_kit::white()).text_size(crate::ui::ui_px(12.)).opacity(0.7).child(format!("Showing the first {page_count} pages. Open the file for the rest."))))
                 .into_any_element()
         } else {
             match ql.pages.first() {
@@ -889,8 +895,8 @@ impl MailWindow {
                     .h(px(52.))
                     .text_color(gpui_kit::white())
                     .child(icon(if is_pdf { "file-text" } else { "image" }).size(px(16.)).text_color(gpui_kit::white()))
-                    .child(div().flex_1().truncate().text_size(px(14.)).font_weight(FontWeight::MEDIUM).child(a.filename.clone()))
-                    .child(div().text_size(px(12.)).opacity(0.7).child(if is_pdf && page_count > 0 { format!("{} · {} page{}", a.human_size(), page_count, if page_count == 1 { "" } else { "s" }) } else { a.human_size() }))
+                    .child(div().flex_1().truncate().text_size(crate::ui::ui_px(14.)).font_weight(FontWeight::MEDIUM).child(a.filename.clone()))
+                    .child(div().text_size(crate::ui::ui_px(12.)).opacity(0.7).child(if is_pdf && page_count > 0 { format!("{} · {} page{}", a.human_size(), page_count, if page_count == 1 { "" } else { "s" }) } else { a.human_size() }))
                     .child(Button::new("ql-open").ghost().small().icon(icon("external-link").size(px(15.))).label("Open").on_click(cx.listener(move |_this, _, window, cx| {
                         cx.stop_propagation();
                         if let Some(path) = open.local_path.as_deref() {
@@ -1003,12 +1009,12 @@ impl MailWindow {
                         v_flex()
                             .flex_1()
                             .min_w_0()
-                            .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child(title))
-                            .when(!when.is_empty(), |d| d.child(div().text_size(px(12.)).text_color(p.muted).child(when)))
-                            .children(event.as_ref().and_then(|e| e.location.clone()).map(|l| div().text_size(px(12.)).text_color(p.muted).child(l))),
+                            .child(div().text_size(crate::ui::ui_px(14.)).font_weight(FontWeight::SEMIBOLD).child(title))
+                            .when(!when.is_empty(), |d| d.child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(when)))
+                            .children(event.as_ref().and_then(|e| e.location.clone()).map(|l| div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(l))),
                     ),
             )
-            .children(status_line.map(|(text, color)| div().text_size(px(12.)).text_color(color).child(text)))
+            .children(status_line.map(|(text, color)| div().text_size(crate::ui::ui_px(12.)).text_color(color).child(text)))
             .child(
                 h_flex()
                     .gap(px(6.))
@@ -1040,12 +1046,12 @@ impl MailWindow {
             .px(px(28.))
             .pt(px(22.))
             .gap(px(14.))
-            .child(div().text_size(px(24.)).font_weight(FontWeight::SEMIBOLD).child(d.display_subject()))
+            .child(div().text_size(crate::ui::ui_px(24.)).font_weight(FontWeight::SEMIBOLD).child(d.display_subject()))
             .child(
                 h_flex()
                     .items_center()
                     .gap(px(8.))
-                    .text_size(px(12.))
+                    .text_size(crate::ui::ui_px(12.))
                     .text_color(p.muted)
                     .child(format!("To {}", d.to.iter().map(Address::to_header).collect::<Vec<_>>().join(", "))),
             )
@@ -1057,7 +1063,7 @@ impl MailWindow {
                     .py(px(10.))
                     .rounded(px(8.))
                     .bg(p.chip)
-                    .text_size(px(13.))
+                    .text_size(crate::ui::ui_px(13.))
                     .child(icon("clock").size(px(15.)).text_color(p.accent))
                     .child(state)
                     .child(div().flex_1())
@@ -1087,13 +1093,21 @@ impl MailWindow {
             .child(divider(&p))
             .child(
                 div()
-                    .text_size(px(15.))
-                    .line_height(px(24.))
+                    .text_size(crate::ui::ui_px(15.))
+                    .line_height(crate::ui::ui_px(24.))
                     .max_w(px(760.))
                     .child({
                         let source = d.in_reply_to.as_ref().and_then(|id| self.store.message(id).ok().flatten());
                         let allow_remote = self.prefs.remote_images == RemoteImages::Allow || source.as_ref().is_some_and(|m| self.remote_allowed.contains(&m.id));
-                        let html = super::signature::resolve_draft_images(&overlook_core::compose::outgoing_bodies(d, source.as_ref()).html, &d.attachments);
+                        let html = super::signature::resolve_draft_images(
+                            &overlook_core::compose::outgoing_bodies_with_font(
+                                d,
+                                source.as_ref(),
+                                self.prefs.fonts.outgoing_font().as_ref(),
+                            )
+                            .html,
+                            &d.attachments,
+                        );
                         self.browser_message_body(format!("outbox-{}", d.id), &html, source.as_ref(), allow_remote, cx).0
                     }),
             )
@@ -1138,7 +1152,7 @@ fn attachment_card(a: &Attachment, p: &crate::theme::Palette, downloading: bool,
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_size(px(10.))
+                .text_size(crate::ui::ui_px(10.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .child(a.badge()),
         })
@@ -1152,7 +1166,7 @@ fn attachment_card(a: &Attachment, p: &crate::theme::Palette, downloading: bool,
                     let (stem, ext) = split_extension(&a.filename);
                     h_flex()
                         .min_w_0()
-                        .text_size(px(13.))
+                        .text_size(crate::ui::ui_px(13.))
                         .font_weight(FontWeight::MEDIUM)
                         .child(div().min_w_0().truncate().child(stem.to_owned()))
                         .when(!ext.is_empty(), |d| {
@@ -1161,7 +1175,7 @@ fn attachment_card(a: &Attachment, p: &crate::theme::Palette, downloading: bool,
                 })
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(crate::ui::ui_px(11.))
                         .text_color(p.muted)
                         .child(if downloading {
                             format!("{} · Downloading…", a.human_size())
@@ -1257,6 +1271,8 @@ struct NativeTextBody {
     id: SharedString,
     html: SharedString,
     has_content: bool,
+    font_family: SharedString,
+    font_size: f32,
 }
 
 impl RenderOnce for NativeTextBody {
@@ -1278,12 +1294,14 @@ impl RenderOnce for NativeTextBody {
         let menu_link = context_link.clone();
         let open_link = context_link.clone();
         let copy_link = context_link;
+        let line_height = (self.font_size * 1.5).round();
         div()
             .id(SharedString::from(format!("{}/wrap", self.id)))
             .px(px(8.))
             .py(px(8.))
-            .text_size(px(14.))
-            .line_height(px(21.))
+            .font_family(self.font_family)
+            .text_size(px(self.font_size))
+            .line_height(px(line_height))
             .on_action(move |_: &super::context_menu::OpenContextLink, _, cx| {
                 if let Some(url) = open_link
                     .read(cx)

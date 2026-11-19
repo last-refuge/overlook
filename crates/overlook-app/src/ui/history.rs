@@ -274,7 +274,7 @@ impl MailWindow {
                 g => g.label().to_owned(),
             };
             if group.as_deref() != Some(label.as_str()) {
-                list = list.child(div().pt(px(10.)).pb(px(4.)).text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).text_color(p.muted).child(label.clone()));
+                list = list.child(div().pt(px(10.)).pb(px(4.)).text_size(crate::ui::ui_px(11.)).font_weight(FontWeight::SEMIBOLD).text_color(p.muted).child(label.clone()));
                 group = Some(label);
             }
             list = list.child(self.render_history_row(entry, &p, cx));
@@ -313,10 +313,10 @@ impl MailWindow {
                     .child(
                         h_flex()
                             .items_center()
-                            .child(div().flex_1().min_w_0().truncate().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child("Change history"))
+                            .child(div().flex_1().min_w_0().truncate().text_size(crate::ui::ui_px(16.)).font_weight(FontWeight::SEMIBOLD).child("Change history"))
                             .child(kbd("Esc", &p)),
                     )
-                    .child(div().text_size(px(12.)).text_color(p.muted).child(format!(
+                    .child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(format!(
                         "{} · Undo one change, or restore to a point to take back everything after it. Ctrl+Z undoes the latest.",
                         self.account_name(&state.account)
                     )))
@@ -337,7 +337,7 @@ impl MailWindow {
                 .into_any_element()
         } else {
             let text = if undone { "Undone" } else { "Can’t be undone" };
-            div().text_size(px(11.)).text_color(p.muted).child(text).into_any_element()
+            div().text_size(crate::ui::ui_px(11.)).text_color(p.muted).child(text).into_any_element()
         };
         h_flex()
             .id(SharedString::from(format!("history-row-{id}")))
@@ -347,14 +347,14 @@ impl MailWindow {
             .py(px(6.))
             .rounded(px(6.))
             .hover(|s| s.bg(p.hover))
-            .child(div().w(px(64.)).flex_none().text_size(px(11.)).text_color(p.muted).child(format_clock(time)))
+            .child(div().w(px(64.)).flex_none().text_size(crate::ui::ui_px(11.)).text_color(p.muted).child(format_clock(time)))
             .child(
                 v_flex()
                     .flex_1()
                     .min_w_0()
                     .when(undone, |d| d.opacity(0.55))
                     .child(div().truncate().font_weight(FontWeight::MEDIUM).when(undone, |d| d.line_through()).child(entry.title.clone()))
-                    .child(div().truncate().text_size(px(12.)).text_color(p.muted).child(entry.detail.clone())),
+                    .child(div().truncate().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(entry.detail.clone())),
             )
             .child(div().flex_none().child(status))
             .into_any_element()

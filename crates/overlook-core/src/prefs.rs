@@ -39,6 +39,212 @@ pub enum RemoteImages {
     Allow,
 }
 
+/// Sentinel stored in font preferences for the operating system's UI font.
+pub const SYSTEM_UI_FONT: &str = ".SystemUIFont";
+/// Bundled default interface font family.
+pub const DEFAULT_UI_FONT: &str = "Inter";
+
+/// Font family and size applied to outgoing HTML email bodies when requested.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct OutgoingFont {
+    pub family: Option<String>,
+    pub size_px: u8,
+}
+
+impl OutgoingFont {
+    pub fn css_family(&self) -> String {
+        css_sans_font_stack(self.family.as_deref())
+    }
+
+    pub fn clamped_size(&self) -> u8 {
+        self.size_px.clamp(FontPrefs::MIN_EMAIL_SIZE, FontPrefs::MAX_EMAIL_SIZE)
+    }
+}
+
+/// Font and text size preferences across the interface, message list, email reader,
+/// composer, and monospace code/HTML views.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FontPrefs {
+    /// Interface font family (`None` = bundled Inter; `Some(".SystemUIFont")` = OS UI font).
+    pub ui_family: Option<String>,
+    /// Base interface text size in px (`14` default, clamped `11..=20`).
+    pub ui_size: u8,
+    /// Monospace font family (`None` = platform default).
+    pub mono_family: Option<String>,
+    /// Monospace text size in px (`13` default, clamped `10..=20`).
+    pub mono_size: u8,
+    /// Message list font family (`None` = follow interface font).
+    pub list_family: Option<String>,
+    /// Message list text size in px (`None` = follow interface size, else `11..=20`).
+    pub list_size: Option<u8>,
+    /// Email reading font family (`None` = default; `Some(".SystemUIFont")` or installed font).
+    pub reading_family: Option<String>,
+    /// Email reading text size in px (`16` default, clamped `12..=28`).
+    pub reading_size: u8,
+    /// When true, overrides sender-specified fonts and forces the reading size in HTML emails.
+    pub override_email_fonts: bool,
+    /// Composer editor font family (`None` = follow interface font).
+    pub compose_family: Option<String>,
+    /// Composer editor text size in px (`14` default, clamped `11..=28`).
+    pub compose_size: u8,
+    /// When true, includes the compose font family and size in outgoing HTML emails.
+    pub style_outgoing_mail: bool,
+}
+
+impl FontPrefs {
+    pub const DEFAULT_UI_SIZE: u8 = 14;
+    pub const MIN_UI_SIZE: u8 = 11;
+    pub const MAX_UI_SIZE: u8 = 20;
+
+    pub const DEFAULT_MONO_SIZE: u8 = 13;
+    pub const MIN_MONO_SIZE: u8 = 10;
+    pub const MAX_MONO_SIZE: u8 = 20;
+
+    pub const DEFAULT_LIST_SIZE: u8 = 13;
+    pub const MIN_LIST_SIZE: u8 = 11;
+    pub const MAX_LIST_SIZE: u8 = 20;
+
+    pub const DEFAULT_READING_SIZE: u8 = 16;
+    pub const DEFAULT_COMPOSE_SIZE: u8 = 14;
+    pub const MIN_EMAIL_SIZE: u8 = 11;
+    pub const MAX_EMAIL_SIZE: u8 = 28;
+
+    pub fn effective_ui_family(&self) -> &str {
+        clean_family(self.ui_family.as_deref()).unwrap_or(DEFAULT_UI_FONT)
+    }
+
+    pub fn clamped_ui_size(&self) -> u8 {
+        self.ui_size.clamp(Self::MIN_UI_SIZE, Self::MAX_UI_SIZE)
+    }
+
+    pub fn effective_mono_family(&self) -> Option<&str> {
+        clean_family(self.mono_family.as_deref())
+    }
+
+    pub fn clamped_mono_size(&self) -> u8 {
+        self.mono_size.clamp(Self::MIN_MONO_SIZE, Self::MAX_MONO_SIZE)
+    }
+
+    pub fn effective_list_family(&self) -> &str {
+        clean_family(self.list_family.as_deref()).unwrap_or_else(|| self.effective_ui_family())
+    }
+
+    /// Scale multiplier for message-list typography relative to the 13 px baseline.
+    pub fn list_scale(&self) -> f32 {
+        match self.list_size {
+            Some(size) => {
+                f32::from(size.clamp(Self::MIN_LIST_SIZE, Self::MAX_LIST_SIZE))
+                    / f32::from(Self::DEFAULT_LIST_SIZE)
+            }
+            None => f32::from(self.clamped_ui_size()) / f32::from(Self::DEFAULT_UI_SIZE),
+        }
+    }
+
+    /// Effective reading font family for native plain-text email bodies.
+    pub fn effective_native_reading_family(&self) -> &str {
+        clean_family(self.reading_family.as_deref()).unwrap_or_else(|| self.effective_ui_family())
+    }
+
+    /// Explicit reading font family for Chromium HTML email rendering, if configured.
+    /// Returns `None` when left at default so HTML emails keep Chromium's `Arial, sans-serif` default.
+    pub fn browser_reading_family(&self) -> Option<String> {
+        clean_family(self.reading_family.as_deref()).map(str::to_owned)
+    }
+
+    pub fn clamped_reading_size(&self) -> u8 {
+        self.reading_size.clamp(12, Self::MAX_EMAIL_SIZE)
+    }
+
+    /// Plain-text emails rendered natively default to 14 px when reading_size is the 16 px HTML default,
+    /// scaling smoothly when the user adjusts reading_size.
+    pub fn native_reading_size(&self) -> f32 {
+        let reading = f32::from(self.clamped_reading_size());
+        (reading - 2.).clamp(11., f32::from(Self::MAX_EMAIL_SIZE))
+    }
+
+    pub fn effective_compose_family(&self) -> &str {
+        clean_family(self.compose_family.as_deref()).unwrap_or_else(|| self.effective_ui_family())
+    }
+
+    pub fn clamped_compose_size(&self) -> u8 {
+        self.compose_size.clamp(Self::MIN_EMAIL_SIZE, Self::MAX_EMAIL_SIZE)
+    }
+
+    /// Outgoing email font when "Include font in sent emails" is enabled.
+    pub fn outgoing_font(&self) -> Option<OutgoingFont> {
+        self.style_outgoing_mail.then(|| OutgoingFont {
+            family: clean_family(self.compose_family.as_deref())
+                .or_else(|| clean_family(self.ui_family.as_deref()))
+                .map(str::to_owned),
+            size_px: self.clamped_compose_size(),
+        })
+    }
+}
+
+impl Default for FontPrefs {
+    fn default() -> Self {
+        Self {
+            ui_family: None,
+            ui_size: Self::DEFAULT_UI_SIZE,
+            mono_family: None,
+            mono_size: Self::DEFAULT_MONO_SIZE,
+            list_family: None,
+            list_size: None,
+            reading_family: None,
+            reading_size: Self::DEFAULT_READING_SIZE,
+            override_email_fonts: false,
+            compose_family: None,
+            compose_size: Self::DEFAULT_COMPOSE_SIZE,
+            style_outgoing_mail: false,
+        }
+    }
+}
+
+fn clean_family(family: Option<&str>) -> Option<&str> {
+    family.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Sanitizes a single font family name for safe inclusion inside a CSS string literal.
+/// Strips control characters and CSS/HTML delimiters so untrusted preferences can never
+/// break out of a `<style>` block or inline `style="..."` attribute.
+pub fn sanitize_css_font_name(name: &str) -> Option<String> {
+    let cleaned: String = name
+        .chars()
+        .filter(|&c| {
+            !c.is_control()
+                && !matches!(
+                    c,
+                    '\'' | '"' | '\\' | ';' | '{' | '}' | '<' | '>' | '(' | ')' | '/'
+                )
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// Builds a safe CSS `font-family` stack for body / reading / outgoing mail text.
+pub fn css_sans_font_stack(family: Option<&str>) -> String {
+    match clean_family(family) {
+        None => "Arial, sans-serif".to_owned(),
+        Some(SYSTEM_UI_FONT) => {
+            "-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, Arial, sans-serif".to_owned()
+        }
+        Some(name) => match sanitize_css_font_name(name) {
+            Some(safe) => {
+                format!("'{safe}', -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif")
+            }
+            None => "Arial, sans-serif".to_owned(),
+        },
+    }
+}
+
+/// Builds a safe CSS `font-family` stack for monospace code blocks.
+pub fn css_mono_font_stack(family: Option<&str>) -> Option<String> {
+    let safe = sanitize_css_font_name(clean_family(family)?)?;
+    Some(format!("'{safe}', ui-monospace, Menlo, Consolas, monospace"))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Prefs {
@@ -84,6 +290,8 @@ pub struct Prefs {
     pub account_order: Vec<crate::AccountId>,
     /// Pinned folders; `None` until the user changes them, meaning every account's Inbox.
     pub favorites: Option<Vec<crate::Favorite>>,
+    // Typography
+    pub fonts: FontPrefs,
 }
 
 impl Default for Prefs {
@@ -117,6 +325,7 @@ impl Default for Prefs {
             sidebar_mode: crate::SidebarMode::AllAccounts,
             account_order: Vec::new(),
             favorites: None,
+            fonts: FontPrefs::default(),
         }
     }
 }
@@ -281,5 +490,42 @@ mod tests {
         let prefs: AccountPrefs = serde_json::from_str(r#"{"signatures":[{"id":"a","name":"A","body":"Hi"}]}"#).unwrap();
         let prefs = prefs.normalized();
         assert_eq!((prefs.signatures[0].images.len(), prefs.signatures[0].html.contains("Hi")), (0, true));
+    }
+
+    #[test]
+    fn font_prefs_defaults_and_sanitization() {
+        let p: Prefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(p.fonts, FontPrefs::default());
+        assert_eq!(p.fonts.effective_ui_family(), DEFAULT_UI_FONT);
+        assert_eq!(p.fonts.clamped_ui_size(), 14);
+        assert_eq!(p.fonts.clamped_reading_size(), 16);
+        assert_eq!(p.fonts.list_scale(), 1.0);
+        assert!(p.fonts.outgoing_font().is_none());
+
+        assert_eq!(css_sans_font_stack(None), "Arial, sans-serif");
+        assert!(css_sans_font_stack(Some(SYSTEM_UI_FONT)).contains("system-ui"));
+        assert!(css_sans_font_stack(Some("Georgia")).starts_with("'Georgia',"));
+        // Reject CSS/HTML breakout characters in untrusted font names.
+        let escaped = css_sans_font_stack(Some("Georgia'; }</style><script>alert(1)</script>"));
+        assert!(!escaped.contains("</style>"));
+        assert!(!escaped.contains(';'));
+        assert!(!escaped.contains('{'));
+        assert!(!escaped.contains('}'));
+
+        let custom = FontPrefs {
+            ui_size: 255,
+            reading_size: 2,
+            list_size: Some(16),
+            compose_family: Some("Georgia".into()),
+            compose_size: 15,
+            style_outgoing_mail: true,
+            ..Default::default()
+        };
+        assert_eq!(custom.clamped_ui_size(), FontPrefs::MAX_UI_SIZE);
+        assert_eq!(custom.clamped_reading_size(), 12);
+        assert!((custom.list_scale() - (16.0 / 13.0)).abs() < 0.001);
+        let out = custom.outgoing_font().expect("outgoing font enabled");
+        assert_eq!(out.family.as_deref(), Some("Georgia"));
+        assert_eq!(out.clamped_size(), 15);
     }
 }

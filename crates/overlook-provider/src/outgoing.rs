@@ -18,21 +18,51 @@ fn finished(addresses: &[Address]) -> impl Iterator<Item = Mailbox> + '_ {
 
 /// Returns the raw message bytes. `rfc_id` is the Message-ID (with angle brackets).
 pub fn build_raw(account: &Account, draft: &Draft, in_reply_to: Option<&Message>, rfc_id: &str) -> Result<Vec<u8>, String> {
-    build_message(account, draft, in_reply_to, rfc_id, false, false)
+    build_raw_with_font(account, draft, in_reply_to, rfc_id, None)
+}
+
+/// Returns the raw message bytes, optionally wrapping the outgoing HTML body with `font`.
+pub fn build_raw_with_font(
+    account: &Account,
+    draft: &Draft,
+    in_reply_to: Option<&Message>,
+    rfc_id: &str,
+    font: Option<&OutgoingFont>,
+) -> Result<Vec<u8>, String> {
+    build_message(account, draft, in_reply_to, rfc_id, false, false, font)
 }
 
 /// Gmail derives its envelope from MIME headers, including Bcc.
 pub fn build_gmail_raw(account: &Account, draft: &Draft, in_reply_to: Option<&Message>, rfc_id: &str) -> Result<Vec<u8>, String> {
-    build_message(account, draft, in_reply_to, rfc_id, false, true)
+    build_gmail_raw_with_font(account, draft, in_reply_to, rfc_id, None)
+}
+
+/// Same as [`build_gmail_raw`], optionally wrapping the outgoing HTML body with `font`.
+pub fn build_gmail_raw_with_font(
+    account: &Account,
+    draft: &Draft,
+    in_reply_to: Option<&Message>,
+    rfc_id: &str,
+    font: Option<&OutgoingFont>,
+) -> Result<Vec<u8>, String> {
+    build_message(account, draft, in_reply_to, rfc_id, false, true, font)
 }
 
 /// Drafts may have no recipient yet, or an unfinished recipient. The artificial SMTP
 /// envelope satisfies lettre's send-time checks but is never serialized or submitted.
 pub fn build_draft_raw(account: &Account, draft: &Draft, in_reply_to: Option<&Message>, rfc_id: &str) -> Result<Vec<u8>, String> {
-    build_message(account, draft, in_reply_to, rfc_id, true, true)
+    build_message(account, draft, in_reply_to, rfc_id, true, true, None)
 }
 
-fn build_message(account: &Account, draft: &Draft, in_reply_to: Option<&Message>, rfc_id: &str, editing: bool, keep_bcc: bool) -> Result<Vec<u8>, String> {
+fn build_message(
+    account: &Account,
+    draft: &Draft,
+    in_reply_to: Option<&Message>,
+    rfc_id: &str,
+    editing: bool,
+    keep_bcc: bool,
+    font: Option<&OutgoingFont>,
+) -> Result<Vec<u8>, String> {
     let mut builder = MimeMessage::builder()
         .from(mailbox(&Address::named(&account.display_name, &account.email))?)
         .subject(draft.subject.clone())
@@ -65,7 +95,7 @@ fn build_message(account: &Account, draft: &Draft, in_reply_to: Option<&Message>
         if let Some(id) = &original.in_reply_to { builder = builder.in_reply_to(id.clone()); }
         if !original.references.is_empty() { builder = builder.references(original.references.join(" ")); }
     }
-    let bodies = overlook_core::compose::outgoing_bodies(draft, in_reply_to);
+    let bodies = overlook_core::compose::outgoing_bodies_with_font(draft, in_reply_to, font);
     let text = if bodies.text.is_empty() { "\n".to_owned() } else { bodies.text };
     let html = format!("<!DOCTYPE html><html><body>{}</body></html>", bodies.html);
     // Images the quoted original embeds travel inline, next to the HTML that refers to them.

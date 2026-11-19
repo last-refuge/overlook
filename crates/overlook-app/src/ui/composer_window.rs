@@ -29,7 +29,7 @@ pub(crate) enum WindowSetup {
 
 pub(super) struct DetachedComposer {
     window: AnyWindowHandle,
-    editor: WeakEntity<MailWindow>,
+    pub(super) editor: WeakEntity<MailWindow>,
     _closed: Subscription,
 }
 
@@ -331,8 +331,8 @@ impl MailWindow {
             .size_full()
             .bg(p.message_surface())
             .text_color(p.foreground)
-            .font_family("Inter")
-            .text_size(px(13.))
+            .font_family(SharedString::from(self.prefs.fonts.effective_ui_family().to_owned()))
+            .text_size(ui_px(13.))
             .child(TitleBar::new().child(div().px_3().child("Overlook · Compose")))
             .child(if self.composer.is_some() {
                 div()

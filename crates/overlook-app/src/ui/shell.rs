@@ -200,7 +200,7 @@ impl MailWindow {
                             .max_w(px(220.))
                             .mr(px(-14.))
                             .truncate()
-                            .text_size(px(12.))
+                            .text_size(crate::ui::ui_px(12.))
                             .text_color(p.muted)
                             .child(owner.display_name()),
                     )

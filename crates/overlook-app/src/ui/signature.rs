@@ -6,6 +6,7 @@
 //! its own folder, so editing a signature later never changes a message already written.
 
 use super::composer::{stage_attachment, Composer};
+use gpui_kit::component::ActiveTheme;
 use super::settings::{SettingsPage, SettingsState};
 use super::MailWindow;
 use crate::assets::icon;
@@ -152,7 +153,7 @@ impl MailWindow {
                     h_flex()
                         .items_center()
                         .gap(px(8.))
-                        .text_size(px(12.))
+                        .text_size(crate::ui::ui_px(12.))
                         .text_color(p.muted)
                         .child(icon("signature").size(px(14.)))
                         .child(div().flex_1().truncate().child(format!("Signature · {name}")))
@@ -166,8 +167,8 @@ impl MailWindow {
                         .pl(px(12.))
                         .border_l_2()
                         .border_color(p.divider)
-                        .text_size(px(14.))
-                        .line_height(px(22.))
+                        .text_size(crate::ui::ui_px(14.))
+                        .line_height(crate::ui::ui_px(22.))
                         .child(TextView::html(SharedString::from(format!("signature-{}-{id}", c.draft.id)), view)),
                 )
                 .into_any_element(),
@@ -203,7 +204,7 @@ impl MailWindow {
             .child(Button::new("sig-image").ghost().xsmall().icon(icon("image-plus").size(px(15.))).label("Image").tooltip("Insert a picture (PNG, JPEG, GIF or WebP)").on_click(cx.listener(|this, _, window, cx| this.choose_signature_image(window, cx))));
 
         let preview: AnyElement = if signature.html.trim().is_empty() {
-            div().text_size(px(12.)).text_color(p.muted).child("Nothing to show yet. Type or paste HTML above.").into_any_element()
+            div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child("Nothing to show yet. Type or paste HTML above.").into_any_element()
         } else {
             let html = sig::with_data_urls(&clean_only(&signature.html, RemoteContent::Blocked), &signature.images);
             TextView::html(SharedString::from(format!("signature-preview-{}", signature.id)), html).into_any_element()
@@ -211,10 +212,23 @@ impl MailWindow {
         v_flex()
             .gap(px(8.))
             .child(toolbar)
-            .child(div().rounded(px(8.)).border_1().border_color(p.divider).h(px(170.)).child(Textarea::new(&state.signature).h_full().font_family("monospace").text_size(px(12.)).context_menu(super::context_menu::editable_text_menu(state.signature.clone()))))
-            .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child("Preview"))
-            .child(div().rounded(px(8.)).border_1().border_color(p.divider).px(px(14.)).py(px(10.)).min_h(px(64.)).text_size(px(14.)).line_height(px(22.)).child(preview))
-            .when(has_remote_images(&signature.html), |d| d.child(div().text_size(px(11.)).text_color(p.muted).child("Pictures from the web are not loaded in the preview. They are sent as links, and many mail programs hold them back until the reader allows them.")))
+            .child(
+                div()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(p.divider)
+                    .h(px(170.))
+                    .child(
+                        Textarea::new(&state.signature)
+                            .h_full()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_size(px(f32::from(self.prefs.fonts.clamped_mono_size())))
+                            .context_menu(super::context_menu::editable_text_menu(state.signature.clone())),
+                    ),
+            )
+            .child(div().text_size(crate::ui::ui_px(12.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child("Preview"))
+            .child(div().rounded(px(8.)).border_1().border_color(p.divider).px(px(14.)).py(px(10.)).min_h(px(64.)).text_size(crate::ui::ui_px(14.)).line_height(crate::ui::ui_px(22.)).child(preview))
+            .when(has_remote_images(&signature.html), |d| d.child(div().text_size(crate::ui::ui_px(11.)).text_color(p.muted).child("Pictures from the web are not loaded in the preview. They are sent as links, and many mail programs hold them back until the reader allows them.")))
             .into_any_element()
     }
 

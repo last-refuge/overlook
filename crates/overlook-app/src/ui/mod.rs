@@ -391,7 +391,7 @@ impl Render for DragPreview {
             .border_1()
             .border_color(p.accent)
             .shadow_md()
-            .text_size(px(13.))
+            .text_size(crate::ui::ui_px(13.))
             .text_color(p.foreground)
             .child(icon("mail").size(px(14.)).text_color(p.accent))
             .child(self.label.clone())
@@ -419,11 +419,20 @@ struct RowsKey {
 }
 
 /// The settings that decide how tall a row is.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq, Eq)]
 struct RowLayout {
     compact: bool,
     avatars: bool,
     previews: bool,
+    ui_size: u8,
+    list_family: Option<String>,
+    list_size: Option<u8>,
+}
+
+/// Converts a baseline UI text size (designed at the default 14 px root) into `rems`
+/// so all application chrome scales smoothly with the user's Interface text size setting.
+pub(crate) fn ui_px(px_at_default: f32) -> Rems {
+    rems(px_at_default / f32::from(FontPrefs::DEFAULT_UI_SIZE))
 }
 
 /// Hands a received attachment to the desktop, except programs and scripts: those are
@@ -617,7 +626,7 @@ pub struct MailWindow {
     /// looked up when a row first shows it, forgotten when mail or the calendar reloads.
     invite_rows: std::cell::RefCell<HashMap<String, Option<list::InviteRow>>>,
     /// The row layout the list's cached heights were measured with.
-    row_layout: std::cell::Cell<Option<RowLayout>>,
+    row_layout: std::cell::RefCell<Option<RowLayout>>,
     drafts: Vec<Draft>,
     outbox: Vec<Draft>,
     status: AccountStatus,
@@ -4083,7 +4092,7 @@ impl MailWindow {
             .bg(p.background)
             .border_t_1()
             .border_color(p.divider)
-            .text_size(px(12.))
+            .text_size(crate::ui::ui_px(12.))
             .text_color(p.muted)
             .child(
                 h_flex()
@@ -4180,7 +4189,7 @@ impl MailWindow {
                 .bg(p.chip)
                 .border_b_1()
                 .border_color(p.divider)
-                .text_size(px(13.))
+                .text_size(crate::ui::ui_px(13.))
                 .child(icon("arrow-down-to-line").size(px(16.)).text_color(color))
                 .child(div().flex_1().truncate().child(text))
                 .child(Button::new("update-notes").ghost().small().label("What’s new").on_click(move |_, _, cx| cx.open_url(&url)))
@@ -4214,7 +4223,7 @@ impl MailWindow {
                 .bg(p.chip)
                 .border_b_1()
                 .border_color(p.divider)
-                .text_size(px(13.))
+                .text_size(crate::ui::ui_px(13.))
                 .child(icon(icon_name).size(px(16.)).text_color(color))
                 .child(div().flex_1().truncate().child(text))
                 .children(action.map(|(label, sign_in)| {
@@ -4464,8 +4473,8 @@ impl Render for MailWindow {
             .size_full()
             .bg(p.background)
             .text_color(p.foreground)
-            .font_family("Inter")
-            .text_size(px(13.))
+            .font_family(SharedString::from(self.prefs.fonts.effective_ui_family().to_owned()))
+            .text_size(ui_px(13.))
             .relative()
             .child(
                 v_flex().size_full().min_h_0()

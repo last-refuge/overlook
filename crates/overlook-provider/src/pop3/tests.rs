@@ -368,7 +368,7 @@ fn send_goes_over_smtp_and_keeps_a_local_sent_copy() {
     draft.bcc = vec![Address::named("Me", "jason@example.com")];
     draft.subject = "Hello".into();
     draft.body_text = "Sent over SMTP.".into();
-    let context = SendContext { sent_label: None, in_reply_to: None, labels: labels_for(&acct.id) };
+    let context = SendContext { sent_label: None, in_reply_to: None, labels: labels_for(&acct.id), ..Default::default() };
     let receipt = block(p.send(&acct, &draft, context)).unwrap();
     assert!(is_sent_copy(&receipt.provider_id));
     assert_eq!(receipt.rfc_message_id.as_deref(), Some(draft_message_id(&draft).as_str()));

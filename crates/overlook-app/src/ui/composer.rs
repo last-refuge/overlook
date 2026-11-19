@@ -794,7 +794,7 @@ impl MailWindow {
         let owner = self.owner();
 
         let field_label = |text: &'static str| {
-            div().w(px(56.)).flex_none().text_size(px(12.)).text_color(p.muted).child(text)
+            div().w(px(56.)).flex_none().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(text)
         };
         let field_row = |label: &'static str, input: AnyElement| {
             h_flex()
@@ -846,7 +846,7 @@ impl MailWindow {
                         .rounded(px(7.))
                         .border_1()
                         .border_color(p.divider)
-                        .text_size(px(12.))
+                        .text_size(crate::ui::ui_px(12.))
                         .child(icon("paperclip").size(px(13.)).text_color(p.muted))
                         .child(a.filename.clone())
                         .child(div().text_color(p.muted).child(overlook_core::human_size(a.size_bytes)))
@@ -858,7 +858,7 @@ impl MailWindow {
                                 .on_click(cx.listener(move |this, _, window, cx| this.remove_attachment(id.clone(), window, cx))),
                         )
                 }))
-                .when(attaching, |d| d.child(div().text_size(px(12.)).text_color(p.muted).child("Preparing attachments…")))
+                .when(attaching, |d| d.child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child("Preparing attachments…")))
         });
 
         let error = c.error.clone().map(|e| {
@@ -867,7 +867,7 @@ impl MailWindow {
                 .gap(px(8.))
                 .px(px(16.))
                 .py(px(8.))
-                .text_size(px(12.))
+                .text_size(crate::ui::ui_px(12.))
                 .text_color(p.error)
                 .child(icon("circle-alert").size(px(14.)).text_color(p.error))
                 .child(e)
@@ -921,7 +921,7 @@ impl MailWindow {
                     .child(Button::new("close-composer").ghost().small().disabled(c.attaching || c.pending_saves > 0).icon(icon("x").size(px(16.)))
                         .tooltip("Save and close (Esc)").accessibility_label("Save and close draft")
                         .on_click(cx.listener(|this, _, window, cx| this.close_composer(window, cx))))))
-            .child(h_flex().flex_none().items_center().gap(px(5.)).px(px(16.)).py(px(5.)).text_size(px(11.))
+            .child(h_flex().flex_none().items_center().gap(px(5.)).px(px(16.)).py(px(5.)).text_size(crate::ui::ui_px(11.))
                 .text_color(if c.dirty { p.muted } else { p.success })
                 .child(icon(if c.dirty { "loader-circle" } else { "check" }).size(px(13.))).child(saved_text))
             .children(error)
@@ -930,7 +930,7 @@ impl MailWindow {
                 .child(v_flex().flex_none().h_auto().min_h_full()
             .when(!inline || c.show_headers, |d| d.child(field_row(
                 "From",
-                div().text_size(px(13.)).child(format!("{} <{}>", owner.display_name(), owner.email)).into_any_element(),
+                div().text_size(crate::ui::ui_px(13.)).child(format!("{} <{}>", owner.display_name(), owner.email)).into_any_element(),
             )))
             .child(
                 h_flex()
@@ -978,10 +978,18 @@ impl MailWindow {
                     .track_scroll(&c.preview_scroll)
                     .px(px(16.))
                     .py(px(12.))
-                    .text_size(px(15.))
-                    .line_height(px(24.))
+                    .text_size(crate::ui::ui_px(15.))
+                    .line_height(crate::ui::ui_px(24.))
                     .child({
-                        let html = super::signature::resolve_draft_images(&overlook_core::compose::outgoing_bodies(&c.draft, None).html, &c.draft.attachments);
+                        let html = super::signature::resolve_draft_images(
+                            &overlook_core::compose::outgoing_bodies_with_font(
+                                &c.draft,
+                                None,
+                                self.prefs.fonts.outgoing_font().as_ref(),
+                            )
+                            .html,
+                            &c.draft.attachments,
+                        );
                         self.browser_message_body(
                             format!("preview-{}", c.draft.id), &html, None,
                             self.prefs.remote_images == RemoteImages::Allow, cx,
@@ -989,6 +997,9 @@ impl MailWindow {
                     })
                     .into_any_element()
             } else {
+                let compose_family = SharedString::from(self.prefs.fonts.effective_compose_family().to_owned());
+                let compose_size = f32::from(self.prefs.fonts.clamped_compose_size());
+                let compose_line_height = (compose_size * 1.55).round();
                 div()
                     .relative()
                     .when(inline, |d| d.flex_none().h(editor_height))
@@ -1000,9 +1011,9 @@ impl MailWindow {
                             .appearance(false)
                             .bordered(false)
                             .h_full()
-                            .font_family("Inter")
-                            .text_size(px(14.))
-                            .line_height(px(22.))
+                            .font_family(compose_family)
+                            .text_size(px(compose_size))
+                            .line_height(px(compose_line_height))
                             .context_menu(super::context_menu::editable_text_menu(c.body.clone())),
                     )
                     .into_any_element()
@@ -1104,7 +1115,7 @@ impl MailWindow {
                     h_flex()
                         .items_center()
                         .gap(px(8.))
-                        .text_size(px(12.))
+                        .text_size(crate::ui::ui_px(12.))
                         .text_color(p.muted)
                         .child(icon("text-quote").size(px(14.)))
                         .child(div().flex_1().truncate().child(label))
@@ -1123,8 +1134,8 @@ impl MailWindow {
                             .pl(px(12.))
                             .border_l_2()
                             .border_color(p.divider)
-                            .text_size(px(14.))
-                            .line_height(px(22.))
+                            .text_size(crate::ui::ui_px(14.))
+                            .line_height(crate::ui::ui_px(22.))
                             .text_color(p.muted)
                             .child(html),
                     )

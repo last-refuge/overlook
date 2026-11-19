@@ -959,7 +959,7 @@ impl MailWindow {
                     .px(px(11.))
                     .rounded(px(7.))
                     .cursor_pointer()
-                    .text_size(px(13.))
+                    .text_size(crate::ui::ui_px(13.))
                     .text_color(if c.visible { p.foreground } else { p.muted })
                     .hover(|d| d.bg(p.hover))
                     .child(
@@ -989,7 +989,7 @@ impl MailWindow {
             .pt(px(18.))
             .px(px(11.))
             .pb(px(14.))
-            .child(div().mt(px(18.)).mb(px(6.)).px(px(11.)).text_size(px(11.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child("My calendars"))
+            .child(div().mt(px(18.)).mb(px(6.)).px(px(11.)).text_size(crate::ui::ui_px(11.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child("My calendars"))
             .child(v_flex().id("calendar-list").flex_1().min_h_0().child(list).overflow_y_scrollbar())
             .child(
                 h_flex()
@@ -1001,12 +1001,12 @@ impl MailWindow {
                     .child(
                         v_flex()
                             .min_w_0()
-                            .child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).truncate().child(owner.display_name()))
+                            .child(div().text_size(crate::ui::ui_px(13.)).font_weight(FontWeight::MEDIUM).truncate().child(owner.display_name()))
                             .child(
                                 h_flex()
                                     .items_center()
                                     .gap(px(5.))
-                                    .text_size(px(11.))
+                                    .text_size(crate::ui::ui_px(11.))
                                     .text_color(p.muted)
                                     .child(div().size(px(6.)).rounded_full().bg(dot))
                                     .child(format!("Calendar · {text}")),
@@ -1028,8 +1028,8 @@ impl MailWindow {
         };
         let heading = h_flex().items_center().gap(px(12.)).min_h(px(52.)).px(px(20.))
             .border_b_1().border_color(p.divider)
-            .child(div().flex_1().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).child(title))
-            .child(div().text_size(px(11.)).text_color(p.muted).child(tz::zone_label(&self.time_zone)));
+            .child(div().flex_1().text_size(crate::ui::ui_px(18.)).font_weight(FontWeight::SEMIBOLD).child(title))
+            .child(div().text_size(crate::ui::ui_px(11.)).text_color(p.muted).child(tz::zone_label(&self.time_zone)));
 
         let banner = match &self.cal_status {
             SyncState::SignInRequired if self.account.provider == ProviderKind::Gmail => {
@@ -1043,7 +1043,7 @@ impl MailWindow {
                         .bg(p.chip)
                         .border_b_1()
                         .border_color(p.divider)
-                        .text_size(px(13.))
+                        .text_size(crate::ui::ui_px(13.))
                         .child(icon("key-round").size(px(16.)).text_color(p.warning))
                         .child(div().flex_1().child(crate::sync::CALENDAR_SIGNIN_WORDING))
                         .child(Button::new("cal-signin").small().label("Sign in again").on_click(cx.listener(move |this, _, window, cx| this.start_google_sign_in(Some(email.clone()), window, cx)))),
@@ -1063,7 +1063,7 @@ impl MailWindow {
                     .bg(p.chip)
                     .border_b_1()
                     .border_color(p.divider)
-                    .text_size(px(13.))
+                    .text_size(crate::ui::ui_px(13.))
                     .text_color(p.muted)
                     .child(icon("info").size(px(16.)).text_color(p.muted))
                     .child(div().flex_1().child(if self.caldav_connection.is_none() {
@@ -1093,7 +1093,7 @@ impl MailWindow {
                     .bg(p.chip)
                     .border_b_1()
                     .border_color(p.divider)
-                    .text_size(px(13.))
+                    .text_size(crate::ui::ui_px(13.))
                     .text_color(p.muted)
                     .child(icon("info").size(px(16.)).text_color(p.muted))
                     .child("Sample calendar with fictional events. Connect the sample account (status bar switch) to load them."),
@@ -1159,7 +1159,7 @@ impl MailWindow {
                     .items_center()
                     .py(px(8.))
                     .gap(px(2.))
-                    .child(div().text_size(px(11.)).text_color(if is_today { p.accent } else { p.muted }).child(z.strftime("%a").to_string().to_uppercase()))
+                    .child(div().text_size(crate::ui::ui_px(11.)).text_color(if is_today { p.accent } else { p.muted }).child(z.strftime("%a").to_string().to_uppercase()))
                     .child(
                         div()
                             .size(px(28.))
@@ -1167,7 +1167,7 @@ impl MailWindow {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_size(px(15.))
+                            .text_size(crate::ui::ui_px(15.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .when(is_today, |d| d.bg(p.action).text_color(p.on_action))
                             .child(z.day().to_string()),
@@ -1176,7 +1176,7 @@ impl MailWindow {
                         h_flex()
                             .items_center()
                             .gap(px(3.))
-                            .text_size(px(10.))
+                            .text_size(crate::ui::ui_px(10.))
                             .text_color(p.muted)
                             .child(icon("map-pin").size(px(10.)).text_color(p.muted))
                             .child(l)
@@ -1203,7 +1203,7 @@ impl MailWindow {
                 .absolute()
                 .top(px(h as f32 * HOUR_PX - 7.))
                 .right(px(8.))
-                .text_size(px(10.))
+                .text_size(crate::ui::ui_px(10.))
                 .text_color(p.muted)
                 .child(format!("{} {}", if h % 12 == 0 { 12 } else { h % 12 }, if h < 12 { "AM" } else { "PM" }))
         }));
@@ -1300,9 +1300,9 @@ impl MailWindow {
                         .bg(p.accent.opacity(0.2))
                         .border_1()
                         .border_color(p.accent)
-                        .text_size(px(11.))
+                        .text_size(crate::ui::ui_px(11.))
                         .text_color(p.foreground)
-                        .when(height >= 36., |d| d.child(div().text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).truncate().child("New event")))
+                        .when(height >= 36., |d| d.child(div().text_size(crate::ui::ui_px(12.)).font_weight(FontWeight::SEMIBOLD).truncate().child("New event")))
                         .when(height >= 20., |d| d.child(div().truncate().child(format!("{} – {}", tz::format_clock(start), tz::format_clock(end))))),
                 );
             }
@@ -1462,11 +1462,11 @@ impl MailWindow {
             .py(px(3.))
             .overflow_hidden()
             .cursor_pointer()
-            .text_size(px(12.))
+            .text_size(crate::ui::ui_px(12.))
             .text_color(p.foreground)
             .child(div().font_weight(FontWeight::SEMIBOLD).truncate().child(e.display_title()))
-            .when(height >= 36., |d| d.child(div().text_size(px(11.)).text_color(p.muted).truncate().child(format!("{} – {}", tz::format_clock(e.start), tz::format_clock(e.end)))))
-            .when(height >= 54. && e.location.is_some(), |d| d.child(div().text_size(px(11.)).text_color(p.muted).truncate().child(e.location.clone().unwrap_or_default())))
+            .when(height >= 36., |d| d.child(div().text_size(crate::ui::ui_px(11.)).text_color(p.muted).truncate().child(format!("{} – {}", tz::format_clock(e.start), tz::format_clock(e.end)))))
+            .when(height >= 54. && e.location.is_some(), |d| d.child(div().text_size(crate::ui::ui_px(11.)).text_color(p.muted).truncate().child(e.location.clone().unwrap_or_default())))
             .on_click(cx.listener(move |this, click: &ClickEvent, window, cx| this.click_event(id.clone(), click, window, cx)))
             .context_menu(self.event_menu(e, cx))
     }
@@ -1483,7 +1483,7 @@ impl MailWindow {
             .bg(fill)
             .border_l_2()
             .border_color(edge)
-            .text_size(px(11.))
+            .text_size(crate::ui::ui_px(11.))
             .truncate()
             .cursor_pointer()
             .child(e.display_title())
@@ -1497,7 +1497,7 @@ impl MailWindow {
         let month = tz::local_date(self.cal_anchor).month();
         let names: [&str; 7] = if self.prefs.week_starts_monday { ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"] } else { ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] };
         let header = h_flex().border_b_1().border_color(p.divider).children(names.iter().map(|d| {
-            div().flex_1().py(px(6.)).text_size(px(11.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child(div().px(px(8.)).child(d.to_uppercase()))
+            div().flex_1().py(px(6.)).text_size(crate::ui::ui_px(11.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child(div().px(px(8.)).child(d.to_uppercase()))
         }));
         let mut rows = v_flex().flex_1().min_h_0();
         for week in 0..6 {
@@ -1533,7 +1533,7 @@ impl MailWindow {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .text_size(px(12.))
+                                    .text_size(crate::ui::ui_px(12.))
                                     .cursor_pointer()
                                     .text_color(if in_month { p.foreground } else { p.muted })
                                     .when(is_today, |d| d.bg(p.action).text_color(p.on_action).font_weight(FontWeight::SEMIBOLD))
@@ -1557,7 +1557,7 @@ impl MailWindow {
                                 .bg(fill)
                                 .border_l_2()
                                 .border_color(edge)
-                                .text_size(px(11.))
+                                .text_size(crate::ui::ui_px(11.))
                                 .truncate()
                                 .cursor_pointer()
                                 .when(self.cal_selected.as_ref() == Some(&e.id), |d| d.bg(fill.opacity(1.0)))
@@ -1570,7 +1570,7 @@ impl MailWindow {
                                 div()
                                     .id(SharedString::from(format!("more-{day}")))
                                     .px(px(5.))
-                                    .text_size(px(11.))
+                                    .text_size(crate::ui::ui_px(11.))
                                     .text_color(p.muted)
                                     .cursor_pointer()
                                     .child(format!("+{more} more"))
@@ -1606,7 +1606,7 @@ impl MailWindow {
                     .gap(px(8.))
                     .pt(px(14.))
                     .pb(px(4.))
-                    .text_size(px(12.))
+                    .text_size(crate::ui::ui_px(12.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(if day == today { p.accent } else { p.muted })
                     .child(tz::zoned(day).strftime("%A, %B %-d").to_string())
@@ -1629,8 +1629,8 @@ impl MailWindow {
                         .when(selected, |r| r.bg(p.selection))
                         .when(!selected, |r| r.hover(|r| r.bg(p.hover)))
                         .child(div().w(px(4.)).h(px(32.)).rounded(px(2.)).bg(edge))
-                        .child(div().w(px(130.)).text_size(px(12.)).text_color(p.muted).child(time))
-                        .child(v_flex().flex_1().min_w_0().child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).truncate().child(e.display_title())).children(e.location.clone().map(|l| div().text_size(px(11.)).text_color(p.muted).truncate().child(l))))
+                        .child(div().w(px(130.)).text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(time))
+                        .child(v_flex().flex_1().min_w_0().child(div().text_size(crate::ui::ui_px(13.)).font_weight(FontWeight::MEDIUM).truncate().child(e.display_title())).children(e.location.clone().map(|l| div().text_size(crate::ui::ui_px(11.)).text_color(p.muted).truncate().child(l))))
                         .when(e.pending, |r| r.child(icon("cloud-off").size(px(13.)).text_color(p.warning)))
                         .child(div().size(px(10.)).rounded_full().bg(fill.opacity(1.0)))
                         .on_click(cx.listener(move |this, click: &ClickEvent, window, cx| this.click_event(id.clone(), click, window, cx)))
@@ -1639,7 +1639,7 @@ impl MailWindow {
             }
         }
         if !any {
-            list = list.child(v_flex().items_center().pt(px(72.)).gap(px(6.)).text_color(p.muted).child(icon("calendar").size(px(28.)).text_color(p.divider)).child(div().text_size(px(14.)).font_weight(FontWeight::MEDIUM).text_color(p.foreground).child("Nothing scheduled")).child(div().text_size(px(12.)).child("The next two weeks are clear.")));
+            list = list.child(v_flex().items_center().pt(px(72.)).gap(px(6.)).text_color(p.muted).child(icon("calendar").size(px(28.)).text_color(p.divider)).child(div().text_size(crate::ui::ui_px(14.)).font_weight(FontWeight::MEDIUM).text_color(p.foreground).child("Nothing scheduled")).child(div().text_size(crate::ui::ui_px(12.)).child("The next two weeks are clear.")));
         }
         list.overflow_y_scrollbar()
     }
@@ -1700,7 +1700,7 @@ impl MailWindow {
                 .bg(p.chip)
                 .border_1()
                 .border_color(p.divider)
-                .child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child(format!("This event repeats. {verb}:")))
+                .child(div().text_size(crate::ui::ui_px(13.)).font_weight(FontWeight::MEDIUM).child(format!("This event repeats. {verb}:")))
                 .child(
                     h_flex()
                         .flex_wrap()
@@ -1725,10 +1725,10 @@ impl MailWindow {
                     .gap(px(10.))
                     .child(div().mt(px(5.)).size(px(12.)).rounded(px(3.)).bg(fill.opacity(1.0)).border_1().border_color(edge))
                     // Without `min_w_0` a long title stays on one line and pushes the close button out.
-                    .child(div().flex_1().min_w_0().text_size(px(20.)).line_height(px(26.)).font_weight(FontWeight::SEMIBOLD).child(e.display_title()))
+                    .child(div().flex_1().min_w_0().text_size(crate::ui::ui_px(20.)).line_height(crate::ui::ui_px(26.)).font_weight(FontWeight::SEMIBOLD).child(e.display_title()))
                     .child(Button::new("close-detail").ghost().xsmall().icon(icon("x").size(px(14.))).on_click(cx.listener(|this, _, window, cx| this.close_event_details(window, cx)))),
             )
-            .child(v_flex().gap(px(6.)).text_size(px(13.))
+            .child(v_flex().gap(px(6.)).text_size(crate::ui::ui_px(13.))
                 .child(h_flex().gap(px(8.)).items_center().child(icon("clock").size(px(15.)).text_color(p.muted)).child(when))
                 .children(e.location.clone().map(|l| h_flex().gap(px(8.)).items_center().child(icon("map-pin").size(px(15.)).text_color(p.muted)).child(div().flex_1().min_w_0().child(l))))
                 .children(calendar.map(|c| h_flex().gap(px(8.)).items_center().child(icon("calendar").size(px(15.)).text_color(p.muted)).child(c.name.clone())))
@@ -1738,7 +1738,7 @@ impl MailWindow {
                 d.child(
                     v_flex()
                         .gap(px(8.))
-                        .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child(match my {
+                        .child(div().text_size(crate::ui::ui_px(12.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child(match my {
                             Some(ResponseStatus::NeedsAction) | None => "Respond".to_owned(),
                             Some(r) => format!("Your response: {}", r.label()),
                         }))
@@ -1769,7 +1769,7 @@ impl MailWindow {
                 d.child(
                     v_flex()
                         .gap(px(6.))
-                        .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child(format!("{total} guests")))
+                        .child(div().text_size(crate::ui::ui_px(12.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child(format!("{total} guests")))
                         .children(e.attendees.iter().take(shown).map(|a| {
                             let (ic, color) = match a.response {
                                 ResponseStatus::Accepted => ("circle-check", p.success),
@@ -1780,20 +1780,20 @@ impl MailWindow {
                             h_flex()
                                 .items_center()
                                 .gap(px(8.))
-                                .text_size(px(12.))
+                                .text_size(crate::ui::ui_px(12.))
                                 .child(icon(ic).size(px(14.)).text_color(color))
                                 .child(div().flex_1().truncate().child(format!("{}{}", a.display_name(), if a.is_organizer { " · Organizer" } else if a.optional { " · Optional" } else { "" })))
                         }))
                         .when(total > GUESTS_SHOWN + 1, |d| {
                             let text = if expanded { "show fewer".to_owned() } else { format!("+{} more", total - shown) };
-                            d.child(div().id("guests-more").w_full().cursor_pointer().text_size(px(12.)).text_color(p.accent).child(text).on_click(cx.listener(move |this, _, _w, cx| {
+                            d.child(div().id("guests-more").w_full().cursor_pointer().text_size(crate::ui::ui_px(12.)).text_color(p.accent).child(text).on_click(cx.listener(move |this, _, _w, cx| {
                                 this.cal_guests_expanded = (!expanded).then(|| event_id.clone());
                                 cx.notify();
                             })))
                         }),
                 )
             })
-            .children(description_html.map(|html| div().text_size(px(13.)).line_height(px(20.)).child(TextView::html(SharedString::from(format!("evdesc-{}", e.id)), html).selectable(true))));
+            .children(description_html.map(|html| div().text_size(crate::ui::ui_px(13.)).line_height(crate::ui::ui_px(20.)).child(TextView::html(SharedString::from(format!("evdesc-{}", e.id)), html).selectable(true))));
         // The scope question stays above the scrolling details, so it is seen from any scroll
         // position. This is a plain scroll area because `overflow_y_scrollbar` collapses to no
         // height in the modal, whose height comes from its content.
@@ -1811,9 +1811,9 @@ impl MailWindow {
         let editable: Vec<(CalendarId, String)> = self.calendars.iter().filter(|c| c.can_edit).map(|c| (c.id.clone(), c.name.clone())).collect();
         let this = cx.entity().downgrade();
         let field = |label: &'static str, input: AnyElement| {
-            v_flex().gap(px(4.)).child(div().text_size(px(11.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child(label)).child(input)
+            v_flex().gap(px(4.)).child(div().text_size(crate::ui::ui_px(11.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child(label)).child(input)
         };
-        let heading = h_flex().flex_none().items_center().px(px(20.)).pt(px(20.)).pb(px(12.)).child(div().flex_1().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(if form.editing.is_some() { "Edit event" } else if form.duplicate_of.is_some() { "Duplicate event" } else { "New event" })).child(Button::new("cancel-new-event").ghost().xsmall().icon(icon("x").size(px(14.))).on_click(cx.listener(|this, _, window, cx| this.cancel_new_event(window, cx))));
+        let heading = h_flex().flex_none().items_center().px(px(20.)).pt(px(20.)).pb(px(12.)).child(div().flex_1().text_size(crate::ui::ui_px(16.)).font_weight(FontWeight::SEMIBOLD).child(if form.editing.is_some() { "Edit event" } else if form.duplicate_of.is_some() { "Duplicate event" } else { "New event" })).child(Button::new("cancel-new-event").ghost().xsmall().icon(icon("x").size(px(14.))).on_click(cx.listener(|this, _, window, cx| this.cancel_new_event(window, cx))));
         let fields = v_flex()
             .id("new-event")
             .flex_1()
@@ -1831,7 +1831,7 @@ impl MailWindow {
                 cx.notify();
             }))))
             .when(!form.all_day, |d| d.child(h_flex().gap(px(10.)).child(div().flex_1().child(field("Start", Input::new(&form.start).aria_label("Event start time").into_any_element()))).child(div().flex_1().child(field("End", Input::new(&form.end).aria_label("Event end time").into_any_element())))))
-            .when(!form.all_day, |d| d.child(div().text_size(px(12.)).text_color(p.muted).child(format!("Times in {}", tz::zone_label(&form.time_zone)))))
+            .when(!form.all_day, |d| d.child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(format!("Times in {}", tz::zone_label(&form.time_zone)))))
             .child(field("Location", Input::new(&form.location).aria_label("Event location").into_any_element()))
             .when(!caldav,|d|d.child(field(
                 "Guests",
@@ -1849,7 +1849,7 @@ impl MailWindow {
                                     Some(false) => ("free", p.success, "circle-check"),
                                     None => ("unknown", p.muted, "circle"),
                                 };
-                                h_flex().items_center().gap(px(4.)).px(px(7.)).py(px(2.)).rounded(px(5.)).bg(p.chip).text_size(px(11.)).child(icon(ic).size(px(12.)).text_color(color)).child(format!("{email} · {label}"))
+                                h_flex().items_center().gap(px(4.)).px(px(7.)).py(px(2.)).rounded(px(5.)).bg(p.chip).text_size(crate::ui::ui_px(11.)).child(icon(ic).size(px(12.)).text_color(color)).child(format!("{email} · {label}"))
                             }))
                             .child(
                                 Button::new("check-availability")
@@ -1869,10 +1869,10 @@ impl MailWindow {
                 cx.notify();
             })))))
             .when(form.editing.is_some() && form.scope != RecurrenceScope::This, |d| {
-                d.child(h_flex().items_center().gap(px(6.)).text_size(px(12.)).text_color(p.muted).child(icon("repeat").size(px(13.))).child(format!("Applies to: {}", form.scope.label().to_lowercase())))
+                d.child(h_flex().items_center().gap(px(6.)).text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(icon("repeat").size(px(13.))).child(format!("Applies to: {}", form.scope.label().to_lowercase())))
             })
             .when(form.duplicate_of.as_ref().is_some_and(|e| e.is_recurring_instance()), |d| {
-                d.child(h_flex().items_center().gap(px(6.)).text_size(px(12.)).text_color(p.muted).child(icon("repeat").size(px(13.))).child("Copies this occurrence. The copy won’t repeat."))
+                d.child(h_flex().items_center().gap(px(6.)).text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(icon("repeat").size(px(13.))).child("Copies this occurrence. The copy won’t repeat."))
             })
             .child(field("Description", div().h(px(120.)).child(Textarea::new(&form.description).h_full()).into_any_element()))
             .when(form.editing.is_none(), |d| d.child(field(
@@ -1907,7 +1907,7 @@ impl MailWindow {
             .py(px(14.))
             .border_t_1()
             .border_color(p.divider)
-            .children(form.error.clone().map(|e| h_flex().gap(px(6.)).items_center().text_size(px(12.)).text_color(p.error).child(icon("circle-alert").size(px(14.)).text_color(p.error)).child(e)))
+            .children(form.error.clone().map(|e| h_flex().gap(px(6.)).items_center().text_size(crate::ui::ui_px(12.)).text_color(p.error).child(icon("circle-alert").size(px(14.)).text_color(p.error)).child(e)))
             .child(h_flex().gap(px(8.)).child(Button::new("save-event").primary().label("Save").tooltip("Save event (Ctrl S)").on_click(cx.listener(|this, _, window, cx| this.save_new_event(window, cx)))).child(Button::new("discard-event").ghost().label("Cancel").on_click(cx.listener(|this, _, window, cx| this.cancel_new_event(window, cx)))));
         v_flex().size_full().child(heading).child(fields).child(footer).into_any_element()
     }

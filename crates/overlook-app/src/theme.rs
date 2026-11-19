@@ -242,8 +242,19 @@ impl Palette {
     }
 
     /// Keep mail on light paper in every shell theme; sender-authored colors still win.
+    #[cfg(test)]
     pub fn prepare_browser_document(&self, source: &str) -> overlook_core::BrowserDocument {
         overlook_core::browser::prepare_document_with_colors(source, EMAIL_PAPER, EMAIL_INK)
+    }
+
+    /// Keep mail on light paper in every shell theme, applying the user's reading typography.
+    pub fn prepare_browser_document_with_fonts(
+        &self,
+        source: &str,
+        fonts: &overlook_core::FontPrefs,
+    ) -> overlook_core::BrowserDocument {
+        let typography = overlook_core::browser::BrowserTypography::from_prefs(fonts);
+        overlook_core::browser::prepare_document_with_options(source, EMAIL_PAPER, EMAIL_INK, &typography)
     }
 
     pub fn is_dark(&self) -> bool {
@@ -378,13 +389,32 @@ fn color_hex(color: Hsla) -> String {
     format!("#{:06X}", color_rgb(color))
 }
 
-fn component_theme(theme: ResolvedTheme) -> ThemeConfig {
+#[derive(Clone, Debug, Default)]
+pub struct ActiveFonts(pub overlook_core::FontPrefs);
+
+impl Global for ActiveFonts {}
+
+pub fn current_fonts(cx: &App) -> overlook_core::FontPrefs {
+    cx.try_global::<ActiveFonts>().map(|f| f.0.clone()).unwrap_or_default()
+}
+
+fn component_theme(theme: ResolvedTheme, fonts: &overlook_core::FontPrefs) -> ThemeConfig {
     let mode = if theme.is_dark() { "dark" } else { "light" };
-    serde_json::from_value(serde_json::json!({
-        "name": format!("Overlook {theme:?}"), "mode": mode,
-        "font.family": "Inter", "font.size": 14, "radius": 6,
-        "radius.lg": 10, "shadow": true, "colors": component_colors(theme),
-    })).expect("theme json is valid")
+    let mut cfg = serde_json::json!({
+        "name": format!("Overlook {theme:?}"),
+        "mode": mode,
+        "font.family": fonts.effective_ui_family(),
+        "font.size": fonts.clamped_ui_size(),
+        "mono_font.size": fonts.clamped_mono_size(),
+        "radius": 6,
+        "radius.lg": 10,
+        "shadow": true,
+        "colors": component_colors(theme),
+    });
+    if let Some(mono) = fonts.effective_mono_family() {
+        cfg["mono_font.family"] = serde_json::Value::String(mono.to_owned());
+    }
+    serde_json::from_value(cfg).expect("theme json is valid")
 }
 
 const LIGHT_JSON: &str = r##"{
@@ -441,8 +471,9 @@ const DARK_JSON: &str = r##"{
 
 /// Installs the selected colorway and applies its light/dark rendering mode.
 pub fn apply(theme: ResolvedTheme, cx: &mut App) {
-    let light = Rc::new(component_theme(if theme.is_dark() { ResolvedTheme::Light } else { theme }));
-    let dark = Rc::new(component_theme(if theme.is_dark() { theme } else { ResolvedTheme::Dark }));
+    let fonts = current_fonts(cx);
+    let light = Rc::new(component_theme(if theme.is_dark() { ResolvedTheme::Light } else { theme }, &fonts));
+    let dark = Rc::new(component_theme(if theme.is_dark() { theme } else { ResolvedTheme::Dark }, &fonts));
     Theme::update(cx, |t| {
         t.light_theme = light;
         t.dark_theme = dark;
@@ -451,6 +482,14 @@ pub fn apply(theme: ResolvedTheme, cx: &mut App) {
     Theme::change(mode, None, cx);
     cx.set_global(Palette::for_theme(theme));
     cx.refresh_windows();
+}
+
+/// Applies font and text size preferences across every window and component theme.
+pub fn apply_fonts(fonts: &overlook_core::FontPrefs, cx: &mut App) {
+    cx.set_global(ActiveFonts(fonts.clone()));
+    if let Some(resolved) = cx.try_global::<Palette>().map(|p| p.resolved) {
+        apply(resolved, cx);
+    }
 }
 
 pub fn system_appearance(appearance: WindowAppearance) -> SystemAppearance {
@@ -678,7 +717,7 @@ mod tests {
             ] {
                 assert_eq!(colors[key].as_str(), Some(color_hex(color).as_str()), "{theme:?}: {key}");
             }
-            let _ = component_theme(theme);
+            let _ = component_theme(theme, &overlook_core::FontPrefs::default());
         }
     }
 
@@ -730,7 +769,23 @@ magenta = "#ad8ee6"
             let value = value.as_str().unwrap();
             assert!(!built_in.contains(value) || dark[key].as_str() != Some(value), "{key} kept the built-in {value}");
         }
-        let _ = component_theme(ResolvedTheme::SystemDark);
+        let _ = component_theme(ResolvedTheme::SystemDark, &overlook_core::FontPrefs::default());
+    }
+
+    #[test]
+    fn component_theme_projects_font_preferences() {
+        let fonts = overlook_core::FontPrefs {
+            ui_family: Some("Georgia".into()),
+            ui_size: 17,
+            mono_family: Some("JetBrains Mono".into()),
+            mono_size: 15,
+            ..Default::default()
+        };
+        let cfg = component_theme(ResolvedTheme::Light, &fonts);
+        assert_eq!(cfg.font_family.as_deref(), Some("Georgia"));
+        assert_eq!(cfg.font_size, Some(17.));
+        assert_eq!(cfg.mono_font_family.as_deref(), Some("JetBrains Mono"));
+        assert_eq!(cfg.mono_font_size, Some(15.));
     }
 
     #[test]
