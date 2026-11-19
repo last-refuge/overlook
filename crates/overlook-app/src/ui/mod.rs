@@ -3368,7 +3368,7 @@ impl MailWindow {
     /// conversations whatever folder the search began in, so there the newest message
     /// outside Trash is starred, which keeps the conversation in Starred.
     fn star_view(&self) -> MailboxView {
-        if self.search_query.is_empty() { self.view.clone() } else { MailboxView::Kind(LabelKind::Inbox) }
+        if self.search_query.trim().is_empty() { self.view.clone() } else { MailboxView::Kind(LabelKind::Inbox) }
     }
 
     /// Stars or unstars whole conversations: starring marks each one's newest message,
