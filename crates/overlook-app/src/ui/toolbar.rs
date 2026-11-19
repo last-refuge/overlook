@@ -55,7 +55,7 @@ impl Render for ToolbarDrag {
             .border_1()
             .border_color(p.action)
             .shadow_md()
-            .text_size(px(13.))
+            .text_size(crate::ui::ui_px(13.))
             .text_color(p.foreground)
             .child(self.glyph.render(&p, false))
             .child(self.label.clone())
@@ -699,7 +699,7 @@ impl MailWindow {
                     .when(layout.strip.is_empty(), |d| {
                         d.child(
                             div()
-                                .text_size(px(12.))
+                                .text_size(crate::ui::ui_px(12.))
                                 .text_color(p.muted)
                                 .child("Drag buttons here from More"),
                         )
@@ -815,7 +815,7 @@ impl MailWindow {
                         .on_drop(cx.listener(move |this, d: &ToolbarDrag, _, cx| {
                             this.drop_toolbar_action(d, area, None, cx)
                         }))
-                        .text_size(px(11.))
+                        .text_size(crate::ui::ui_px(11.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(p.muted)
                         .child(title)
@@ -825,7 +825,7 @@ impl MailWindow {
                     rows.push(
                         div()
                             .p(px(8.))
-                            .text_size(px(12.))
+                            .text_size(crate::ui::ui_px(12.))
                             .text_color(p.muted)
                             .child("No buttons here")
                             .into_any_element(),
@@ -846,7 +846,7 @@ impl MailWindow {
                 rows.push(
                     div()
                         .pb(px(6.))
-                        .text_size(px(11.))
+                        .text_size(crate::ui::ui_px(11.))
                         .text_color(p.muted)
                         .child("More room needed — your order is saved")
                         .into_any_element(),
@@ -857,7 +857,7 @@ impl MailWindow {
                 rows.push(
                     div()
                         .p(px(8.))
-                        .text_size(px(12.))
+                        .text_size(crate::ui::ui_px(12.))
                         .text_color(p.muted)
                         .child("All buttons are on the toolbar")
                         .into_any_element(),
@@ -906,7 +906,7 @@ impl MailWindow {
             )
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(crate::ui::ui_px(12.))
                     .text_color(p.muted)
                     .w_full()
                     .whitespace_normal()
@@ -946,7 +946,7 @@ impl MailWindow {
                     )
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(crate::ui::ui_px(11.))
                             .text_color(p.muted)
                             .child("Changes save automatically"),
                     ),
@@ -1026,7 +1026,7 @@ impl MailWindow {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_size(px(12.))
+                    .text_size(crate::ui::ui_px(12.))
                     .child(command.label.clone()),
             );
         for forward in [false, true] {

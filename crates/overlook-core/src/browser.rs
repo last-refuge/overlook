@@ -44,6 +44,41 @@ pub fn prepare_document(source: &str) -> BrowserDocument {
     prepare_document_with_defaults(source, "body { background: white; color: black; }")
 }
 
+/// Display-only typography preferences applied when preparing a browser email document.
+/// These never alter stored or sent mail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserTypography {
+    pub font_family: Option<String>,
+    pub font_size_px: u8,
+    pub mono_family: Option<String>,
+    pub mono_size_px: u8,
+    pub override_sender: bool,
+}
+
+impl Default for BrowserTypography {
+    fn default() -> Self {
+        Self {
+            font_family: None,
+            font_size_px: crate::prefs::FontPrefs::DEFAULT_READING_SIZE,
+            mono_family: None,
+            mono_size_px: crate::prefs::FontPrefs::DEFAULT_MONO_SIZE,
+            override_sender: false,
+        }
+    }
+}
+
+impl BrowserTypography {
+    pub fn from_prefs(prefs: &crate::prefs::FontPrefs) -> Self {
+        Self {
+            font_family: prefs.browser_reading_family(),
+            font_size_px: prefs.clamped_reading_size(),
+            mono_family: prefs.effective_mono_family().map(str::to_owned),
+            mono_size_px: prefs.clamped_mono_size(),
+            override_sender: prefs.override_email_fonts,
+        }
+    }
+}
+
 /// Apply display-only RGB defaults at zero CSS specificity so sender styles and
 /// legacy body color attributes win. These colors never enter stored/sent mail.
 pub fn prepare_document_with_colors(
@@ -51,18 +86,36 @@ pub fn prepare_document_with_colors(
     background: u32,
     foreground: u32,
 ) -> BrowserDocument {
+    prepare_document_with_options(source, background, foreground, &BrowserTypography::default())
+}
+
+/// Apply display-only RGB defaults and user reading typography to a prepared browser document.
+pub fn prepare_document_with_options(
+    source: &str,
+    background: u32,
+    foreground: u32,
+    typography: &BrowserTypography,
+) -> BrowserDocument {
     let defaults = format!(
         ":where(body:not([bgcolor]):not([background])) {{ background-color: #{:06X}; }} :where(body:not([text])) {{ color: #{:06X}; }}",
         background & 0xFFFFFF, foreground & 0xFFFFFF,
     );
-    prepare_document_with_defaults(source, &defaults)
+    prepare_document_with_defaults_and_typography(source, &defaults, typography)
 }
 
 fn prepare_document_with_defaults(source: &str, defaults: &str) -> BrowserDocument {
+    prepare_document_with_defaults_and_typography(source, defaults, &BrowserTypography::default())
+}
+
+fn prepare_document_with_defaults_and_typography(
+    source: &str,
+    defaults: &str,
+    typography: &BrowserTypography,
+) -> BrowserDocument {
     let Some(dom) = parse_bounded_document(source) else {
         return preparation_error(defaults);
     };
-    prepare_dom(dom, defaults)
+    prepare_dom(dom, defaults, typography)
 }
 
 /// Shared with display-only thread history folding. Every parser entry point
@@ -87,7 +140,7 @@ pub(crate) fn parse_bounded_document(source: &str) -> Option<RcDom> {
     Some(dom)
 }
 
-fn prepare_dom(dom: RcDom, defaults: &str) -> BrowserDocument {
+fn prepare_dom(dom: RcDom, defaults: &str, typography: &BrowserTypography) -> BrowserDocument {
     let mut styles = String::new();
     prepare_nodes(&dom.document, false, &mut styles);
     // Only the parser's actual document roots may supply root attributes. No
@@ -100,6 +153,7 @@ fn prepare_dom(dom: RcDom, defaults: &str) -> BrowserDocument {
         .iter()
         .map(serialize_node)
         .collect::<String>();
+    let override_sender = typography.override_sender;
     let mut cleaner = ammonia::Builder::default();
     cleaner
         .tags(words("a abbr address article aside b bdi bdo blockquote br button caption center cite code col colgroup dd del details div dl dt em figcaption figure font footer h1 h2 h3 h4 h5 h6 header hr i img ins kbd li main mark nav ol p pre q s samp section small span strong sub summary sup table tbody td tfoot th thead time tr tt u ul var wbr style"))
@@ -123,11 +177,17 @@ fn prepare_dom(dom: RcDom, defaults: &str) -> BrowserDocument {
         .url_schemes(words("http https data cid mailto tel"))
         .url_relative(ammonia::UrlRelative::Deny)
         .link_rel(None)
-        .attribute_filter(|tag, attr, value| {
+        .attribute_filter(move |tag, attr, value| {
             if matches!(attr, "src" | "background") && !resource_url(value) {
                 None
             } else if tag == "a" && attr == "href" && !navigation_url(value) {
                 None
+            } else if override_sender && tag == "font" && matches!(attr, "face" | "size") {
+                None
+            } else if override_sender && attr == "style" {
+                let is_heading = matches!(tag, "h1" | "h2" | "h3" | "h4" | "h5" | "h6");
+                let cleaned = strip_inline_font_declarations(value, !is_heading);
+                (!cleaned.trim().is_empty()).then(|| cleaned.into())
             } else {
                 Some(value.into())
             }
@@ -138,7 +198,31 @@ fn prepare_dom(dom: RcDom, defaults: &str) -> BrowserDocument {
     let styles = cleaner.clean(&styles).to_string();
     let html_attrs = clean_root_attributes(&html_root, &cleaner, false);
     let body_attrs = clean_root_attributes(&body_root, &cleaner, true);
-    let html = format!("<!doctype html><html{html_attrs}><head><meta http-equiv=\"Content-Security-Policy\" content=\"{CSP}\"><style>body {{ margin: 0; font-family: Arial, sans-serif; font-size: 16px; }} {defaults}</style>{styles}</head><body{body_attrs}>{body}</body></html>");
+    let body_font = crate::prefs::css_sans_font_stack(typography.font_family.as_deref());
+    let body_size = typography.font_size_px.clamp(12, crate::prefs::FontPrefs::MAX_EMAIL_SIZE);
+    let mono_size = typography
+        .mono_size_px
+        .clamp(crate::prefs::FontPrefs::MIN_MONO_SIZE, crate::prefs::FontPrefs::MAX_MONO_SIZE);
+    let mono_family = crate::prefs::css_mono_font_stack(typography.mono_family.as_deref());
+    let mono_rule = match (&mono_family, mono_size != crate::prefs::FontPrefs::DEFAULT_MONO_SIZE) {
+        (Some(mono), true) => format!(" pre, code, kbd, samp, tt {{ font-family: {mono}; font-size: {mono_size}px; }}"),
+        (Some(mono), false) => format!(" pre, code, kbd, samp, tt {{ font-family: {mono}; }}"),
+        (None, true) => format!(" pre, code, kbd, samp, tt {{ font-size: {mono_size}px; }}"),
+        (None, false) => String::new(),
+    };
+    let override_styles = if override_sender {
+        let mono_override = match (&mono_family, mono_size != crate::prefs::FontPrefs::DEFAULT_MONO_SIZE) {
+            (Some(mono), _) => format!(" pre, code, kbd, samp, tt {{ font-family: {mono} !important; font-size: {mono_size}px !important; }}"),
+            (None, true) => format!(" pre, code, kbd, samp, tt {{ font-size: {mono_size}px !important; }}"),
+            (None, false) => String::new(),
+        };
+        format!(
+            "<style>body, p, div, td, th, li, span, a, blockquote, font, h1, h2, h3, h4, h5, h6, dd, dt, address, cite, em, strong, b, i, u, s, small, label {{ font-family: {body_font} !important; }} body, p, div, td, th, li, font, blockquote {{ font-size: {body_size}px !important; line-height: 1.5 !important; }} span, a, b, i, em, strong, u, s {{ font-size: inherit !important; }}{mono_override}</style>"
+        )
+    } else {
+        String::new()
+    };
+    let html = format!("<!doctype html><html{html_attrs}><head><meta http-equiv=\"Content-Security-Policy\" content=\"{CSP}\"><style>body {{ margin: 0; font-family: {body_font}; font-size: {body_size}px; }}{mono_rule} {defaults}</style>{styles}{override_styles}</head><body{body_attrs}>{body}</body></html>");
     let counted = parse_document(RcDom::default(), ParseOpts::default()).one(html.as_str());
     if !dom_within_limits(&counted.document) {
         return preparation_error(defaults);
@@ -355,6 +439,72 @@ fn normalize_css_url(raw: &str, url: &str) -> String {
     format!("{}https:{}", &raw[..offset], &raw[offset..])
 }
 
+/// Strips inline `font`, `font-family` (and optionally `font-size`/`line-height`)
+/// declarations from a `style="..."` attribute so sender inline `!important` styles
+/// cannot defeat the user's "Use my reading font for all emails" override.
+fn strip_inline_font_declarations(style: &str, strip_size: bool) -> String {
+    let mut parser = Parser::new(style);
+    parser.set_nested_block_limit(MAX_CSS_DEPTH as u8);
+    let mut kept: Vec<&str> = Vec::new();
+    let mut decl_start = parser.position();
+    let mut prop_name: Option<String> = None;
+
+    let should_strip = |name: &str| -> bool {
+        name.eq_ignore_ascii_case("font-family")
+            || name.eq_ignore_ascii_case("font")
+            || (strip_size
+                && (name.eq_ignore_ascii_case("font-size")
+                    || name.eq_ignore_ascii_case("line-height")))
+    };
+
+    loop {
+        let before = parser.position();
+        match parser.next_including_whitespace_and_comments().cloned() {
+            Ok(Token::Semicolon) => {
+                let raw = parser.slice(decl_start..before).trim();
+                if !raw.is_empty() && !prop_name.as_deref().is_some_and(should_strip) {
+                    kept.push(raw);
+                }
+                decl_start = parser.position();
+                prop_name = None;
+            }
+            Ok(Token::WhiteSpace(_)) | Ok(Token::Comment(_)) => {}
+            Ok(Token::Ident(ident)) if prop_name.is_none() => {
+                prop_name = Some(ident.as_ref().to_owned());
+            }
+            Ok(
+                Token::Function(_)
+                | Token::ParenthesisBlock
+                | Token::SquareBracketBlock
+                | Token::CurlyBracketBlock,
+            ) => {
+                if prop_name.is_none() {
+                    prop_name = Some(String::new());
+                }
+                // Consume the nested block now so `parser.position()` advances past its
+                // closing delimiter before the next `;` or EOF boundary is sliced.
+                let _ = parser.parse_nested_block(|nested| {
+                    while nested.next_including_whitespace_and_comments().is_ok() {}
+                    Ok::<_, cssparser::ParseError<()>>(())
+                });
+            }
+            Ok(_) => {
+                if prop_name.is_none() {
+                    prop_name = Some(String::new());
+                }
+            }
+            Err(_) => {
+                let raw = parser.slice(decl_start..parser.position()).trim();
+                if !raw.is_empty() && !prop_name.as_deref().is_some_and(should_strip) {
+                    kept.push(raw);
+                }
+                break;
+            }
+        }
+    }
+    kept.join("; ")
+}
+
 // Tokenize CSS rather than regex-matching: CSS escapes and nested blocks must
 // not conceal URL schemes. Leave ordinary tokens byte-for-byte unchanged.
 fn clean_css(css: &str, count: &mut usize) -> String {
@@ -555,4 +705,64 @@ fn count_resources(node: &Handle) -> usize {
             .iter()
             .map(count_resources)
             .sum::<usize>()
+}
+
+#[cfg(test)]
+mod typography_tests {
+    use super::*;
+
+    #[test]
+    fn default_typography_matches_prepare_document_with_colors() {
+        let source = "<p>Hello</p>";
+        assert_eq!(
+            prepare_document_with_colors(source, 0xFFFFFF, 0x20242B),
+            prepare_document_with_options(source, 0xFFFFFF, 0x20242B, &BrowserTypography::default())
+        );
+    }
+
+    #[test]
+    fn custom_typography_and_sender_override_emit_expected_styles() {
+        let source = "<style>p { font-family: Comic Sans MS; font-size: 10px; }</style><p style=\"color: red; font-size: 10px !important; font-family: 'Times New Roman' !important\">Hello</p><h1 style=\"font-family: Impact !important; font-size: 28px\">Heading</h1><font face=\"Comic Sans MS\" size=\"1\" color=\"blue\">Legacy</font><pre><code>fn main() {}</code></pre>";
+        let doc = prepare_document_with_options(
+            source,
+            0xFFFFFF,
+            0x20242B,
+            &BrowserTypography {
+                font_family: Some("Georgia".into()),
+                font_size_px: 19,
+                mono_family: Some("JetBrains Mono".into()),
+                mono_size_px: 15,
+                override_sender: true,
+            },
+        );
+        assert!(doc.html.contains("font-family: 'Georgia'"), "{}", doc.html);
+        assert!(doc.html.contains("font-size: 19px"), "{}", doc.html);
+        assert!(doc.html.contains("font-family: 'JetBrains Mono'"), "{}", doc.html);
+        assert!(doc.html.contains("font-size: 15px"), "{}", doc.html);
+        assert!(doc.html.contains("color: red"), "{}", doc.html);
+        assert!(!doc.html.contains("Times New Roman"), "inline !important font-family should be stripped: {}", doc.html);
+        assert!(!doc.html.contains("font-size: 10px !important"), "inline !important font-size should be stripped: {}", doc.html);
+        assert!(doc.html.contains("font-size: 28px"), "heading inline size stays intact: {}", doc.html);
+        assert!(!doc.html.contains("Impact"), "heading inline font-family should be stripped: {}", doc.html);
+        assert!(!doc.html.contains("face=\"Comic Sans MS\""), "legacy font face should be stripped: {}", doc.html);
+        // Override block must come after sender styles so it wins the cascade.
+        let sender_pos = doc.html.find("Comic Sans MS").unwrap();
+        let override_pos = doc.html.rfind("!important").unwrap();
+        assert!(override_pos > sender_pos);
+    }
+
+    #[test]
+    fn strip_inline_font_declarations_preserves_css_functions() {
+        assert_eq!(
+            strip_inline_font_declarations("color: rgb(255, 255, 255)", true),
+            "color: rgb(255, 255, 255)"
+        );
+        assert_eq!(
+            strip_inline_font_declarations(
+                "color: rgb(10, 20, 30); font-size: 10px !important; background: linear-gradient(rgb(1, 2, 3), rgba(4, 5, 6, 0.5))",
+                true,
+            ),
+            "color: rgb(10, 20, 30); background: linear-gradient(rgb(1, 2, 3), rgba(4, 5, 6, 0.5))"
+        );
+    }
 }

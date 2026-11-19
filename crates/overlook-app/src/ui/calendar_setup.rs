@@ -140,29 +140,29 @@ impl MailWindow {
             .collect();
         let this = cx.entity().downgrade();
         v_flex().gap(px(10.)).p(px(16.)).rounded(px(10.)).border_1().border_color(p.divider)
-            .child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child("Calendars"))
-            .child(div().text_size(px(12.)).text_color(p.muted).child("Connect Fastmail or another CalDAV service. Personal events and offline changes sync in both directions. Invitations are not enabled yet."))
-            .child(div().text_size(px(12.)).child("Calendar server URL"))
+            .child(div().text_size(crate::ui::ui_px(15.)).font_weight(FontWeight::SEMIBOLD).child("Calendars"))
+            .child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child("Connect Fastmail or another CalDAV service. Personal events and offline changes sync in both directions. Invitations are not enabled yet."))
+            .child(div().text_size(crate::ui::ui_px(12.)).child("Calendar server URL"))
             .child(Input::new(&form.server).aria_label("Calendar server URL").disabled(form.busy))
-            .child(div().text_size(px(12.)).child("Calendar username"))
+            .child(div().text_size(crate::ui::ui_px(12.)).child("Calendar username"))
             .child(Input::new(&form.username).aria_label("Calendar username").disabled(form.busy))
             .child(h_flex().gap(px(8.)).items_center()
                 .child(Switch::new("caldav-reuse-mail").accessibility_label("Use this account’s saved mail password").checked(form.reuse_mail).disabled(form.busy).on_click(cx.listener(|this, checked: &bool, _, cx| {
                     if let Some(f) = this.settings.as_mut().and_then(|s| s.caldav.as_mut()) { f.reuse_mail = *checked; }
                     cx.notify();
                 })))
-                .child(div().text_size(px(12.)).child("Use this account’s saved mail password")))
-            .when(!form.reuse_mail, |d| d.child(div().text_size(px(12.)).child("Calendar app password")).child(Input::new(&form.password).aria_label("Calendar app password").disabled(form.busy)))
-            .child(div().text_size(px(12.)).text_color(p.muted).child("Fastmail needs an app password with calendar access. Passwords stay in your system keyring. To update a separate password while preserving pending changes, enter it here and reconnect with the same server and username."))
+                .child(div().text_size(crate::ui::ui_px(12.)).child("Use this account’s saved mail password")))
+            .when(!form.reuse_mail, |d| d.child(div().text_size(crate::ui::ui_px(12.)).child("Calendar app password")).child(Input::new(&form.password).aria_label("Calendar app password").disabled(form.busy)))
+            .child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child("Fastmail needs an app password with calendar access. Passwords stay in your system keyring. To update a separate password while preserving pending changes, enter it here and reconnect with the same server and username."))
             .child(h_flex().gap(px(8.)).flex_wrap()
                 .child(Button::new("caldav-connect").primary().small().disabled(form.busy)
                     .label(if form.busy { "Connecting…" } else if form.previous.is_some() { "Reconnect calendars" } else { "Connect calendars" })
                     .on_click(cx.listener(|this, _, window, cx| this.connect_calendar(window, cx))))
                 .when(form.previous.is_some(), |d| d.child(Button::new("caldav-disconnect").small().disabled(form.busy).label("Disconnect calendars")
                     .on_click(cx.listener(|this, _, window, cx| this.disconnect_calendar(window, cx))))))
-            .children(form.note.as_ref().map(|note| div().id("caldav-setup-status").text_size(px(12.)).text_color(p.muted).child(note.clone())))
+            .children(form.note.as_ref().map(|note| div().id("caldav-setup-status").text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(note.clone())))
             .when(!choices.is_empty(), |d| d
-                .child(div().text_size(px(12.)).child("Default calendar for new events"))
+                .child(div().text_size(crate::ui::ui_px(12.)).child("Default calendar for new events"))
                 .child(Button::new("caldav-default-calendar").small().disabled(form.busy).label(default_name).dropdown_caret(true)
                     .dropdown_menu(move |mut menu, _, _| {
                         for (name, key) in &choices {
@@ -180,7 +180,7 @@ impl MailWindow {
                         }
                         menu
                     })))
-            .when(!form.calendars.is_empty(), |d| d.child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).child("Show calendars")))
+            .when(!form.calendars.is_empty(), |d| d.child(div().text_size(crate::ui::ui_px(12.)).font_weight(FontWeight::MEDIUM).child("Show calendars")))
             .children(form.calendars.iter().map(|calendar| {
                 let id = calendar.id.clone();
                 let account_id = calendar.account_id.clone();
@@ -194,8 +194,8 @@ impl MailWindow {
                         }
                         cx.notify();
                     })))
-                    .child(div().text_size(px(12.)).child(calendar.name.clone()))
-                    .when(!calendar.can_edit, |d| d.child(div().text_size(px(11.)).text_color(p.muted).child("Read only")))
+                    .child(div().text_size(crate::ui::ui_px(12.)).child(calendar.name.clone()))
+                    .when(!calendar.can_edit, |d| d.child(div().text_size(crate::ui::ui_px(11.)).text_color(p.muted).child("Read only")))
             }))
             .into_any_element()
     }

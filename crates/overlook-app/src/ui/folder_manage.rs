@@ -545,12 +545,12 @@ impl MailWindow {
                     .child(
                         h_flex()
                             .items_center()
-                            .child(div().flex_1().min_w_0().truncate().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(title))
+                            .child(div().flex_1().min_w_0().truncate().text_size(crate::ui::ui_px(16.)).font_weight(FontWeight::SEMIBOLD).child(title))
                             .child(kbd("Esc", &p)),
                     )
-                    .child(div().text_size(px(12.)).text_color(p.muted).child(account))
+                    .child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(account))
                     .child(Input::new(&prompt.input))
-                    .children(prompt.error.clone().map(|e| div().text_size(px(12.)).text_color(p.error).child(e)))
+                    .children(prompt.error.clone().map(|e| div().text_size(crate::ui::ui_px(12.)).text_color(p.error).child(e)))
                     .child(
                         h_flex()
                             .justify_end()

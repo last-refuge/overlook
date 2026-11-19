@@ -560,7 +560,7 @@ impl MailWindow {
                 })
                 .rounded(px(7.))
                 .cursor_pointer()
-                .text_size(px(13.))
+                .text_size(crate::ui::ui_px(13.))
                 .text_color(if current { p.accent } else if container { p.muted } else { p.foreground })
                 .when(container, |d| d.tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Holds folders only. Mail cannot be stored here. Right-click to learn more.").build(window, cx)))
                 .font_weight(if current { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
@@ -577,7 +577,7 @@ impl MailWindow {
                     d.child(
                         div()
                             .flex_none()
-                            .text_size(px(11.))
+                            .text_size(crate::ui::ui_px(11.))
                             .when(inbox, |d| {
                                 let (fill, ink) = count_pill(&p);
                                 d.min_w(px(20.))
@@ -716,7 +716,7 @@ impl MailWindow {
                 .py(px(m.header_padding))
                 .rounded(px(6.))
                 .cursor_pointer()
-                .text_size(px(11.))
+                .text_size(crate::ui::ui_px(11.))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(p.muted)
                 .hover(|d| d.bg(p.hover))
@@ -863,12 +863,12 @@ impl MailWindow {
                     .child(
                         v_flex()
                             .min_w_0()
-                            .child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).truncate().child(owner.display_name()))
+                            .child(div().text_size(crate::ui::ui_px(13.)).font_weight(FontWeight::MEDIUM).truncate().child(owner.display_name()))
                             .child(
                                 h_flex()
                                     .items_center()
                                     .gap(px(5.))
-                                    .text_size(px(11.))
+                                    .text_size(crate::ui::ui_px(11.))
                                     .text_color(p.muted)
                                     .child(div().size(px(6.)).rounded_full().bg(state_color))
                                     .child(format!("{} · {}", self.account.provider.label(), status.state.label())),

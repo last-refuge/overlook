@@ -787,7 +787,7 @@ fn send_submits_over_smtp_appends_to_sent_and_reconciles() {
     let (labels, _, cp) = synced(&server, &p);
     let sent_label = labels.iter().find(|l| l.kind == LabelKind::Sent).unwrap().id.clone();
     let d = draft(&acct, "Agenda");
-    let context = SendContext { sent_label: Some(sent_label.clone()), in_reply_to: None, labels: labels.clone() };
+    let context = SendContext { sent_label: Some(sent_label.clone()), in_reply_to: None, labels: labels.clone(), ..Default::default() };
     let receipt = block(p.send(&acct, &d, context)).unwrap();
 
     let rfc_id = crate::draft_message_id(&d);
@@ -829,7 +829,7 @@ fn a_dropped_send_is_uncertain_until_the_sent_folder_or_the_user_decides() {
     let acct = account();
     let (labels, _, _) = synced(&server, &p);
     let d = draft(&acct, "Dropped");
-    let context = || SendContext { sent_label: None, in_reply_to: None, labels: labels.clone() };
+    let context = || SendContext { sent_label: None, in_reply_to: None, labels: labels.clone(), ..Default::default() };
     assert_eq!(block(p.send(&acct, &d, context())).err(), Some(ProviderError::Uncertain));
     assert_eq!(server.lock().folder("Sent").messages.len(), 1, "no Sent copy was appended");
     assert_eq!(block(p.reconcile_send(&acct, &d)).unwrap(), SendOutcome::Unknown, "the bytes left this machine; not finding a copy proves nothing");
@@ -862,7 +862,7 @@ fn a_failed_sent_copy_still_counts_as_sent() {
     let p = sending_provider(&server, &smtp);
     let acct = account();
     let (labels, _, _) = synced(&server, &p);
-    let context = || SendContext { sent_label: None, in_reply_to: None, labels: labels.clone() };
+    let context = || SendContext { sent_label: None, in_reply_to: None, labels: labels.clone(), ..Default::default() };
 
     // The server refuses the APPEND: the message left, the copy is local.
     server.lock().fail_next = Some(("APPEND".into(), "NO [OVERQUOTA] Quota exceeded".into()));
@@ -890,7 +890,7 @@ fn a_failed_sent_copy_still_counts_as_sent() {
     let server = serve(state);
     let p = sending_provider(&server, &smtp);
     let (labels, _, _) = synced(&server, &p);
-    let receipt = block(p.send(&acct, &draft(&acct, "No folder"), SendContext { sent_label: Some(LabelId::from("imap:jason@example.com:sent-local")), in_reply_to: None, labels })).unwrap();
+    let receipt = block(p.send(&acct, &draft(&acct, "No folder"), SendContext { sent_label: Some(LabelId::from("imap:jason@example.com:sent-local")), in_reply_to: None, labels, ..Default::default() })).unwrap();
     assert!(is_local_placeholder(&receipt.provider_id));
     assert_eq!(receipt.message.label_ids.iter().map(|l| l.as_str()).collect::<Vec<_>>(), vec!["imap:jason@example.com:sent-local"]);
     assert_eq!(block(p.reconcile_send(&acct, &draft(&acct, "x"))).unwrap(), SendOutcome::Unknown, "nothing to search");
@@ -1806,7 +1806,7 @@ fn microsoft_servers_file_their_own_sent_copy_so_none_is_appended() {
         }
         panic!("SMTP never accepted the message");
     });
-    let context = SendContext { sent_label: None, in_reply_to: None, labels: labels.clone() };
+    let context = SendContext { sent_label: None, in_reply_to: None, labels: labels.clone(), ..Default::default() };
     let receipt = block(p.send(&acct, &d, context)).unwrap();
     let uid = filer.join().unwrap();
     assert_eq!(receipt.provider_id, pid("Sent", 1760400001, uid), "the server's copy is adopted");
@@ -1818,7 +1818,7 @@ fn microsoft_servers_file_their_own_sent_copy_so_none_is_appended() {
     // A server that files nothing within the wait still gets one copy.
     let quiet = p.with_server_copy_wait(Duration::from_millis(300));
     let d = draft(&acct, "Not filed");
-    let receipt = block(quiet.send(&acct, &d, SendContext { sent_label: None, in_reply_to: None, labels })).unwrap();
+    let receipt = block(quiet.send(&acct, &d, SendContext { sent_label: None, in_reply_to: None, labels, ..Default::default() })).unwrap();
     assert!(!is_local_placeholder(&receipt.provider_id));
     assert_eq!(server.lock().commands("APPEND"), 1);
 }

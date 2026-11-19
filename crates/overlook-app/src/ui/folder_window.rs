@@ -176,7 +176,12 @@ impl MailWindow {
             });
             return;
         }
-        let editors: Vec<WeakEntity<MailWindow>> = self.folder_windows.iter().map(|f| f.editor.clone()).collect();
+        let editors: Vec<WeakEntity<MailWindow>> = self
+            .folder_windows
+            .iter()
+            .map(|f| f.editor.clone())
+            .chain(self.detached_composers.values().map(|d| d.editor.clone()))
+            .collect();
         if editors.is_empty() {
             return;
         }
@@ -218,9 +223,13 @@ impl MailWindow {
         if self.prefs == prefs && self.account_prefs == account_prefs {
             return;
         }
+        let fonts_changed = self.prefs.fonts != prefs.fonts;
         self.prefs = prefs;
         self.account_prefs = account_prefs;
         self.reminders_enabled = self.prefs.event_reminders;
+        if fonts_changed && crate::theme::current_fonts(cx) != self.prefs.fonts {
+            crate::theme::apply_fonts(&self.prefs.fonts, cx);
+        }
         self.reload(cx);
         cx.notify();
     }

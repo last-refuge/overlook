@@ -264,7 +264,7 @@ impl MailWindow {
                 if i > 0 {
                     rows.push(div().mx(px(12.)).mt(px(6.)).h(px(1.)).bg(p.divider).into_any_element());
                 }
-                rows.push(div().px(px(12.)).pt(px(if i == 0 { 2. } else { 8. })).pb(px(2.)).text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).text_color(p.muted).child(heading).into_any_element());
+                rows.push(div().px(px(12.)).pt(px(if i == 0 { 2. } else { 8. })).pb(px(2.)).text_size(crate::ui::ui_px(11.)).font_weight(FontWeight::SEMIBOLD).text_color(p.muted).child(heading).into_any_element());
                 last_section = e.section.clone();
             }
             let command = e.command.clone();
@@ -278,13 +278,13 @@ impl MailWindow {
                     .h(px(34.))
                     .rounded(px(6.))
                     .cursor_pointer()
-                    .text_size(px(13.))
+                    .text_size(crate::ui::ui_px(13.))
                     .when(i == selected, |d| d.bg(p.selection).text_color(p.accent))
                     .when(i != selected, |d| d.hover(|d| d.bg(p.hover)))
                     .children(e.icon.map(|name| crate::assets::icon(name).size(px(15.)).text_color(if i == selected { p.accent } else { p.muted }).into_any_element()))
                     // Folder paths can be long: the name gives way, the hint keeps its place.
                     .child(div().flex_1().min_w_0().truncate().child(e.title.clone()))
-                    .children(e.hint.clone().map(|h| div().flex_none().text_size(px(11.)).text_color(p.muted).child(h)))
+                    .children(e.hint.clone().map(|h| div().flex_none().text_size(crate::ui::ui_px(11.)).text_color(p.muted).child(h)))
                     .on_click(cx.listener(move |this, _, window, cx| this.run_palette_command(command.clone(), window, cx)))
                     .into_any_element(),
             );

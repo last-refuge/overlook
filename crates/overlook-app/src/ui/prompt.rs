@@ -64,7 +64,7 @@ impl Render for ThemedPrompt {
         div()
             .id("prompt-overlay")
             // Drawn outside the window's own tree, so it doesn't inherit the app font.
-            .font_family("Inter")
+            .font_family(SharedString::from(crate::theme::current_fonts(cx).effective_ui_family().to_owned()))
             .absolute()
             .inset_0()
             .occlude()
@@ -97,8 +97,8 @@ impl Render for ThemedPrompt {
                     .p(px(20.))
                     .gap(px(8.))
                     .text_color(p.foreground)
-                    .child(div().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(self.message.clone()))
-                    .children(self.detail.clone().map(|d| div().text_size(px(13.)).text_color(p.muted).child(d)))
+                    .child(div().text_size(crate::ui::ui_px(16.)).font_weight(FontWeight::SEMIBOLD).child(self.message.clone()))
+                    .children(self.detail.clone().map(|d| div().text_size(crate::ui::ui_px(13.)).text_color(p.muted).child(d)))
                     .child(h_flex().mt(px(8.)).justify_end().gap(px(8.)).children(buttons)),
             )
     }

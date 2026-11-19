@@ -412,7 +412,7 @@ impl MailWindow {
                             .px(px(9.))
                             .rounded(px(12.))
                             .bg(p.chip)
-                            .text_size(px(11.5))
+                            .text_size(crate::ui::ui_px(11.5))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(if in_trash { p.warning } else { p.muted })
                             .child(
@@ -433,7 +433,7 @@ impl MailWindow {
                             .px(px(9.))
                             .rounded(px(12.))
                             .bg(p.chip)
-                            .text_size(px(11.5))
+                            .text_size(crate::ui::ui_px(11.5))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(p.accent)
                             .child(div().size(px(6.)).rounded_full().bg(p.accent))
@@ -486,7 +486,7 @@ impl MailWindow {
                 .bg(p.surface)
                 .child(
                     div()
-                        .text_size(px(13.))
+                        .text_size(crate::ui::ui_px(13.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(p.foreground)
                         .child(title),

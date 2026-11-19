@@ -2,7 +2,6 @@
 
 use super::api::{ApiError, GmailClient};
 use super::mapping::{self, base64url_encode, gmail_id, inside_inbox, label_from_json, message_from_json};
-use crate::outgoing::build_gmail_raw as build_raw;
 use crate::{draft_message_id, folder_name_problem, AppliedChanges, BoxFuture, MailProvider, MailboxSnapshot, ProviderError, RemoteChanges, RenamedFolder, SendContext, SendOutcome, SentReceipt};
 use overlook_core::time::Timestamp;
 use overlook_core::*;
@@ -705,7 +704,7 @@ impl MailProvider for GmailProvider {
         let draft = draft.clone();
         Box::pin(async move {
             let rfc_id = draft_message_id(&draft);
-            let raw = build_raw(&account, &draft, context.in_reply_to.as_ref(), &rfc_id).map_err(ProviderError::Rejected)?;
+            let raw = crate::outgoing::build_gmail_raw_with_font(&account, &draft, context.in_reply_to.as_ref(), &rfc_id, context.outgoing_font.as_ref()).map_err(ProviderError::Rejected)?;
             let mut body = json!({ "raw": base64url_encode(&raw) });
             if let Some(source) = &context.in_reply_to {
                 if let Some(thread) = gmail_id(&account.id, source.conversation_id.as_str()) {
@@ -736,7 +735,7 @@ impl MailProvider for GmailProvider {
                 Ok(Some(m)) => m,
                 _ => {
                     // Accepted but not re-fetchable right now: build the Sent copy locally.
-                    let mut m = crate::sample::sent_message(&account, &draft, context.in_reply_to.as_ref(), &ProviderId(id.clone()), &rfc_id, context.sent_label.as_ref(), overlook_core::time::now());
+                    let mut m = crate::sample::sent_message_with_font(&account, &draft, context.in_reply_to.as_ref(), &ProviderId(id.clone()), &rfc_id, context.sent_label.as_ref(), overlook_core::time::now(), context.outgoing_font.as_ref());
                     m.id = mapping::local_message_id(&account.id, &id);
                     if let Some(thread) = response.get("threadId").and_then(|t| t.as_str()) {
                         m.conversation_id = mapping::local_conversation_id(&account.id, thread);

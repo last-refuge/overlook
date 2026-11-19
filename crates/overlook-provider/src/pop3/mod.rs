@@ -41,7 +41,7 @@ pub mod fake;
 mod tests;
 
 use crate::mime::{headers_from_rfc822, message_from_rfc822, MessageFlags};
-use crate::{build_raw, draft_message_id, smtp, AppliedChanges, BoxFuture, Credential, MailProvider, MailboxSnapshot, ProviderError, RemoteChanges, SendContext, SendOutcome, SentReceipt};
+use crate::{draft_message_id, smtp, AppliedChanges, BoxFuture, Credential, MailProvider, MailboxSnapshot, ProviderError, RemoteChanges, SendContext, SendOutcome, SentReceipt};
 use client::Client;
 use overlook_core::time::now;
 use overlook_core::*;
@@ -431,7 +431,7 @@ impl Pop3Provider {
 
     fn send_draft(&self, account: &Account, draft: &Draft, context: SendContext) -> Result<SentReceipt, ProviderError> {
         let rfc_id = draft_message_id(draft);
-        let raw = build_raw(account, draft, context.in_reply_to.as_ref(), &rfc_id).map_err(ProviderError::Rejected)?;
+        let raw = crate::build_raw_with_font(account, draft, context.in_reply_to.as_ref(), &rfc_id, context.outgoing_font.as_ref()).map_err(ProviderError::Rejected)?;
         let recipients: Vec<String> = draft.to.iter().chain(&draft.cc).chain(&draft.bcc).map(|a| a.email.trim().to_owned()).filter(|e| !e.is_empty()).collect();
         let transport = smtp::Transport::new(self.servers.outgoing.clone(), self.outgoing_credential()).with_timeout(self.timeout);
         let reply = transport.send(&account.email, &recipients, &raw)?;
@@ -439,7 +439,7 @@ impl Pop3Provider {
 
         let provider_id = ProviderId(format!("{SENT_PREFIX}{rfc_id}"));
         let sent_label = context.sent_label.clone().unwrap_or_else(|| label_id(&account.id, LabelKind::Sent));
-        let mut message = crate::sample::sent_message(account, draft, context.in_reply_to.as_ref(), &provider_id, &rfc_id, Some(&sent_label), now());
+        let mut message = crate::sample::sent_message_with_font(account, draft, context.in_reply_to.as_ref(), &provider_id, &rfc_id, Some(&sent_label), now(), context.outgoing_font.as_ref());
         message.id = Self::local_id(account);
         if let Some(source) = &context.in_reply_to {
             message.in_reply_to = source.rfc_message_id.clone();

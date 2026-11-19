@@ -47,7 +47,7 @@ pub fn chip(text: impl Into<SharedString>, p: &Palette) -> Div {
         .bg(p.chip)
         .border_1()
         .border_color(p.divider)
-        .text_size(px(11.))
+        .text_size(crate::ui::ui_px(11.))
         .text_color(p.muted)
         .child(text.into())
 }
@@ -61,7 +61,7 @@ pub fn kbd(text: impl Into<SharedString>, p: &Palette) -> Div {
         .border_1()
         .border_color(p.divider)
         .bg(p.surface)
-        .text_size(px(11.))
+        .text_size(crate::ui::ui_px(11.))
         .text_color(p.muted)
         .child(text.into())
 }
@@ -91,7 +91,7 @@ fn segment_base(id: impl Into<ElementId>, selected: bool, p: &Palette) -> Statef
         .px(px(10.))
         .py(px(4.))
         .rounded(px(6.))
-        .text_size(px(13.))
+        .text_size(crate::ui::ui_px(13.))
         .cursor_pointer()
         .when(selected, |d| d.bg(p.surface).text_color(p.foreground).font_weight(FontWeight::SEMIBOLD).border_1().border_color(p.control_border).shadow_sm())
         .when(!selected, |d| d.text_color(p.muted).hover(|d| d.bg(p.hover).text_color(p.foreground)))

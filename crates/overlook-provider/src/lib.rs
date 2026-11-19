@@ -25,7 +25,7 @@ pub mod smtp;
 
 pub use calendar::{CalendarProvider, EventChanges};
 pub use credential::{AccessTokenSource, Credential};
-pub use outgoing::{build_raw, message_to_raw};
+pub use outgoing::{build_raw, build_raw_with_font, message_to_raw};
 
 use overlook_core::*;
 use std::future::Future;
@@ -191,6 +191,8 @@ pub struct SendContext {
     pub in_reply_to: Option<Message>,
     /// The account's labels, for provider id lookups.
     pub labels: Vec<Label>,
+    /// Optional font family and size to wrap around the outgoing HTML body.
+    pub outgoing_font: Option<OutgoingFont>,
 }
 
 /// What the provider recorded after accepting a send.

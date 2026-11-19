@@ -52,7 +52,7 @@ impl MailWindow {
         let setup = self.settings.as_ref().map(|s| &s.contacts);
         let busy = setup.is_some_and(|s| s.busy);
         let mut rows: Vec<AnyElement> = Vec::new();
-        let note = setup.and_then(|s| s.note.clone()).map(|note| div().id("contacts-setup-note").text_size(px(12.)).text_color(p.warning).whitespace_normal().child(note).into_any_element());
+        let note = setup.and_then(|s| s.note.clone()).map(|note| div().id("contacts-setup-note").text_size(crate::ui::ui_px(12.)).text_color(p.warning).whitespace_normal().child(note).into_any_element());
         if let ContactsSource::Server(name) = self.contacts_source_of(account) {
             rows.push(self.render_contacts_status(account, name, busy, cx));
             // Signing in again can come back as someone else, or fail: both are shown here too.
@@ -186,7 +186,7 @@ impl MailWindow {
     /// `has_password`: the account signs in to mail with a password, which may be offered here.
     fn render_contacts_form(&self, account: &Account, form: &ContactsForm, busy: bool, has_password: bool, cx: &mut Context<Self>) -> AnyElement {
         let p = *cx.palette();
-        let label = |text: &'static str| div().text_size(px(12.)).child(text);
+        let label = |text: &'static str| div().text_size(crate::ui::ui_px(12.)).child(text);
         let owner = account.clone();
         v_flex()
             .gap(px(8.))
@@ -194,8 +194,8 @@ impl MailWindow {
             .rounded(px(10.))
             .border_1()
             .border_color(p.divider)
-            .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child("Another contacts server"))
-            .child(div().text_size(px(12.)).text_color(p.muted).whitespace_normal().child("Overlook finds the address books at this address and keeps them in step both ways. Requests go only to this server, over a verified connection."))
+            .child(div().text_size(crate::ui::ui_px(13.)).font_weight(FontWeight::SEMIBOLD).child("Another contacts server"))
+            .child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).whitespace_normal().child("Overlook finds the address books at this address and keeps them in step both ways. Requests go only to this server, over a verified connection."))
             .child(label("Server address"))
             .child(Input::new(&form.server).aria_label("Contacts server address").disabled(busy))
             .child(label("User name"))
@@ -210,10 +210,10 @@ impl MailWindow {
                         }
                         cx.notify();
                     })))
-                    .child(div().text_size(px(12.)).child("Use this account’s mail password")),
+                    .child(div().text_size(crate::ui::ui_px(12.)).child("Use this account’s mail password")),
             ))
             .when(!form.reuse_mail, |d| d.child(label("Password")).child(Input::new(&form.password).aria_label("Contacts server password").disabled(busy)))
-            .child(div().text_size(px(12.)).text_color(p.muted).whitespace_normal().child("Passwords stay in your system keyring."))
+            .child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).whitespace_normal().child("Passwords stay in your system keyring."))
             .child(
                 h_flex()
                     .gap(px(8.))

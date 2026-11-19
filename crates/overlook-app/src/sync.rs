@@ -843,10 +843,16 @@ async fn replay_operations(
                 };
                 let subject = draft.display_subject();
                 let _ = store.set_draft_state(&draft.id, &DraftState::Sending);
+                let outgoing_font = store
+                    .setting::<overlook_core::Prefs>("prefs")
+                    .ok()
+                    .flatten()
+                    .and_then(|p| p.fonts.outgoing_font());
                 let context = SendContext {
                     sent_label: sent_label.clone(),
                     in_reply_to: draft.in_reply_to.as_ref().and_then(|id| store.message(id).ok().flatten()),
                     labels: labels.clone(),
+                    outgoing_font,
                 };
                 let needs_reconcile = op.state == OperationState::Uncertain || draft.state == DraftState::Uncertain;
                 let send_result = if needs_reconcile {
@@ -854,7 +860,7 @@ async fn replay_operations(
                         Ok(SendOutcome::Delivered(provider_id)) => {
                             let rfc = overlook_provider::draft_message_id(&draft);
                             Ok(overlook_provider::SentReceipt {
-                                message: overlook_provider::sample::sent_message(&account, &draft, context.in_reply_to.as_ref(), &provider_id, &rfc, sent_label.as_ref(), now()),
+                                message: overlook_provider::sample::sent_message_with_font(&account, &draft, context.in_reply_to.as_ref(), &provider_id, &rfc, sent_label.as_ref(), now(), context.outgoing_font.as_ref()),
                                 provider_id,
                                 rfc_message_id: Some(rfc),
                             })

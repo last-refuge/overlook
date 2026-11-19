@@ -329,13 +329,13 @@ impl MailWindow {
                 .px(px(11.))
                 .rounded(px(7.))
                 .cursor_pointer()
-                .text_size(px(13.))
+                .text_size(crate::ui::ui_px(13.))
                 .text_color(if active { p.selection_text } else { p.foreground })
                 .when(active, |d| d.bg(p.selection).font_weight(FontWeight::SEMIBOLD))
                 .when(!active, |d| d.hover(|d| d.bg(p.hover)))
                 .child(icon(icon_name).size(px(15.)).text_color(if active { p.accent } else { p.muted }))
                 .child(div().flex_1().child(label))
-                .child(div().text_size(px(11.)).text_color(if active { p.selection_text } else { p.muted }).child(count.to_string()))
+                .child(div().text_size(crate::ui::ui_px(11.)).text_color(if active { p.selection_text } else { p.muted }).child(count.to_string()))
                 .on_click(cx.listener(move |this, _, _w, cx| this.set_contact_filter(filter, cx)))
         };
         v_flex()
@@ -359,7 +359,7 @@ impl MailWindow {
                         .p(px(10.))
                         .rounded(px(8.))
                         .bg(p.chip)
-                        .text_size(px(11.))
+                        .text_size(crate::ui::ui_px(11.))
                         .text_color(cx.palette().muted)
                         .whitespace_normal()
                         .child(match self.known_contacts_service(&self.account) {
@@ -376,7 +376,7 @@ impl MailWindow {
                         .p(px(10.))
                         .rounded(px(8.))
                         .bg(p.chip)
-                        .text_size(px(11.))
+                        .text_size(crate::ui::ui_px(11.))
                         .text_color(cx.palette().muted)
                         .child("Changes stay on this device until Overlook may edit your Google Contacts.")
                         .child(Button::new("contacts-write-signin").xsmall().label("Sign in again").on_click(cx.listener(move |this, _, window, cx| this.start_google_sign_in(Some(email.clone()), window, cx)))),
@@ -395,10 +395,10 @@ impl MailWindow {
             .border_r_1()
             .border_color(p.divider)
             .child(h_flex().items_center().h(px(52.)).px(px(16.)).gap(px(8.)).border_b_1().border_color(p.divider)
-                .child(div().flex_1().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child(match self.contact_filter {
+                .child(div().flex_1().text_size(crate::ui::ui_px(15.)).font_weight(FontWeight::SEMIBOLD).child(match self.contact_filter {
                     ContactFilter::All => "All contacts", ContactFilter::AddressBook => "Address book", ContactFilter::Other => "Other contacts",
                 }))
-                .child(div().text_size(px(12.)).text_color(p.muted).child(visible.len().to_string())))
+                .child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(visible.len().to_string())))
             .child(
                 div()
                     .id("contact-list")
@@ -408,7 +408,7 @@ impl MailWindow {
                     .child(if visible.is_empty() {
                         div()
                             .p(px(20.))
-                            .text_size(px(13.))
+                            .text_size(crate::ui::ui_px(13.))
                             .text_color(p.muted)
                             .child(match (self.contacts.is_empty(), self.contacts_source) {
                                 (true, ContactsSource::Device) => "No contacts yet. Contacts you add stay on this device.",
@@ -437,11 +437,11 @@ impl MailWindow {
                                         v_flex()
                                             .flex_1()
                                             .min_w_0()
-                                            .child(div().truncate().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child(c.display_name()))
-                                            .child(div().truncate().text_size(px(11.)).text_color(p.muted).child(if c.email.is_empty() { c.organization.clone().unwrap_or_default() } else { c.email.clone() })),
+                                            .child(div().truncate().text_size(crate::ui::ui_px(13.)).font_weight(FontWeight::MEDIUM).child(c.display_name()))
+                                            .child(div().truncate().text_size(crate::ui::ui_px(11.)).text_color(p.muted).child(if c.email.is_empty() { c.organization.clone().unwrap_or_default() } else { c.email.clone() })),
                                     )
                                     .when(c.pending, |d| d.child(icon("cloud-off").size(px(13.)).text_color(p.warning)))
-                                    .when(!c.in_address_book, |d| d.child(div().text_size(px(10.)).text_color(p.muted).child("other")))
+                                    .when(!c.in_address_book, |d| d.child(div().text_size(crate::ui::ui_px(10.)).text_color(p.muted).child("other")))
                                     .on_click(cx.listener(move |this, _, _w, cx| {
                                         this.contact_form = None;
                                         this.contact_selected = Some(id.clone());
@@ -462,7 +462,7 @@ impl MailWindow {
                 .justify_center()
                 .gap(px(8.))
                 .child(icon("book-user").size(px(40.)).text_color(p.divider))
-                .child(div().text_size(px(14.)).text_color(p.muted).child("Select a contact, or add one."))
+                .child(div().text_size(crate::ui::ui_px(14.)).text_color(p.muted).child("Select a contact, or add one."))
                 .into_any_element()
         };
         h_flex().size_full().bg(p.surface).child(list).child(div().flex_1().min_w_0().h_full().child(detail))
@@ -472,7 +472,7 @@ impl MailWindow {
         let p = *cx.palette();
         let who = c.address();
         let row = |icon_name: &'static str, text: String| {
-            h_flex().items_center().gap(px(10.)).text_size(px(13.)).child(icon(icon_name).size(px(15.)).text_color(p.muted)).child(div().child(text))
+            h_flex().items_center().gap(px(10.)).text_size(crate::ui::ui_px(13.)).child(icon(icon_name).size(px(15.)).text_color(p.muted)).child(div().child(text))
         };
         v_flex()
             .id("contact-detail")
@@ -492,12 +492,12 @@ impl MailWindow {
                         v_flex()
                             .flex_1()
                             .min_w_0()
-                            .child(div().text_size(px(22.)).font_weight(FontWeight::SEMIBOLD).child(c.display_name()))
-                            .children(c.title.clone().or_else(|| c.organization.clone()).map(|t| div().text_size(px(13.)).text_color(p.muted).child(match (&c.title, &c.organization) {
+                            .child(div().text_size(crate::ui::ui_px(22.)).font_weight(FontWeight::SEMIBOLD).child(c.display_name()))
+                            .children(c.title.clone().or_else(|| c.organization.clone()).map(|t| div().text_size(crate::ui::ui_px(13.)).text_color(p.muted).child(match (&c.title, &c.organization) {
                                 (Some(t), Some(o)) => format!("{t} · {o}"),
                                 _ => t,
                             })))
-                            .child(div().text_size(px(11.)).text_color(p.muted).child(match (c.pending, c.in_address_book, self.contacts_source) {
+                            .child(div().text_size(crate::ui::ui_px(11.)).text_color(p.muted).child(match (c.pending, c.in_address_book, self.contacts_source) {
                                 (true, _, ContactsSource::Device) => "Saved on this device".to_owned(),
                                 (true, _, _) => "Saved on this device, waiting to sync".to_owned(),
                                 (false, true, ContactsSource::Google) => "In your Google Contacts".to_owned(),
@@ -522,7 +522,7 @@ impl MailWindow {
     fn render_contact_form(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *cx.palette();
         let Some(form) = self.contact_form.as_ref() else { return div().into_any_element() };
-        let field = |label: &'static str, input: AnyElement| v_flex().gap(px(4.)).child(div().text_size(px(11.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child(label)).child(input);
+        let field = |label: &'static str, input: AnyElement| v_flex().gap(px(4.)).child(div().text_size(crate::ui::ui_px(11.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child(label)).child(input);
         v_flex()
             .id("contact-form")
             .size_full()
@@ -530,13 +530,13 @@ impl MailWindow {
             .p(px(28.))
             .gap(px(12.))
             .max_w(px(560.))
-            .child(div().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).child(if form.editing.is_some() { "Edit contact" } else { "New contact" }))
+            .child(div().text_size(crate::ui::ui_px(18.)).font_weight(FontWeight::SEMIBOLD).child(if form.editing.is_some() { "Edit contact" } else { "New contact" }))
             .child(h_flex().gap(px(10.)).child(div().flex_1().child(field("First name", Input::new(&form.given).into_any_element()))).child(div().flex_1().child(field("Last name", Input::new(&form.family).into_any_element()))))
             .child(field("Email", Input::new(&form.email).into_any_element()))
             .child(field("Phone", Input::new(&form.phone).into_any_element()))
             .child(h_flex().gap(px(10.)).child(div().flex_1().child(field("Company", Input::new(&form.organization).into_any_element()))).child(div().flex_1().child(field("Job title", Input::new(&form.title).into_any_element()))))
             .child(field("Notes", div().h(px(100.)).child(Textarea::new(&form.notes).h_full()).into_any_element()))
-            .children(form.error.clone().map(|e| h_flex().gap(px(6.)).items_center().text_size(px(12.)).text_color(p.error).child(icon("circle-alert").size(px(14.)).text_color(p.error)).child(e)))
+            .children(form.error.clone().map(|e| h_flex().gap(px(6.)).items_center().text_size(crate::ui::ui_px(12.)).text_color(p.error).child(icon("circle-alert").size(px(14.)).text_color(p.error)).child(e)))
             .child(
                 h_flex()
                     .gap(px(8.))

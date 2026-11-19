@@ -1285,13 +1285,13 @@ impl MailWindow {
             .rounded(px(8.))
             .border_1()
             .border_color(if changed { p.error } else { p.divider })
-            .child(h_flex().items_center().gap(px(8.)).child(icon(if changed { "shield-alert" } else { "shield-check" }).size(px(16.)).text_color(if changed { p.error } else { p.muted })).child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(title)))
-            .child(div().text_size(px(12.)).text_color(p.muted).child(explanation))
+            .child(h_flex().items_center().gap(px(8.)).child(icon(if changed { "shield-alert" } else { "shield-check" }).size(px(16.)).text_color(if changed { p.error } else { p.muted })).child(div().text_size(crate::ui::ui_px(13.)).font_weight(FontWeight::SEMIBOLD).child(title)))
+            .child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(explanation))
             .children(certificates.into_iter().map(|(fingerprint, addresses)| {
                 v_flex()
                     .gap(px(2.))
-                    .child(div().text_size(px(12.)).child(format!("{}, SHA-256 fingerprint:", addresses.join(" and "))))
-                    .child(div().text_size(px(12.)).text_color(p.muted).child(fingerprint.to_owned()))
+                    .child(div().text_size(crate::ui::ui_px(12.)).child(format!("{}, SHA-256 fingerprint:", addresses.join(" and "))))
+                    .child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(fingerprint.to_owned()))
             }))
             .child(h_flex().child(Button::new("setup-trust-certificate").small().icon(icon("shield-check").size(px(14.))).label(if changed { "Trust the new certificate" } else { "Trust certificate" }).disabled(busy).on_click(cx.listener(|this, _, window, cx| this.setup_trust_certificates(window, cx)))))
             .into_any_element()
@@ -1468,7 +1468,7 @@ impl MailWindow {
         let p = *cx.palette();
         let Some(setup) = self.account_setup.as_ref() else { return div().into_any_element() };
         let busy = setup.busy;
-        let field = |label: &str, input: AnyElement| v_flex().gap(px(4.)).child(div().text_size(px(11.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child(label.to_owned())).child(input);
+        let field = |label: &str, input: AnyElement| v_flex().gap(px(4.)).child(div().text_size(crate::ui::ui_px(11.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child(label.to_owned())).child(input);
         let is_pop3 = setup.kind == ProviderKind::Pop3;
         let is_microsoft = setup.is_microsoft();
         // Waiting for the browser: the sign-in button stays live so it can start over.
@@ -1490,12 +1490,12 @@ impl MailWindow {
         let body: AnyElement = match setup.step {
             SetupStep::Basics if is_microsoft => v_flex()
                 .gap(px(12.))
-                .child(div().text_size(px(13.)).text_color(p.muted).child(if is_pop3 {
+                .child(div().text_size(crate::ui::ui_px(13.)).text_color(p.muted).child(if is_pop3 {
                     "For Outlook.com, Hotmail and Live addresses, and Microsoft 365 work or school accounts. You sign in with Microsoft in your browser, so Overlook never sees your password. Mail is downloaded over POP3 and kept on this device as the only copy; the sign-in Microsoft issues is kept in the system keyring."
                 } else {
                     "For Outlook.com, Hotmail and Live addresses, and Microsoft 365 work or school accounts. You sign in with Microsoft in your browser, so Overlook never sees your password. Mail is read over IMAP and sent over SMTP; the sign-in Microsoft issues is kept in the system keyring."
                 }))
-                .children(setup.note.clone().map(|n| div().text_size(px(12.)).text_color(p.muted).child(n)))
+                .children(setup.note.clone().map(|n| div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(n)))
                 .child(field("Account name", Input::new(&setup.account_name).into_any_element()))
                 .child(field("Your name", Input::new(&setup.name).into_any_element()))
                 .child(field("Email address", Input::new(&setup.email).into_any_element()))
@@ -1505,9 +1505,9 @@ impl MailWindow {
                 let url = guide.create_url;
                 v_flex()
                     .gap(px(12.))
-                    .child(div().text_size(px(13.)).text_color(p.muted).child(guide.explanation))
+                    .child(div().text_size(crate::ui::ui_px(13.)).text_color(p.muted).child(guide.explanation))
                     .child(h_flex().child(Button::new("setup-create-app-password").small().icon(icon("external-link").size(px(14.))).label(guide.create_label).on_click(move |_, _, cx| cx.open_url(url))))
-                    .children(setup.note.clone().map(|n| div().text_size(px(12.)).text_color(p.muted).child(n)))
+                    .children(setup.note.clone().map(|n| div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(n)))
                     .child(field("Account name", Input::new(&setup.account_name).into_any_element()))
                     .child(field("Your name", Input::new(&setup.name).into_any_element()))
                     .child(field("Email address", Input::new(&setup.email).into_any_element()))
@@ -1516,7 +1516,7 @@ impl MailWindow {
             }
             SetupStep::Basics => v_flex()
                 .gap(px(12.))
-                .child(div().text_size(px(13.)).text_color(p.muted).child(if is_pop3 {
+                .child(div().text_size(crate::ui::ui_px(13.)).text_color(p.muted).child(if is_pop3 {
                     "Overlook downloads mail over POP3 and sends it over SMTP. Downloaded messages are kept on this device as the only copy, so back them up from Settings → About. Your password is kept in the system keyring and never written to disk by Overlook."
                 } else {
                     "Overlook reads mail over IMAP and sends it over SMTP. Your password is kept in the system keyring and never written to disk by Overlook."
@@ -1542,7 +1542,7 @@ impl MailWindow {
                     d.child(h_flex()
                         .items_center()
                         .gap(px(10.))
-                        .child(div().flex_1().text_size(px(13.)).child(signed_in))
+                        .child(div().flex_1().text_size(crate::ui::ui_px(13.)).child(signed_in))
                         .child(Button::new("setup-microsoft-signin").small().label(if setup.microsoft.is_some() { "Sign in again" } else { "Sign in with Microsoft" }).disabled(busy.is_some() && !in_browser).on_click(cx.listener(|this, _, window, cx| this.setup_microsoft_sign_in(window, cx)))))
                 } else {
                     d.child(field(setup.guide.map(|g| g.password_label).unwrap_or("Password"), Input::new(&setup.password).into_any_element()))
@@ -1552,18 +1552,18 @@ impl MailWindow {
                         })
                 })
                 .child(divider(&p))
-                .children(setup.note.clone().map(|n| div().text_size(px(12.)).text_color(p.muted).child(n)))
-                .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(format!("Incoming ({})", setup.incoming_name())))
+                .children(setup.note.clone().map(|n| div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(n)))
+                .child(div().text_size(crate::ui::ui_px(13.)).font_weight(FontWeight::SEMIBOLD).child(format!("Incoming ({})", setup.incoming_name())))
                 .child(h_flex().gap(px(10.)).child(div().flex_1().child(field("Host", Input::new(&setup.in_host).into_any_element()))).child(div().w(px(90.)).child(field("Port", Input::new(&setup.in_port).into_any_element()))).child(field("Security", self.security_picker("setup-in-security", true, setup.in_security, cx))))
                 .child(field("User name", Input::new(&setup.in_user).into_any_element()))
-                .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).pt(px(6.)).child("Outgoing (SMTP)"))
+                .child(div().text_size(crate::ui::ui_px(13.)).font_weight(FontWeight::SEMIBOLD).pt(px(6.)).child("Outgoing (SMTP)"))
                 .child(h_flex().gap(px(10.)).child(div().flex_1().child(field("Host", Input::new(&setup.out_host).into_any_element()))).child(div().w(px(90.)).child(field("Port", Input::new(&setup.out_port).into_any_element()))).child(field("Security", self.security_picker("setup-out-security", false, setup.out_security, cx))))
                 .child(field("User name", Input::new(&setup.out_user).into_any_element()))
                 .when(!is_microsoft, |d| d.child(h_flex().items_center().gap(px(10.)).child(Switch::new("setup-same-password").checked(setup.same_password).label("Use the same password for sending").on_click(cx.listener(|this, checked: &bool, _w, cx| this.setup_toggle_same_password(*checked, cx))))))
                 .when(!setup.same_password && !is_microsoft, |d| d.child(field("Outgoing password", Input::new(&setup.out_password).into_any_element())))
                 .when(offer_calendars, |d| d
                     .child(divider(&p))
-                    .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child("Fastmail calendars"))
+                    .child(div().text_size(crate::ui::ui_px(13.)).font_weight(FontWeight::SEMIBOLD).child("Fastmail calendars"))
                     .child(Switch::new("setup-fastmail-calendars")
                         .checked(setup.connect_calendars).disabled(busy.is_some())
                         .label("Connect calendars using this mail password")
@@ -1572,10 +1572,10 @@ impl MailWindow {
                             if let Some(setup) = this.account_setup.as_mut() { setup.connect_calendars = *checked; }
                             cx.notify();
                         })))
-                    .child(div().text_size(px(12.)).text_color(p.muted).child("Use a Fastmail app password with calendar access. Calendars connect in the background after you add the account. If access is denied, mail keeps working and you can enter a separate calendar password in Settings → Accounts → Calendars.")))
+                    .child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child("Use a Fastmail app password with calendar access. Calendars connect in the background after you add the account. If access is denied, mail keeps working and you can enter a separate calendar password in Settings → Accounts → Calendars.")))
                 .when_some(offer_contacts, |d, service| d
                     .child(divider(&p))
-                    .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(format!("{} contacts", service.name)))
+                    .child(div().text_size(crate::ui::ui_px(13.)).font_weight(FontWeight::SEMIBOLD).child(format!("{} contacts", service.name)))
                     .child(Switch::new("setup-service-contacts")
                         .checked(setup.connect_contacts).disabled(busy.is_some())
                         .label("Connect contacts using this mail password")
@@ -1584,37 +1584,37 @@ impl MailWindow {
                             if let Some(setup) = this.account_setup.as_mut() { setup.connect_contacts = *checked; }
                             cx.notify();
                         })))
-                    .child(div().text_size(px(12.)).text_color(p.muted).whitespace_normal().child(format!("Your {name} contacts appear in Overlook, and changes you make here go back to {name}. {note} If access is denied, mail keeps working.", name = service.name, note = service.password_note))))
+                    .child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).whitespace_normal().child(format!("Your {name} contacts appear in Overlook, and changes you make here go back to {name}. {note} If access is denied, mail keeps working.", name = service.name, note = service.password_note))))
                 .when(!is_pop3, |d| {
-                    d.child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).pt(px(6.)).child("Folders on the server"))
-                        .child(div().text_size(px(12.)).text_color(p.muted).child("Sent, Trash and Archive are found from the server’s folder list. Name a folder here only when the server gets it wrong (paths as the server names them, like INBOX/Archive)."))
+                    d.child(div().text_size(crate::ui::ui_px(13.)).font_weight(FontWeight::SEMIBOLD).pt(px(6.)).child("Folders on the server"))
+                        .child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child("Sent, Trash and Archive are found from the server’s folder list. Name a folder here only when the server gets it wrong (paths as the server names them, like INBOX/Archive)."))
                         .child(field("Archive folder", Input::new(&setup.archive_folder).into_any_element()))
                         .child(field("Sent folder", Input::new(&setup.sent_folder).into_any_element()))
                         .child(field("Trash folder", Input::new(&setup.trash_folder).into_any_element()))
                         .child(h_flex().items_center().gap(px(10.)).child(Switch::new("setup-expunge-on-trash").checked(setup.expunge_on_trash).label("Delete permanently when the server has no Trash folder").on_click(cx.listener(|this, checked: &bool, _w, cx| this.setup_toggle_expunge_on_trash(*checked, cx)))))
-                        .when(setup.expunge_on_trash, |d| d.child(div().text_size(px(12.)).text_color(p.muted).child("Without a Trash folder, deleting a message removes it from the server at once instead of creating one.")))
+                        .when(setup.expunge_on_trash, |d| d.child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child("Without a Trash folder, deleting a message removes it from the server at once instead of creating one.")))
                 })
                 .when(is_pop3, |d| {
-                    d.child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).pt(px(6.)).child("On the server"))
+                    d.child(div().text_size(crate::ui::ui_px(13.)).font_weight(FontWeight::SEMIBOLD).pt(px(6.)).child("On the server"))
                         .child(h_flex().items_center().gap(px(10.)).child(Switch::new("setup-leave-on-server").checked(setup.leave_on_server).label("Leave messages on the server after downloading").on_click(cx.listener(|this, checked: &bool, _w, cx| this.setup_toggle_leave_on_server(*checked, cx)))))
                         .when(setup.leave_on_server, |d| {
                             d.child(
                                 h_flex()
                                     .items_center()
                                     .gap(px(10.))
-                                    .child(div().text_size(px(13.)).child("Delete from the server after"))
+                                    .child(div().text_size(crate::ui::ui_px(13.)).child("Delete from the server after"))
                                     .child(div().w(px(90.)).child(Input::new(&setup.delete_after_days).into_any_element()))
-                                    .child(div().text_size(px(13.)).text_color(p.muted).child("days (empty: never)")),
+                                    .child(div().text_size(crate::ui::ui_px(13.)).text_color(p.muted).child("days (empty: never)")),
                             )
                         })
-                        .when(!setup.leave_on_server, |d| d.child(div().text_size(px(12.)).text_color(p.muted).child("Each message is deleted from the server once its download is saved here.")))
+                        .when(!setup.leave_on_server, |d| d.child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child("Each message is deleted from the server once its download is saved here.")))
                         .child(h_flex().items_center().gap(px(10.)).child(Switch::new("setup-delete-when-trashed").checked(setup.delete_when_trashed).label("Also delete from the server when a message is moved to Trash").on_click(cx.listener(|this, checked: &bool, _w, cx| this.setup_toggle_delete_when_trashed(*checked, cx)))))
                 })
                 .children(setup.test_result.iter().map(|(ok, line)| {
                     h_flex()
                         .items_start()
                         .gap(px(8.))
-                        .text_size(px(12.))
+                        .text_size(crate::ui::ui_px(12.))
                         .child(icon(if *ok { "circle-check" } else { "circle-x" }).size(px(14.)).text_color(if *ok { p.success } else { p.error }))
                         .child(div().flex_1().min_w_0().child(line.clone()))
                 }))
@@ -1657,7 +1657,7 @@ impl MailWindow {
             });
         let footer = v_flex()
             .gap(px(8.))
-            .children(message.map(|(text, color)| div().w_full().text_size(px(12.)).text_color(color).child(text)))
+            .children(message.map(|(text, color)| div().w_full().text_size(crate::ui::ui_px(12.)).text_color(color).child(text)))
             .child(buttons);
 
         div()
@@ -1694,7 +1694,7 @@ impl MailWindow {
                             .px(px(20.))
                             .border_b_1()
                             .border_color(p.divider)
-                            .child(div().flex_1().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(title))
+                            .child(div().flex_1().text_size(crate::ui::ui_px(16.)).font_weight(FontWeight::SEMIBOLD).child(title))
                             .child(kbd("Esc", &p))
                             .child(Button::new("setup-close").ghost().small().icon(icon("x").size(px(16.))).ml(px(8.)).on_click(cx.listener(|this, _, window, cx| this.close_account_setup(window, cx)))),
                     )
