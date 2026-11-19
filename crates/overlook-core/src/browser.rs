@@ -472,13 +472,29 @@ fn strip_inline_font_declarations(style: &str, strip_size: bool) -> String {
             Ok(Token::Ident(ident)) if prop_name.is_none() => {
                 prop_name = Some(ident.as_ref().to_owned());
             }
+            Ok(
+                Token::Function(_)
+                | Token::ParenthesisBlock
+                | Token::SquareBracketBlock
+                | Token::CurlyBracketBlock,
+            ) => {
+                if prop_name.is_none() {
+                    prop_name = Some(String::new());
+                }
+                // Consume the nested block now so `parser.position()` advances past its
+                // closing delimiter before the next `;` or EOF boundary is sliced.
+                let _ = parser.parse_nested_block(|nested| {
+                    while nested.next_including_whitespace_and_comments().is_ok() {}
+                    Ok::<_, cssparser::ParseError<()>>(())
+                });
+            }
             Ok(_) => {
                 if prop_name.is_none() {
                     prop_name = Some(String::new());
                 }
             }
             Err(_) => {
-                let raw = parser.slice(decl_start..before).trim();
+                let raw = parser.slice(decl_start..parser.position()).trim();
                 if !raw.is_empty() && !prop_name.as_deref().is_some_and(should_strip) {
                     kept.push(raw);
                 }
@@ -733,5 +749,20 @@ mod typography_tests {
         let sender_pos = doc.html.find("Comic Sans MS").unwrap();
         let override_pos = doc.html.rfind("!important").unwrap();
         assert!(override_pos > sender_pos);
+    }
+
+    #[test]
+    fn strip_inline_font_declarations_preserves_css_functions() {
+        assert_eq!(
+            strip_inline_font_declarations("color: rgb(255, 255, 255)", true),
+            "color: rgb(255, 255, 255)"
+        );
+        assert_eq!(
+            strip_inline_font_declarations(
+                "color: rgb(10, 20, 30); font-size: 10px !important; background: linear-gradient(rgb(1, 2, 3), rgba(4, 5, 6, 0.5))",
+                true,
+            ),
+            "color: rgb(10, 20, 30); background: linear-gradient(rgb(1, 2, 3), rgba(4, 5, 6, 0.5))"
+        );
     }
 }
