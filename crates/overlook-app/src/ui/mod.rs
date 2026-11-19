@@ -269,11 +269,13 @@ pub struct Nav {
     /// An IMAP container (`\Noselect`): it holds folders, not mail, so a click expands or
     /// collapses it instead of opening it, and nothing can be dropped in it but folders.
     pub container: bool,
+    /// Shown on hover: where an offline folder is on disk.
+    pub tooltip: Option<SharedString>,
 }
 
 impl Nav {
     pub fn view(label: &str, icon: &'static str, view: MailboxView) -> Self {
-        Self { label: label.to_owned().into(), icon, view, color: None, depth: 0, expander: None, container: false }
+        Self { label: label.to_owned().into(), icon, view, color: None, depth: 0, expander: None, container: false, tooltip: None }
     }
 }
 
@@ -577,6 +579,9 @@ pub struct MailWindow {
     /// Messages being copied into offline folders right now, so a second drag of the same
     /// mail does not copy it twice.
     offline_moving: HashSet<MessageId>,
+    /// Files of offline messages being deleted, removed from disk once the deletion is
+    /// written.
+    offline_doomed: Vec<PathBuf>,
     /// How many messages offline folders hold while no mail account is connected, for the
     /// add-account page to say they are still here.
     offline_kept: usize,
@@ -966,6 +971,7 @@ impl MailWindow {
             offline,
             last_mail_account,
             offline_moving: HashSet::new(),
+            offline_doomed: Vec::new(),
             offline_kept: 0,
             time_zone: overlook_core::tz::current_zone(),
             time_zone_revision: overlook_core::tz::revision(),
@@ -1217,8 +1223,8 @@ impl MailWindow {
         }
         this.sync_all(window, cx);
         if first_start {
-            // Saved originals left by offline mail deleted in an earlier session.
-            this.clean_offline_files(cx);
+            // Offline folders: older ones get a place on disk, and files catch up.
+            this.start_offline_files(cx);
         }
         // IMAP IDLE: one thread per account asks for a sync the moment the Inbox changes.
         this.watch_idle_events(idle_rx, window, cx);
@@ -2929,8 +2935,8 @@ impl MailWindow {
                             }
                         }
                         if accounts.contains(&this.offline.id) {
-                            // A message deleted from an offline folder leaves its saved original behind.
-                            this.clean_offline_files(cx);
+                            // Offline files follow: moved, deleted, and their state saved beside them.
+                            this.sync_offline_files(cx);
                         }
                         for acct in accounts.iter().cloned() {
                             this.next_retry.remove(&acct);
@@ -4043,6 +4049,10 @@ impl MailWindow {
                 }
                 let n = ids.len();
                 let next = this.neighbour_after_removal_of(&targets);
+                if this.offline_active() {
+                    // Their files go from disk once the deletion is written.
+                    this.doom_offline_files(&ids);
+                }
                 this.apply_local(overlook_store::LocalChange::DeleteForever { message_ids: ids, folder: None }, window, cx);
                 let title = if n == 1 { "Permanently deleted a message".to_owned() } else { format!("Permanently deleted {n} messages") };
                 this.record(account.clone(), title.clone(), "Skipped Trash".into(), overlook_store::Reversal::None, None, window, cx);

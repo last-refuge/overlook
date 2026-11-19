@@ -19,6 +19,9 @@ use overlook_store::MailboxView;
 /// folder on a server.
 pub(super) const OFFLINE_FOLDER_ICON: &str = "folder-down";
 
+/// The file manager's own name for showing a folder.
+pub(super) const REVEAL_LABEL: &str = if cfg!(target_os = "macos") { "Show in Finder" } else { "Show in Files" };
+
 /// How far each level of the folder tree is indented: a child's arrow sits under its parent's
 /// icon.
 const DEPTH_STEP: f32 = 16.;
@@ -88,6 +91,15 @@ impl MailWindow {
             .into_iter()
             .filter_map(|id| self.accounts.iter().find(|a| a.id == id).cloned())
             .collect()
+    }
+
+    /// Where an offline folder is on disk, for its tooltip. Only the recorded path: the
+    /// sidebar draws often, and asking a disconnected drive could stall it.
+    fn offline_tooltip(&self, account: &AccountId, label: &Label) -> Option<SharedString> {
+        if !self.is_offline(account) {
+            return None;
+        }
+        overlook_provider::local::dir_of(label).map(|dir| crate::offline_disk::shown_path(&dir).into())
     }
 
     /// Pinned folders, or every account's Inbox until the user has changed them. The default
@@ -370,6 +382,7 @@ impl MailWindow {
                     depth: base + row.depth,
                     expander: None,
                     container,
+                    tooltip: None,
                 };
                 if row.has_children {
                     let key = format!("folder:{}:{}", account.0, l.id.0);
@@ -419,7 +432,7 @@ impl MailWindow {
             }
             let nav = match (f.kind, &f.label) {
                 (LabelKind::User, Some(id)) => match self.labels_of(&f.account).iter().find(|l| &l.id == id && l.kind == LabelKind::User) {
-                    Some(l) => Nav { label: overlook_core::sidebar::folder_title(&l.name).to_owned().into(), icon: if self.is_offline(&f.account) { OFFLINE_FOLDER_ICON } else { "folder" }, view: MailboxView::Label(id.clone()), color: p.label_color(l.color.as_deref()), depth: 0, expander: None, container: false },
+                    Some(l) => Nav { label: overlook_core::sidebar::folder_title(&l.name).to_owned().into(), icon: if self.is_offline(&f.account) { OFFLINE_FOLDER_ICON } else { "folder" }, view: MailboxView::Label(id.clone()), color: p.label_color(l.color.as_deref()), depth: 0, expander: None, container: false, tooltip: self.offline_tooltip(&f.account, l) },
                     None => continue,
                 },
                 (kind, _) => match system_folder(kind) {
@@ -503,6 +516,13 @@ impl MailWindow {
                 MailboxView::Kind(kind) if this.can_empty(account, &nav.view) => Some(*kind),
                 _ => None,
             };
+            // An offline folder's menu says where it is on disk; a top-level one can be
+            // disconnected.
+            let offline_menu: Option<(LabelId, bool)> = match &nav.view {
+                MailboxView::Label(id) if this.is_offline(account) => this.offline_folder(id).map(|l| (l.id.clone(), !l.name.contains('/'))),
+                _ => None,
+            };
+            let tooltip = nav.tooltip.clone();
             // Folders are dragged and dropped in the account tree; Favorites rows reorder.
             let folder_drag = user_folder.clone().filter(|_| !in_favorites).map(|label| super::FolderDrag { account: account.clone(), label });
             let folder_target = new_inside.clone().filter(|_| !in_favorites);
@@ -578,6 +598,7 @@ impl MailWindow {
                 .text_size(crate::ui::ui_px(13.))
                 .text_color(if current { p.accent } else if container { p.muted } else { p.foreground })
                 .when(container, |d| d.tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Holds folders only. Mail cannot be stored here. Right-click to learn more.").build(window, cx)))
+                .when_some(tooltip, |d, text| d.tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(text.clone()).build(window, cx)))
                 .font_weight(if current { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
                 .when(current, |d| d.bg(p.selection))
                 .when(!current, |d| d.hover(|d| d.bg(p.hover)))
@@ -689,6 +710,27 @@ impl MailWindow {
                             t.update(cx, |this, cx| this.delete_folder(account.clone(), label.clone(), window, cx)).ok();
                         }));
                     }
+                    if let Some((id, top)) = offline_menu.clone() {
+                        let (t, shown) = (me.clone(), id.clone());
+                        menu = menu.separator().item(PopupMenuItem::new(REVEAL_LABEL).on_click(move |_, window, cx| {
+                            t.update(cx, |this, cx| this.reveal_offline_folder(&shown, window, cx)).ok();
+                        }));
+                        let (t, copied) = (me.clone(), id.clone());
+                        menu = menu.item(PopupMenuItem::new("Copy Location").on_click(move |_, window, cx| {
+                            t.update(cx, |this, cx| this.copy_offline_location(&copied, window, cx)).ok();
+                        }));
+                        if top {
+                            let t = me.clone();
+                            menu = menu.item(PopupMenuItem::new("Disconnect…").on_click(move |_, window, cx| {
+                                t.update(cx, |this, cx| {
+                                    if let Some(label) = this.offline_folder(&id) {
+                                        this.disconnect_offline_folder(label, window, cx);
+                                    }
+                                })
+                                .ok();
+                            }));
+                        }
+                    }
                     if let Some(kind) = empty_kind {
                         let (t, account) = (me.clone(), menu_account.clone());
                         let label = format!("Empty {}…", system_folder(kind).map(|(name, _)| name).unwrap_or("Folder"));
@@ -753,13 +795,21 @@ impl MailWindow {
             }
             let (me, account) = (cx.entity().downgrade(), account.clone());
             let over_account = account.clone();
+            let offline = self.is_offline(&account);
             title
                 .drag_over::<super::FolderDrag>(move |style, drag, _, _| if drag.fits(&over_account, None) { style.bg(p.selection).border_1().border_color(p.accent) } else { style })
                 .on_drop(cx.listener(|this, drag: &super::FolderDrag, window, cx| this.move_folder(drag.clone(), None, window, cx)))
                 .context_menu(move |menu, _window, _cx| {
                     let (t, account) = (me.clone(), account.clone());
-                    menu.item(PopupMenuItem::new("New Folder…").on_click(move |_, window, cx| {
+                    let menu = menu.item(PopupMenuItem::new(if offline { "New Offline Folder…" } else { "New Folder…" }).on_click(move |_, window, cx| {
                         t.update(cx, |this, cx| this.open_folder_prompt(account.clone(), super::folder_manage::FolderPromptMode::New { parent: None }, window, cx)).ok();
+                    }));
+                    if !offline {
+                        return menu;
+                    }
+                    let t = me.clone();
+                    menu.item(PopupMenuItem::new("Open Offline Folder…").on_click(move |_, window, cx| {
+                        t.update(cx, |this, cx| this.open_offline_folder(window, cx)).ok();
                     }))
                 })
                 .into_any_element()
@@ -858,9 +908,10 @@ impl MailWindow {
             if !collapsed {
                 let (_, folders) = self.account_folders(&offline, &p);
                 if folders.is_empty() {
-                    column = column.child(
+                    // Lettered like the section title above them.
+                    let action = |id: &'static str, glyph: &'static str, text: &'static str| {
                         div()
-                            .id("offline-new-folder")
+                            .id(id)
                             .h_flex()
                             .items_center()
                             .gap(px(9.))
@@ -869,22 +920,27 @@ impl MailWindow {
                             .pr(px(10.))
                             .rounded(px(7.))
                             .cursor_pointer()
-                            // Lettered like the section title above it.
                             .font_family(SharedString::from(crate::theme::current_fonts(cx).effective_ui_family().to_owned()))
                             .text_size(crate::ui::ui_px(11.))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(p.muted)
                             .hover(|d| d.bg(p.hover).text_color(p.foreground))
-                            .child(icon("folder-plus").flex_none().size(px(14.)).text_color(p.muted))
-                            .child(div().flex_1().truncate().child("New Offline Folder…"))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                let account = this.offline.id.clone();
-                                this.open_folder_prompt(account, super::folder_manage::FolderPromptMode::New { parent: None }, window, cx);
-                            })),
-                    );
+                            .child(icon(glyph).flex_none().size(px(14.)).text_color(p.muted))
+                            .child(div().flex_1().truncate().child(text))
+                    };
+                    column = column
+                        .child(action("offline-new-folder", "folder-plus", "New Offline Folder…").on_click(cx.listener(move |this, _, window, cx| {
+                            let account = this.offline.id.clone();
+                            this.open_folder_prompt(account, super::folder_manage::FolderPromptMode::New { parent: None }, window, cx);
+                        })))
+                        .child(action("offline-open-folder", "folder-open", "Open Offline Folder…").on_click(cx.listener(|this, _, window, cx| this.open_offline_folder(window, cx))));
                 } else {
                     column = column.child(v_flex().gap(px(m.row_gap)).children(folders.into_iter().map(|mut nav| {
                         nav.icon = OFFLINE_FOLDER_ICON;
+                        nav.tooltip = match &nav.view {
+                            MailboxView::Label(id) => self.offline_folder(id).and_then(|l| self.offline_tooltip(&offline, &l)),
+                            _ => None,
+                        };
                         nav_button(self, "offline", &offline, nav, &pinned_list, cx)
                     })));
                 }

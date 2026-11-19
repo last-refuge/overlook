@@ -15,16 +15,18 @@ pub(crate) enum FolderPromptMode {
 }
 
 pub(crate) struct FolderPrompt {
-    account: AccountId,
-    mode: FolderPromptMode,
-    input: Entity<InputState>,
-    error: Option<String>,
-    busy: bool,
+    pub(super) account: AccountId,
+    pub(super) mode: FolderPromptMode,
+    pub(super) input: Entity<InputState>,
+    pub(super) error: Option<String>,
+    pub(super) busy: bool,
+    /// Where a new top-level offline folder's directory goes.
+    pub(super) location: Option<PathBuf>,
     _enter: Subscription,
 }
 
 /// What the dialog shows for a failed folder change.
-fn folder_error(e: &ProviderError) -> String {
+pub(super) fn folder_error(e: &ProviderError) -> String {
     match e {
         ProviderError::Offline => "You’re offline. Folders can be changed only while connected.".into(),
         ProviderError::SignInRequired => "Sign in to this account again to change its folders.".into(),
@@ -57,7 +59,8 @@ impl MailWindow {
             }
         });
         input.update(cx, |state, cx| state.focus(window, cx));
-        self.folder_prompt = Some(FolderPrompt { account, mode, input, error: None, busy: false, _enter: enter });
+        let location = (self.is_offline(&account) && matches!(mode, FolderPromptMode::New { parent: None })).then(|| self.offline_location());
+        self.folder_prompt = Some(FolderPrompt { account, mode, input, error: None, busy: false, location, _enter: enter });
         cx.notify();
     }
 
@@ -69,6 +72,9 @@ impl MailWindow {
     }
 
     fn submit_folder_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.folder_prompt.as_ref().is_some_and(|p| self.is_offline(&p.account)) {
+            return self.submit_offline_folder_prompt(window, cx);
+        }
         let known = self.folder_prompt.as_ref().and_then(|p| self.known_account(&p.account));
         let Some(prompt) = self.folder_prompt.as_mut() else { return };
         if prompt.busy {
@@ -215,6 +221,9 @@ impl MailWindow {
     pub(crate) fn move_folder(&mut self, drag: super::FolderDrag, parent: Option<Label>, window: &mut Window, cx: &mut Context<Self>) {
         if !drag.fits(&drag.account, parent.as_ref()) {
             return;
+        }
+        if self.is_offline(&drag.account) {
+            return self.move_offline_folder(drag.label, parent, window, cx);
         }
         let (account_id, label) = (drag.account, drag.label);
         let Some(account) = self.known_account(&account_id) else { return };
@@ -523,7 +532,18 @@ impl MailWindow {
             FolderPromptMode::New { parent: Some(parent) } => (format!("New {noun} in “{}”", parent.name), "Create"),
             FolderPromptMode::Rename { label } => (format!("Rename “{}”", label.name), "Rename"),
         };
-        let account = if self.is_offline(&prompt.account) { "Offline folders · on this computer only".to_owned() } else { self.account_name(&prompt.account) };
+        let account = if self.is_offline(&prompt.account) { "Offline folders · kept in folders on this computer".to_owned() } else { self.account_name(&prompt.account) };
+        // A new top-level offline folder is a directory: where it goes, and a way to change it.
+        let location = prompt.location.as_ref().map(|dir| {
+            h_flex()
+                .gap(px(8.))
+                .items_center()
+                .text_size(crate::ui::ui_px(12.))
+                .text_color(p.muted)
+                .child(icon("hard-drive").flex_none().size(px(14.)))
+                .child(div().flex_1().min_w_0().truncate().child(format!("In {}", crate::offline_disk::shown_path(dir))))
+                .child(Button::new("folder-prompt-location").ghost().xsmall().label("Change…").on_click(cx.listener(|this, _, window, cx| this.choose_offline_location(window, cx))))
+        });
         div()
             .id("folder-prompt-overlay")
             .absolute()
@@ -555,6 +575,7 @@ impl MailWindow {
                     )
                     .child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(account))
                     .child(Input::new(&prompt.input))
+                    .children(location)
                     .children(prompt.error.clone().map(|e| div().text_size(crate::ui::ui_px(12.)).text_color(p.error).child(e)))
                     .child(
                         h_flex()

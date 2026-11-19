@@ -20,6 +20,7 @@ mod malware_scan;
 mod pdf_preview;
 mod single_instance;
 mod updater;
+mod offline_disk;
 mod providers;
 mod sync;
 mod draft_sync;

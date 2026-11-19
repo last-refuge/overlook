@@ -1,114 +1,28 @@
-//! Offline folders: mail moved off the server and kept only on this computer.
+//! Offline folders: mail moved off the server and kept in folders on this computer.
 //!
 //! The folders belong to one hidden account (`MailWindow::offline`, provider
 //! [`ProviderKind::Local`]), so opening one shows it with the usual list, reader, search and
-//! folder menus. Dropping mail of a server account onto an offline folder copies each
-//! message's original bytes from the server to `raw/local_offline/` (written and flushed to
-//! disk), files a parsed copy in the folder, and only then deletes the message from the
-//! server: permanently where the server allows it, otherwise into its Trash. A message that
-//! can't be downloaded completely stays on the server untouched.
+//! folder menus. Each top-level offline folder is a directory the person chose, with one
+//! `.eml` file per message (see `crate::offline_disk`); its menu shows where it is, and it
+//! can be disconnected (forgotten here, left on disk) and opened again.
+//!
+//! Dropping mail of a server account onto an offline folder copies each message's original
+//! bytes from the server into the folder's directory (written and flushed to disk), files a
+//! parsed copy, and only then deletes the message from the server: permanently where the
+//! server allows it, otherwise into its Trash. A message that can't be downloaded
+//! completely stays on the server untouched.
 
+use super::folder_manage::{folder_error, FolderPromptMode};
 use super::*;
+use crate::offline_disk::{self, shown_path};
 use overlook_provider::local;
-use overlook_provider::mime::{message_from_rfc822, MessageFlags};
-use overlook_provider::{MailProvider, ProviderError};
 
 /// How many messages are copied before the copied ones leave the server and the lists
 /// update, so a large drag shows progress.
 const BATCH: usize = 10;
 
-/// Held while a saved original is written and its row stored, and while unreferenced files
-/// are removed, so a cleanup never takes a file whose row is about to be written.
-static OFFLINE_FILES: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// What copying one batch into an offline folder did.
-#[derive(Default)]
-struct Copied {
-    /// Source messages now safely offline, ready to leave the server.
-    copied: Vec<MessageId>,
-    /// Source messages left where they are, and why.
-    failed: Vec<(MessageId, String)>,
-    /// Set when the server can't be reached: the rest of the drag is not attempted.
-    stopped: Option<String>,
-}
-
-fn reason(e: &ProviderError) -> String {
-    match e {
-        ProviderError::Offline => "you’re offline".into(),
-        ProviderError::SignInRequired => "the account needs you to sign in again".into(),
-        ProviderError::RateLimited(_) => "the server asked Overlook to slow down".into(),
-        other => other.to_string(),
-    }
-}
-
-/// Copies `ids` of `source` into offline folder `target`. Runs off the UI thread.
-async fn copy_to_offline(store: Arc<Store>, provider: Arc<dyn MailProvider>, source: Account, offline: Account, dir: PathBuf, target: LabelId, ids: Vec<MessageId>) -> Copied {
-    let mut out = Copied::default();
-    for (i, id) in ids.iter().enumerate() {
-        let message = match store.message(id) {
-            Ok(Some(m)) => m,
-            // Deleted or moved meanwhile: nothing to copy, and nothing to delete.
-            Ok(None) => continue,
-            Err(e) => {
-                out.failed.push((id.clone(), e.to_string()));
-                continue;
-            }
-        };
-        let raw = match provider.fetch_original(&source, &message).await {
-            Ok(raw) if !raw.is_empty() => raw,
-            Ok(_) => {
-                out.failed.push((id.clone(), "the server sent an empty message".into()));
-                continue;
-            }
-            Err(e) => {
-                let why = reason(&e);
-                if matches!(e, ProviderError::Offline | ProviderError::SignInRequired | ProviderError::RateLimited(_)) {
-                    out.failed.extend(ids[i..].iter().map(|id| (id.clone(), why.clone())));
-                    out.stopped = Some(why);
-                    break;
-                }
-                out.failed.push((id.clone(), why));
-                continue;
-            }
-        };
-        let copy_id = MessageId(format!("offline:{}", MessageId::generate().0));
-        let flags = MessageFlags {
-            provider_id: None,
-            label_ids: [target.clone()].into_iter().collect(),
-            is_read: message.is_read,
-            is_starred: message.is_starred,
-            received_at: Some(message.date),
-        };
-        let mut copy = message_from_rfc822(&offline, &raw, copy_id, &flags);
-        // A second guard after `fetch_original`: a copy that lost the attachments the stored
-        // message lists is not complete enough to delete the server's.
-        let files = |m: &Message| m.attachments.iter().filter(|a| !a.mime_type.to_ascii_lowercase().starts_with("text/calendar") && !a.filename.to_ascii_lowercase().ends_with(".ics")).count();
-        if files(&message) > 0 && files(&copy) == 0 {
-            out.failed.push((id.clone(), "the server didn’t send the attachments".into()));
-            continue;
-        }
-        // Keep it with the rest of its conversation, and as the account showed it.
-        copy.conversation_id = ConversationId(format!("offline:{}", message.conversation_id.0));
-        copy.is_outgoing = message.is_outgoing;
-        copy.category = message.category.clone();
-        copy.is_important = message.is_important;
-        if copy.date == 0 {
-            copy.date = message.date;
-        }
-        let _files = OFFLINE_FILES.lock().unwrap_or_else(|e| e.into_inner());
-        let saved = local::write_raw_durably(&dir, &copy.id, &raw).map_err(|e| format!("couldn’t save it on this computer: {e}")).and_then(|path| {
-            store.upsert_messages(std::slice::from_ref(&copy)).map_err(|e| {
-                let _ = std::fs::remove_file(&path);
-                format!("couldn’t file it: {e}")
-            })
-        });
-        match saved {
-            Ok(()) => out.copied.push(id.clone()),
-            Err(why) => out.failed.push((id.clone(), why)),
-        }
-    }
-    out
-}
+/// The setting that remembers where new offline folders go.
+const LOCATION_KEY: &str = "offline.location";
 
 impl MailWindow {
     pub(crate) fn is_offline(&self, account: &AccountId) -> bool {
@@ -124,7 +38,6 @@ impl MailWindow {
     pub(crate) fn offers_offline(&self) -> bool {
         self.has_account() && self.providers.contains_key(&self.offline.id)
     }
-
 
     /// Notes how much offline mail there is when no account is connected: offline folders
     /// outlive the accounts their mail came from, and show again once one is added.
@@ -179,6 +92,40 @@ impl MailWindow {
         name.replace('/', " › ")
     }
 
+    /// An offline folder by id.
+    pub(crate) fn offline_folder(&self, id: &LabelId) -> Option<Label> {
+        self.labels_of(&self.offline.id).iter().find(|l| &l.id == id && l.kind == LabelKind::User).cloned()
+    }
+
+    /// Where an offline folder is on disk.
+    pub(crate) fn offline_dir(&self, id: &LabelId) -> Option<PathBuf> {
+        self.offline_folder(id).as_ref().and_then(local::dir_of)
+    }
+
+    /// Where new top-level offline folders go: the last place picked, or the default.
+    pub(crate) fn offline_location(&self) -> PathBuf {
+        self.store.setting::<PathBuf>(LOCATION_KEY).ok().flatten().unwrap_or_else(offline_disk::default_location)
+    }
+
+    /// Shows an offline folder's directory in the file manager.
+    pub(crate) fn reveal_offline_folder(&self, id: &LabelId, window: &mut Window, cx: &mut Context<Self>) {
+        match self.offline_dir(id) {
+            Some(dir) if dir.is_dir() => cx.reveal_path(&dir),
+            Some(dir) => crate::ui::toast(window, cx, crate::notify::Level::Warning, format!("{} can’t be found. Is its drive connected?", shown_path(&dir))),
+            None => {}
+        }
+    }
+
+    /// Copies an offline folder's location to the clipboard.
+    pub(crate) fn copy_offline_location(&self, id: &LabelId, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(dir) = self.offline_dir(id) {
+            cx.write_to_clipboard(ClipboardItem::new_string(dir.display().to_string()));
+            crate::ui::toast(window, cx, crate::notify::Level::Info, format!("Copied {}", shown_path(&dir)));
+        }
+    }
+
+    // ------------------------------------------------------------------ moving mail in
+
     /// Mail dragged from the list onto offline folder `target`: the messages of the dragged
     /// conversations that the open view shows (a conversation's trashed messages go only
     /// when dragged from Trash).
@@ -197,7 +144,12 @@ impl MailWindow {
     /// account it is copied here and deleted from the server; within offline folders it
     /// just changes folder.
     pub(crate) fn move_offline(&mut self, ids: Vec<MessageId>, target: LabelId, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(folder) = self.labels_of(&self.offline.id).iter().find(|l| l.id == target && l.kind == LabelKind::User).cloned() else { return };
+        let Some(folder) = self.offline_folder(&target) else { return };
+        if !local::dir_of(&folder).is_some_and(|d| d.is_dir()) {
+            let place = local::dir_of(&folder).map(|d| shown_path(&d)).unwrap_or_default();
+            crate::ui::toast(window, cx, crate::notify::Level::Error, format!("“{}” can’t be found at {place}. Connect its drive, or disconnect the folder.", Self::offline_folder_name(&folder.name)));
+            return;
+        }
         if self.offline_active() {
             return self.move_within_offline(ids, folder, window, cx);
         }
@@ -216,15 +168,13 @@ impl MailWindow {
         self.offline_moving.extend(ids.iter().cloned());
         crate::ui::toast(window, cx, crate::notify::Level::Info, format!("Moving {} to “{name}” on this computer…", messages_phrase(total)));
         let next = self.removal_neighbour();
-        let (store, offline, dir) = (self.store.clone(), self.offline.clone(), providers::offline_dir());
+        let (store, offline) = (self.store.clone(), self.offline.clone());
         cx.spawn_in(window, async move |this, cx| {
             let mut moved = 0usize;
             let mut failed: Vec<(MessageId, String)> = Vec::new();
             for chunk in ids.chunks(BATCH) {
                 let chunk = chunk.to_vec();
-                let result = cx
-                    .background_spawn(copy_to_offline(store.clone(), provider.clone(), source.clone(), offline.clone(), dir.clone(), folder.id.clone(), chunk.clone()))
-                    .await;
+                let result = cx.background_spawn(offline_disk::copy_to_offline(store.clone(), provider.clone(), source.clone(), offline.clone(), folder.clone(), chunk.clone())).await;
                 let stopped = result.stopped.is_some();
                 let alive = this.update_in(cx, |this, window, cx| {
                     for id in &chunk {
@@ -265,10 +215,12 @@ impl MailWindow {
                 for id in &ids {
                     this.offline_moving.remove(id);
                 }
-                if moved > 0 && this.account.id == source.id {
-                    this.select_after_removal(next.clone(), window, cx);
-                }
                 if moved > 0 {
+                    // The folder's manifest learns about the new mail.
+                    this.sync_offline_files(cx);
+                    if this.account.id == source.id {
+                        this.select_after_removal(next.clone(), window, cx);
+                    }
                     let title = format!("Moved {} to offline folder “{name}”", messages_phrase(moved));
                     let detail = if delete_forever { "Deleted from the server" } else { "Server copies moved to Trash" };
                     this.record(source.id.clone(), title, detail.into(), overlook_store::Reversal::None, None, window, cx);
@@ -290,7 +242,7 @@ impl MailWindow {
     }
 
     /// Moves offline messages to another offline folder. A message is in one folder at a
-    /// time, as on a server.
+    /// time, as on a server; its file follows once the change is written.
     fn move_within_offline(&mut self, ids: Vec<MessageId>, folder: Label, window: &mut Window, cx: &mut Context<Self>) {
         let mut changes = vec![overlook_store::LocalChange::AddLabel { message_ids: ids.clone(), label_id: folder.id.clone() }];
         for other in self.labels.iter().filter(|l| l.id != folder.id) {
@@ -304,24 +256,222 @@ impl MailWindow {
         self.select_after_removal(next, window, cx);
     }
 
+    // ------------------------------------------------------------- keeping disk in step
+
+    /// Marks the files of offline messages about to be deleted, so they go from disk once
+    /// the deletion is written.
+    pub(crate) fn doom_offline_files(&mut self, ids: &[MessageId]) {
+        let files = ids.iter().filter_map(|id| self.mail_index.message(id)).filter_map(|m| m.provider_id.as_ref()).map(|p| PathBuf::from(&p.0)).filter(|p| p.is_absolute());
+        self.offline_doomed.extend(files);
+    }
+
+    /// Moves files to the folders their messages are now in, deletes the files of deleted
+    /// messages and rewrites the folders' manifests. Runs after every offline change.
+    pub(crate) fn sync_offline_files(&mut self, cx: &mut Context<Self>) {
+        let doomed = std::mem::take(&mut self.offline_doomed);
+        let (store, offline) = (self.store.clone(), self.offline.id.clone());
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_spawn(async move { offline_disk::reconcile(&store, &offline, &providers::offline_dir(), &doomed) }).await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    // Files that couldn't be deleted yet are tried again after the next change.
+                    Ok(kept_back) => this.offline_doomed.extend(kept_back),
+                    Err(e) => tracing::warn!("offline folders: {e}"),
+                }
+                // Files moved: the open messages read them from their new places.
+                if this.offline_active() {
+                    this.reload(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// At startup: folders from the first version of offline folders get directories, then
+    /// files and manifests are brought in step.
+    pub(crate) fn start_offline_files(&mut self, cx: &mut Context<Self>) {
+        let (store, offline, location) = (self.store.clone(), self.offline.id.clone(), self.offline_location());
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let adopted = offline_disk::adopt_legacy_folders(&store, &offline, &location)?;
+                    if adopted > 0 {
+                        tracing::info!("offline folders: gave {adopted} folder(s) a place in {}", location.display());
+                    }
+                    offline_disk::reconcile(&store, &offline, &providers::offline_dir(), &[])?;
+                    Ok::<usize, String>(adopted)
+                })
+                .await;
+            match result {
+                Ok(adopted) if adopted > 0 => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.reload_account_labels();
+                        this.reload(cx);
+                    });
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("offline folders: {e}"),
+            }
+        })
+        .detach();
+    }
+
+    // ------------------------------------------------------------------------- folders
+
+    /// Picks where new offline folders go, for the New Offline Folder dialog.
+    pub(crate) fn choose_offline_location(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("Choose".into()) });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else { return };
+            let Some(dir) = paths.into_iter().next() else { return };
+            let _ = this.update(cx, |this, cx| {
+                this.save_setting(LOCATION_KEY, &dir);
+                if let Some(prompt) = this.folder_prompt.as_mut() {
+                    prompt.location = Some(dir);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The New and Rename dialog for an offline folder: the directory is made or renamed
+    /// on disk.
+    pub(crate) fn submit_offline_folder_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(prompt) = self.folder_prompt.as_mut() else { return };
+        if prompt.busy {
+            return;
+        }
+        let name = prompt.input.read(cx).value().trim().to_owned();
+        if let Some(problem) = overlook_provider::folder_name_problem(&name, "/") {
+            prompt.error = Some(problem);
+            cx.notify();
+            return;
+        }
+        prompt.busy = true;
+        prompt.error = None;
+        let (parent, renaming) = match &prompt.mode {
+            FolderPromptMode::New { parent } => (parent.clone(), None),
+            FolderPromptMode::Rename { label } => (None, Some(label.clone())),
+        };
+        let location = prompt.location.clone().unwrap_or_else(offline_disk::default_location);
+        let asked = prompt.input.entity_id();
+        let (store, offline) = (self.store.clone(), self.offline.id.clone());
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn({
+                    let renaming = renaming.clone();
+                    async move {
+                        match renaming {
+                            Some(label) => {
+                                let labels = store.labels(&offline).unwrap_or_default();
+                                let changed = local::rename_folder(&label, &name, &labels)?;
+                                offline_disk::rename_folder(&store, &offline, &changed)?;
+                                Ok(changed.first().map(|c| c.new.clone()).unwrap_or(label))
+                            }
+                            None => offline_disk::create_folder(&store, &offline, &name, parent.as_ref(), &location),
+                        }
+                    }
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let current = this.folder_prompt.as_ref().is_some_and(|p| p.input.entity_id() == asked);
+                match result {
+                    Ok(label) => {
+                        if current {
+                            this.close_folder_prompt(window, cx);
+                        }
+                        let offline = this.offline.id.clone();
+                        this.reload_account_labels();
+                        this.mark_counts_stale([offline]);
+                        this.reload(cx);
+                        let place = local::dir_of(&label).map(|d| shown_path(&d)).unwrap_or_default();
+                        let what = if renaming.is_some() { "Renamed to" } else { "Created" };
+                        crate::ui::toast(window, cx, crate::notify::Level::Success, format!("{what} “{}” in {place}.", Self::offline_folder_name(&label.name)));
+                    }
+                    Err(e) => {
+                        if current {
+                            if let Some(prompt) = this.folder_prompt.as_mut() {
+                                prompt.busy = false;
+                                prompt.error = Some(folder_error(&e));
+                            }
+                            cx.notify();
+                        } else {
+                            crate::ui::toast(window, cx, crate::notify::Level::Error, folder_error(&e));
+                        }
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Moves a dragged offline folder into another, after asking. Folders stay inside the
+    /// top-level folder they are in, so their files never cross drives.
+    pub(crate) fn move_offline_folder(&mut self, label: Label, parent: Option<Label>, window: &mut Window, cx: &mut Context<Self>) {
+        let labels = self.labels_of(&self.offline.id).to_vec();
+        let root = |l: &Label| local::root_of(l, &labels).map(|r| r.id.clone());
+        let same_root = match &parent {
+            Some(p) => root(p) == root(&label) && label.name.contains('/'),
+            None => false,
+        };
+        if !same_root {
+            crate::ui::toast(window, cx, crate::notify::Level::Info, "Folders move within the offline folder they are in. To move mail elsewhere, drag the messages instead.");
+            return;
+        }
+        let changed = match local::move_folder(&label, parent.as_ref(), &labels) {
+            Ok(changed) => changed,
+            Err(e) => return crate::ui::toast(window, cx, crate::notify::Level::Error, folder_error(&e)),
+        };
+        let title = format!("Move “{}” into “{}”?", Self::offline_folder_name(&label.name), parent.as_ref().map(|p| Self::offline_folder_name(&p.name)).unwrap_or_default());
+        let answer = window.prompt(PromptLevel::Info, &title, Some("Its messages and the folders inside it move with it, on disk too."), &["Move", "Cancel"], cx);
+        let (store, offline) = (self.store.clone(), self.offline.id.clone());
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            let result = cx.background_spawn(async move { offline_disk::rename_folder(&store, &offline, &changed) }).await;
+            let _ = this.update_in(cx, |this, window, cx| match result {
+                Ok(()) => {
+                    this.reload_account_labels();
+                    this.reload(cx);
+                    crate::ui::toast(window, cx, crate::notify::Level::Success, format!("Moved “{}”.", Self::offline_folder_name(&label.name)));
+                }
+                Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t move “{}”: {}", Self::offline_folder_name(&label.name), folder_error(&e))),
+            });
+        })
+        .detach();
+    }
+
     /// Deletes an offline folder, the folders inside it and all their mail from this
     /// computer, after asking. There is no other copy, so it can't be undone.
     pub(crate) fn delete_offline_folder(&mut self, label: Label, window: &mut Window, cx: &mut Context<Self>) {
         let offline = self.offline.id.clone();
         let labels = self.labels_of(&offline).to_vec();
         let gone = local::folder_and_inside(&label, &labels);
+        let Some(top) = local::root_of(&label, &labels).cloned() else { return };
         let count: usize = gone.iter().map(|l| self.store.message_ids_with_label(&offline, &l.id).map(|ids| ids.len()).unwrap_or(0)).sum();
         let name = Self::offline_folder_name(&label.name);
+        let place = local::dir_of(&label).map(|d| format!(" in {}", shown_path(&d))).unwrap_or_default();
         let inside = if gone.len() > 1 { ", the folders inside it," } else { "" };
         let detail = format!(
-            "The folder{inside} and {} in it are deleted from this computer. They are no longer on any server, so this can’t be undone.",
+            "The folder{inside} and {} in it are deleted from this computer{place}. They are no longer on any server, so this can’t be undone. To stop showing it but keep it on disk, choose Disconnect instead.",
             if count == 1 { "the 1 message".to_owned() } else { format!("the {count} messages") }
         );
         let answer = window.prompt(PromptLevel::Warning, &format!("Delete the offline folder “{name}”?"), Some(&detail), &["Delete", "Cancel"], cx);
+        let store = self.store.clone();
         cx.spawn_in(window, async move |this, cx| {
             if answer.await != Ok(0) {
                 return;
             }
+            let files_gone = gone.clone();
+            let offline_id = offline.clone();
+            cx.background_spawn(async move {
+                let files = offline_disk::files_in(&store, &offline_id, &files_gone);
+                offline_disk::delete_files(&files, &files_gone, &top)
+            })
+            .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 let showing = this.offline_active() && gone.iter().any(|l| this.view == MailboxView::Label(l.id.clone()));
                 for l in &gone {
@@ -331,79 +481,70 @@ impl MailWindow {
                     this.leave_offline(window, cx);
                 }
                 this.record(offline.clone(), format!("Deleted offline folder “{name}”"), format!("With {}", messages_phrase(count)), overlook_store::Reversal::None, None, window, cx);
-                this.clean_offline_files(cx);
+                this.sync_offline_files(cx);
                 crate::ui::toast(window, cx, crate::notify::Level::Success, format!("Deleted “{name}”."));
             });
         })
         .detach();
     }
 
-    /// Removes saved originals whose messages are gone (deleted from an offline folder).
-    pub(crate) fn clean_offline_files(&self, cx: &mut Context<Self>) {
-        let (store, offline) = (self.store.clone(), self.offline.id.clone());
-        cx.background_spawn(async move {
-            let _files = OFFLINE_FILES.lock().unwrap_or_else(|e| e.into_inner());
-            match store.message_ids_of(&offline) {
-                Ok(keep) => {
-                    let removed = local::remove_unreferenced(&providers::offline_dir(), &keep, std::time::Duration::ZERO);
-                    if removed > 0 {
-                        tracing::info!("offline folders: removed {removed} saved message(s) no longer in any folder");
-                    }
-                }
-                Err(e) => tracing::warn!("offline folders: could not list messages for cleanup: {e}"),
+    /// Stops showing a top-level offline folder, after asking. Its directory, mail and
+    /// state stay on disk; Open Offline Folder brings it back.
+    pub(crate) fn disconnect_offline_folder(&mut self, label: Label, window: &mut Window, cx: &mut Context<Self>) {
+        let offline = self.offline.id.clone();
+        let labels = self.labels_of(&offline).to_vec();
+        let gone = local::folder_and_inside(&label, &labels);
+        let place = local::dir_of(&label).map(|d| shown_path(&d)).unwrap_or_default();
+        let detail = format!("It stays on disk in {place} with all its mail. Open Offline Folder… brings it back, on this computer or another.");
+        let answer = window.prompt(PromptLevel::Info, &format!("Disconnect “{}”?", label.name), Some(&detail), &["Disconnect", "Cancel"], cx);
+        let store = self.store.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
             }
+            let (offline_id, root) = (offline.clone(), label.clone());
+            let saved = cx.background_spawn(async move { offline_disk::save_before_disconnect(&store, &offline_id, &root) }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if let Err(e) = saved {
+                    // Without its state saved, opening it again would lose read and starred marks.
+                    crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t disconnect “{}”: {e}", label.name));
+                    return;
+                }
+                let showing = this.offline_active() && gone.iter().any(|l| this.view == MailboxView::Label(l.id.clone()));
+                // The rows go; the files are left alone.
+                for l in &gone {
+                    this.forget_deleted_folder(&offline, l, true, window, cx);
+                }
+                if showing {
+                    this.leave_offline(window, cx);
+                }
+                crate::ui::toast(window, cx, crate::notify::Level::Success, format!("Disconnected “{}”. It’s still in {place}.", label.name));
+            });
         })
         .detach();
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::{copy_to_offline, local};
-    use overlook_core::*;
-    use overlook_provider::sample::SampleProvider;
-    use overlook_provider::MailProvider;
-    use overlook_store::Store;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-
-    fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("overlook-offline-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
-    }
-
-    #[test]
-    fn copies_keep_the_original_and_refuse_incomplete_downloads() {
-        let store = Arc::new(Store::open_in_memory().unwrap());
-        let source = crate::seed_sample_account(&store).unwrap();
-        let offline = store.offline_account().unwrap();
-        let folder = local::new_folder(&offline.id, "Archive 2025", None, &[]).unwrap();
-        store.upsert_label(&folder).unwrap();
-        let all: Vec<Message> = store.message_ids_of(&source.id).unwrap().into_iter().filter_map(|id| store.message(&id).unwrap()).collect();
-        let plain = all.iter().find(|m| m.attachments.is_empty() && m.body.is_cached()).expect("a sample message without attachments").clone();
-        let with_files = all.iter().find(|m| !m.attachments.is_empty()).expect("a sample message with attachments").clone();
-        let dir = temp_dir("copy");
-        let provider: Arc<dyn MailProvider> = Arc::new(SampleProvider::new());
-
-        // The sample provider rebuilds messages from stored text, without attachments: one
-        // that has files must stay on the server.
-        let out = crate::sync::pollster_block(copy_to_offline(store.clone(), provider, source.clone(), offline.clone(), dir.clone(), folder.id.clone(), vec![plain.id.clone(), with_files.id.clone()]));
-        assert_eq!(out.copied, vec![plain.id.clone()]);
-        assert_eq!(out.failed.len(), 1);
-        assert_eq!(out.failed[0].0, with_files.id);
-        assert!(out.stopped.is_none());
-
-        let copies: Vec<Message> = store.message_ids_of(&offline.id).unwrap().into_iter().filter_map(|id| store.message(&id).unwrap()).collect();
-        assert_eq!(copies.len(), 1);
-        let copy = &copies[0];
-        assert_eq!(copy.subject, plain.subject);
-        assert_eq!(copy.is_read, plain.is_read);
-        assert!(copy.label_ids.contains(&folder.id) && copy.label_ids.len() == 1, "filed in the folder only");
-        assert_eq!(copy.conversation_id.0, format!("offline:{}", plain.conversation_id.0));
-        assert!(local::raw_path_in(&dir, &copy.id).exists(), "the original is saved beside the row");
-        // The source is untouched: deleting it from the server is the caller's next step.
-        assert!(store.message(&plain.id).unwrap().is_some());
-        let _ = std::fs::remove_dir_all(&dir);
+    /// Opens a folder from disk: one disconnected earlier, or any folder of `.eml` files.
+    pub(crate) fn open_offline_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("Open".into()) });
+        let (store, offline) = (self.store.clone(), self.offline.clone());
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else { return };
+            let Some(dir) = paths.into_iter().next() else { return };
+            let _ = this.update_in(cx, |_, window, cx| crate::ui::toast(window, cx, crate::notify::Level::Info, format!("Opening {}…", shown_path(&dir))));
+            let result = cx.background_spawn(async move { offline_disk::open_folder(&store, &offline, &dir) }).await;
+            let _ = this.update_in(cx, |this, window, cx| match result {
+                Ok(opened) => {
+                    let offline = this.offline.id.clone();
+                    this.reload_account_labels();
+                    this.mark_counts_stale([offline.clone()]);
+                    this.open_folder(offline, MailboxView::Label(opened.root.id.clone()), window, cx);
+                    let skipped = if opened.skipped > 0 { format!(" {} file(s) couldn’t be read.", opened.skipped) } else { String::new() };
+                    crate::ui::toast(window, cx, crate::notify::Level::Success, format!("Opened “{}” with {}.{skipped}", opened.root.name, messages_phrase(opened.messages)));
+                }
+                Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, e),
+            });
+        })
+        .detach();
     }
 }
