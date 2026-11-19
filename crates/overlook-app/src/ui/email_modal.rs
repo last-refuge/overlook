@@ -72,6 +72,17 @@ pub(super) fn backdrop_closes_modal(has_composer: bool) -> bool {
     !has_composer
 }
 
+/// While the email modal is open, list refreshes triggered by mailbox actions
+/// (archive, trash, folder move, filter changes) must keep the open email
+/// loaded as long as at least one message in its conversation still exists in
+/// the mail index. Only permanent deletion empties it.
+pub(super) fn keep_modal_selection_after_refresh(
+    email_modal: bool,
+    remaining_in_index: usize,
+) -> bool {
+    email_modal && remaining_in_index > 0
+}
+
 /// Subtle location pill shown in the modal header when the email has moved out
 /// of the background list's folder (or sits in Trash/Junk), confirming the
 /// result of actions taken while staying in the modal.
@@ -202,7 +213,7 @@ impl MailWindow {
         }
         let deferred_next = self.email_modal_next.take();
         if self.outbox_selected.is_none()
-            && self.selected.is_some()
+            && (self.selected.is_some() || deferred_next.is_some())
             && !self
                 .conversations
                 .iter()
@@ -785,6 +796,14 @@ mod tests {
     fn backdrop_does_not_close_while_composing() {
         assert!(backdrop_closes_modal(false));
         assert!(!backdrop_closes_modal(true));
+    }
+
+    #[test]
+    fn refresh_preserves_modal_selection_until_permanently_deleted() {
+        assert!(keep_modal_selection_after_refresh(true, 1));
+        assert!(keep_modal_selection_after_refresh(true, 3));
+        assert!(!keep_modal_selection_after_refresh(true, 0));
+        assert!(!keep_modal_selection_after_refresh(false, 1));
     }
 
     #[test]

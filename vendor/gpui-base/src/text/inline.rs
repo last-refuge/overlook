@@ -1020,6 +1020,20 @@ impl Element for Inline {
 
         _ = text_layout.paint_foreground(window, cx);
 
+        if !self.links.is_empty()
+            && let Some(text_view_state) = GlobalState::global(cx).text_view_state()
+        {
+            text_view_state
+                .read(cx)
+                .painted_links
+                .borrow_mut()
+                .push(crate::text::state::PaintedLinkRun {
+                    bounds: hitbox.bounds,
+                    layout: text_layout.clone(),
+                    links: self.links.clone(),
+                });
+        }
+
         if is_selectable {
             if let Some(text_view_state) = GlobalState::global(cx).text_view_state() {
                 let text_bounds = Self::text_line_bounds(

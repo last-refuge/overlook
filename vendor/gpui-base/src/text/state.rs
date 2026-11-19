@@ -2,8 +2,10 @@ use futures::Stream as _;
 #[cfg(not(target_family = "wasm"))]
 use std::time::Instant;
 use std::{
+    cell::RefCell,
     ops::{Range, RangeInclusive},
     pin::Pin,
+    rc::Rc,
     sync::{Arc, Mutex, OnceLock},
     task::Poll,
     time::Duration,
@@ -93,6 +95,14 @@ pub(super) struct LineSpan {
     pub(super) line_height: Pixels,
 }
 
+/// One painted inline run carrying links, recorded during paint so callers
+/// (such as context menus) can hit-test links at a window pointer position.
+pub(super) struct PaintedLinkRun {
+    pub(super) bounds: Bounds<Pixels>,
+    pub(super) layout: gpui::TextLayout,
+    pub(super) links: Rc<Vec<(Range<usize>, node::LinkMark)>>,
+}
+
 /// The state of a TextView.
 pub struct TextViewState {
     entity_id: EntityId,
@@ -127,6 +137,7 @@ pub struct TextViewState {
     select_all: bool,
     pub(super) auto_scroll: AutoScroll,
     pub(super) selection_adapter: TextViewSelectionAdapter,
+    pub(super) painted_links: Rc<RefCell<Vec<PaintedLinkRun>>>,
 
     pub(super) parsed_content: ParsedContent,
     pub(super) stream_fade: StreamFadeTracker,
@@ -228,6 +239,7 @@ impl TextViewState {
             preserve_inline_selection: false,
             auto_scroll: AutoScroll::default(),
             selection_adapter,
+            painted_links: Rc::default(),
             parsed_content: Default::default(),
             stream_fade: StreamFadeTracker::default(),
             fade_tick: None,
@@ -304,6 +316,22 @@ impl TextViewState {
     /// [`TextView::max_lines`](crate::text::TextView::max_lines).
     pub fn is_clamped(&self) -> bool {
         self.clamped
+    }
+
+    /// Returns the URL of the link painted at `position`, if any.
+    pub fn link_at(&self, position: Point<Pixels>) -> Option<SharedString> {
+        for run in self.painted_links.borrow().iter() {
+            if !run.bounds.contains(&position) {
+                continue;
+            }
+            let Ok(offset) = run.layout.index_for_position(position) else {
+                continue;
+            };
+            if let Some((_, link)) = run.links.iter().find(|(range, _)| range.contains(&offset)) {
+                return Some(link.url.clone());
+            }
+        }
+        None
     }
 
     /// Set the text content.

@@ -24,6 +24,8 @@ necessarily drawn on the editor background. Overlook's composer uses it for reci
 
 `InputBaseState::can_undo` and `can_redo` (`src/input/base/state.rs`, `src/input/base/undo_manager.rs`)
 report whether undo or redo history is available for editable text context menus.
+`TextViewState::link_at` (`src/text/state.rs`, `src/text/text_view.rs`, `src/text/inline.rs`)
+hit-tests painted inline links at a pointer position for native text body context menus.
 
 `RoundedFrameCover::top` keeps the mail panes' top corners rounded over their
 child backgrounds while leaving the bottom corners square (`src/scrollable_mask.rs`).

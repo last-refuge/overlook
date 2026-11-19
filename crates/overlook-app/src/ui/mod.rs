@@ -1915,10 +1915,19 @@ impl MailWindow {
         }
         if let Some(sel) = &self.selected {
             if !self.conversations.iter().any(|c| &c.id == sel) && self.search_query.is_empty() {
-                // The selected conversation left this view (archived, trashed, filtered).
-                self.selected = None;
-                self.marked.clear();
-                self.thread.clear();
+                let remaining = self.mail_index.message_ids_in(sel);
+                if email_modal::keep_modal_selection_after_refresh(self.email_modal, remaining.len()) {
+                    // Stay on the open conversation in the modal after mailbox actions
+                    // (archive, trash, folder move, filter change) until closed or sent.
+                    let remaining: HashSet<MessageId> = remaining.into_iter().collect();
+                    self.thread.retain(|m| remaining.contains(&m.id));
+                } else {
+                    // The selected conversation left this view (archived, trashed, filtered)
+                    // or was permanently deleted while open in the modal.
+                    self.selected = None;
+                    self.marked.clear();
+                    self.thread.clear();
+                }
             }
         }
     }
@@ -2766,6 +2775,10 @@ impl MailWindow {
         let trash = self.labels.iter().find(|l| l.kind == LabelKind::Trash).map(|l| l.id.clone());
         for change in changes {
             let ids = change.message_ids();
+            if matches!(change, LocalChange::DeleteForever { .. }) {
+                self.thread.retain(|m| !ids.contains(&m.id));
+                continue;
+            }
             for m in self.thread.iter_mut().filter(|m| ids.contains(&m.id)) {
                 overlook_store::apply_to_message(m, change, inbox.as_ref(), trash.as_ref());
             }

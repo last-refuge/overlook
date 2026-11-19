@@ -1268,16 +1268,47 @@ impl RenderOnce for NativeTextBody {
             move |_, cx| gpui_kit::base::text::TextViewState::html(initial_html.as_str(), cx),
         );
         state.update(cx, |s, cx| s.set_text(self.html.as_str(), cx));
+        let context_link = window.use_keyed_state(
+            SharedString::from(format!("{}/context-link", self.id)),
+            cx,
+            |_, _| None::<String>,
+        );
         let has_content = self.has_content;
         let menu_state = state.clone();
+        let menu_link = context_link.clone();
+        let open_link = context_link.clone();
+        let copy_link = context_link;
         div()
             .id(SharedString::from(format!("{}/wrap", self.id)))
             .px(px(8.))
             .py(px(8.))
             .text_size(px(14.))
             .line_height(px(21.))
+            .on_action(move |_: &super::context_menu::OpenContextLink, _, cx| {
+                if let Some(url) = open_link
+                    .read(cx)
+                    .as_deref()
+                    .filter(|u| crate::browser_body::allowed_url(u))
+                {
+                    cx.open_url(url);
+                }
+            })
+            .on_action(move |_: &super::context_menu::CopyContextLink, _, cx| {
+                if let Some(url) = copy_link.read(cx).as_deref() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(url.to_owned()));
+                }
+            })
             .on_mouse_down(MouseButton::Right, move |event: &MouseDownEvent, window, cx| {
-                let focus = menu_state.read(cx).focus_handle().clone();
+                let (focus, link) = {
+                    let view = menu_state.read(cx);
+                    let link = view
+                        .link_at(event.position)
+                        .map(|u| u.to_string())
+                        .filter(|u| crate::browser_body::allowed_url(u));
+                    (view.focus_handle().clone(), link)
+                };
+                let has_link = link.is_some();
+                menu_link.update(cx, |slot, _| *slot = link);
                 let position = event.position;
                 let has_selection = !gpui_kit::base::TextSelection::selected_text(window, cx)
                     .trim()
@@ -1285,7 +1316,7 @@ impl RenderOnce for NativeTextBody {
                 let menu = super::context_menu::ReadOnlyEmailMenuState {
                     has_selection,
                     has_content,
-                    has_link: false,
+                    has_link,
                 };
                 window.defer(cx, move |window, cx| {
                     focus.focus(window, cx);
