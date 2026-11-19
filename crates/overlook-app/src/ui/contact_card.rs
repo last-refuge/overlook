@@ -533,4 +533,19 @@ mod tests {
         assert_eq!(CardData { who: who.clone(), contact: Some(c), contact_account: None, is_me: false }.name(), "Sam Okafor");
         assert_eq!(CardData { who: Address::new(None, "sam@example.com"), contact: None, contact_account: None, is_me: false }.name(), "sam@example.com");
     }
+
+    #[test]
+    fn other_account_contact_index_handles_repeated_primary_email_and_prefers_address_book() {
+        let mut repeated = contact("g1", "Maya@Northstar.example", &["maya@northstar.example", "maya.chen@home.example"], true);
+        repeated.name = Some("Maya Chen".into());
+        let inferred = contact("c1", "maya@northstar.example", &["maya@northstar.example"], false);
+        let (entries, index) = MailWindow::index_other_contacts(vec![
+            (AccountId::from("acct-a"), vec![inferred]),
+            (AccountId::from("acct-b"), vec![repeated]),
+        ]);
+        let idx = *index.get("maya@northstar.example").expect("primary email indexed");
+        assert_eq!(entries[idx].0, AccountId::from("acct-b"));
+        assert_eq!(entries[idx].1.name.as_deref(), Some("Maya Chen"));
+        assert_eq!(index.get("maya.chen@home.example"), Some(&idx));
+    }
 }

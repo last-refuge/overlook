@@ -103,59 +103,129 @@ impl MailWindow {
         }
     }
 
-    /// Loads other accounts' contacts on a background thread so calendar guest cards can
-    /// resolve cross-account contacts without blocking the UI thread during mail syncs.
-    pub(crate) fn refresh_other_contacts(&mut self, cx: &mut Context<Self>) {
-        let other_ids: Vec<AccountId> = self
-            .accounts
-            .iter()
-            .filter(|a| a.id != self.account.id)
-            .map(|a| a.id.clone())
-            .collect();
-        self.other_contacts_generation += 1;
-        let generation = self.other_contacts_generation;
-        if other_ids.is_empty() {
-            self.other_contacts.clear();
-            self.other_contact_index.clear();
-            return;
-        }
-        let store = self.store.clone();
-        cx.spawn(async move |this, cx| {
-            let (entries, index) = cx
-                .background_spawn(async move {
-                    let mut entries: Vec<(AccountId, Contact)> = Vec::new();
-                    let mut index: std::collections::HashMap<String, usize> =
-                        std::collections::HashMap::new();
-                    for acct_id in other_ids {
-                        for contact in store.contacts(&acct_id).unwrap_or_default() {
-                            let idx = entries.len();
-                            let in_book = contact.in_address_book;
-                            let mut indexed_any = false;
-                            for email in std::iter::once(&contact.email)
-                                .chain(&contact.emails)
-                                .filter(|e| !e.trim().is_empty())
-                            {
-                                let key = email.trim().to_ascii_lowercase();
-                                match index.get(&key) {
-                                    Some(&kept) if entries[kept].1.in_address_book || !in_book => {}
-                                    _ => {
-                                        index.insert(key, idx);
-                                        indexed_any = true;
-                                    }
-                                }
-                            }
-                            if indexed_any {
-                                entries.push((acct_id.clone(), contact));
-                            }
+    /// Builds a flat `(AccountId, Contact)` table and lower-cased email lookup index from
+    /// per-account contact lists. Address-book entries win over correspondence entries, and
+    /// contacts repeating their primary `email` in `emails` are handled safely.
+    pub(super) fn index_other_contacts(
+        by_account: impl IntoIterator<Item = (AccountId, Vec<Contact>)>,
+    ) -> (Vec<(AccountId, Contact)>, std::collections::HashMap<String, usize>) {
+        let mut entries: Vec<(AccountId, Contact)> = Vec::new();
+        let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (acct_id, contacts) in by_account {
+            for contact in contacts {
+                let idx = entries.len();
+                let in_book = contact.in_address_book;
+                // Push before indexing so any repeated email on the same contact (primary
+                // `email` also listed in `emails`) always reads a valid slot.
+                entries.push((acct_id.clone(), contact));
+                let mut indexed_any = false;
+                let emails: Vec<String> = {
+                    let c = &entries[idx].1;
+                    std::iter::once(&c.email)
+                        .chain(&c.emails)
+                        .filter(|e| !e.trim().is_empty())
+                        .map(|e| e.trim().to_ascii_lowercase())
+                        .collect()
+                };
+                for key in emails {
+                    match index.get(&key) {
+                        Some(&kept) if kept == idx => {}
+                        Some(&kept) if entries[kept].1.in_address_book || !in_book => {}
+                        _ => {
+                            index.insert(key, idx);
+                            indexed_any = true;
                         }
                     }
-                    (entries, index)
+                }
+                if !indexed_any {
+                    entries.pop();
+                }
+            }
+        }
+        (entries, index)
+    }
+
+    fn rebuild_other_contact_index(&mut self) {
+        let active = &self.account.id;
+        let ordered: Vec<(AccountId, Vec<Contact>)> = self
+            .accounts
+            .iter()
+            .filter(|a| &a.id != active)
+            .filter_map(|a| {
+                self.other_contacts_by_account
+                    .get(&a.id)
+                    .map(|list| (a.id.clone(), list.clone()))
+            })
+            .collect();
+        let (entries, index) = Self::index_other_contacts(ordered);
+        self.other_contacts = entries;
+        self.other_contact_index = index;
+    }
+
+    /// Loads any uncached non-active accounts' contacts on a background thread, reusing
+    /// already-cached accounts so calendar switches and account changes don't re-read every
+    /// address book from SQLite.
+    pub(crate) fn refresh_other_contacts(&mut self, cx: &mut Context<Self>) {
+        let active = self.account.id.clone();
+        let valid: std::collections::HashSet<&AccountId> =
+            self.accounts.iter().filter(|a| a.id != active).map(|a| &a.id).collect();
+        self.other_contacts_by_account.retain(|id, _| valid.contains(id));
+        self.rebuild_other_contact_index();
+        let missing: Vec<AccountId> = self
+            .accounts
+            .iter()
+            .filter(|a| a.id != active && !self.other_contacts_by_account.contains_key(&a.id))
+            .map(|a| a.id.clone())
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        self.other_contacts_generation += 1;
+        let generation = self.other_contacts_generation;
+        let store = self.store.clone();
+        cx.spawn(async move |this, cx| {
+            let loaded: Vec<(AccountId, Vec<Contact>)> = cx
+                .background_spawn(async move {
+                    missing
+                        .into_iter()
+                        .map(|id| {
+                            let list = store.contacts(&id).unwrap_or_default();
+                            (id, list)
+                        })
+                        .collect()
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if this.other_contacts_generation == generation {
-                    this.other_contacts = entries;
-                    this.other_contact_index = index;
+                    for (id, list) in loaded {
+                        if id != this.account.id && this.accounts.iter().any(|a| a.id == id) {
+                            this.other_contacts_by_account.insert(id, list);
+                        }
+                    }
+                    this.rebuild_other_contact_index();
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Refreshes a single non-active account's cached contacts on a background thread after
+    /// its sync finishes, leaving unchanged accounts untouched.
+    pub(crate) fn refresh_other_contacts_for(&mut self, account_id: AccountId, cx: &mut Context<Self>) {
+        if account_id == self.account.id || !self.accounts.iter().any(|a| a.id == account_id) {
+            return;
+        }
+        let store = self.store.clone();
+        let id = account_id.clone();
+        cx.spawn(async move |this, cx| {
+            let list = cx
+                .background_spawn(async move { store.contacts(&id).unwrap_or_default() })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if account_id != this.account.id && this.accounts.iter().any(|a| a.id == account_id) {
+                    this.other_contacts_by_account.insert(account_id, list);
+                    this.rebuild_other_contact_index();
                     cx.notify();
                 }
             });

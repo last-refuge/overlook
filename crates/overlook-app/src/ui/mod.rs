@@ -656,9 +656,10 @@ pub struct MailWindow {
     recipients_expanded: BTreeSet<MessageId>,
     /// Lower-cased address → position in `contacts`.
     contact_index: HashMap<String, usize>,
-    /// Contacts loaded in the background from other accounts, stored once each and indexed
-    /// by lower-cased address so calendar guests on secondary calendars resolve without
-    /// blocking the UI thread or duplicating contacts per email address.
+    /// Contacts loaded in the background from other accounts, cached per account so syncing
+    /// one account refreshes only that account without re-reading unchanged address books or
+    /// blocking the UI thread.
+    other_contacts_by_account: HashMap<AccountId, Vec<Contact>>,
     other_contacts: Vec<(AccountId, Contact)>,
     other_contact_index: HashMap<String, usize>,
     other_contacts_generation: u64,
@@ -994,6 +995,7 @@ impl MailWindow {
             contact_card: None,
             recipients_expanded: BTreeSet::new(),
             contact_index: HashMap::new(),
+            other_contacts_by_account: HashMap::new(),
             other_contacts: Vec::new(),
             other_contact_index: HashMap::new(),
             other_contacts_generation: 0,
@@ -1411,6 +1413,12 @@ impl MailWindow {
         if self.composer.is_some() {
             self.close_composer(window, cx);
         }
+        let previous_id = self.account.id.clone();
+        let previous_contacts = std::mem::take(&mut self.contacts);
+        if !previous_contacts.is_empty() && previous_id != account.id {
+            self.other_contacts_by_account.insert(previous_id, previous_contacts);
+        }
+        self.other_contacts_by_account.remove(&account.id);
         self.account = account;
         self.load_recent_moves();
         // The account a folder window shows is not the one the app opens with next time.
@@ -3563,6 +3571,9 @@ impl MailWindow {
                 }
                 this.mark_counts_stale([account.id.clone()]);
                 this.reload(cx);
+                if account.id != this.account.id {
+                    this.refresh_other_contacts_for(account.id.clone(), cx);
+                }
                 this.reload_folder_windows([account.id.clone()], cx);
                 if verify && !outcome.verified {
                     // Offline or failed before the check ran: check on the next sync instead.
