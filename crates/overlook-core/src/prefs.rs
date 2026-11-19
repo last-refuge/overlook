@@ -174,9 +174,7 @@ impl FontPrefs {
     /// Outgoing email font when "Include font in sent emails" is enabled.
     pub fn outgoing_font(&self) -> Option<OutgoingFont> {
         self.style_outgoing_mail.then(|| OutgoingFont {
-            family: clean_family(self.compose_family.as_deref())
-                .or_else(|| clean_family(self.ui_family.as_deref()))
-                .map(str::to_owned),
+            family: Some(self.effective_compose_family().to_owned()),
             size_px: self.clamped_compose_size(),
         })
     }
@@ -527,5 +525,14 @@ mod tests {
         let out = custom.outgoing_font().expect("outgoing font enabled");
         assert_eq!(out.family.as_deref(), Some("Georgia"));
         assert_eq!(out.clamped_size(), 15);
+
+        let default_outgoing = FontPrefs {
+            style_outgoing_mail: true,
+            ..Default::default()
+        }
+        .outgoing_font()
+        .expect("default outgoing font enabled");
+        assert_eq!(default_outgoing.family.as_deref(), Some(DEFAULT_UI_FONT));
+        assert!(default_outgoing.css_family().starts_with("'Inter',"));
     }
 }

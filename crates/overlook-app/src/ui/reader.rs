@@ -86,12 +86,19 @@ impl MailWindow {
         }
         use std::hash::{Hash, Hasher};
         let mut hash = std::collections::hash_map::DefaultHasher::new();
+        let mut fonts = self.prefs.fonts.clone();
+        // Compose and Outbox previews represent authored outgoing mail, not received messages:
+        // do not let the reading override replace the compose font and size.
+        if key.starts_with("preview-") || key.starts_with("outbox-") {
+            fonts.override_email_fonts = false;
+        }
         source.hash(&mut hash);
         allow_remote.hash(&mut hash);
-        self.prefs.fonts.reading_family.hash(&mut hash);
-        self.prefs.fonts.reading_size.hash(&mut hash);
-        self.prefs.fonts.mono_family.hash(&mut hash);
-        self.prefs.fonts.override_email_fonts.hash(&mut hash);
+        fonts.reading_family.hash(&mut hash);
+        fonts.reading_size.hash(&mut hash);
+        fonts.mono_family.hash(&mut hash);
+        fonts.mono_size.hash(&mut hash);
+        fonts.override_email_fonts.hash(&mut hash);
         // App-theme switches do not change the document or invalidate its light-paper tiles.
         if source.as_bytes().windows(4).any(|chunk| chunk.eq_ignore_ascii_case(b"cid:")) {
             if let Some(m) = original {
@@ -107,7 +114,7 @@ impl MailWindow {
         let mut cache = self.browser_bodies.borrow_mut();
         if let Some((old, count, view)) = cache.get_mut(&key) {
             if *old != fingerprint {
-                let (html, resources) = self.browser_document(source, original, cx.palette());
+                let (html, resources) = self.browser_document_with_fonts(source, original, cx.palette(), &fonts);
                 *count = resources;
                 *old = fingerprint;
                 view.update(cx, |body, cx| body.set_document(html, allow_remote, false, cx));
@@ -117,7 +124,7 @@ impl MailWindow {
         if cache.len() >= 4 {
             return (self.message_text_fallback(original, &key, cx), 0);
         }
-        let (html, count) = self.browser_document(source, original, cx.palette());
+        let (html, count) = self.browser_document_with_fonts(source, original, cx.palette(), &fonts);
         let native_scroll = if key.starts_with("message-") || key.starts_with("outbox-") {
             Some(self.reader_scroll.clone())
         } else if key.starts_with("preview-") {
@@ -176,7 +183,17 @@ impl MailWindow {
     /// The document Chromium renders for a body: prepared, with inline images resolved.
     /// Opening and pre-rendering must agree on it exactly to share a finished render.
     pub(super) fn browser_document(&self, source: &str, original: Option<&Message>, palette: &crate::theme::Palette) -> (String, usize) {
-        let mut doc = palette.prepare_browser_document_with_fonts(source, &self.prefs.fonts);
+        self.browser_document_with_fonts(source, original, palette, &self.prefs.fonts)
+    }
+
+    fn browser_document_with_fonts(
+        &self,
+        source: &str,
+        original: Option<&Message>,
+        palette: &crate::theme::Palette,
+        fonts: &FontPrefs,
+    ) -> (String, usize) {
+        let mut doc = palette.prepare_browser_document_with_fonts(source, fonts);
         if let Some(m) = original { doc.html = self.resolve_inline_images(m, doc.html); }
         (doc.html, doc.remote_resources)
     }

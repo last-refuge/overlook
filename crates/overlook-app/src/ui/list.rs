@@ -342,7 +342,7 @@ impl MailWindow {
             avatars: self.prefs.show_avatars,
             previews: self.prefs.show_previews,
             ui_size: self.prefs.fonts.clamped_ui_size(),
-            list_family: self.prefs.fonts.list_family.clone(),
+            list_family: self.prefs.fonts.effective_list_family().to_owned(),
             list_size: self.prefs.fonts.list_size,
         };
         if self.row_layout.borrow_mut().replace(layout.clone()).is_some_and(|before| before != layout) {

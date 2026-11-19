@@ -425,7 +425,7 @@ struct RowLayout {
     avatars: bool,
     previews: bool,
     ui_size: u8,
-    list_family: Option<String>,
+    list_family: String,
     list_size: Option<u8>,
 }
 
