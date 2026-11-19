@@ -2499,6 +2499,33 @@ mod tests {
     }
 
     #[test]
+    fn unstarring_a_conversation_clears_every_starred_message_in_it() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+        // One conversation: an older starred message and a newer one that is not (#39).
+        let mut older = message("t1", "Plan", "first", &["label-inbox"]);
+        older.conversation_id = ConversationId::from("conv-thread");
+        older.is_starred = true;
+        let mut newer = message("t2", "Re: Plan", "second", &["label-inbox"]);
+        newer.conversation_id = ConversationId::from("conv-thread");
+        newer.date = older.date + 60_000;
+        store.upsert_messages(&[older, newer]).unwrap();
+        let mut index = store.mail_index(&acct).unwrap();
+        let thread = [ConversationId::from("conv-thread")];
+        let starred = |index: &MailIndex| index.conversations("jason@example.com", &MailboxView::Kind(LabelKind::Starred), ListFilter::All, None).iter().any(|c| c.id == thread[0]);
+        assert!(starred(&index), "a starred older message stars the conversation");
+
+        let off = index.star_targets(&thread, false);
+        assert_eq!(off, vec![MessageId::from("t1")], "unstar clears the starred message, not the newest");
+        index.apply(&LocalChange::SetStarred { message_ids: off, starred: false });
+        assert!(!starred(&index), "the conversation leaves Starred");
+
+        assert_eq!(index.star_targets(&thread, true), vec![MessageId::from("t2")], "star marks the newest");
+        assert!(index.star_targets(&[ConversationId::from("missing")], false).is_empty());
+    }
+
+    #[test]
     fn in_memory_index_matches_the_store_after_each_change() {
         let store = Store::open_in_memory().unwrap();
         seeded(&store);
