@@ -2503,26 +2503,31 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         seeded(&store);
         let acct = AccountId::from("acct-1");
-        // One conversation: an older starred message and a newer one that is not (#39).
-        let mut older = message("t1", "Plan", "first", &["label-inbox"]);
-        older.conversation_id = ConversationId::from("conv-thread");
-        older.is_starred = true;
-        let mut newer = message("t2", "Re: Plan", "second", &["label-inbox"]);
-        newer.conversation_id = ConversationId::from("conv-thread");
-        newer.date = older.date + 60_000;
-        store.upsert_messages(&[older, newer]).unwrap();
+        // One conversation: two older starred messages, a newer one that is not (#39), and a
+        // newest one in Trash, which the Inbox row doesn't show.
+        let at = |id: &str, minutes: i64, labels: &[&str], starred: bool| {
+            let mut m = message(id, "Plan", id, labels);
+            m.conversation_id = ConversationId::from("conv-thread");
+            m.date += minutes * 60_000;
+            m.is_starred = starred;
+            m
+        };
+        store.upsert_messages(&[at("t1", 0, &["label-inbox"], true), at("t2", 1, &["label-inbox"], true), at("t3", 2, &["label-inbox"], false), at("t4", 3, &["label-trash"], false)]).unwrap();
         let mut index = store.mail_index(&acct).unwrap();
         let thread = [ConversationId::from("conv-thread")];
+        let inbox = MailboxView::Kind(LabelKind::Inbox);
         let starred = |index: &MailIndex| index.conversations("jason@example.com", &MailboxView::Kind(LabelKind::Starred), ListFilter::All, None).iter().any(|c| c.id == thread[0]);
         assert!(starred(&index), "a starred older message stars the conversation");
 
-        let off = index.star_targets(&thread, false);
-        assert_eq!(off, vec![MessageId::from("t1")], "unstar clears the starred message, not the newest");
+        let mut off = index.star_targets(&thread, &inbox, false);
+        off.sort();
+        assert_eq!(off, vec![MessageId::from("t1"), MessageId::from("t2")], "unstar clears every starred message, not the newest");
         index.apply(&LocalChange::SetStarred { message_ids: off, starred: false });
         assert!(!starred(&index), "the conversation leaves Starred");
 
-        assert_eq!(index.star_targets(&thread, true), vec![MessageId::from("t2")], "star marks the newest");
-        assert!(index.star_targets(&[ConversationId::from("missing")], false).is_empty());
+        assert_eq!(index.star_targets(&thread, &inbox, true), vec![MessageId::from("t3")], "star marks the newest message the row shows");
+        assert_eq!(index.star_targets(&thread, &MailboxView::Kind(LabelKind::Trash), true), vec![MessageId::from("t4")], "in Trash, the trashed one");
+        assert!(index.star_targets(&[ConversationId::from("missing")], &inbox, false).is_empty());
     }
 
     #[test]
