@@ -461,6 +461,9 @@ impl MailWindow {
 
     /// Opens the module a new item belongs to and starts it there.
     pub(super) fn start_new_item(&mut self, item: NewItem, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_message_window() && self.in_main_window(cx, move |this, window, cx| this.start_new_item(item, window, cx)) {
+            return;
+        }
         self.toolbar_more_open = false;
         match item {
             NewItem::Message => {

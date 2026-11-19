@@ -325,8 +325,8 @@ impl MailWindow {
                             .child(summary.subject.clone()),
                     )
                     // The conversation as printed: its newest message, with the history it quotes.
-                    // Inside the email modal, Print lives in the modal's top action bar instead.
-                    .children((!self.email_modal).then_some(newest).flatten().map(|m| {
+                    // Inside a standalone message window, Print lives in the window's top toolbar instead.
+                    .children((!self.is_message_window()).then_some(newest).flatten().map(|m| {
                         Button::new("print-conversation")
                             .ghost()
                             .small()

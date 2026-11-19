@@ -243,6 +243,12 @@ impl MailWindow {
     }
 
     pub(super) fn search_from(&mut self, email: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_message_window() {
+            let owned = email.to_owned();
+            if self.in_main_window(cx, move |this, window, cx| this.search_from(&owned, window, cx)) {
+                return;
+            }
+        }
         if self.module != super::calendar::Module::Mail {
             self.cal_event_modal = None;
             self.set_module(super::calendar::Module::Mail, window, cx);

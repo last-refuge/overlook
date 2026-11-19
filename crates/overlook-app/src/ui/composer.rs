@@ -534,11 +534,12 @@ impl MailWindow {
                     self.reload_drafts();
                 }
             }
-            if self.email_modal {
+            if self.is_message_window() {
+                self.notify_owner(cx);
                 if !self.thread.is_empty() || self.outbox_selected.is_some() {
-                    self.email_modal_focus.focus(window, cx);
+                    self.focus_handle.focus(window, cx);
                 } else {
-                    self.close_email_modal(window, cx);
+                    window.remove_window();
                 }
             } else {
                 self.list_focus.focus(window, cx);
@@ -564,11 +565,11 @@ impl MailWindow {
             if self.composer_owner.is_some() { window.remove_window(); }
             else {
                 crate::ui::toast(window, cx, crate::notify::Level::Info, "Draft discarded.");
-                if self.email_modal {
+                if self.is_message_window() {
                     if !self.thread.is_empty() || self.outbox_selected.is_some() {
-                        self.email_modal_focus.focus(window, cx);
+                        self.focus_handle.focus(window, cx);
                     } else {
-                        self.close_email_modal(window, cx);
+                        window.remove_window();
                     }
                 } else {
                     self.list_focus.focus(window, cx);
@@ -622,9 +623,6 @@ impl MailWindow {
         match self.store.queue_send(&draft) {
             Ok(_) => {
                 self.composer = None;
-                if self.email_modal {
-                    self.close_email_modal(window, cx);
-                }
                 self.finish_queued_send(&draft, window, cx);
             }
             Err(e) => {

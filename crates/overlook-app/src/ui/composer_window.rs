@@ -10,6 +10,13 @@ pub(crate) struct WindowOwner {
     pub(super) window: AnyWindowHandle,
 }
 
+/// What a standalone message window opens on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MessageTarget {
+    Conversation(ConversationId),
+    Outbox(DraftId),
+}
+
 pub(crate) enum WindowSetup {
     Mail(AppearancePreference),
     Composer {
@@ -19,6 +26,14 @@ pub(crate) enum WindowSetup {
     },
     /// "Open in New Window": one folder of one account, beside the main window.
     Folder {
+        appearance: AppearancePreference,
+        owner: WindowOwner,
+        providers: HashMap<AccountId, providers::AccountProviders>,
+        account: AccountId,
+        view: MailboxView,
+    },
+    /// Double-clicking an email (or Outbox item): one message in its own native window.
+    Message {
         appearance: AppearancePreference,
         owner: WindowOwner,
         providers: HashMap<AccountId, providers::AccountProviders>,
@@ -118,12 +133,15 @@ impl MailWindow {
         let prefs = self.prefs.clone();
         let account_prefs = self.account_prefs.clone();
         let remote_allowed = self.remote_allowed.clone();
+        let owner = self.window_owner().unwrap_or_else(|| WindowOwner {
+            parent: cx.entity(),
+            window: window.window_handle(),
+        });
+        let owner_entity = owner.parent.clone();
+        let in_detached_window = self.window_owner().is_some();
         let setup = WindowSetup::Composer {
             appearance: self.appearance,
-            owner: WindowOwner {
-                parent: cx.entity(),
-                window: window.window_handle(),
-            },
+            owner,
             providers: self.providers.clone(),
         };
         let options = WindowOptions {
@@ -149,7 +167,7 @@ impl MailWindow {
             editor
         }) {
             Ok((handle, editor)) => {
-                let parent = cx.entity().downgrade();
+                let parent = owner_entity.downgrade();
                 let closed_id = id.clone();
                 let closed = cx.on_window_closed(move |cx, closed| {
                     if closed == handle.window_id() {
@@ -161,16 +179,24 @@ impl MailWindow {
                             .ok();
                     }
                 });
-                self.detached_composers.insert(
-                    id,
-                    DetachedComposer {
-                        window: handle,
-                        editor: editor.downgrade(),
-                        _closed: closed,
-                    },
-                );
+                let detached = DetachedComposer {
+                    window: handle,
+                    editor: editor.downgrade(),
+                    _closed: closed,
+                };
+                if in_detached_window {
+                    owner_entity.update(cx, |main, _| {
+                        main.detached_composers.insert(id, detached);
+                    });
+                } else {
+                    self.detached_composers.insert(id, detached);
+                }
                 self.composer = None;
-                self.list_focus.focus(window, cx);
+                if self.is_message_window() {
+                    self.focus_handle.focus(window, cx);
+                } else {
+                    self.list_focus.focus(window, cx);
+                }
                 cx.notify();
             }
             Err(_) => {
@@ -231,7 +257,11 @@ impl MailWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(owner) = self.composer_owner.clone() else {
+        let Some(owner) = self
+            .composer_owner
+            .clone()
+            .or_else(|| self.message_owner.clone())
+        else {
             self.announce_queued_send(draft, window, cx);
             return;
         };

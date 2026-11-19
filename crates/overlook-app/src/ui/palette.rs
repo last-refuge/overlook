@@ -236,6 +236,15 @@ impl MailWindow {
             PaletteCommand::Action(action) => window.dispatch_action(action.boxed_clone(), cx),
             PaletteCommand::Module(module) => self.set_module(module, window, cx),
             PaletteCommand::View(view) => {
+                if self.is_message_window() {
+                    let view = view.clone();
+                    if self.in_main_window(cx, move |this, window, cx| {
+                        this.set_module(Module::Mail, window, cx);
+                        this.select_view(view, window, cx);
+                    }) {
+                        return;
+                    }
+                }
                 self.set_module(Module::Mail, window, cx);
                 self.select_view(view, window, cx);
             }
@@ -243,7 +252,15 @@ impl MailWindow {
                 let drag = ConversationDrag { mail: DraggedMail::Selection, title: String::new(), count: 0 };
                 self.drop_on_view(drag, view, window, cx);
             }
-            PaletteCommand::Account(id) => self.switch_account(id, window, cx),
+            PaletteCommand::Account(id) => {
+                if self.is_message_window() {
+                    let id = id.clone();
+                    if self.in_main_window(cx, move |this, window, cx| this.switch_account(id, window, cx)) {
+                        return;
+                    }
+                }
+                self.switch_account(id, window, cx);
+            }
             PaletteCommand::Settings(page) => self.open_settings(page, window, cx),
         }
     }
