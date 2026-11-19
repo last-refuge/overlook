@@ -96,6 +96,21 @@ impl MailWindow {
         self.contacts_source = self.contacts_source_of(&self.account);
         self.contacts = self.store.contacts(&self.account.id).unwrap_or_default();
         self.contact_index = super::contact_card::index_contacts(&self.contacts);
+        let mut others: std::collections::HashMap<String, Contact> = std::collections::HashMap::new();
+        for acct in self.accounts.iter().filter(|a| a.id != self.account.id) {
+            for c in self.store.contacts(&acct.id).unwrap_or_default() {
+                for email in std::iter::once(&c.email).chain(&c.emails).filter(|e| !e.trim().is_empty()) {
+                    let key = email.trim().to_ascii_lowercase();
+                    match others.get(&key) {
+                        Some(kept) if kept.in_address_book || !c.in_address_book => {}
+                        _ => {
+                            others.insert(key, c.clone());
+                        }
+                    }
+                }
+            }
+        }
+        self.other_contacts = others;
         if let Some(sel) = &self.contact_selected {
             if !self.contacts.iter().any(|c| &c.id == sel) {
                 self.contact_selected = None;

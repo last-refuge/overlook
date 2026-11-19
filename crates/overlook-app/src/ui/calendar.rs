@@ -383,6 +383,7 @@ impl MailWindow {
     pub(crate) fn close_event_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.leave_event_modal(window, cx);
         self.cal_selected = None;
+        self.cal_contact_card = None;
         cx.notify();
     }
 
@@ -1766,33 +1767,191 @@ impl MailWindow {
                 let expanded = self.cal_guests_expanded.as_ref() == Some(&e.id);
                 let shown = visible_guests(total, expanded);
                 let event_id = e.id.clone();
+                let summary = guest_summary_label(&e.attendees);
                 d.child(
                     v_flex()
-                        .gap(px(6.))
-                        .child(div().text_size(crate::ui::ui_px(12.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child(format!("{total} guests")))
-                        .children(e.attendees.iter().take(shown).map(|a| {
+                        .gap(px(4.))
+                        .child(
+                            div()
+                                .text_size(crate::ui::ui_px(12.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(p.muted)
+                                .pb(px(2.))
+                                .child(summary),
+                        )
+                        .children(e.attendees.iter().take(shown).enumerate().map(|(i, a)| {
+                            let contact = self.contact_for(&a.email);
+                            let guest = resolved_guest(a, e.organizer.as_ref(), contact, &self.accounts);
                             let (ic, color) = match a.response {
                                 ResponseStatus::Accepted => ("circle-check", p.success),
                                 ResponseStatus::Declined => ("circle-x", p.error),
                                 ResponseStatus::Tentative => ("circle-question-mark", p.warning),
                                 ResponseStatus::NeedsAction => ("circle", p.muted),
                             };
-                            h_flex()
+                            let is_me = a.is_self || self.accounts.iter().any(|acct| acct.email.eq_ignore_ascii_case(&a.email));
+                            let pinned = self
+                                .cal_contact_card
+                                .as_ref()
+                                .is_some_and(|(ev, em)| ev == &e.id && em.eq_ignore_ascii_case(&a.email));
+                            let photo = match contact.and_then(|c| c.photo_url.clone()) {
+                                Some(url) => div()
+                                    .flex_none()
+                                    .size(px(26.))
+                                    .rounded_full()
+                                    .overflow_hidden()
+                                    .bg(p.avatar)
+                                    .child(img(SharedUri::from(url)).size_full().object_fit(ObjectFit::Cover))
+                                    .into_any_element(),
+                                None if is_me => owner_avatar(&guest.address, 26., &p).into_any_element(),
+                                None => avatar(&guest.address, 26., &p).into_any_element(),
+                            };
+                            let mut meta_parts: Vec<String> = Vec::new();
+                            if let Some(email) = &guest.secondary_email {
+                                meta_parts.push(email.clone());
+                            }
+                            if let Some(role) = guest.role {
+                                meta_parts.push(role.to_owned());
+                            } else if is_me {
+                                meta_parts.push("You".to_owned());
+                            }
+                            if guest.secondary_email.is_none() || meta_parts.len() == 1 {
+                                meta_parts.push(guest.response_label.to_owned());
+                            }
+                            let meta = meta_parts.join(" · ");
+                            let row = h_flex()
+                                .id(SharedString::from(format!("cal-guest-{}-{i}", e.id)))
                                 .items_center()
-                                .gap(px(8.))
-                                .text_size(crate::ui::ui_px(12.))
-                                .child(icon(ic).size(px(14.)).text_color(color))
-                                .child(div().flex_1().truncate().child(format!("{}{}", a.display_name(), if a.is_organizer { " · Organizer" } else if a.optional { " · Optional" } else { "" })))
+                                .gap(px(9.))
+                                .px(px(6.))
+                                .py(px(5.))
+                                .mx(px(-6.))
+                                .rounded(px(7.))
+                                .when(pinned, |d| d.bg(p.selection))
+                                .when(!pinned, |d| d.hover(|d| d.bg(p.hover)))
+                                .child(photo)
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .gap(px(1.))
+                                        .child(
+                                            div()
+                                                .text_size(crate::ui::ui_px(12.5))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(if pinned { p.selection_text } else { p.foreground })
+                                                .whitespace_normal()
+                                                .child(guest.primary.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(crate::ui::ui_px(11.))
+                                                .text_color(if pinned { p.selection_text.opacity(0.8) } else { p.muted })
+                                                .truncate()
+                                                .child(meta),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("cal-guest-status-{}-{i}", e.id)))
+                                        .flex_none()
+                                        .tooltip(move |window, cx| {
+                                            gpui_kit::component::tooltip::Tooltip::new(guest.response_label).build(window, cx)
+                                        })
+                                        .child(icon(ic).size(px(14.)).text_color(color)),
+                                );
+                            let trigger = self.calendar_contact_trigger(&format!("guest-{i}"), &e.id, &guest.address, row, cx);
+                            let pinned_card = self.pinned_calendar_contact_card(&e.id, &guest.address, cx);
+                            v_flex()
+                                .gap(px(6.))
+                                .child(trigger)
+                                .children(pinned_card)
                         }))
                         .when(total > GUESTS_SHOWN + 1, |d| {
                             let text = if expanded { "show fewer".to_owned() } else { format!("+{} more", total - shown) };
-                            d.child(div().id("guests-more").w_full().cursor_pointer().text_size(crate::ui::ui_px(12.)).text_color(p.accent).child(text).on_click(cx.listener(move |this, _, _w, cx| {
+                            d.child(div().id("guests-more").w_full().cursor_pointer().pt(px(2.)).text_size(crate::ui::ui_px(12.)).text_color(p.accent).child(text).on_click(cx.listener(move |this, _, _w, cx| {
                                 this.cal_guests_expanded = (!expanded).then(|| event_id.clone());
                                 cx.notify();
                             })))
                         }),
                 )
             })
+            .when_some(
+                e.organizer.as_ref().filter(|org| {
+                    !org.email.trim().is_empty()
+                        && !e.attendees.iter().any(|a| a.email.eq_ignore_ascii_case(&org.email))
+                }),
+                |d, org| {
+                    let contact = self.contact_for(&org.email);
+                    let synthetic = Attendee {
+                        email: org.email.clone(),
+                        name: org.name.clone(),
+                        response: ResponseStatus::Accepted,
+                        is_self: self.accounts.iter().any(|a| a.email.eq_ignore_ascii_case(&org.email)),
+                        is_organizer: true,
+                        optional: false,
+                    };
+                    let guest = resolved_guest(&synthetic, Some(org), contact, &self.accounts);
+                    let pinned = self
+                        .cal_contact_card
+                        .as_ref()
+                        .is_some_and(|(ev, em)| ev == &e.id && em.eq_ignore_ascii_case(&org.email));
+                    let photo = match contact.and_then(|c| c.photo_url.clone()) {
+                        Some(url) => div()
+                            .flex_none()
+                            .size(px(26.))
+                            .rounded_full()
+                            .overflow_hidden()
+                            .bg(p.avatar)
+                            .child(img(SharedUri::from(url)).size_full().object_fit(ObjectFit::Cover))
+                            .into_any_element(),
+                        None if synthetic.is_self => owner_avatar(&guest.address, 26., &p).into_any_element(),
+                        None => avatar(&guest.address, 26., &p).into_any_element(),
+                    };
+                    let row = h_flex()
+                        .id(SharedString::from(format!("cal-organizer-{}", e.id)))
+                        .items_center()
+                        .gap(px(9.))
+                        .px(px(6.))
+                        .py(px(5.))
+                        .mx(px(-6.))
+                        .rounded(px(7.))
+                        .when(pinned, |d| d.bg(p.selection))
+                        .when(!pinned, |d| d.hover(|d| d.bg(p.hover)))
+                        .child(photo)
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap(px(1.))
+                                .child(
+                                    div()
+                                        .text_size(crate::ui::ui_px(12.5))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(if pinned { p.selection_text } else { p.foreground })
+                                        .whitespace_normal()
+                                        .child(guest.primary.clone()),
+                                )
+                                .when_some(guest.secondary_email.clone(), |col, email| {
+                                    col.child(
+                                        div()
+                                            .text_size(crate::ui::ui_px(11.))
+                                            .text_color(if pinned { p.selection_text.opacity(0.8) } else { p.muted })
+                                            .truncate()
+                                            .child(email),
+                                    )
+                                }),
+                        );
+                    let trigger = self.calendar_contact_trigger("organizer", &e.id, &guest.address, row, cx);
+                    let pinned_card = self.pinned_calendar_contact_card(&e.id, &guest.address, cx);
+                    d.child(
+                        v_flex()
+                            .gap(px(4.))
+                            .child(div().text_size(crate::ui::ui_px(12.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child("Organizer"))
+                            .child(trigger)
+                            .children(pinned_card),
+                    )
+                },
+            )
             .children(description_html.map(|html| div().text_size(crate::ui::ui_px(13.)).line_height(crate::ui::ui_px(20.)).child(TextView::html(SharedString::from(format!("evdesc-{}", e.id)), html).selectable(true))));
         // The scope question stays above the scrolling details, so it is seen from any scroll
         // position. This is a plain scroll area because `overflow_y_scrollbar` collapses to no
@@ -2096,6 +2255,103 @@ fn guest_text(attendees: &[Attendee]) -> String {
     attendees.iter().filter(|a| !a.is_self).map(|a| a.email.clone()).collect::<Vec<_>>().join(", ")
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResolvedGuest {
+    address: Address,
+    primary: String,
+    secondary_email: Option<String>,
+    role: Option<&'static str>,
+    response_label: &'static str,
+}
+
+fn non_email_name(candidate: Option<&str>, email: &str) -> Option<String> {
+    let trimmed = candidate?.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case(email.trim()) {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
+/// Resolves a calendar guest's full name and email from Contacts, the event attendee/organizer
+/// records, and the user's own accounts — falling back to the full email address rather than
+/// truncating to the local-part before `@`.
+fn resolved_guest(
+    attendee: &Attendee,
+    organizer: Option<&Address>,
+    contact: Option<&Contact>,
+    accounts: &[Account],
+) -> ResolvedGuest {
+    let email = attendee.email.trim().to_owned();
+    let full_name = contact
+        .and_then(Contact::known_name)
+        .and_then(|n| non_email_name(Some(&n), &email))
+        .or_else(|| non_email_name(attendee.name.as_deref(), &email))
+        .or_else(|| {
+            organizer
+                .filter(|o| o.email.eq_ignore_ascii_case(&email))
+                .and_then(|o| non_email_name(o.name.as_deref(), &email))
+        })
+        .or_else(|| {
+            accounts
+                .iter()
+                .find(|a| a.email.eq_ignore_ascii_case(&email))
+                .and_then(|a| non_email_name(Some(&a.display_name), &email))
+        });
+    let (primary, secondary_email) = match &full_name {
+        Some(name) => (name.clone(), (!email.is_empty()).then(|| email.clone())),
+        None => (email.clone(), None),
+    };
+    let role = if attendee.is_organizer {
+        Some("Organizer")
+    } else if attendee.optional {
+        Some("Optional")
+    } else {
+        None
+    };
+    let response_label = match attendee.response {
+        ResponseStatus::Accepted => "Accepted",
+        ResponseStatus::Declined => "Declined",
+        ResponseStatus::Tentative => "Tentative",
+        ResponseStatus::NeedsAction => "Awaiting response",
+    };
+    ResolvedGuest {
+        address: Address { name: full_name, email },
+        primary,
+        secondary_email,
+        role,
+        response_label,
+    }
+}
+
+/// Heading for the guest section: total count plus a concise response breakdown.
+fn guest_summary_label(attendees: &[Attendee]) -> String {
+    let total = attendees.len();
+    let noun = if total == 1 { "guest" } else { "guests" };
+    let mut accepted = 0usize;
+    let mut tentative = 0usize;
+    let mut declined = 0usize;
+    let mut awaiting = 0usize;
+    for a in attendees {
+        match a.response {
+            ResponseStatus::Accepted => accepted += 1,
+            ResponseStatus::Tentative => tentative += 1,
+            ResponseStatus::Declined => declined += 1,
+            ResponseStatus::NeedsAction => awaiting += 1,
+        }
+    }
+    let mut parts = Vec::new();
+    if accepted > 0 { parts.push(format!("{accepted} accepted")); }
+    if tentative > 0 { parts.push(format!("{tentative} tentative")); }
+    if declined > 0 { parts.push(format!("{declined} declined")); }
+    if awaiting > 0 { parts.push(format!("{awaiting} awaiting")); }
+    if parts.is_empty() {
+        format!("{total} {noun}")
+    } else {
+        format!("{total} {noun} · {}", parts.join(", "))
+    }
+}
+
 /// Greedy lane assignment for overlapping timed events (sorted by start). Returns
 /// `(lane, lanes_in_cluster)` per event.
 fn assign_lanes(events: &[&Event]) -> Vec<(usize, usize)> {
@@ -2155,9 +2411,9 @@ fn merge_guests(existing: &[Attendee], guests: &[Address], owner: &Address) -> V
 
 #[cfg(test)]
 mod calendar_drag_tests {
-    use super::{delete_question, guest_text, is_double_click, visible_guests, CalDrag, CalRangeDrag, DragMode, EventModalResize, EventModalSize, HOUR_PX};
+    use super::{delete_question, guest_summary_label, guest_text, is_double_click, resolved_guest, visible_guests, CalDrag, CalRangeDrag, DragMode, EventModalResize, EventModalSize, HOUR_PX};
     use gpui_kit::{point, px, size, ClickEvent, CursorStyle, MouseClickEvent, MouseDownEvent, MouseUpEvent};
-    use overlook_core::{tz, Attendee, EventId, RecurrenceScope, ResponseStatus};
+    use overlook_core::{tz, Account, AccountId, Attendee, Contact, EventId, ProviderKind, RecurrenceScope, ResponseStatus};
 
     fn click(count: usize, moved: f32) -> ClickEvent {
         ClickEvent::Mouse(MouseClickEvent {
@@ -2260,5 +2516,74 @@ mod calendar_drag_tests {
             drag.day_offset = -1;
             assert_eq!(drag.proposed(), (start, start + 3_600_000));
         }
+    }
+
+    #[test]
+    fn resolved_guest_prefers_full_name_and_keeps_full_email_fallback() {
+        let attendee = |email: &str, name: Option<&str>, response| Attendee {
+            email: email.into(),
+            name: name.map(str::to_owned),
+            response,
+            is_self: false,
+            is_organizer: false,
+            optional: false,
+        };
+        let contact = Contact {
+            id: "c1".into(),
+            name: Some("Maya Chen".into()),
+            email: "mchen@northstar.example".into(),
+            in_address_book: true,
+            ..Default::default()
+        };
+        let acct = Account {
+            id: AccountId::from("a1"),
+            provider: ProviderKind::Sample,
+            display_name: "Jason Alexander".into(),
+            email: "jason@example.com".into(),
+            created_at: 0,
+        };
+
+        // Contact full name wins over bare email (even when attendee.name is None).
+        let from_contact = resolved_guest(
+            &attendee("mchen@northstar.example", None, ResponseStatus::Accepted),
+            None,
+            Some(&contact),
+            &[acct.clone()],
+        );
+        assert_eq!(from_contact.primary, "Maya Chen");
+        assert_eq!(from_contact.secondary_email.as_deref(), Some("mchen@northstar.example"));
+        assert_eq!(from_contact.address.name.as_deref(), Some("Maya Chen"));
+        assert_eq!(from_contact.response_label, "Accepted");
+
+        // Unknown guest with no name (or name == email) keeps full email, not vague local-part.
+        let unknown = resolved_guest(
+            &attendee("jsmith@acme.example", Some("jsmith@acme.example"), ResponseStatus::NeedsAction),
+            None,
+            None,
+            &[acct.clone()],
+        );
+        assert_eq!(unknown.primary, "jsmith@acme.example");
+        assert_eq!(unknown.secondary_email, None);
+        assert_eq!(unknown.response_label, "Awaiting response");
+
+        // Own account resolves full display name even if not in contacts.
+        let self_guest = resolved_guest(
+            &attendee("jason@example.com", None, ResponseStatus::Accepted),
+            None,
+            None,
+            &[acct],
+        );
+        assert_eq!(self_guest.primary, "Jason Alexander");
+        assert_eq!(self_guest.secondary_email.as_deref(), Some("jason@example.com"));
+
+        // Guest summary gives clear count + breakdown.
+        assert_eq!(
+            guest_summary_label(&[
+                attendee("a@x.test", None, ResponseStatus::Accepted),
+                attendee("b@x.test", None, ResponseStatus::Tentative),
+                attendee("c@x.test", None, ResponseStatus::NeedsAction),
+            ]),
+            "3 guests · 1 accepted, 1 tentative, 1 awaiting"
+        );
     }
 }

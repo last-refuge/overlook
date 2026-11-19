@@ -656,6 +656,9 @@ pub struct MailWindow {
     recipients_expanded: BTreeSet<MessageId>,
     /// Lower-cased address → position in `contacts`.
     contact_index: HashMap<String, usize>,
+    /// Lower-cased address → contact from other accounts, so calendar guests on another
+    /// account's calendar still resolve their full name and contact details.
+    other_contacts: HashMap<String, Contact>,
     // Contacts module state.
     pub(crate) contacts: Vec<Contact>,
     /// Where the open account's contacts live; set with the contacts.
@@ -732,6 +735,8 @@ pub struct MailWindow {
     pub(crate) cal_selected: Option<EventId>,
     /// The event whose details list all of its guests.
     pub(crate) cal_guests_expanded: Option<EventId>,
+    /// Event and lower-cased email whose guest contact card is pinned open in event details.
+    pub(crate) cal_contact_card: Option<(EventId, String)>,
     /// The event whose details are open in a modal, after a double click.
     pub(crate) cal_event_modal: Option<EventId>,
     /// Holds the modal's keyboard focus, which keeps the calendar's keys from acting behind it.
@@ -986,6 +991,7 @@ impl MailWindow {
             contact_card: None,
             recipients_expanded: BTreeSet::new(),
             contact_index: HashMap::new(),
+            other_contacts: HashMap::new(),
             contacts_source: Default::default(),
             contacts: Vec::new(),
             contact_selected: None,
@@ -1033,6 +1039,7 @@ impl MailWindow {
             calendars: Vec::new(),
             cal_selected: None,
             cal_guests_expanded: None,
+            cal_contact_card: None,
             cal_event_modal: None,
             cal_modal_focus: cx.focus_handle(),
             cal_modal_size: calendar::EventModalSize::default(),

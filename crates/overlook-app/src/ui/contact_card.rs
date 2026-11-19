@@ -122,7 +122,7 @@ impl CardData {
 /// The card itself, without a frame: the hover card and the pinned card each supply their
 /// own. `scope` keeps the button ids of cards on screen together apart, and the actions
 /// reach the window through `t` because a hover card is not drawn by the window's own view.
-fn card_body(data: &CardData, p: &Palette, t: &WeakEntity<MailWindow>, scope: &str) -> Div {
+fn card_body(data: &CardData, p: &Palette, t: &WeakEntity<MailWindow>, scope: &str, fill_width: bool) -> Div {
     let who = &data.who;
     let contact = data.contact.as_ref();
     let id = |part: &str| SharedString::from(format!("{scope}-{part}"));
@@ -173,7 +173,8 @@ fn card_body(data: &CardData, p: &Palette, t: &WeakEntity<MailWindow>, scope: &s
         }));
 
     v_flex()
-        .w(px(320.))
+        .when(fill_width, |d| d.w_full().min_w_0())
+        .when(!fill_width, |d| d.w(px(320.)))
         .gap(px(12.))
         .child(
             h_flex()
@@ -195,17 +196,36 @@ fn card_body(data: &CardData, p: &Palette, t: &WeakEntity<MailWindow>, scope: &s
 
 impl MailWindow {
     /// The contact with this address, in memory: an address-book entry before one only
-    /// inferred from correspondence.
+    /// inferred from correspondence, preferring the active account and falling back to
+    /// other accounts so calendar guests across accounts still resolve cleanly.
     pub(super) fn contact_for(&self, email: &str) -> Option<&Contact> {
-        self.contact_index.get(&email.trim().to_ascii_lowercase()).and_then(|&i| self.contacts.get(i))
+        let key = email.trim().to_ascii_lowercase();
+        let active = self.contact_index.get(&key).and_then(|&i| self.contacts.get(i));
+        let other = self.other_contacts.get(&key);
+        match (active, other) {
+            (Some(a), Some(o)) if !a.in_address_book && o.in_address_book => Some(o),
+            (Some(a), _) => Some(a),
+            (None, other) => other,
+        }
     }
 
     fn card_data(&self, who: &Address) -> CardData {
-        let is_me = who.email.eq_ignore_ascii_case(&self.account.email);
-        CardData { who: if is_me { self.owner() } else { who.clone() }, contact: self.contact_for(&who.email).cloned(), is_me }
+        let is_me = self.accounts.iter().any(|a| a.email.eq_ignore_ascii_case(&who.email));
+        let resolved_who = if who.email.eq_ignore_ascii_case(&self.account.email) {
+            self.owner()
+        } else if let Some(acct) = self.accounts.iter().find(|a| a.email.eq_ignore_ascii_case(&who.email)) {
+            Address::named(&acct.display_name, &acct.email)
+        } else {
+            who.clone()
+        };
+        CardData { who: resolved_who, contact: self.contact_for(&who.email).cloned(), is_me }
     }
 
     pub(super) fn search_from(&mut self, email: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.module != super::calendar::Module::Mail {
+            self.cal_event_modal = None;
+            self.set_module(super::calendar::Module::Mail, window, cx);
+        }
         let query = format!("from:{email}");
         let input = self.search_input.clone();
         input.update(cx, |s, cx| s.set_value(query.clone(), window, cx));
@@ -234,8 +254,85 @@ impl MailWindow {
             .anchor(Anchor::TopLeft)
             .open_delay(Duration::from_millis(350))
             .trigger(label)
-            .content(move |_state, _window, _cx| card_body(&data, &p, &t, &scope))
+            .content(move |_state, _window, _cx| card_body(&data, &p, &t, &scope, false))
             .into_any_element()
+    }
+
+    /// Makes a calendar guest row open the contact card for `who`: hovering shows the
+    /// floating contact details card (aligned inward from the right sidebar), and clicking
+    /// pins the card inline under the guest row until clicked again.
+    pub(super) fn calendar_contact_trigger(
+        &self,
+        key: &str,
+        event: &EventId,
+        who: &Address,
+        row: Stateful<Div>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let p = *cx.palette();
+        let target = (event.clone(), who.email.to_ascii_lowercase());
+        let pinned = self.cal_contact_card.as_ref() == Some(&target);
+        let row = row.cursor_pointer().on_click(cx.listener(move |this, _, _window, cx| {
+            cx.stop_propagation();
+            this.cal_contact_card = if this.cal_contact_card.as_ref() == Some(&target) {
+                None
+            } else {
+                Some(target.clone())
+            };
+            cx.notify();
+        }));
+        if pinned {
+            return row.into_any_element();
+        }
+        let data = self.card_data(who);
+        let t = cx.entity().downgrade();
+        let scope = format!("cal-card-{event}-{key}");
+        HoverCard::new(SharedString::from(scope.clone()))
+            .anchor(Anchor::TopRight)
+            .open_delay(Duration::from_millis(300))
+            .trigger(row)
+            .content(move |_state, _window, _cx| card_body(&data, &p, &t, &scope, false))
+            .into_any_element()
+    }
+
+    /// The contact card pinned inline beneath a clicked guest row in calendar event details.
+    pub(super) fn pinned_calendar_contact_card(
+        &self,
+        event: &EventId,
+        who: &Address,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let (pinned_event, email) = self.cal_contact_card.as_ref()?;
+        if pinned_event != event || !email.eq_ignore_ascii_case(&who.email) {
+            return None;
+        }
+        let p = *cx.palette();
+        let t = cx.entity().downgrade();
+        let body = card_body(&self.card_data(who), &p, &t, &format!("cal-pinned-{event}"), true);
+        Some(
+            div()
+                .relative()
+                .flex_none()
+                .w_full()
+                .p(px(12.))
+                .rounded(px(10.))
+                .bg(p.chip)
+                .border_1()
+                .border_color(p.divider)
+                .child(body)
+                .child(div().absolute().top(px(6.)).right(px(6.)).child(
+                    Button::new(SharedString::from(format!("cal-pinned-close-{event}")))
+                        .ghost()
+                        .xsmall()
+                        .icon(icon("x").size(px(12.)))
+                        .tooltip("Close")
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.cal_contact_card = None;
+                            cx.notify();
+                        })),
+                ))
+                .into_any_element(),
+        )
     }
 
     /// The To and Cc line of a message header: each name opens its card. Past a handful of
@@ -296,7 +393,7 @@ impl MailWindow {
             .or_else(|| email.eq_ignore_ascii_case(&self.account.email).then(|| self.owner()))?;
         let p = *cx.palette();
         let t = cx.entity().downgrade();
-        let body = card_body(&self.card_data(&who), &p, &t, &format!("pinned-{}", m.id));
+        let body = card_body(&self.card_data(&who), &p, &t, &format!("pinned-{}", m.id), false);
         Some(
             div()
                 .relative()
