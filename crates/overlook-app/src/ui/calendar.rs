@@ -262,6 +262,7 @@ impl MailWindow {
         match module {
             Module::Calendar => {
                 self.reload_calendar();
+                self.refresh_other_contacts(cx);
                 self.ensure_caldav_range(cx);
                 self.cal_focus.focus(window, cx);
             }

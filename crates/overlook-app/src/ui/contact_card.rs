@@ -80,6 +80,7 @@ fn notes_excerpt(notes: &str) -> Option<String> {
 struct CardData {
     who: Address,
     contact: Option<Contact>,
+    contact_account: Option<AccountId>,
     is_me: bool,
 }
 
@@ -155,7 +156,11 @@ fn card_body(data: &CardData, p: &Palette, t: &WeakEntity<MailWindow>, scope: &s
 
     let in_book = contact.is_some_and(|c| c.in_address_book);
     let (write_to, write_t) = (who.clone(), t.clone());
-    let (book_who, book_t) = (who.clone(), t.clone());
+    let (book_who, book_account, book_t) = (
+        who.clone(),
+        in_book.then(|| data.contact_account.clone()).flatten(),
+        t.clone(),
+    );
     let (search_email, search_t) = (who.email.clone(), t.clone());
     let actions = h_flex()
         .flex_wrap()
@@ -165,7 +170,7 @@ fn card_body(data: &CardData, p: &Palette, t: &WeakEntity<MailWindow>, scope: &s
         }))
         .child(
             Button::new(id("book")).ghost().small().icon(icon(if in_book { "book-user" } else { "user-plus" }).size(px(14.))).label(if in_book { "Open in Contacts" } else { "Add to contacts" }).on_click(move |_, window, cx| {
-                let _ = book_t.update(cx, |this, cx| this.show_in_contacts(book_who.clone(), window, cx));
+                let _ = book_t.update(cx, |this, cx| this.show_in_contacts_for(book_account.clone(), book_who.clone(), window, cx));
             }),
         )
         .child(Button::new(id("search")).ghost().small().icon(icon("search").size(px(14.))).label("Mail from them").on_click(move |_, window, cx| {
@@ -195,18 +200,30 @@ fn card_body(data: &CardData, p: &Palette, t: &WeakEntity<MailWindow>, scope: &s
 }
 
 impl MailWindow {
-    /// The contact with this address, in memory: an address-book entry before one only
-    /// inferred from correspondence, preferring the active account and falling back to
-    /// other accounts so calendar guests across accounts still resolve cleanly.
-    pub(super) fn contact_for(&self, email: &str) -> Option<&Contact> {
+    /// The contact with this address and its owning account, in memory: an address-book
+    /// entry before one only inferred from correspondence, preferring the active account
+    /// and falling back to other accounts loaded in the background.
+    pub(super) fn contact_with_account_for(&self, email: &str) -> Option<(&AccountId, &Contact)> {
         let key = email.trim().to_ascii_lowercase();
-        let active = self.contact_index.get(&key).and_then(|&i| self.contacts.get(i));
-        let other = self.other_contacts.get(&key);
+        let active = self
+            .contact_index
+            .get(&key)
+            .and_then(|&i| self.contacts.get(i))
+            .map(|c| (&self.account.id, c));
+        let other = self
+            .other_contact_index
+            .get(&key)
+            .and_then(|&i| self.other_contacts.get(i))
+            .map(|(acct, c)| (acct, c));
         match (active, other) {
-            (Some(a), Some(o)) if !a.in_address_book && o.in_address_book => Some(o),
+            (Some((_, a)), Some((acct, o))) if !a.in_address_book && o.in_address_book => Some((acct, o)),
             (Some(a), _) => Some(a),
             (None, other) => other,
         }
+    }
+
+    pub(super) fn contact_for(&self, email: &str) -> Option<&Contact> {
+        self.contact_with_account_for(email).map(|(_, c)| c)
     }
 
     fn card_data(&self, who: &Address) -> CardData {
@@ -218,7 +235,11 @@ impl MailWindow {
         } else {
             who.clone()
         };
-        CardData { who: resolved_who, contact: self.contact_for(&who.email).cloned(), is_me }
+        let (contact_account, contact) = match self.contact_with_account_for(&who.email) {
+            Some((acct, c)) => (Some(acct.clone()), Some(c.clone())),
+            None => (None, None),
+        };
+        CardData { who: resolved_who, contact, contact_account, is_me }
     }
 
     pub(super) fn search_from(&mut self, email: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -485,17 +506,18 @@ mod tests {
         let data = |opened_for: &str| CardData {
             who: Address::new(None, opened_for),
             contact: Some(contact("a", "maya@northstar.example", &["Maya.Chen@home.example", "MAYA@northstar.example", "work@northstar.example"], true)),
+            contact_account: None,
             is_me: false,
         };
         assert_eq!(data("maya@northstar.example").other_emails(), vec!["Maya.Chen@home.example", "work@northstar.example"]);
         assert_eq!(data("work@northstar.example").other_emails(), vec!["maya@northstar.example", "Maya.Chen@home.example"]);
-        assert!(CardData { who: Address::new(None, "x@example.com"), contact: None, is_me: false }.other_emails().is_empty());
+        assert!(CardData { who: Address::new(None, "x@example.com"), contact: None, contact_account: None, is_me: false }.other_emails().is_empty());
     }
 
     #[test]
     fn a_card_says_where_it_knows_the_person_from() {
         let who = Address::named("Sam", "sam@example.com");
-        let source = |contact: Option<Contact>, is_me| CardData { who: who.clone(), contact, is_me }.source();
+        let source = |contact: Option<Contact>, is_me| CardData { who: who.clone(), contact, contact_account: None, is_me }.source();
         assert_eq!(source(None, false), "Not in your contacts");
         assert_eq!(source(Some(contact("o", "sam@example.com", &[], false)), false), "Someone you have corresponded with");
         assert_eq!(source(Some(contact("b", "sam@example.com", &[], true)), false), "In your Google Contacts");
@@ -506,9 +528,9 @@ mod tests {
     fn a_card_prefers_the_address_book_name_to_the_one_in_the_header() {
         let who = Address::named("sam via list", "sam@example.com");
         let mut c = contact("b", "sam@example.com", &[], true);
-        assert_eq!(CardData { who: who.clone(), contact: Some(c.clone()), is_me: false }.name(), "sam via list", "a contact without a name defers to the header");
+        assert_eq!(CardData { who: who.clone(), contact: Some(c.clone()), contact_account: None, is_me: false }.name(), "sam via list", "a contact without a name defers to the header");
         c.name = Some("Sam Okafor".into());
-        assert_eq!(CardData { who: who.clone(), contact: Some(c), is_me: false }.name(), "Sam Okafor");
-        assert_eq!(CardData { who: Address::new(None, "sam@example.com"), contact: None, is_me: false }.name(), "sam@example.com");
+        assert_eq!(CardData { who: who.clone(), contact: Some(c), contact_account: None, is_me: false }.name(), "Sam Okafor");
+        assert_eq!(CardData { who: Address::new(None, "sam@example.com"), contact: None, contact_account: None, is_me: false }.name(), "sam@example.com");
     }
 }

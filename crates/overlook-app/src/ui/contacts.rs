@@ -96,26 +96,71 @@ impl MailWindow {
         self.contacts_source = self.contacts_source_of(&self.account);
         self.contacts = self.store.contacts(&self.account.id).unwrap_or_default();
         self.contact_index = super::contact_card::index_contacts(&self.contacts);
-        let mut others: std::collections::HashMap<String, Contact> = std::collections::HashMap::new();
-        for acct in self.accounts.iter().filter(|a| a.id != self.account.id) {
-            for c in self.store.contacts(&acct.id).unwrap_or_default() {
-                for email in std::iter::once(&c.email).chain(&c.emails).filter(|e| !e.trim().is_empty()) {
-                    let key = email.trim().to_ascii_lowercase();
-                    match others.get(&key) {
-                        Some(kept) if kept.in_address_book || !c.in_address_book => {}
-                        _ => {
-                            others.insert(key, c.clone());
-                        }
-                    }
-                }
-            }
-        }
-        self.other_contacts = others;
         if let Some(sel) = &self.contact_selected {
             if !self.contacts.iter().any(|c| &c.id == sel) {
                 self.contact_selected = None;
             }
         }
+    }
+
+    /// Loads other accounts' contacts on a background thread so calendar guest cards can
+    /// resolve cross-account contacts without blocking the UI thread during mail syncs.
+    pub(crate) fn refresh_other_contacts(&mut self, cx: &mut Context<Self>) {
+        let other_ids: Vec<AccountId> = self
+            .accounts
+            .iter()
+            .filter(|a| a.id != self.account.id)
+            .map(|a| a.id.clone())
+            .collect();
+        self.other_contacts_generation += 1;
+        let generation = self.other_contacts_generation;
+        if other_ids.is_empty() {
+            self.other_contacts.clear();
+            self.other_contact_index.clear();
+            return;
+        }
+        let store = self.store.clone();
+        cx.spawn(async move |this, cx| {
+            let (entries, index) = cx
+                .background_spawn(async move {
+                    let mut entries: Vec<(AccountId, Contact)> = Vec::new();
+                    let mut index: std::collections::HashMap<String, usize> =
+                        std::collections::HashMap::new();
+                    for acct_id in other_ids {
+                        for contact in store.contacts(&acct_id).unwrap_or_default() {
+                            let idx = entries.len();
+                            let in_book = contact.in_address_book;
+                            let mut indexed_any = false;
+                            for email in std::iter::once(&contact.email)
+                                .chain(&contact.emails)
+                                .filter(|e| !e.trim().is_empty())
+                            {
+                                let key = email.trim().to_ascii_lowercase();
+                                match index.get(&key) {
+                                    Some(&kept) if entries[kept].1.in_address_book || !in_book => {}
+                                    _ => {
+                                        index.insert(key, idx);
+                                        indexed_any = true;
+                                    }
+                                }
+                            }
+                            if indexed_any {
+                                entries.push((acct_id.clone(), contact));
+                            }
+                        }
+                    }
+                    (entries, index)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.other_contacts_generation == generation {
+                    this.other_contacts = entries;
+                    this.other_contact_index = index;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn visible_contacts(&self) -> Vec<&Contact> {
@@ -302,7 +347,14 @@ impl MailWindow {
     }
 
     /// Opens the Contacts module on this person, or on a new contact for them.
-    pub(crate) fn show_in_contacts(&mut self, who: Address, window: &mut Window, cx: &mut Context<Self>) {
+    /// Opens `who` in Contacts, switching to `account` first when the saved contact lives
+    /// in another account so "Open in Contacts" never opens a duplicate new-contact form.
+    pub(crate) fn show_in_contacts_for(&mut self, account: Option<AccountId>, who: Address, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(acct_id) = account.filter(|id| id != &self.account.id) {
+            if self.accounts.iter().any(|a| a.id == acct_id) {
+                self.switch_account(acct_id, window, cx);
+            }
+        }
         self.set_module(super::calendar::Module::Contacts, window, cx);
         self.reload_contacts();
         match self.contacts.iter().find(|c| c.has_email(&who.email) && c.in_address_book).map(|c| c.id.clone()) {

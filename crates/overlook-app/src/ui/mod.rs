@@ -656,9 +656,12 @@ pub struct MailWindow {
     recipients_expanded: BTreeSet<MessageId>,
     /// Lower-cased address → position in `contacts`.
     contact_index: HashMap<String, usize>,
-    /// Lower-cased address → contact from other accounts, so calendar guests on another
-    /// account's calendar still resolve their full name and contact details.
-    other_contacts: HashMap<String, Contact>,
+    /// Contacts loaded in the background from other accounts, stored once each and indexed
+    /// by lower-cased address so calendar guests on secondary calendars resolve without
+    /// blocking the UI thread or duplicating contacts per email address.
+    other_contacts: Vec<(AccountId, Contact)>,
+    other_contact_index: HashMap<String, usize>,
+    other_contacts_generation: u64,
     // Contacts module state.
     pub(crate) contacts: Vec<Contact>,
     /// Where the open account's contacts live; set with the contacts.
@@ -991,7 +994,9 @@ impl MailWindow {
             contact_card: None,
             recipients_expanded: BTreeSet::new(),
             contact_index: HashMap::new(),
-            other_contacts: HashMap::new(),
+            other_contacts: Vec::new(),
+            other_contact_index: HashMap::new(),
+            other_contacts_generation: 0,
             contacts_source: Default::default(),
             contacts: Vec::new(),
             contact_selected: None,
@@ -1151,6 +1156,7 @@ impl MailWindow {
         // Keep a Chromium started so the first message opens without its launch (paused while
         // hidden: see `browser_engine::set_prewarm`).
         crate::browser_engine::prewarm();
+        this.refresh_other_contacts(cx);
         // A fresh process has not reached any provider yet: say so until a probe succeeds.
         for a in this.accounts.clone().into_iter().filter(|_| first_start) {
             if this.provider_issues.contains_key(&a.id) {
@@ -1424,6 +1430,7 @@ impl MailWindow {
             input.update(cx, |s, cx| s.set_value("", window, cx));
         }
         self.reload(cx);
+        self.refresh_other_contacts(cx);
         self.selected = self.conversations.first().map(|c| c.id.clone());
         self.marked.clear();
         self.load_thread(cx);
