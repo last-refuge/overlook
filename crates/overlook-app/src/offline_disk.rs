@@ -607,21 +607,16 @@ mod tests {
         let refused = save_before_disconnect(&store, &offline.id, &work).unwrap_err();
         assert!(refused.contains("1 message"), "{refused}");
 
-        // A file that can't be deleted yet comes back, to be tried again.
-        let locked = base.join("locked");
-        std::fs::create_dir_all(&locked).unwrap();
-        let stuck = locked.join("stuck.eml");
+        // A file that can't be deleted yet comes back, to be tried again. (Something in the
+        // way that can't be removed as a file, even by root as in CI.)
+        let stuck = base.join("stuck.eml");
+        std::fs::create_dir_all(stuck.join("inside")).unwrap();
+        let kept = reconcile(&store, &offline.id, &legacy, std::slice::from_ref(&stuck)).unwrap();
+        assert_eq!(kept, vec![stuck.clone()]);
+        std::fs::remove_dir_all(&stuck).unwrap();
         std::fs::write(&stuck, b"x").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
-            let kept = reconcile(&store, &offline.id, &legacy, std::slice::from_ref(&stuck)).unwrap();
-            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
-            assert_eq!(kept, vec![stuck.clone()]);
-            assert!(reconcile(&store, &offline.id, &legacy, &kept).unwrap().is_empty(), "deleted once it can be");
-            assert!(!stuck.exists());
-        }
+        assert!(reconcile(&store, &offline.id, &legacy, &kept).unwrap().is_empty(), "deleted once it can be");
+        assert!(!stuck.exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 
