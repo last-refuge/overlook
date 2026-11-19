@@ -62,6 +62,7 @@ use overlook_provider::sample::SampleProvider;
 use overlook_store::{LocalChange, ListFilter, MailIndex, MailboxView, Store};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -593,7 +594,9 @@ pub struct MailWindow {
     /// Bumped whenever the index changes; a background rebuild started earlier is dropped.
     mail_index_generation: u64,
     /// Local changes waiting to be written, in order, and the batch being written now.
-    local_writes: VecDeque<(AccountId, LocalWrite)>,
+    /// Shared with the in-flight writer task so changes queued right before a detached
+    /// window closes are still flushed in order rather than dropped.
+    local_writes: Arc<Mutex<VecDeque<(AccountId, LocalWrite)>>>,
     local_in_flight: Vec<(AccountId, LocalWrite)>,
     /// Off-screen renders of the conversations next to the open one; replaced (and so
     /// cancelled) whenever the selection moves.
@@ -681,14 +684,6 @@ pub struct MailWindow {
     pub(crate) inline_images: std::cell::RefCell<HashMap<AttachmentId, Option<String>>>,
     /// Live isolated message documents; released when their reader surface closes.
     pub(crate) browser_bodies: std::cell::RefCell<HashMap<String, (u64, usize, Entity<crate::browser_body::BrowserBody>)>>,
-    /// The focused email modal, opened by double-clicking an item in the message list.
-    pub(crate) email_modal: bool,
-    pub(crate) email_modal_focus: FocusHandle,
-    pub(crate) email_modal_size: email_modal::EmailModalSize,
-    pub(crate) email_modal_resize: Option<email_modal::EmailModalResize>,
-    /// Next conversation to select once the email modal closes, if this email left the list.
-    pub(crate) email_modal_next: Option<ConversationId>,
-
     composer: Option<Composer>,
     /// Set in a pop-out composer window: the main window it belongs to.
     composer_owner: Option<composer_window::WindowOwner>,
@@ -697,6 +692,10 @@ pub struct MailWindow {
     folder_owner: Option<composer_window::WindowOwner>,
     /// In the main window: the folder windows opened from it.
     folder_windows: Vec<folder_window::FolderWindow>,
+    /// Set in a standalone message window: the main window it belongs to.
+    message_owner: Option<composer_window::WindowOwner>,
+    /// In the main window: the standalone message windows opened from it.
+    message_windows: Vec<email_modal::MessageWindow>,
     /// The New/Rename folder dialog, when open.
     folder_prompt: Option<folder_manage::FolderPrompt>,
     history: Option<history::HistoryState>,
@@ -816,7 +815,7 @@ pub struct MailWindow {
 impl Drop for MailWindow {
     fn drop(&mut self) {
         // Only the main window checks reminders; its state outlives it (see `new`).
-        if self.composer_owner.is_none() && self.folder_owner.is_none() {
+        if self.composer_owner.is_none() && self.folder_owner.is_none() && self.message_owner.is_none() {
             let memory = (std::mem::take(&mut self.notified), std::mem::take(&mut self.snoozed_reminders));
             *REMINDER_MEMORY.lock().unwrap() = Some(memory);
             tracing::info!("main window state released");
@@ -836,22 +835,25 @@ impl MailWindow {
     ) -> Self {
         tracing::debug!("startup: window opening after {} ms", crate::since_start_ms());
         let account = accounts.iter().find(|a| Some(&a.id) == active.as_ref()).or_else(|| accounts.first()).cloned().unwrap_or_else(no_account);
-        let (appearance, composer_owner, folder_owner, shared_providers, folder) = match setup {
-            WindowSetup::Mail(appearance) => (appearance, None, None, None, None),
-            WindowSetup::Composer { appearance, owner, providers } => (appearance, Some(owner), None, Some(providers), None),
-            WindowSetup::Folder { appearance, owner, providers, account, view } => (appearance, None, Some(owner), Some(providers), Some((account, view))),
+        let (appearance, composer_owner, folder_owner, message_owner, shared_providers, folder, message_view) = match setup {
+            WindowSetup::Mail(appearance) => (appearance, None, None, None, None, None, None),
+            WindowSetup::Composer { appearance, owner, providers } => (appearance, Some(owner), None, None, Some(providers), None, None),
+            WindowSetup::Folder { appearance, owner, providers, account, view } => (appearance, None, Some(owner), None, Some(providers), Some((account, view)), None),
+            WindowSetup::Message { appearance, owner, providers, account, view } => (appearance, None, None, Some(owner), Some(providers), None, Some((account, view))),
         };
         #[cfg(target_os = "macos")]
         window.set_window_title(if composer_owner.is_some() {
             "Compose"
         } else if folder_owner.is_some() {
             "Mail Folder"
+        } else if message_owner.is_some() {
+            "Message"
         } else {
             "Overlook"
         });
-        let detached = composer_owner.is_some() || folder_owner.is_some();
-        // A folder window opens on its own account, whatever the main window shows.
-        let account = match &folder {
+        let detached = composer_owner.is_some() || folder_owner.is_some() || message_owner.is_some();
+        // A folder or message window opens on its own account, whatever the main window shows.
+        let account = match folder.as_ref().or(message_view.as_ref()) {
             Some((id, _)) => accounts.iter().find(|a| &a.id == id).cloned().unwrap_or(account),
             None => account,
         };
@@ -957,7 +959,7 @@ impl MailWindow {
             mail_index_account: None,
             other_indexes: HashMap::new(),
             mail_index_generation: 0,
-            local_writes: VecDeque::new(),
+            local_writes: Arc::new(Mutex::new(VecDeque::new())),
             local_in_flight: Vec::new(),
             prerender: None,
             prefetching: false,
@@ -1010,16 +1012,13 @@ impl MailWindow {
             pdf_thumbs_pending: HashSet::new(),
             inline_images: std::cell::RefCell::new(HashMap::new()),
             browser_bodies: std::cell::RefCell::new(HashMap::new()),
-            email_modal: false,
-            email_modal_focus: cx.focus_handle(),
-            email_modal_size: email_modal::EmailModalSize::default(),
-            email_modal_resize: None,
-            email_modal_next: None,
             composer: None,
             composer_owner,
             detached_composers: HashMap::new(),
             folder_owner,
             folder_windows: Vec::new(),
+            message_owner,
+            message_windows: Vec::new(),
             folder_prompt: None,
             history: None,
             appearance,
@@ -1122,6 +1121,13 @@ impl MailWindow {
             this.module = Module::Mail;
             this.select_view(view, window, cx);
             this.focus_current_module(window, cx);
+            return this;
+        }
+        if let Some((_, view)) = message_view {
+            this.module = Module::Mail;
+            this.view = view;
+            this.reload_contacts();
+            this.refresh_other_contacts(cx);
             return this;
         }
         if detached {
@@ -1407,9 +1413,6 @@ impl MailWindow {
 
     pub(crate) fn switch_account(&mut self, id: AccountId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(account) = self.accounts.iter().find(|a| a.id == id).cloned() else { return };
-        if self.email_modal && !self.close_email_modal(window, cx) {
-            return;
-        }
         if self.composer.is_some() {
             self.close_composer(window, cx);
         }
@@ -1911,10 +1914,14 @@ impl MailWindow {
         self.reload_drafts();
         self.status = self.store.account_status(&acct).unwrap_or_default();
         self.queued_downloads = crate::sync::queued_downloads(&self.store, &acct);
-        self.reload_account_labels();
-        self.refresh_account_counts(cx);
+        if !self.is_message_window() {
+            self.reload_account_labels();
+            self.refresh_account_counts(cx);
+        }
         self.load_thread(cx);
-        self.reload_calendar();
+        if !self.is_message_window() {
+            self.reload_calendar();
+        }
         self.reload_contacts();
         cx.notify();
     }
@@ -1947,14 +1954,15 @@ impl MailWindow {
         if let Some(sel) = &self.selected {
             if !self.conversations.iter().any(|c| &c.id == sel) && self.search_query.is_empty() {
                 let remaining = self.mail_index.message_ids_in(sel);
-                if email_modal::keep_modal_selection_after_refresh(self.email_modal, remaining.len()) {
-                    // Stay on the open conversation in the modal after mailbox actions
-                    // (archive, trash, folder move, filter change) until closed or sent.
+                if email_modal::keep_modal_selection_after_refresh(self.is_message_window(), remaining.len()) {
+                    // Stay on the open conversation in a standalone message window after
+                    // mailbox actions (archive, trash, folder move, filter change) until
+                    // closed or sent.
                     let remaining: HashSet<MessageId> = remaining.into_iter().collect();
                     self.thread.retain(|m| remaining.contains(&m.id));
                 } else {
                     // The selected conversation left this view (archived, trashed, filtered)
-                    // or was permanently deleted while open in the modal.
+                    // or was permanently deleted while open in a message window.
                     self.selected = None;
                     self.marked.clear();
                     self.thread.clear();
@@ -2010,7 +2018,7 @@ impl MailWindow {
             })
             .await;
             let _ = this.update(cx, |this, cx| {
-                let current = this.mail_index_generation == generation && this.account.id == acct && this.local_writes.is_empty() && this.local_in_flight.is_empty();
+                let current = this.mail_index_generation == generation && this.account.id == acct && this.local_writes.lock().unwrap().is_empty() && this.local_in_flight.is_empty();
                 if let (true, Ok(index)) = (current, index) {
                     this.replace_mail_index(index);
                     this.refresh_mail();
@@ -2160,11 +2168,11 @@ impl MailWindow {
         }
         let sender = self.thread.iter().filter(|m| !m.is_outgoing).max_by_key(|m| m.date).map(|m| m.from.clone());
         self.mail_index.set_focus_override(&ids, Some(focused));
-        self.local_writes.push_back((self.account.id.clone(), LocalWrite::FocusOverride { ids, focused: Some(focused) }));
+        self.queue_local_write(self.account.id.clone(), LocalWrite::FocusOverride { ids, focused: Some(focused) });
         if always {
             if let Some(sender) = &sender {
                 self.mail_index.set_focus_rule(&sender.email, Some(focused));
-                self.local_writes.push_back((self.account.id.clone(), LocalWrite::FocusRule { email: sender.email.clone(), focused: Some(focused) }));
+                self.queue_local_write(self.account.id.clone(), LocalWrite::FocusRule { email: sender.email.clone(), focused: Some(focused) });
             }
         }
         self.mail_index_generation += 1;
@@ -2545,9 +2553,6 @@ impl MailWindow {
     // ------------------------------------------------------------ navigation
 
     fn select_view(&mut self, view: MailboxView, window: &mut Window, cx: &mut Context<Self>) {
-        if self.email_modal && !self.close_email_modal(window, cx) {
-            return;
-        }
         if !self.search_query.is_empty() {
             self.search_query.clear();
             let input = self.search_input.clone();
@@ -2708,8 +2713,12 @@ impl MailWindow {
                 MarkAsRead::Never => {}
             }
         }
-        self.list_focus.focus(window, cx);
-        self.schedule_prerender(cx);
+        if self.is_message_window() {
+            self.focus_handle.focus(window, cx);
+        } else {
+            self.list_focus.focus(window, cx);
+            self.schedule_prerender(cx);
+        }
         cx.notify();
     }
 
@@ -2787,6 +2796,10 @@ impl MailWindow {
 
     // --------------------------------------------------------- local changes
 
+    fn queue_local_write(&self, account: AccountId, write: LocalWrite) {
+        self.local_writes.lock().unwrap().push_back((account, write));
+    }
+
     /// Applies a mailbox change: the list, counts and open conversation update at once in
     /// memory, then the store write (with its pending operation) and the sync to the
     /// provider run in the background, in the order the changes were made.
@@ -2795,7 +2808,7 @@ impl MailWindow {
         self.mail_index_generation += 1;
         self.apply_to_thread(std::slice::from_ref(&change));
         self.refresh_mail();
-        self.local_writes.push_back((self.account.id.clone(), LocalWrite::Change(change)));
+        self.queue_local_write(self.account.id.clone(), LocalWrite::Change(change));
         self.write_local_changes(window, cx);
         cx.notify();
     }
@@ -2818,9 +2831,10 @@ impl MailWindow {
 
     /// Mailbox changes made in the window that the store does not have yet.
     fn unwritten_changes(&self) -> Vec<LocalChange> {
+        let queued = self.local_writes.lock().unwrap();
         self.local_in_flight
             .iter()
-            .chain(self.local_writes.iter())
+            .chain(queued.iter())
             .filter_map(|(_, w)| match w {
                 LocalWrite::Change(c) => Some(c.clone()),
                 _ => None,
@@ -2831,66 +2845,105 @@ impl MailWindow {
     /// Writes queued local changes on a background thread, then reads a fresh index and
     /// syncs. Only one write runs at a time, so changes reach the store in order.
     fn write_local_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.local_in_flight.is_empty() || self.local_writes.is_empty() {
+        if !self.local_in_flight.is_empty() {
             return;
         }
-        self.local_in_flight = self.local_writes.drain(..).collect();
+        let batch: Vec<(AccountId, LocalWrite)> = self.local_writes.lock().unwrap().drain(..).collect();
+        if batch.is_empty() {
+            return;
+        }
+        self.local_in_flight = batch;
         let writes = self.local_in_flight.clone();
         let store = self.store.clone();
-        let accounts: BTreeSet<AccountId> = writes.iter().map(|(a, _)| a.clone()).collect();
+        let pending_writes = self.local_writes.clone();
+        let mut accounts: BTreeSet<AccountId> = writes.iter().map(|(a, _)| a.clone()).collect();
         let acct = self.account.id.clone();
-        cx.spawn_in(window, async move |this, cx| {
+        let window_handle = window.window_handle();
+        let owner = self.window_owner();
+        cx.spawn(async move |this, cx| {
             let (errors, index) = cx
                 .background_spawn({
+                    let store = store.clone();
                     let acct = acct.clone();
                     async move {
-                        let errors: Vec<String> = writes
-                            .into_iter()
-                            .filter_map(|(acct, w)| {
-                                match w {
-                                    LocalWrite::Change(c) => store.apply_change(&acct, c).map(|_| ()),
-                                    LocalWrite::FocusOverride { ids, focused } => store.set_focus_override(&acct, &ids, focused),
-                                    LocalWrite::FocusRule { email, focused } => store.set_focus_rule(&acct, &email, focused),
-                                }
-                                .err()
-                                .map(|e| e.to_string())
-                            })
-                            .collect();
+                        let errors = apply_local_writes(&store, writes);
                         (errors, store.mail_index(&acct))
                     }
                 })
                 .await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.local_in_flight.clear();
-                for e in &errors {
-                    crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t save that change: {e}"));
-                }
-                if !this.local_writes.is_empty() {
-                    // More changes arrived while writing; this index is already behind them.
-                    this.write_local_changes(window, cx);
-                    return;
-                }
-                if this.account.id == acct {
-                    if let Ok(index) = index {
-                        this.replace_mail_index(index);
-                        this.mail_index_generation += 1;
-                        this.refresh_mail();
+            let updated = window_handle
+                .update(cx, |_, window, cx| {
+                    this.update(cx, |this, cx| {
+                        this.local_in_flight.clear();
+                        for e in &errors {
+                            crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t save that change: {e}"));
+                        }
+                        if !this.local_writes.lock().unwrap().is_empty() {
+                            // More changes arrived while writing; this index is already behind them.
+                            this.write_local_changes(window, cx);
+                            return;
+                        }
+                        if this.account.id == acct {
+                            if let Ok(index) = index {
+                                this.replace_mail_index(index);
+                                this.mail_index_generation += 1;
+                                this.refresh_mail();
+                            }
+                        }
+                        for acct in accounts.iter().cloned() {
+                            this.next_retry.remove(&acct);
+                            if this.connected(&acct) {
+                                this.sync_account(acct, window, cx);
+                            }
+                        }
+                        // Show the change in the other windows now rather than after the sync.
+                        if this.window_owner().is_some() {
+                            this.notify_owner(cx);
+                        } else {
+                            this.reload_folder_windows(accounts.clone(), cx);
+                        }
+                        cx.notify();
+                    })
+                    .is_ok()
+                })
+                .unwrap_or(false);
+            if !updated {
+                // The window closed while a write was in flight: drain any follow-up changes
+                // that queued behind it in strict order, then reload and sync via the main window.
+                loop {
+                    let remaining: Vec<(AccountId, LocalWrite)> = pending_writes.lock().unwrap().drain(..).collect();
+                    if remaining.is_empty() {
+                        break;
+                    }
+                    accounts.extend(remaining.iter().map(|(a, _)| a.clone()));
+                    let store = store.clone();
+                    let more_errors = cx
+                        .background_spawn(async move { apply_local_writes(&store, remaining) })
+                        .await;
+                    for e in more_errors {
+                        tracing::warn!("could not save queued change after window close: {e}");
                     }
                 }
-                for acct in accounts.iter().cloned() {
-                    this.next_retry.remove(&acct);
-                    if this.connected(&acct) {
-                        this.sync_account(acct, window, cx);
-                    }
+                if let Some(owner) = owner {
+                    let _ = cx.update(|cx| {
+                        owner.parent.update(cx, |main, cx| {
+                            main.mark_counts_stale(accounts.iter().cloned());
+                            main.reload(cx);
+                            main.reload_folder_windows(accounts.iter().cloned(), cx);
+                        });
+                        let _ = owner.window.update(cx, |_, window, cx| {
+                            owner.parent.update(cx, |main, cx| {
+                                for acct in accounts.iter().cloned() {
+                                    main.next_retry.remove(&acct);
+                                    if main.connected(&acct) {
+                                        main.sync_account(acct, window, cx);
+                                    }
+                                }
+                            });
+                        });
+                    });
                 }
-                // Show the change in the other windows now rather than after the sync.
-                if this.folder_owner.is_some() {
-                    this.notify_owner(cx);
-                } else {
-                    this.reload_folder_windows(accounts, cx);
-                }
-                cx.notify();
-            });
+            }
         })
         .detach();
     }
@@ -3223,13 +3276,11 @@ impl MailWindow {
     }
 
     fn select_after_removal(&mut self, next: Option<ConversationId>, window: &mut Window, cx: &mut Context<Self>) {
-        if self.email_modal {
-            // Stay in the modal with this email until closed or sent, unless it was permanently deleted.
+        if self.is_message_window() {
+            // Stay in the message window with this email until closed or sent,
+            // unless it was permanently deleted.
             if self.thread.is_empty() {
-                self.email_modal_next = next;
-                self.close_email_modal(window, cx);
-            } else if self.email_modal_next.is_none() {
-                self.email_modal_next = next;
+                window.remove_window();
             }
             return;
         }
@@ -3270,15 +3321,12 @@ impl MailWindow {
         draft.body_text = m.body;
         self.apply_signature(&mut draft, self.default_signature_id(false).as_deref());
         self.set_module(Module::Mail, window, cx);
-        if self.email_modal && !self.close_email_modal(window, cx) {
-            return;
-        }
         self.outbox_selected = None;
         self.open_composer(draft, window, cx);
     }
 
     pub(crate) fn compose_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.email_modal && !self.close_email_modal(window, cx) {
+        if self.is_message_window() && self.in_main_window(cx, |this, window, cx| this.compose_new(window, cx)) {
             return;
         }
         let mut draft = Draft::new(self.account.id.clone(), DraftKind::New, now());
@@ -3398,6 +3446,7 @@ impl MailWindow {
         match self.store.resend(&self.account.id, &id) {
             Ok(draft) => {
                 self.reload(cx);
+                self.notify_owner(cx);
                 self.sync_account(draft.account_id, window, cx);
             }
             Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Warning, e.to_string()),
@@ -3410,6 +3459,10 @@ impl MailWindow {
             Ok(()) => {
                 self.outbox_selected = None;
                 self.reload(cx);
+                self.notify_owner(cx);
+                if self.is_message_window() {
+                    window.remove_window();
+                }
             }
             Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Warning, e.to_string()),
         }
@@ -3640,7 +3693,7 @@ impl MailWindow {
             return;
         }
         if self.module == Module::Calendar { self.open_palette(window, cx); return; }
-        if self.email_modal && !self.close_email_modal(window, cx) {
+        if self.is_message_window() && self.in_main_window(cx, |this, window, cx| this.on_focus_search(&FocusSearch, window, cx)) {
             return;
         }
         let input = if self.module == Module::Contacts { self.contact_search.clone() } else { self.search_input.clone() };
@@ -3681,8 +3734,10 @@ impl MailWindow {
             }
         } else if self.composer.is_some() {
             self.close_composer(window, cx);
-        } else if self.email_modal {
-            self.close_email_modal(window, cx);
+        } else if self.is_message_window() {
+            if self.prepare_composer_window_close(window, cx) {
+                window.remove_window();
+            }
         } else if self.contact_form.is_some() {
             self.cancel_contact_form(cx);
         } else if self.new_event.is_some() {
@@ -3878,7 +3933,15 @@ impl MailWindow {
             return;
         }
         let targets = self.target_conversations();
-        let ids: Vec<MessageId> = targets.iter().flat_map(|c| self.mail_index.visible_message_ids_in(c, &self.view)).collect();
+        let delete_view = if self.is_message_window() {
+            email_modal::delete_forever_view(&self.view, &self.thread, &self.labels)
+        } else {
+            self.view.clone()
+        };
+        let ids: Vec<MessageId> = targets
+            .iter()
+            .flat_map(|c| self.mail_index.visible_message_ids_in(c, &delete_view))
+            .collect();
         if ids.is_empty() {
             return;
         }
@@ -4288,12 +4351,7 @@ impl MailWindow {
         // Keep the resize hit areas and cursors, with no painted pane dividers.
         let handles: gpui_kit::base::ResizeHandleRenderer = std::rc::Rc::new(|_, _, _| Some(Empty.into_any_element()));
         let list = mail_pane(self.render_list(cx), gutter, px(8.)).into_any_element();
-        let reader_content = if self.email_modal {
-            div().size_full().bg(cx.palette().message_surface()).into_any_element()
-        } else {
-            self.render_reader(cx).into_any_element()
-        };
-        let reader = mail_pane(reader_content, gutter, px(0.)).into_any_element();
+        let reader = mail_pane(self.render_reader(cx), gutter, px(0.)).into_any_element();
 
         let content = match self.reading_pane {
             ReadingPane::Right => h_resizable("content-h")
@@ -4333,6 +4391,21 @@ impl MailWindow {
             }))
             .into_any_element()
     }
+}
+
+fn apply_local_writes(store: &Store, writes: Vec<(AccountId, LocalWrite)>) -> Vec<String> {
+    writes
+        .into_iter()
+        .filter_map(|(acct, w)| {
+            match w {
+                LocalWrite::Change(c) => store.apply_change(&acct, c).map(|_| ()),
+                LocalWrite::FocusOverride { ids, focused } => store.set_focus_override(&acct, &ids, focused),
+                LocalWrite::FocusRule { email, focused } => store.set_focus_rule(&acct, &email, focused),
+            }
+            .err()
+            .map(|e| e.to_string())
+        })
+        .collect()
 }
 
 /// Expands a leading `~` to the home directory.
@@ -4398,6 +4471,7 @@ impl Focusable for MailWindow {
 impl Render for MailWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.composer_owner.is_some() { return self.render_composer_window(cx).into_any_element(); }
+        if self.message_owner.is_some() { return self.render_message_window(window, cx).into_any_element(); }
         crate::watchdog::mark("render");
         if !self.first_frame_logged {
             self.first_frame_logged = true;
@@ -4516,7 +4590,6 @@ impl Render for MailWindow {
                             .child(div().flex_1().min_h_0().child(self.render_body(cx)))
                             .child(self.render_status_bar(cx)))),
             )
-            .when(self.email_modal, |d| d.child(self.render_email_modal(cx)))
             .when(self.settings.is_some(), |d| d.child(self.render_settings(cx)))
             .when(self.account_setup.is_some(), |d| d.child(self.render_account_setup(cx)))
             .when(self.module == Module::Calendar && self.new_event.as_ref().is_some_and(|f| f.dragged.is_some()), |d| d.child(self.render_event_modal(cx)))

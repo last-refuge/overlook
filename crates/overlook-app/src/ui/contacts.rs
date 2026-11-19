@@ -420,6 +420,12 @@ impl MailWindow {
     /// Opens `who` in Contacts, switching to `account` first when the saved contact lives
     /// in another account so "Open in Contacts" never opens a duplicate new-contact form.
     pub(crate) fn show_in_contacts_for(&mut self, account: Option<AccountId>, who: Address, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_message_window() {
+            let (acct, addr) = (account.clone(), who.clone());
+            if self.in_main_window(cx, move |this, window, cx| this.show_in_contacts_for(acct, addr, window, cx)) {
+                return;
+            }
+        }
         if let Some(acct_id) = account.filter(|id| id != &self.account.id) {
             if self.accounts.iter().any(|a| a.id == acct_id) {
                 self.switch_account(acct_id, window, cx);
@@ -438,6 +444,12 @@ impl MailWindow {
     }
 
     pub(super) fn compose_to_contact(&mut self, who: Address, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_message_window() {
+            let addr = who.clone();
+            if self.in_main_window(cx, move |this, window, cx| this.compose_to_contact(addr, window, cx)) {
+                return;
+            }
+        }
         self.set_module(super::calendar::Module::Mail, window, cx);
         self.compose_new(window, cx);
         if let Some(c) = self.composer.as_ref() {

@@ -616,7 +616,7 @@ impl MailWindow {
                 } else if modifiers.shift {
                     this.extend_marked_to(conv_id.clone(), window, cx);
                 } else if e.click_count() == 2 {
-                    this.open_conversation_modal(conv_id.clone(), window, cx);
+                    this.open_conversation_window(conv_id.clone(), window, cx);
                 } else {
                     this.select_conversation(Some(conv_id.clone()), window, cx);
                 }
@@ -835,7 +835,7 @@ impl MailWindow {
             menu = menu
                 .item(PopupMenuItem::new("Open").icon(icon("mail-open")).on_click(move |_, window, cx| {
                     open_me
-                        .update(cx, |this, cx| this.open_conversation_modal(open_id.clone(), window, cx))
+                        .update(cx, |this, cx| this.open_conversation_window(open_id.clone(), window, cx))
                         .ok();
                 }))
                 .separator()
@@ -1026,11 +1026,16 @@ impl MailWindow {
                     if this.outbox_selected.as_ref() != Some(&draft_id) {
                         this.select_outbox_item(draft_id.clone(), window, cx);
                     }
-                } else if !this.composer.as_ref().is_some_and(|c| c.draft.id == draft_id) {
-                    this.open_draft(draft_id.clone(), window, cx);
-                }
-                if e.click_count() == 2 {
-                    this.open_current_in_modal(window, cx);
+                    if e.click_count() == 2 {
+                        this.open_outbox_window(draft_id.clone(), window, cx);
+                    }
+                } else {
+                    if !this.composer.as_ref().is_some_and(|c| c.draft.id == draft_id) {
+                        this.open_draft(draft_id.clone(), window, cx);
+                    }
+                    if e.click_count() == 2 {
+                        this.pop_out_composer(window, cx);
+                    }
                 }
             }))
     }

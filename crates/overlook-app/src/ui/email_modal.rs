@@ -1,91 +1,88 @@
-//! Focused email modal opened by double-clicking an item in the message list.
+//! Standalone native message windows opened by double-clicking an email in the list.
 //!
-//! Actions taken inside the modal (Archive, Trash, Move, Star, Mark read/unread,
-//! Reply, Forward) act on this email and keep the user in the modal until they
-//! explicitly close it or send their message.
+//! Like pop-out composers and folder windows, a message window is a detached `MailWindow`
+//! that shares the store and providers with the main window and never syncs by itself.
+//! Actions taken inside the window (Archive, Trash, Move, Star, Mark read/unread, Reply,
+//! Forward) act on this email and keep the window on it until the user closes the window
+//! or sends their message.
 
+use super::composer_window::{MessageTarget, WindowOwner, WindowSetup};
 use super::*;
 use crate::assets::{color_icon, icon, ColorIcon as C};
 
-const MODAL_DEFAULT_WIDTH: f32 = 920.;
-const MODAL_DEFAULT_HEIGHT: f32 = 760.;
-const MODAL_MIN_WIDTH: f32 = 560.;
-const MODAL_MIN_HEIGHT: f32 = 420.;
-const MODAL_MAX_WIDTH: f32 = 0.94;
-const MODAL_MAX_HEIGHT: f32 = 0.90;
+const WINDOW_DEFAULT_WIDTH: f32 = 920.;
+const WINDOW_DEFAULT_HEIGHT: f32 = 760.;
+const WINDOW_MIN_WIDTH: f32 = 560.;
+const WINDOW_MIN_HEIGHT: f32 = 420.;
 
-/// The email modal's dimensions. Resizing persists for the session.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct EmailModalSize {
-    pub width: Pixels,
-    pub height: Pixels,
+pub(super) struct MessageWindow {
+    pub(super) window: AnyWindowHandle,
+    pub(super) editor: WeakEntity<MailWindow>,
+    pub(super) account: AccountId,
+    target: MessageTarget,
+    _closed: Subscription,
 }
 
-impl Default for EmailModalSize {
-    fn default() -> Self {
-        Self {
-            width: px(MODAL_DEFAULT_WIDTH),
-            height: px(MODAL_DEFAULT_HEIGHT),
-        }
-    }
-}
-
-impl EmailModalSize {
-    fn dragged_to(
-        self,
-        resize: EmailModalResize,
-        pointer: Point<Pixels>,
-        window: Size<Pixels>,
-    ) -> Self {
-        let span = |at: Pixels, whole: Pixels, least: f32, most: f32| {
-            let whole = f32::from(whole);
-            px((2. * (f32::from(at) - whole / 2.).abs())
-                .max(least)
-                .min(whole * most))
-        };
-        Self {
-            width: if resize.width {
-                span(pointer.x, window.width, MODAL_MIN_WIDTH, MODAL_MAX_WIDTH)
-            } else {
-                self.width
-            },
-            height: if resize.height {
-                span(pointer.y, window.height, MODAL_MIN_HEIGHT, MODAL_MAX_HEIGHT)
-            } else {
-                self.height
-            },
-        }
-    }
-}
-
-/// Active edge/corner resize drag on the email modal.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct EmailModalResize {
-    pub width: bool,
-    pub height: bool,
-    pub cursor: CursorStyle,
-}
-
-/// Clicking the backdrop closes the modal only when nothing is being composed,
-/// so a stray click outside cannot interrupt an active reply or draft.
-pub(super) fn backdrop_closes_modal(has_composer: bool) -> bool {
-    !has_composer
-}
-
-/// While the email modal is open, list refreshes triggered by mailbox actions
-/// (archive, trash, folder move, filter changes) must keep the open email
-/// loaded as long as at least one message in its conversation still exists in
-/// the mail index. Only permanent deletion empties it.
+/// While an email is open in a standalone message window, list refreshes triggered by
+/// mailbox actions (archive, trash, folder move, filter changes) must keep the open email
+/// loaded as long as at least one message in its conversation still exists in the mail
+/// index. Only permanent deletion empties it.
 pub(super) fn keep_modal_selection_after_refresh(
-    email_modal: bool,
+    is_message_window: bool,
     remaining_in_index: usize,
 ) -> bool {
-    email_modal && remaining_in_index > 0
+    is_message_window && remaining_in_index > 0
 }
 
-/// Subtle location pill shown in the modal header when the email has moved out
-/// of the background list's folder (or sits in Trash/Junk), confirming the
-/// result of actions taken while staying in the modal.
+/// Effective view used for permanent deletion inside a standalone message window.
+///
+/// Preserves the Trash boundary for mixed conversations (messages both in Trash and
+/// outside Trash) by keeping the originating `view`, while still allowing permanent
+/// deletion after an entire conversation is moved to Trash or restored from Trash while
+/// staying open in this window.
+pub(super) fn delete_forever_view(
+    view: &MailboxView,
+    thread: &[Message],
+    labels: &[Label],
+) -> MailboxView {
+    if thread.is_empty() {
+        return view.clone();
+    }
+    let trash = labels.iter().find(|l| l.kind == LabelKind::Trash).map(|l| &l.id);
+    let all_in_trash = trash.is_some_and(|t| thread.iter().all(|m| m.has_label(t)));
+    if all_in_trash {
+        return MailboxView::Kind(LabelKind::Trash);
+    }
+    let none_in_trash = trash.is_none_or(|t| thread.iter().all(|m| !m.has_label(t)));
+    if none_in_trash {
+        return MailboxView::Kind(LabelKind::Inbox);
+    }
+    view.clone()
+}
+
+/// Title shown in the message window's native title bar.
+pub(super) fn message_window_title(subject: Option<&str>, is_outbox: bool) -> String {
+    let clean = subject.map(str::trim).filter(|s| !s.is_empty());
+    match (clean, is_outbox) {
+        (Some(subject), true) => format!("Outbox · {subject}"),
+        (Some(subject), false) => subject.to_owned(),
+        (None, true) => "Outbox".to_owned(),
+        (None, false) => "Overlook · Message".to_owned(),
+    }
+}
+
+/// Title reported to the OS window manager / macOS Window menu.
+pub(super) fn os_window_title(title: &str) -> String {
+    if title.starts_with("Overlook") {
+        title.to_owned()
+    } else {
+        format!("{title} — Overlook")
+    }
+}
+
+/// Subtle location pill shown in the message window's toolbar when the email has moved out
+/// of the originating folder (or sits in Trash/Junk), confirming the result of actions
+/// taken while staying in the window.
 pub(super) fn modal_location_badge(
     view: &MailboxView,
     thread: &[Message],
@@ -139,102 +136,235 @@ pub(super) fn modal_location_badge(
 }
 
 impl MailWindow {
-    /// Opens `id` in the focused email modal (selecting it first if needed).
-    pub(super) fn open_conversation_modal(
+    pub(crate) fn is_message_window(&self) -> bool {
+        self.message_owner.is_some()
+    }
+
+    /// Opens `id` in its own native window, or brings an already-open window forward.
+    pub(super) fn open_conversation_window(
         &mut self,
         id: ConversationId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let needs_select = self.selected.as_ref() != Some(&id)
-            || self.outbox_selected.is_some()
-            || self
-                .composer
-                .as_ref()
-                .is_some_and(|c| c.draft.kind == DraftKind::New)
-            || self.thread.is_empty();
-        if needs_select {
-            self.select_conversation(Some(id), window, cx);
-        } else if !self.marked.is_empty() {
-            self.marked.clear();
-        }
-        if self.selected.is_none() || self.thread.is_empty() {
-            return;
-        }
-        self.email_modal = true;
-        self.email_modal_next = None;
-        self.email_modal_resize = None;
-        self.email_modal_focus.focus(window, cx);
-        cx.notify();
+        let account = self.account.id.clone();
+        let view = self.view.clone();
+        self.open_message_window(account, view, MessageTarget::Conversation(id), window, cx);
     }
 
-    /// Opens the currently selected draft or outbox item in the email modal.
-    pub(super) fn open_current_in_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.composer.is_none() && self.outbox_selected.is_none() && self.thread.is_empty() {
-            return;
-        }
-        self.email_modal = true;
-        self.email_modal_next = None;
-        self.email_modal_resize = None;
-        if self.composer.is_none() {
-            self.email_modal_focus.focus(window, cx);
-        }
-        cx.notify();
-    }
-
-    /// Closes the email modal, saving any open draft first and advancing the
-    /// background list if the conversation moved out of the current folder.
-    /// Returns `false` if a draft save/attachment is still in flight.
-    pub(super) fn close_email_modal(
+    /// Opens an Outbox item in its own native window, or brings an already-open window forward.
+    pub(super) fn open_outbox_window(
         &mut self,
+        id: DraftId,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> bool {
-        if !self.email_modal {
-            return true;
-        }
-        if self
-            .composer
-            .as_ref()
-            .is_some_and(|c| c.attaching || c.pending_saves > 0)
-        {
-            crate::ui::toast(
-                window,
-                cx,
-                crate::notify::Level::Info,
-                "Wait for the draft and attachments to finish saving.",
-            );
-            return false;
-        }
-        self.email_modal = false;
-        self.email_modal_resize = None;
-        if self.composer.is_some() {
-            self.close_composer(window, cx);
-        }
-        let deferred_next = self.email_modal_next.take();
-        if self.outbox_selected.is_none()
-            && (self.selected.is_some() || deferred_next.is_some())
-            && !self
-                .conversations
-                .iter()
-                .any(|c| Some(&c.id) == self.selected.as_ref())
-        {
-            let next = deferred_next
-                .filter(|id| self.conversations.iter().any(|c| &c.id == id))
-                .or_else(|| self.conversations.first().map(|c| c.id.clone()));
-            self.select_quietly(next, false, window, cx);
-        }
-        self.list_focus.focus(window, cx);
-        cx.notify();
-        true
+    ) {
+        let account = self.account.id.clone();
+        let view = self.view.clone();
+        self.open_message_window(account, view, MessageTarget::Outbox(id), window, cx);
     }
 
-    pub(crate) fn render_email_modal(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// Opens `target` of `account` in a standalone native window belonging to the main window.
+    fn open_message_window(
+        &mut self,
+        account: AccountId,
+        view: MailboxView,
+        target: MessageTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(owner) = self.window_owner() {
+            let parent = owner.parent.clone();
+            let opened = owner
+                .window
+                .update(cx, |_, window, cx| {
+                    parent.update(cx, |this, cx| {
+                        this.open_message_window(
+                            account.clone(),
+                            view.clone(),
+                            target.clone(),
+                            window,
+                            cx,
+                        );
+                    });
+                })
+                .is_ok();
+            if !opened {
+                crate::ui::toast(
+                    window,
+                    cx,
+                    crate::notify::Level::Warning,
+                    "Open the main Overlook window to open messages in new windows.",
+                );
+            }
+            return;
+        }
+
+        self.message_windows.retain(|m| m.editor.upgrade().is_some());
+        if let Some(open) = self
+            .message_windows
+            .iter()
+            .find(|m| m.account == account && m.target == target)
+        {
+            if open
+                .window
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok()
+            {
+                return;
+            }
+        }
+
+        let exists = match &target {
+            MessageTarget::Conversation(id) => self
+                .store
+                .messages_in_conversation(&account, id)
+                .is_ok_and(|msgs| !msgs.is_empty()),
+            MessageTarget::Outbox(id) => self.store.draft(id).ok().flatten().is_some(),
+        };
+        if !exists {
+            return;
+        }
+
+        let store = self.store.clone();
+        let sample = self.sample.clone();
+        let accounts = self.accounts.clone();
+        let prefs = self.prefs.clone();
+        let account_prefs = self.account_prefs.clone();
+        let provider_issues = self.provider_issues.clone();
+        let remote_allowed = self.remote_allowed.clone();
+        let setup = WindowSetup::Message {
+            appearance: self.appearance,
+            owner: WindowOwner {
+                parent: cx.entity(),
+                window: window.window_handle(),
+            },
+            providers: self.providers.clone(),
+            account: account.clone(),
+            view,
+        };
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                None,
+                size(px(WINDOW_DEFAULT_WIDTH), px(WINDOW_DEFAULT_HEIGHT)),
+                cx,
+            ))),
+            window_min_size: Some(size(px(WINDOW_MIN_WIDTH), px(WINDOW_MIN_HEIGHT))),
+            app_id: Some(crate::APP_ID.into()),
+            ..TitleBar::window_options()
+        };
+        let open_target = target.clone();
+        let open_account = account.clone();
+        let opened = gpui_kit::open_window(options, cx, move |window, cx| {
+            cx.new(|cx| {
+                let mut this = MailWindow::new(
+                    store,
+                    sample,
+                    accounts,
+                    Some(open_account),
+                    setup,
+                    window,
+                    cx,
+                );
+                // Settings saved moments ago may not be on disk yet; start from the main window's.
+                this.prefs = prefs;
+                this.account_prefs = account_prefs;
+                this.provider_issues = provider_issues;
+                this.remote_allowed = remote_allowed;
+                this.open_message_target(open_target, window, cx);
+                this
+            })
+        });
+        match opened {
+            Ok((handle, editor)) => {
+                let parent = cx.entity().downgrade();
+                let closed = cx.on_window_closed(move |cx, closed| {
+                    if closed == handle.window_id() {
+                        parent
+                            .update(cx, |this, cx| {
+                                this.message_windows
+                                    .retain(|m| m.window.window_id() != closed);
+                                this.reload(cx);
+                            })
+                            .ok();
+                    }
+                });
+                self.message_windows.push(MessageWindow {
+                    window: handle,
+                    editor: editor.downgrade(),
+                    account,
+                    target,
+                    _closed: closed,
+                });
+            }
+            Err(error) => {
+                tracing::warn!("could not open a message window: {error}");
+                crate::ui::toast(
+                    window,
+                    cx,
+                    crate::notify::Level::Error,
+                    "Couldn’t open a message window.",
+                );
+            }
+        }
+    }
+
+    /// Loads the target conversation or Outbox item inside a newly opened message window.
+    fn open_message_target(
+        &mut self,
+        target: MessageTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.reload(cx);
+        match target {
+            MessageTarget::Conversation(id) => {
+                self.select_conversation(Some(id), window, cx);
+            }
+            MessageTarget::Outbox(id) => {
+                self.select_outbox_item(id, window, cx);
+            }
+        }
+        window.set_window_title(&self.os_message_window_title());
+        self.focus_handle.focus(window, cx);
+    }
+
+    fn current_message_window_title(&self) -> String {
+        if let Some(id) = &self.outbox_selected {
+            let subject = self
+                .outbox
+                .iter()
+                .find(|d| &d.id == id)
+                .map(|d| d.display_subject());
+            return message_window_title(subject.as_deref(), true);
+        }
+        if self.thread.is_empty() {
+            if let Some(c) = &self.composer {
+                return message_window_title(Some(&c.draft.display_subject()), false);
+            }
+        }
+        let subject = self.active_summary().map(|s| s.subject);
+        message_window_title(subject.as_deref(), false)
+    }
+
+    pub(super) fn os_message_window_title(&self) -> String {
+        os_window_title(&self.current_message_window_title())
+    }
+
+    pub(crate) fn render_message_window(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.prune_browser_bodies();
         let p = *cx.palette();
-        let has_composer = self.composer.is_some();
+        let macos = cfg!(target_os = "macos");
         let reading_conversation = self.outbox_selected.is_none()
             && (self.composer.is_none() || self.composer_is_inline())
             && !self.thread.is_empty();
+        let no_modal = self.palette.is_none() && self.quick_look.is_none();
+        let menu_can_act = no_modal && self.composer.is_none();
+        let message_selected = no_modal && reading_conversation;
         let (in_trash, in_inbox) = self.thread_state();
         let any_unread = self.thread.iter().any(|m| !m.is_read);
         let starred = self.thread.iter().any(|m| m.is_starred);
@@ -242,6 +372,7 @@ impl MailWindow {
         let location = reading_conversation
             .then(|| modal_location_badge(&self.view, &self.thread, &self.labels))
             .flatten();
+        let title = self.current_message_window_title();
 
         let (archive_label, archive_icon, archive_tip) = if in_trash {
             ("Restore", C::Move, "Restore to Inbox")
@@ -251,18 +382,18 @@ impl MailWindow {
             ("Archive", C::Archive, "Archive")
         };
 
-        let header: AnyElement = if reading_conversation {
+        let toolbar = reading_conversation.then(|| {
             h_flex()
                 .flex_none()
                 .items_center()
                 .gap(px(4.))
-                .h(px(48.))
+                .h(px(44.))
                 .px(px(14.))
                 .border_b_1()
                 .border_color(p.divider)
                 .bg(p.surface)
                 .child(
-                    Button::new("modal-reply")
+                    Button::new("msg-win-reply")
                         .ghost()
                         .small()
                         .child(
@@ -278,7 +409,7 @@ impl MailWindow {
                         })),
                 )
                 .child(
-                    Button::new("modal-reply-all")
+                    Button::new("msg-win-reply-all")
                         .ghost()
                         .small()
                         .child(
@@ -294,7 +425,7 @@ impl MailWindow {
                         })),
                 )
                 .child(
-                    Button::new("modal-forward")
+                    Button::new("msg-win-forward")
                         .ghost()
                         .small()
                         .child(
@@ -311,7 +442,7 @@ impl MailWindow {
                 )
                 .child(div().w(px(1.)).h(px(18.)).mx(px(4.)).bg(p.divider))
                 .child(
-                    Button::new("modal-archive")
+                    Button::new("msg-win-archive")
                         .ghost()
                         .small()
                         .child(
@@ -328,7 +459,7 @@ impl MailWindow {
                 )
                 .when(!in_trash, |bar| {
                     bar.child(
-                        Button::new("modal-delete")
+                        Button::new("msg-win-delete")
                             .ghost()
                             .small()
                             .child(
@@ -345,7 +476,7 @@ impl MailWindow {
                     )
                 })
                 .child(
-                    Button::new("modal-move")
+                    Button::new("msg-win-move")
                         .ghost()
                         .small()
                         .child(
@@ -361,7 +492,7 @@ impl MailWindow {
                         })),
                 )
                 .child(
-                    Button::new("modal-toggle-read")
+                    Button::new("msg-win-toggle-read")
                         .ghost()
                         .small()
                         .w(px(32.))
@@ -387,7 +518,7 @@ impl MailWindow {
                         })),
                 )
                 .child(
-                    Button::new("modal-toggle-star")
+                    Button::new("msg-win-toggle-star")
                         .ghost()
                         .small()
                         .w(px(32.))
@@ -441,7 +572,7 @@ impl MailWindow {
                     )
                 })
                 .children(newest.map(|m| {
-                    Button::new("modal-print")
+                    Button::new("msg-win-print")
                         .ghost()
                         .small()
                         .w(px(32.))
@@ -454,103 +585,93 @@ impl MailWindow {
                             this.print_message(m.clone(), window, cx);
                         }))
                 }))
+        });
+
+        let body: AnyElement = if self.thread.is_empty()
+            && self.outbox_selected.is_none()
+            && self.composer.is_none()
+        {
+            v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .text_color(p.muted)
+                .child("This message is no longer available.")
                 .child(
-                    Button::new("modal-close")
-                        .ghost()
-                        .small()
-                        .w(px(32.))
-                        .h(px(30.))
-                        .p(px(0.))
-                        .child(icon("x").size(px(17.)).text_color(p.muted))
-                        .accessibility_label("Close")
-                        .tooltip("Close (Esc)")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.close_email_modal(window, cx);
-                        })),
+                    Button::new("close-gone-message")
+                        .label("Close")
+                        .on_click(|_, window, _| window.remove_window()),
                 )
                 .into_any_element()
         } else {
-            let title = if self.outbox_selected.is_some() {
-                "Outbox"
-            } else {
-                "Draft"
-            };
-            h_flex()
-                .flex_none()
-                .items_center()
-                .gap(px(8.))
-                .h(px(44.))
-                .px(px(16.))
-                .border_b_1()
-                .border_color(p.divider)
-                .bg(p.surface)
-                .child(
-                    div()
-                        .text_size(crate::ui::ui_px(13.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(p.foreground)
-                        .child(title),
-                )
-                .child(div().flex_1())
-                .child(
-                    Button::new("modal-close")
-                        .ghost()
-                        .small()
-                        .w(px(30.))
-                        .h(px(28.))
-                        .p(px(0.))
-                        .child(icon("x").size(px(16.)).text_color(p.muted))
-                        .accessibility_label("Close")
-                        .tooltip("Close (Esc)")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.close_email_modal(window, cx);
-                        })),
-                )
+            div()
+                .flex_1()
+                .min_h_0()
+                .overflow_hidden()
+                .child(self.render_reader(cx))
                 .into_any_element()
         };
 
-        let size = self.email_modal_size;
-        let handle = |name: &'static str,
-                      width: bool,
-                      height: bool,
-                      cursor: CursorStyle,
-                      cx: &mut Context<Self>| {
-            div()
-                .id(name)
-                .absolute()
-                .occlude()
-                .cursor(cursor)
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        this.email_modal_resize = Some(EmailModalResize {
-                            width,
-                            height,
-                            cursor,
-                        });
-                        cx.notify();
-                    }),
-                )
-        };
-        let (out, thick, corner) = (px(-4.), px(6.), px(12.));
-
-        div()
-            .id("email-modal-overlay")
-            .track_focus(&self.email_modal_focus)
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(gpui_kit::black().opacity(if p.is_dark() { 0.55 } else { 0.32 }))
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_click(cx.listener(move |this, _, window, cx| {
-                if backdrop_closes_modal(has_composer) {
-                    this.close_email_modal(window, cx);
-                }
+        let root = v_flex()
+            .id("message-window")
+            .key_context(WINDOW_CONTEXT)
+            .track_focus(&self.focus_handle);
+        #[cfg(target_os = "macos")]
+        let root = self.native_mail_menu_actions(
+            self.native_window_menu_actions(root, cx),
+            menu_can_act,
+            message_selected,
+            window,
+            cx,
+        );
+        #[cfg(not(target_os = "macos"))]
+        let _ = (window, menu_can_act);
+        root.on_action(cx.listener(|_, _: &QuitOverlook, _window, cx| cx.defer(crate::lifecycle::quit)))
+            .on_action(cx.listener(Self::on_compose))
+            .on_action(cx.listener(Self::on_focus_search))
+            .on_action(cx.listener(Self::on_command_palette))
+            .on_action(cx.listener(Self::on_format_bold))
+            .on_action(cx.listener(Self::on_format_italic))
+            .on_action(cx.listener(Self::on_format_strike))
+            .on_action(cx.listener(Self::on_format_code))
+            .on_action(cx.listener(Self::on_format_bullets))
+            .on_action(cx.listener(Self::on_format_numbers))
+            .on_action(cx.listener(Self::on_format_quote))
+            .on_action(cx.listener(Self::on_toggle_preview))
+            .on_action(cx.listener(Self::on_escape))
+            .on_action(cx.listener(Self::on_send))
+            .on_action(cx.listener(Self::on_toggle_message_history))
+            .on_action(cx.listener(Self::on_pop_out_composer))
+            .on_action(cx.listener(Self::on_reply))
+            .when(!macos || message_selected, |root| {
+                root.on_action(cx.listener(Self::on_reply_all))
+                    .on_action(cx.listener(Self::on_forward))
+                    .on_action(cx.listener(Self::on_toggle_star))
+                    .on_action(cx.listener(Self::on_toggle_read))
+                    .on_action(cx.listener(Self::on_move_selected))
+            })
+            .on_action(cx.listener(Self::on_archive))
+            .when(!macos || (message_selected && !in_trash), |root| {
+                root.on_action(cx.listener(Self::on_trash))
+            })
+            .on_action(cx.listener(Self::on_delete_forever))
+            .on_action(cx.listener(Self::on_sync_now))
+            .on_action(cx.listener(Self::on_switch_mail))
+            .on_action(cx.listener(Self::on_switch_calendar))
+            .on_action(cx.listener(Self::on_switch_contacts))
+            .on_action(cx.listener(Self::on_open_settings))
+            .on_action(cx.listener(|this, _: &NewEventAction, _window, cx| {
+                this.in_main_window(cx, |main, window, cx| {
+                    main.on_new_event(&NewEventAction, window, cx);
+                });
             }))
+            .on_action(cx.listener(|this, _: &ShowHistory, _window, cx| {
+                this.in_main_window(cx, |main, window, cx| main.open_history(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &UndoLast, window, cx| this.undo_last(window, cx)))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if this.composer.is_some() {
+                if this.composer.is_some() || this.palette.is_some() || this.quick_look.is_some() {
                     return;
                 }
                 let stroke = &event.keystroke;
@@ -580,167 +701,48 @@ impl MailWindow {
                 cx.stop_propagation();
                 cx.notify();
             }))
+            .relative()
+            .size_full()
+            .bg(p.message_surface())
+            .text_color(p.foreground)
+            .font_family(SharedString::from(
+                self.prefs.fonts.effective_ui_family().to_owned(),
+            ))
+            .text_size(ui_px(13.))
             .child(
-                v_flex()
-                    .id("email-modal")
-                    .relative()
-                    .w(size.width)
-                    .max_w(relative(MODAL_MAX_WIDTH))
-                    .h(size.height)
-                    .max_h(relative(MODAL_MAX_HEIGHT))
-                    .rounded(px(12.))
-                    .occlude()
-                    .bg(p.message_surface())
-                    .border_1()
-                    .border_color(p.divider)
-                    .shadow_lg()
-                    .on_click(|_, _, cx| cx.stop_propagation())
+                TitleBar::new()
+                    .bg(p.chrome())
+                    .on_close_window(cx.listener(|this, _, window, cx| {
+                        if this.prepare_composer_window_close(window, cx) {
+                            window.remove_window();
+                        }
+                    }))
                     .child(
-                        v_flex()
-                            .size_full()
-                            .min_h_0()
-                            .rounded(px(12.))
-                            .overflow_hidden()
-                            .child(header)
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .items_center()
+                            .px_3()
+                            .gap(px(8.))
                             .child(
                                 div()
                                     .flex_1()
-                                    .min_h_0()
-                                    .overflow_hidden()
-                                    .child(self.render_reader(cx)),
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(ui_px(12.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(p.foreground)
+                                    .child(title),
                             ),
-                    )
-                    // Resize handles outside the inner clipping container so they stay easy to grab.
-                    .child(
-                        handle(
-                            "email-modal-resize-top",
-                            false,
-                            true,
-                            CursorStyle::ResizeUpDown,
-                            cx,
-                        )
-                        .top(out)
-                        .left_0()
-                        .right_0()
-                        .h(thick),
-                    )
-                    .child(
-                        handle(
-                            "email-modal-resize-bottom",
-                            false,
-                            true,
-                            CursorStyle::ResizeUpDown,
-                            cx,
-                        )
-                        .bottom(out)
-                        .left_0()
-                        .right_0()
-                        .h(thick),
-                    )
-                    .child(
-                        handle(
-                            "email-modal-resize-left",
-                            true,
-                            false,
-                            CursorStyle::ResizeLeftRight,
-                            cx,
-                        )
-                        .left(out)
-                        .top_0()
-                        .bottom_0()
-                        .w(thick),
-                    )
-                    .child(
-                        handle(
-                            "email-modal-resize-right",
-                            true,
-                            false,
-                            CursorStyle::ResizeLeftRight,
-                            cx,
-                        )
-                        .right(out)
-                        .top_0()
-                        .bottom_0()
-                        .w(thick),
-                    )
-                    .child(
-                        handle(
-                            "email-modal-resize-top-left",
-                            true,
-                            true,
-                            CursorStyle::ResizeUpLeftDownRight,
-                            cx,
-                        )
-                        .top(out)
-                        .left(out)
-                        .size(corner),
-                    )
-                    .child(
-                        handle(
-                            "email-modal-resize-top-right",
-                            true,
-                            true,
-                            CursorStyle::ResizeUpRightDownLeft,
-                            cx,
-                        )
-                        .top(out)
-                        .right(out)
-                        .size(corner),
-                    )
-                    .child(
-                        handle(
-                            "email-modal-resize-bottom-left",
-                            true,
-                            true,
-                            CursorStyle::ResizeUpRightDownLeft,
-                            cx,
-                        )
-                        .bottom(out)
-                        .left(out)
-                        .size(corner),
-                    )
-                    .child(
-                        handle(
-                            "email-modal-resize-bottom-right",
-                            true,
-                            true,
-                            CursorStyle::ResizeUpLeftDownRight,
-                            cx,
-                        )
-                        .bottom(out)
-                        .right(out)
-                        .size(corner),
                     ),
             )
-            .when_some(self.email_modal_resize, |d, resize| {
-                d.child(
-                    div()
-                        .id("email-modal-resizing")
-                        .absolute()
-                        .inset_0()
-                        .occlude()
-                        .cursor(resize.cursor)
-                        .on_mouse_move(cx.listener(move |this, e: &MouseMoveEvent, window, cx| {
-                            if e.dragging() {
-                                this.email_modal_size = this.email_modal_size.dragged_to(
-                                    resize,
-                                    e.position,
-                                    window.viewport_size(),
-                                );
-                            } else {
-                                this.email_modal_resize = None;
-                            }
-                            cx.notify();
-                        }))
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.email_modal_resize = None;
-                                cx.notify();
-                            }),
-                        ),
-                )
+            .children(toolbar)
+            .children(self.render_banner(cx))
+            .child(body)
+            .when(self.quick_look.is_some(), |d| {
+                d.child(self.render_quick_look(cx))
             })
+            .when(self.palette.is_some(), |d| d.child(self.render_palette(cx)))
             .into_any_element()
     }
 }
@@ -793,13 +795,7 @@ mod tests {
     }
 
     #[test]
-    fn backdrop_does_not_close_while_composing() {
-        assert!(backdrop_closes_modal(false));
-        assert!(!backdrop_closes_modal(true));
-    }
-
-    #[test]
-    fn refresh_preserves_modal_selection_until_permanently_deleted() {
+    fn refresh_preserves_message_window_selection_until_permanently_deleted() {
         assert!(keep_modal_selection_after_refresh(true, 1));
         assert!(keep_modal_selection_after_refresh(true, 3));
         assert!(!keep_modal_selection_after_refresh(true, 0));
@@ -807,24 +803,51 @@ mod tests {
     }
 
     #[test]
-    fn modal_size_clamps_to_minimums_and_viewport_fraction() {
-        let resize = EmailModalResize {
-            width: true,
-            height: true,
-            cursor: CursorStyle::ResizeUpLeftDownRight,
-        };
-        let window = size(px(1400.), px(900.));
-        let small = EmailModalSize::default().dragged_to(resize, point(px(720.), px(460.)), window);
-        assert_eq!(small.width, px(MODAL_MIN_WIDTH));
-        assert_eq!(small.height, px(MODAL_MIN_HEIGHT));
+    fn window_titles_format_subject_and_outbox_cleanly() {
+        assert_eq!(message_window_title(Some("  Q3 Plan  "), false), "Q3 Plan");
+        assert_eq!(message_window_title(Some("Invoice"), true), "Outbox · Invoice");
+        assert_eq!(message_window_title(Some("   "), true), "Outbox");
+        assert_eq!(message_window_title(None, false), "Overlook · Message");
 
-        let large = EmailModalSize::default().dragged_to(resize, point(px(1390.), px(895.)), window);
-        assert_eq!(large.width, px(1400. * MODAL_MAX_WIDTH));
-        assert_eq!(large.height, px(900. * MODAL_MAX_HEIGHT));
+        assert_eq!(os_window_title("Q3 Plan"), "Q3 Plan — Overlook");
+        assert_eq!(os_window_title("Overlook · Message"), "Overlook · Message");
     }
 
     #[test]
-    fn location_badge_reflects_actions_taken_inside_modal() {
+    fn delete_forever_view_keeps_trash_boundary_for_mixed_conversations() {
+        let labels = vec![
+            label(LabelKind::Inbox, "inbox", "Inbox"),
+            label(LabelKind::Trash, "trash", "Trash"),
+        ];
+        let mut trashed = message_with_labels(&["trash"]);
+        trashed.id = MessageId::from("m-trash");
+        let mut in_inbox = message_with_labels(&["inbox"]);
+        in_inbox.id = MessageId::from("m-inbox");
+        let mixed = vec![trashed.clone(), in_inbox.clone()];
+
+        // Mixed conversation preserves the originating Trash boundary.
+        assert_eq!(
+            delete_forever_view(&MailboxView::Kind(LabelKind::Trash), &mixed, &labels),
+            MailboxView::Kind(LabelKind::Trash)
+        );
+        assert_eq!(
+            delete_forever_view(&MailboxView::Kind(LabelKind::Inbox), &mixed, &labels),
+            MailboxView::Kind(LabelKind::Inbox)
+        );
+        // Conversation opened in Inbox then moved entirely to Trash can still be deleted forever.
+        assert_eq!(
+            delete_forever_view(&MailboxView::Kind(LabelKind::Inbox), &[trashed], &labels),
+            MailboxView::Kind(LabelKind::Trash)
+        );
+        // Conversation opened in Trash then restored entirely out of Trash targets non-trash messages.
+        assert_eq!(
+            delete_forever_view(&MailboxView::Kind(LabelKind::Trash), &[in_inbox], &labels),
+            MailboxView::Kind(LabelKind::Inbox)
+        );
+    }
+
+    #[test]
+    fn location_badge_reflects_actions_taken_inside_message_window() {
         let labels = vec![
             label(LabelKind::Inbox, "inbox", "Inbox"),
             label(LabelKind::Trash, "trash", "Trash"),

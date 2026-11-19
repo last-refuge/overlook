@@ -9,17 +9,20 @@ use super::composer_window::{WindowOwner, WindowSetup};
 use super::*;
 
 pub(super) struct FolderWindow {
-    window: AnyWindowHandle,
-    editor: WeakEntity<MailWindow>,
+    pub(super) window: AnyWindowHandle,
+    pub(super) editor: WeakEntity<MailWindow>,
     account: AccountId,
     view: MailboxView,
     _closed: Subscription,
 }
 
 impl MailWindow {
-    /// The main window this window belongs to, if it is a composer or folder window.
+    /// The main window this window belongs to, if it is a composer, folder or message window.
     pub(super) fn window_owner(&self) -> Option<WindowOwner> {
-        self.composer_owner.clone().or_else(|| self.folder_owner.clone())
+        self.composer_owner
+            .clone()
+            .or_else(|| self.folder_owner.clone())
+            .or_else(|| self.message_owner.clone())
     }
 
     /// Opens `view` of `account` in a window of its own, or brings an open one forward.
@@ -127,6 +130,9 @@ impl MailWindow {
             f.view = MailboxView::Label(new.clone());
             editors.push(f.editor.clone());
         }
+        for m in self.message_windows.iter().filter(|m| &m.account == account) {
+            editors.push(m.editor.clone());
+        }
         if editors.is_empty() {
             return;
         }
@@ -138,12 +144,17 @@ impl MailWindow {
         });
     }
 
-    /// Re-reads the store in every folder window, after this (main) window synced or wrote
-    /// `changed` accounts. Each window keeps its own badge counts, so it is told which
+    /// Re-reads the store in every folder and message window, after this (main) window synced
+    /// or wrote `changed` accounts. Each window keeps its own badge counts, so it is told which
     /// accounts to recount; otherwise a folder window on another account would keep the
     /// old badges of the one that changed.
     pub(crate) fn reload_folder_windows(&self, changed: impl IntoIterator<Item = AccountId>, cx: &mut Context<Self>) {
-        let editors: Vec<WeakEntity<MailWindow>> = self.folder_windows.iter().map(|f| f.editor.clone()).collect();
+        let editors: Vec<WeakEntity<MailWindow>> = self
+            .folder_windows
+            .iter()
+            .map(|f| f.editor.clone())
+            .chain(self.message_windows.iter().map(|m| m.editor.clone()))
+            .collect();
         if editors.is_empty() {
             return;
         }
@@ -161,12 +172,12 @@ impl MailWindow {
         });
     }
 
-    /// Sends this window's preferences to the others after `save_prefs`: a folder window
-    /// sends them to the main window, and the main window passes them to every folder window.
+    /// Sends this window's preferences to the others after `save_prefs`: a detached window
+    /// sends them to the main window, and the main window passes them to every detached window.
     pub(crate) fn share_prefs(&self, cx: &mut Context<Self>) {
         let prefs = self.prefs.clone();
         let account_prefs = self.account_prefs.clone();
-        if let Some(owner) = &self.folder_owner {
+        if let Some(owner) = self.folder_owner.as_ref().or(self.message_owner.as_ref()) {
             let parent = owner.parent.clone();
             cx.defer(move |cx| {
                 parent.update(cx, |this, cx| {
@@ -180,6 +191,7 @@ impl MailWindow {
             .folder_windows
             .iter()
             .map(|f| f.editor.clone())
+            .chain(self.message_windows.iter().map(|m| m.editor.clone()))
             .chain(self.detached_composers.values().map(|d| d.editor.clone()))
             .collect();
         if editors.is_empty() {
@@ -234,18 +246,28 @@ impl MailWindow {
         cx.notify();
     }
 
-    /// Closes the folder windows when the main window goes. A folder window does not sync
-    /// by itself, so it must not stay behind showing mail that no longer updates.
+    /// Closes the folder windows (and non-composing message windows) when the main window goes.
+    /// Detached reader windows do not sync by themselves, so they must not stay behind showing
+    /// stale mail; a message window with an active reply draft stays open like a pop-out composer.
     pub(super) fn close_folder_windows(&mut self, cx: &mut Context<Self>) {
         for f in self.folder_windows.drain(..) {
             f.window.update(cx, |_, window, _| window.remove_window()).ok();
         }
+        for m in self.message_windows.drain(..) {
+            let composing = m
+                .editor
+                .upgrade()
+                .is_some_and(|e| e.read(cx).composer.is_some());
+            if !composing {
+                m.window.update(cx, |_, window, _| window.remove_window()).ok();
+            }
+        }
     }
 
-    /// In a folder window, runs `f` in the main window instead and brings that window
+    /// In a folder or message window, runs `f` in the main window instead and brings that window
     /// forward. Returns false in the main window, where the caller does the work itself.
     pub(super) fn in_main_window(&self, cx: &mut Context<Self>, f: impl FnOnce(&mut MailWindow, &mut Window, &mut Context<MailWindow>) + 'static) -> bool {
-        let Some(owner) = self.folder_owner.clone() else {
+        let Some(owner) = self.folder_owner.clone().or_else(|| self.message_owner.clone()) else {
             return false;
         };
         let parent = owner.parent.clone();

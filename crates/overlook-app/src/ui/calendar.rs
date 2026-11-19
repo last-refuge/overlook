@@ -248,11 +248,11 @@ impl MailWindow {
     }
 
     pub(crate) fn set_module(&mut self, module: Module, window: &mut Window, cx: &mut Context<Self>) {
-        if self.module == module {
-            self.focus_current_module(window, cx);
+        if self.is_message_window() && self.in_main_window(cx, move |this, window, cx| this.set_module(module, window, cx)) {
             return;
         }
-        if module != Module::Mail && self.email_modal && !self.close_email_modal(window, cx) {
+        if self.module == module {
+            self.focus_current_module(window, cx);
             return;
         }
         self.module = module;
@@ -271,22 +271,20 @@ impl MailWindow {
                 let input = self.contact_search.clone();
                 input.update(cx, |s, cx| s.focus(window, cx));
             }
-            Module::Mail if self.email_modal => self.email_modal_focus.focus(window, cx),
             Module::Mail => self.list_focus.focus(window, cx),
         }
         cx.notify();
     }
 
     pub(crate) fn focus_current_module(&self, window: &mut Window, cx: &mut Context<Self>) {
-        // The add-account page has no module showing: its choices stay reachable by keyboard.
-        if !self.has_account() || self.adding_account.is_some() {
+        // The add-account page and standalone message windows focus their own root handle.
+        if !self.has_account() || self.adding_account.is_some() || self.is_message_window() {
             self.focus_handle.focus(window, cx);
             return;
         }
         match self.module {
             Module::Calendar => self.cal_focus.focus(window, cx),
             Module::Contacts => self.contact_search.update(cx, |s, cx| s.focus(window, cx)),
-            Module::Mail if self.email_modal => self.email_modal_focus.focus(window, cx),
             Module::Mail => self.list_focus.focus(window, cx),
         }
     }

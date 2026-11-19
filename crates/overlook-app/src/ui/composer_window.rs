@@ -10,6 +10,13 @@ pub(crate) struct WindowOwner {
     pub(super) window: AnyWindowHandle,
 }
 
+/// What a standalone message window opens on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MessageTarget {
+    Conversation(ConversationId),
+    Outbox(DraftId),
+}
+
 pub(crate) enum WindowSetup {
     Mail(AppearancePreference),
     Composer {
@@ -25,6 +32,14 @@ pub(crate) enum WindowSetup {
         account: AccountId,
         view: MailboxView,
     },
+    /// Double-clicking an email (or Outbox item): one message in its own native window.
+    Message {
+        appearance: AppearancePreference,
+        owner: WindowOwner,
+        providers: HashMap<AccountId, providers::AccountProviders>,
+        account: AccountId,
+        view: MailboxView,
+    },
 }
 
 pub(super) struct DetachedComposer {
@@ -34,14 +49,66 @@ pub(super) struct DetachedComposer {
 }
 
 impl MailWindow {
+    fn composer_matches_reply(c: &Composer, kind: DraftKind, source: &Message) -> bool {
+        c.draft.in_reply_to.as_ref() == Some(&source.id)
+            && (c.draft.kind == kind
+                || (matches!(c.draft.kind, DraftKind::Reply | DraftKind::ReplyAll)
+                    && matches!(kind, DraftKind::Reply | DraftKind::ReplyAll)))
+    }
+
     pub(super) fn activate_detached_draft(&mut self, id: &DraftId, cx: &mut Context<Self>) -> bool {
-        let Some(detached) = self.detached_composers.get(id) else {
-            return false;
-        };
-        detached
-            .window
-            .update(cx, |_, window, _| window.activate_window())
-            .is_ok()
+        let me = cx.entity_id();
+        if let Some(owner) = self.window_owner() {
+            return owner
+                .parent
+                .update(cx, |main, cx| main.activate_existing_draft(id, Some(owner.window), me, cx));
+        }
+        self.activate_existing_draft(id, None, me, cx)
+    }
+
+    fn activate_existing_draft(
+        &mut self,
+        id: &DraftId,
+        self_window: Option<AnyWindowHandle>,
+        exclude: EntityId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if let Some(window) = self_window {
+            if self.composer.as_ref().is_some_and(|c| &c.draft.id == id) {
+                return window
+                    .update(cx, |_, window, _| window.activate_window())
+                    .is_ok();
+            }
+        }
+        if let Some(detached) = self.detached_composers.get(id) {
+            if detached
+                .window
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok()
+            {
+                return true;
+            }
+        }
+        let matching = self
+            .message_windows
+            .iter()
+            .map(|m| (m.window, &m.editor))
+            .chain(self.folder_windows.iter().map(|f| (f.window, &f.editor)))
+            .find(|(_, editor)| {
+                editor.entity_id() != exclude
+                    && editor.upgrade().is_some_and(|e| {
+                        e.read(cx)
+                            .composer
+                            .as_ref()
+                            .is_some_and(|c| &c.draft.id == id)
+                    })
+            });
+        if let Some((window, _)) = matching {
+            return window
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok();
+        }
+        false
     }
 
     pub(super) fn activate_detached_reply(
@@ -50,26 +117,65 @@ impl MailWindow {
         source: &Message,
         cx: &mut Context<Self>,
     ) -> bool {
-        let matching = self.detached_composers.values().find(|d| {
-            d.editor.upgrade().is_some_and(|e| {
-                e.read(cx).composer.as_ref().is_some_and(|c| {
-                    c.draft.in_reply_to.as_ref() == Some(&source.id)
-                        && (c.draft.kind == kind
-                            || (matches!(c.draft.kind, DraftKind::Reply | DraftKind::ReplyAll)
-                                && matches!(kind, DraftKind::Reply | DraftKind::ReplyAll)))
-                })
-            })
-        });
-        let Some(detached) = matching else {
+        let me = cx.entity_id();
+        if let Some(owner) = self.window_owner() {
+            let main_matches = owner
+                .parent
+                .read(cx)
+                .composer
+                .as_ref()
+                .is_some_and(|c| Self::composer_matches_reply(c, kind, source));
+            if main_matches {
+                let parent = owner.parent.clone();
+                let source = source.clone();
+                return owner
+                    .window
+                    .update(cx, |_, window, cx| {
+                        parent.update(cx, |main, cx| {
+                            main.reuse_local_reply(kind, &source, window, cx);
+                        });
+                        window.activate_window();
+                    })
+                    .is_ok();
+            }
+            return owner
+                .parent
+                .update(cx, |main, cx| main.activate_existing_reply(kind, source, me, cx));
+        }
+        self.activate_existing_reply(kind, source, me, cx)
+    }
+
+    fn activate_existing_reply(
+        &mut self,
+        kind: DraftKind,
+        source: &Message,
+        exclude: EntityId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let matching = self
+            .detached_composers
+            .values()
+            .map(|d| (d.window, &d.editor))
+            .chain(self.message_windows.iter().map(|m| (m.window, &m.editor)))
+            .chain(self.folder_windows.iter().map(|f| (f.window, &f.editor)))
+            .find(|(_, editor)| {
+                editor.entity_id() != exclude
+                    && editor.upgrade().is_some_and(|e| {
+                        e.read(cx)
+                            .composer
+                            .as_ref()
+                            .is_some_and(|c| Self::composer_matches_reply(c, kind, source))
+                    })
+            });
+        let Some((window, editor)) = matching else {
             return false;
         };
-        let editor = detached.editor.clone();
-        detached
-            .window
+        let editor = editor.clone();
+        window
             .update(cx, |_, window, cx| {
                 editor
                     .update(cx, |this, cx| {
-                        this.reuse_reply(kind, source, window, cx);
+                        this.reuse_local_reply(kind, source, window, cx);
                     })
                     .ok();
                 window.activate_window();
@@ -118,12 +224,15 @@ impl MailWindow {
         let prefs = self.prefs.clone();
         let account_prefs = self.account_prefs.clone();
         let remote_allowed = self.remote_allowed.clone();
+        let owner = self.window_owner().unwrap_or_else(|| WindowOwner {
+            parent: cx.entity(),
+            window: window.window_handle(),
+        });
+        let owner_entity = owner.parent.clone();
+        let in_detached_window = self.window_owner().is_some();
         let setup = WindowSetup::Composer {
             appearance: self.appearance,
-            owner: WindowOwner {
-                parent: cx.entity(),
-                window: window.window_handle(),
-            },
+            owner,
             providers: self.providers.clone(),
         };
         let options = WindowOptions {
@@ -149,7 +258,7 @@ impl MailWindow {
             editor
         }) {
             Ok((handle, editor)) => {
-                let parent = cx.entity().downgrade();
+                let parent = owner_entity.downgrade();
                 let closed_id = id.clone();
                 let closed = cx.on_window_closed(move |cx, closed| {
                     if closed == handle.window_id() {
@@ -161,16 +270,24 @@ impl MailWindow {
                             .ok();
                     }
                 });
-                self.detached_composers.insert(
-                    id,
-                    DetachedComposer {
-                        window: handle,
-                        editor: editor.downgrade(),
-                        _closed: closed,
-                    },
-                );
+                let detached = DetachedComposer {
+                    window: handle,
+                    editor: editor.downgrade(),
+                    _closed: closed,
+                };
+                if in_detached_window {
+                    owner_entity.update(cx, |main, _| {
+                        main.detached_composers.insert(id, detached);
+                    });
+                } else {
+                    self.detached_composers.insert(id, detached);
+                }
                 self.composer = None;
-                self.list_focus.focus(window, cx);
+                if self.is_message_window() {
+                    self.focus_handle.focus(window, cx);
+                } else {
+                    self.list_focus.focus(window, cx);
+                }
                 cx.notify();
             }
             Err(_) => {
@@ -231,7 +348,11 @@ impl MailWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(owner) = self.composer_owner.clone() else {
+        let Some(owner) = self
+            .composer_owner
+            .clone()
+            .or_else(|| self.message_owner.clone())
+        else {
             self.announce_queued_send(draft, window, cx);
             return;
         };
