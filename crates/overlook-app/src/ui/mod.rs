@@ -3364,10 +3364,17 @@ impl MailWindow {
         }
     }
 
+    /// The view whose shown messages starring picks from. Search results show whole
+    /// conversations whatever folder the search began in, so there the newest message
+    /// outside Trash is starred, which keeps the conversation in Starred.
+    fn star_view(&self) -> MailboxView {
+        if self.search_query.is_empty() { self.view.clone() } else { MailboxView::Kind(LabelKind::Inbox) }
+    }
+
     /// Stars or unstars whole conversations: starring marks each one's newest message,
     /// unstarring clears every starred message in it, so none stays in Starred (#39).
     pub(crate) fn star_conversations(&mut self, conversations: Vec<ConversationId>, starred: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let ids = self.mail_index.star_targets(&conversations, &self.view, starred);
+        let ids = self.mail_index.star_targets(&conversations, &self.star_view(), starred);
         if !ids.is_empty() {
             self.set_starred(ids, starred, window, cx);
         }
@@ -3980,7 +3987,7 @@ impl MailWindow {
             let mut conversations: Vec<ConversationId> = self.thread.iter().map(|m| m.conversation_id.clone()).collect();
             conversations.dedup();
             let starred = conversations.iter().flat_map(|c| self.mail_index.message_ids_in(c)).any(|id| self.mail_index.message(&id).is_some_and(|m| m.is_starred)) || self.thread.iter().any(|m| m.is_starred);
-            let mut ids = self.mail_index.star_targets(&conversations, &self.view, !starred);
+            let mut ids = self.mail_index.star_targets(&conversations, &self.star_view(), !starred);
             if ids.is_empty() {
                 // Not in this window's index: act on the messages shown.
                 ids = if starred { self.thread.iter().filter(|m| m.is_starred).map(|m| m.id.clone()).collect() } else { self.thread.iter().max_by_key(|m| m.date).map(|m| m.id.clone()).into_iter().collect() };

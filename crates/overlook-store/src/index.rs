@@ -64,7 +64,7 @@ impl MailIndex {
     /// The messages that toggling the star of `conversations` in `view` changes. A
     /// conversation shows as starred while any of its messages is, so unstarring clears
     /// every starred message in it; starring marks only the newest one the view shows (not
-    /// a newer one hidden in Trash), as Gmail does.
+    /// a newer one hidden in Trash; outside Trash, the newest not in Trash), as Gmail does.
     pub fn star_targets(&self, conversations: &[ConversationId], view: &MailboxView, starred: bool) -> Vec<MessageId> {
         let mut out = Vec::new();
         for c in conversations {
