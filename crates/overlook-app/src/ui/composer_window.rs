@@ -220,7 +220,8 @@ impl MailWindow {
         let store = self.store.clone();
         let sample = self.sample.clone();
         let accounts = self.accounts.clone();
-        let active = self.account.id.clone();
+        // The window opens on the draft's account (never on offline folders).
+        let active = transfer.draft.account_id.clone();
         let prefs = self.prefs.clone();
         let account_prefs = self.account_prefs.clone();
         let remote_allowed = self.remote_allowed.clone();

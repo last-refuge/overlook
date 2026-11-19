@@ -114,6 +114,11 @@ fn snapshot_lists_newest_first_tops_large_messages_and_retr_saves_eml_files() {
         assert_eq!(s.quits, 2);
     }
 
+    // Still waiting for its body: "View source" rebuilds it from the headers, but there is
+    // no original to move into an offline folder yet.
+    assert!(block(p.fetch_original(&acct, header)).is_err());
+    assert!(!block(p.fetch_raw(&acct, header)).unwrap().is_empty());
+
     let messages = block(p.fetch_messages(&acct, &snap.message_ids, &snap.labels)).unwrap();
     assert_eq!(messages.iter().map(|m| m.subject.as_str()).collect::<Vec<_>>(), vec!["Big one", "Re: Plain hello", "Plain hello"]);
     assert_eq!(messages[0].id, header.id, "the body download carries the header row's id");
@@ -125,6 +130,8 @@ fn snapshot_lists_newest_first_tops_large_messages_and_retr_saves_eml_files() {
         assert!(p.raw_path(&m.id).exists(), "{} saved", m.subject);
     }
     assert_eq!(std::fs::read(p.raw_path(&messages[2].id)).unwrap(), env.server.lock().messages[0].raw);
+    let original = block(p.fetch_original(&acct, &messages[2])).unwrap();
+    assert_eq!(original, env.server.lock().messages[0].raw, "the original is the downloaded bytes");
     {
         let s = env.server.lock();
         assert_eq!(s.commands("RETR"), 3);

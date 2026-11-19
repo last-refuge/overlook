@@ -62,9 +62,12 @@ pub fn write_raw_durably(dir: &Path, id: &MessageId, bytes: &[u8]) -> std::io::R
         file.sync_all()?;
     }
     std::fs::rename(&tmp, &path)?;
-    // The rename itself must reach the disk too.
-    if let Ok(d) = std::fs::File::open(dir) {
-        let _ = d.sync_all();
+    // The new name must reach the disk too, or a power loss can leave the directory without
+    // it. A failure here is a failed save: the server's copy is then kept.
+    #[cfg(unix)]
+    if let Err(e) = std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+        let _ = std::fs::remove_file(&path);
+        return Err(e);
     }
     Ok(path)
 }
@@ -215,6 +218,11 @@ impl MailProvider for LocalProvider {
     }
 
     fn fetch_raw(&self, _account: &Account, message: &Message) -> BoxFuture<'_, Result<Vec<u8>, ProviderError>> {
+        let result = self.raw(message);
+        Box::pin(async move { result })
+    }
+
+    fn fetch_original(&self, _account: &Account, message: &Message) -> BoxFuture<'_, Result<Vec<u8>, ProviderError>> {
         let result = self.raw(message);
         Box::pin(async move { result })
     }

@@ -122,7 +122,7 @@ impl MailWindow {
     /// The id of the signature an account uses by default for new messages, or for replies and
     /// forwards.
     pub(super) fn default_signature_id(&self, reply: bool) -> Option<String> {
-        self.account_prefs_for(&self.account.id).default_signature(reply).map(|s| s.id.clone())
+        self.account_prefs_for(&self.writing_account().id).default_signature(reply).map(|s| s.id.clone())
     }
 
     /// Gives `draft` the signature `id`, or none; see [`give_signature`].
@@ -176,7 +176,7 @@ impl MailWindow {
     }
 
     fn edit_signature_in_settings(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
-        let account = self.account.id.clone();
+        let account = self.writing_account().id;
         self.open_settings(SettingsPage::Accounts, window, cx);
         self.select_signature(&account, Some(id), window, cx);
     }

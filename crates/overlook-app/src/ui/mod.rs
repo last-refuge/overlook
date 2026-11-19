@@ -577,6 +577,9 @@ pub struct MailWindow {
     /// Messages being copied into offline folders right now, so a second drag of the same
     /// mail does not copy it twice.
     offline_moving: HashSet<MessageId>,
+    /// How many messages offline folders hold while no mail account is connected, for the
+    /// add-account page to say they are still here.
+    offline_kept: usize,
     time_zone: overlook_core::tz::TimeZone,
     time_zone_revision: u64,
     time_zone_pending: bool,
@@ -963,6 +966,7 @@ impl MailWindow {
             offline,
             last_mail_account,
             offline_moving: HashSet::new(),
+            offline_kept: 0,
             time_zone: overlook_core::tz::current_zone(),
             time_zone_revision: overlook_core::tz::revision(),
             time_zone_pending: false,
@@ -1128,6 +1132,7 @@ impl MailWindow {
             _subscriptions: subs,
         };
         this.load_recent_moves();
+        this.count_kept_offline_mail();
         // Main and folder windows can own composers too. Native close and explicit Quit
         // must both finish their saves before the editor and its debounce timer go away.
         let editor = cx.weak_entity();
@@ -1606,6 +1611,7 @@ impl MailWindow {
         self.refresh_idle_watchers();
         self.accounts = self.store.accounts().unwrap_or_default();
         self.account_marks.borrow_mut().clear();
+        self.count_kept_offline_mail();
         crate::ui::toast(window, cx, crate::notify::Level::Info, format!("Removed {} from this device.", account.email));
         match self.accounts.first().map(|a| a.id.clone()) {
             Some(next) => {
@@ -3365,7 +3371,7 @@ impl MailWindow {
             crate::ui::toast(window, cx, crate::notify::Level::Info, "Add an account to send mail.");
             return;
         }
-        let mut draft = Draft::new(self.account.id.clone(), DraftKind::New, now());
+        let mut draft = Draft::new(self.writing_account().id, DraftKind::New, now());
         draft.to = m.to;
         draft.cc = m.cc;
         draft.bcc = m.bcc;
@@ -3402,9 +3408,7 @@ impl MailWindow {
     pub(crate) fn reply_to(&mut self, kind: DraftKind, source: Message, window: &mut Window, cx: &mut Context<Self>) {
         if self.reuse_reply(kind, &source, window, cx) { return; }
         // Mail in an offline folder is answered from the mail account shown before it.
-        let from = self.writing_account();
-        let owner = if self.offline_active() { Address::named(&from.display_name, &from.email) } else { self.owner() };
-        let mut draft = Draft::in_response_to_with(from.id, kind, &source, &owner, now(), self.prefs.quote_on_reply);
+        let mut draft = Draft::in_response_to_with(self.writing_account().id, kind, &source, &self.writing_owner(), now(), self.prefs.quote_on_reply);
         // The quoted original is appended at send time and shown collapsed under the editor, and
         // the signature goes between what is written and the quote.
         self.apply_signature(&mut draft, self.default_signature_id(true).as_deref());

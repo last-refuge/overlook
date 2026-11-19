@@ -409,6 +409,24 @@ impl MailWindow {
                         .child(icon("lock-keyhole").size(px(14.)))
                         .child("Passwords and sign-ins are kept in your system keyring, never in files."),
                 )
+                // Offline folders outlive the accounts their mail came from.
+                .when(!adding && self.offline_kept > 0, |d| {
+                    let n = self.offline_kept;
+                    d.child(
+                        h_flex()
+                            .mt(px(10.))
+                            .gap(px(8.))
+                            .items_center()
+                            .text_size(crate::ui::ui_px(12.))
+                            .line_height(crate::ui::ui_px(16.))
+                            .text_color(p.muted)
+                            .child(icon("hard-drive").size(px(14.)))
+                            .child(format!(
+                                "Your offline folders ({}) are still on this computer. They show again in the sidebar once you connect an account.",
+                                if n == 1 { "1 message".to_owned() } else { format!("{n} messages") }
+                            )),
+                    )
+                })
                 .when(!adding, |d| {
                     d.child(
                         h_flex().mt(px(16.)).ml(px(-12.)).child(

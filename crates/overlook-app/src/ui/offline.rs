@@ -54,7 +54,7 @@ async fn copy_to_offline(store: Arc<Store>, provider: Arc<dyn MailProvider>, sou
                 continue;
             }
         };
-        let raw = match provider.fetch_raw(&source, &message).await {
+        let raw = match provider.fetch_original(&source, &message).await {
             Ok(raw) if !raw.is_empty() => raw,
             Ok(_) => {
                 out.failed.push((id.clone(), "the server sent an empty message".into()));
@@ -80,8 +80,8 @@ async fn copy_to_offline(store: Arc<Store>, provider: Arc<dyn MailProvider>, sou
             received_at: Some(message.date),
         };
         let mut copy = message_from_rfc822(&offline, &raw, copy_id, &flags);
-        // A provider that can't serve the original rebuilds it from the stored text, which
-        // has no attachments. Such a copy is not complete enough to delete the server's.
+        // A second guard after `fetch_original`: a copy that lost the attachments the stored
+        // message lists is not complete enough to delete the server's.
         let files = |m: &Message| m.attachments.iter().filter(|a| !a.mime_type.to_ascii_lowercase().starts_with("text/calendar") && !a.filename.to_ascii_lowercase().ends_with(".ics")).count();
         if files(&message) > 0 && files(&copy) == 0 {
             out.failed.push((id.clone(), "the server didn’t send the attachments".into()));
@@ -126,6 +126,12 @@ impl MailWindow {
     }
 
 
+    /// Notes how much offline mail there is when no account is connected: offline folders
+    /// outlive the accounts their mail came from, and show again once one is added.
+    pub(crate) fn count_kept_offline_mail(&mut self) {
+        self.offline_kept = if self.has_account() { 0 } else { self.store.message_count(&self.offline.id).unwrap_or(0) };
+    }
+
     /// One of the user's accounts, or the offline folders.
     pub(crate) fn known_account(&self, id: &AccountId) -> Option<Account> {
         if self.is_offline(id) {
@@ -146,6 +152,15 @@ impl MailWindow {
             .or_else(|| self.accounts.first())
             .cloned()
             .unwrap_or_else(no_account)
+    }
+
+    /// Who mail is written as: the owner of [`Self::writing_account`].
+    pub(crate) fn writing_owner(&self) -> Address {
+        if !self.offline_active() {
+            return self.owner();
+        }
+        let from = self.writing_account();
+        Address::named(&from.display_name, &from.email)
     }
 
     /// Leaves the offline folders for the mail account shown before them (Calendar and

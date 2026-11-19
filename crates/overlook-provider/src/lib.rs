@@ -331,6 +331,14 @@ pub trait MailProvider: Send + Sync {
         Box::pin(async move { Ok(bytes) })
     }
 
+    /// The message exactly as the server (or, for POP3, the saved download) holds it. Unlike
+    /// [`MailProvider::fetch_raw`] it never rebuilds the message from stored text: moving
+    /// mail into an offline folder deletes the server's copy afterwards, so anything less
+    /// than the original is an error.
+    fn fetch_original(&self, _account: &Account, _message: &Message) -> BoxFuture<'_, Result<Vec<u8>, ProviderError>> {
+        Box::pin(async { Err(ProviderError::Rejected("this account can’t download original messages".into())) })
+    }
+
     /// Searches the whole mailbox at the provider. Returns provider ids, newest first.
     /// The default has no server-side search.
     fn search(&self, _account: &Account, _query: &str, _limit: usize) -> BoxFuture<'_, Result<Vec<ProviderId>, ProviderError>> {
