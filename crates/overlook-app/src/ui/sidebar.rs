@@ -843,7 +843,7 @@ impl MailWindow {
             account_blocks.push(block.into_any_element());
         }
 
-        // Offline folders: after the accounts, set apart by their own mark and caption.
+        // Offline folders: after the accounts, set apart by their own mark.
         let offline_block: Option<AnyElement> = self.offers_offline().then(|| {
             let offline = self.offline.id.clone();
             let key = "offline".to_owned();
@@ -857,15 +857,6 @@ impl MailWindow {
             let mut column = v_flex().child(header);
             if !collapsed {
                 let (_, folders) = self.account_folders(&offline, &p);
-                column = column.child(
-                    div()
-                        .pl(px(ICON_INSET + 25.))
-                        .pr(px(10.))
-                        .mb(px(m.row_gap + 2.))
-                        .text_size(crate::ui::ui_px(11.))
-                        .text_color(p.muted)
-                        .child("On this computer only"),
-                );
                 if folders.is_empty() {
                     column = column.child(
                         div()
@@ -878,10 +869,13 @@ impl MailWindow {
                             .pr(px(10.))
                             .rounded(px(7.))
                             .cursor_pointer()
-                            .text_size(crate::ui::ui_px(13.))
+                            // Lettered like the section title above it.
+                            .font_family(SharedString::from(crate::theme::current_fonts(cx).effective_ui_family().to_owned()))
+                            .text_size(crate::ui::ui_px(11.))
+                            .font_weight(FontWeight::MEDIUM)
                             .text_color(p.muted)
-                            .hover(|d| d.bg(p.hover))
-                            .child(icon("folder-plus").flex_none().size(px(16.)).text_color(p.muted))
+                            .hover(|d| d.bg(p.hover).text_color(p.foreground))
+                            .child(icon("folder-plus").flex_none().size(px(14.)).text_color(p.muted))
                             .child(div().flex_1().truncate().child("New Offline Folder…"))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 let account = this.offline.id.clone();
