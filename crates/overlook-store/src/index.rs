@@ -61,6 +61,24 @@ impl MailIndex {
         msgs.into_iter().map(|m| m.id.clone()).collect()
     }
 
+    /// The messages that toggling the star of `conversations` in `view` changes. A
+    /// conversation shows as starred while any of its messages is, so unstarring clears
+    /// every starred message in it; starring marks only the newest one the view shows (not
+    /// a newer one hidden in Trash; outside Trash, the newest not in Trash), as Gmail does.
+    pub fn star_targets(&self, conversations: &[ConversationId], view: &MailboxView, starred: bool) -> Vec<MessageId> {
+        let mut out = Vec::new();
+        for c in conversations {
+            let Some(messages) = self.by_conv.get(c) else { continue };
+            if starred {
+                let newest_shown = self.visible_message_ids_in(c, view).pop();
+                out.extend(newest_shown.or_else(|| messages.iter().max_by_key(|m| m.date).map(|m| m.id.clone())));
+            } else {
+                out.extend(messages.iter().filter(|m| m.is_starred).map(|m| m.id.clone()));
+            }
+        }
+        out
+    }
+
     pub(crate) fn label_of_kind(&self, kind: LabelKind) -> Option<LabelId> {
         self.labels.iter().find(|l| l.kind == kind).map(|l| l.id.clone())
     }

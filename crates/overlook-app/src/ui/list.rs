@@ -464,7 +464,7 @@ impl MailWindow {
             .find(|l| l.kind == LabelKind::User)
             .map(|l| overlook_core::sidebar::folder_title(&l.name).to_owned());
         let conv_id = c.id.clone();
-        let star_id = c.latest_message_id.clone();
+        let star_conversation = c.id.clone();
         let starred = c.starred;
         let pending = c.pending;
         // Dragging one row of a marked set drags the whole set.
@@ -632,7 +632,7 @@ impl MailWindow {
                     .tooltip(if starred { "Unstar" } else { "Star" })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
-                        this.set_starred(vec![star_id.clone()], !starred, window, cx);
+                        this.star_conversations(vec![star_conversation.clone()], !starred, window, cx);
                     })),
             )
             .child(self.row_quick_actions(c, cx))
@@ -738,7 +738,7 @@ impl MailWindow {
             RowAction::Delete if !state.all_in_trash => self.perform("Moved to Trash", vec![LocalChange::Trash { message_ids: ids }], true, window, cx),
             RowAction::Delete => {}
             RowAction::ToggleRead => self.set_read(ids, state.any_unread, window, cx),
-            RowAction::ToggleStar => self.set_starred(vec![row.latest_message_id.clone()], !state.all_starred, window, cx),
+            RowAction::ToggleStar => self.star_conversations(vec![row.id.clone()], !state.all_starred, window, cx),
         }
     }
 
