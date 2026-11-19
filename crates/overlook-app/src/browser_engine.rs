@@ -168,6 +168,12 @@ pub enum BrowserEvent {
     },
     Link(String),
     Selection(String),
+    ContextMenu {
+        request_id: u64,
+        has_selection: bool,
+        has_content: bool,
+        link_url: Option<String>,
+    },
     Error(String),
 }
 
@@ -211,6 +217,7 @@ enum Input {
     Key(String, String, String, u32, Option<String>),
     Copy,
     SelectAll,
+    ContextMenu { x: f64, y: f64, request_id: u64 },
 }
 fn chromium_executable() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("OVERLOOK_BROWSER_BIN") {
@@ -372,6 +379,9 @@ impl BrowserHandle {
         if matches!(&input, Input::VisibleRange(..)) {
             q.retain(|i| !matches!(i, Input::VisibleRange(..)));
         }
+        if matches!(&input, Input::ContextMenu { .. }) {
+            q.retain(|i| !matches!(i, Input::ContextMenu { .. }));
+        }
         // Coalesce wheel bursts as well as motion/resize. Trackpads can produce
         // more events than the pipe can round-trip; do not replay stale deltas.
         if let (Input::Scroll(x, y, dx, dy), Some(Input::Scroll(old_x, old_y, old_dx, old_dy))) =
@@ -448,6 +458,9 @@ impl BrowserHandle {
     pub fn select_all(&self) {
         self.send(Input::SelectAll);
     }
+    pub fn context_menu(&self, x: f64, y: f64, request_id: u64) {
+        self.send(Input::ContextMenu { x, y, request_id });
+    }
     pub fn drain_events(&self) -> Vec<BrowserEvent> {
         self.0.events.lock().unwrap().drain(..).collect()
     }
@@ -469,6 +482,9 @@ fn push_event(inner: &Inner, event: BrowserEvent) {
     }
     if matches!(event, BrowserEvent::Scrollability { .. }) {
         q.retain(|e| !matches!(e, BrowserEvent::Scrollability { .. }));
+    }
+    if matches!(event, BrowserEvent::ContextMenu { .. }) {
+        q.retain(|e| !matches!(e, BrowserEvent::ContextMenu { .. }));
     }
     if q.len() >= 64 {
         q.pop_front();
@@ -1251,7 +1267,45 @@ impl Actor {
             }
             Input::Copy => self.selection(emit)?,
             Input::SelectAll => self.select_all()?,
+            Input::ContextMenu { x, y, request_id } => {
+                if !x.is_finite() || !y.is_finite() {
+                    return Ok(());
+                }
+                self.context_menu(x, y, request_id, emit)?;
+            }
         }
+        Ok(())
+    }
+    fn context_menu(
+        &mut self,
+        x: f64,
+        y: f64,
+        request_id: u64,
+        emit: &impl Fn(BrowserEvent),
+    ) -> Result<()> {
+        let viewport_y = self.interaction_y(y)?;
+        let args = json!([x, viewport_y]);
+        let state = self.cdp.eval(format!(
+            r#"(([x,y])=>{{
+                const sel=String(getSelection()||'');
+                const body=document.body;
+                const text=body?(body.innerText||body.textContent||''):'';
+                const link=document.elementFromPoint(x,y)?.closest('a,area')?.getAttribute('data-overlook-link')||'';
+                return [sel.length>0,text.trim().length>0,link];
+            }})({args})"#
+        ))?;
+        let has_selection = state[0].as_bool().unwrap_or(false);
+        let has_content = state[1].as_bool().unwrap_or(false);
+        let link_url = state[2]
+            .as_str()
+            .filter(|s| safe_link(s))
+            .map(str::to_owned);
+        emit(BrowserEvent::ContextMenu {
+            request_id,
+            has_selection,
+            has_content,
+            link_url,
+        });
         Ok(())
     }
     fn selection(&mut self, emit: &impl Fn(BrowserEvent)) -> Result<()> {

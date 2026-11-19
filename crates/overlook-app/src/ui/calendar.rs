@@ -252,6 +252,9 @@ impl MailWindow {
             self.focus_current_module(window, cx);
             return;
         }
+        if module != Module::Mail && self.email_modal && !self.close_email_modal(window, cx) {
+            return;
+        }
         self.module = module;
         self.toolbar_more_open = false;
         self.toolbar_editing = false;
@@ -267,6 +270,7 @@ impl MailWindow {
                 let input = self.contact_search.clone();
                 input.update(cx, |s, cx| s.focus(window, cx));
             }
+            Module::Mail if self.email_modal => self.email_modal_focus.focus(window, cx),
             Module::Mail => self.list_focus.focus(window, cx),
         }
         cx.notify();
@@ -281,6 +285,7 @@ impl MailWindow {
         match self.module {
             Module::Calendar => self.cal_focus.focus(window, cx),
             Module::Contacts => self.contact_search.update(cx, |s, cx| s.focus(window, cx)),
+            Module::Mail if self.email_modal => self.email_modal_focus.focus(window, cx),
             Module::Mail => self.list_focus.focus(window, cx),
         }
     }

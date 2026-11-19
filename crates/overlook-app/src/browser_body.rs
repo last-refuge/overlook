@@ -1,6 +1,7 @@
 //! Tiled Chromium document. The native reader scrolls this full-height surface;
 //! Chromium only supplies visible tiles and handles live DOM input.
 use crate::browser_engine::{BrowserEvent, BrowserHandle};
+use gpui_kit::base::AutoScroll;
 use gpui_kit::{prelude::*, *};
 use gpui_kit::component::button::Button;
 use std::{
@@ -386,12 +387,25 @@ impl RetryDocument {
     }
 }
 
+struct ContextMenuReady {
+    has_selection: bool,
+    has_content: bool,
+    link_url: Option<String>,
+}
+
+struct PendingContextMenu {
+    request_id: u64,
+    position: Point<Pixels>,
+    ready: Option<ContextMenuReady>,
+}
+
 pub struct BrowserBody {
     browser: BrowserHandle,
     prepared: RetryDocument,
     document_hash: u64,
     focus: FocusHandle,
     bounds: Rc<Cell<Bounds<Pixels>>>,
+    bounds_scroll_y: Rc<Cell<Pixels>>,
     scale: Rc<Cell<f64>>,
     last_resize: Option<(u32, f64)>,
     tiles: Tiles<Arc<RenderImage>>,
@@ -404,8 +418,12 @@ pub struct BrowserBody {
     cache_initial_layout: bool,
     buttons: u32,
     native_scroll: Option<ScrollHandle>,
+    auto_scroll: AutoScroll,
     /// The message as plain text, shown natively until the first tiles arrive.
     placeholder: Option<SharedString>,
+    context_menu_seq: u64,
+    pending_context_menu: Option<PendingContextMenu>,
+    context_link: Option<String>,
 }
 
 impl BrowserBody {
@@ -451,6 +469,7 @@ impl BrowserBody {
             prepared,
             focus: cx.focus_handle(),
             bounds: Rc::new(Cell::new(Bounds::default())),
+            bounds_scroll_y: Rc::new(Cell::new(px(0.))),
             scale: Rc::new(Cell::new(1.0)),
             // Started at `size`: no resize (and no throwaway layout) unless the pane differs.
             last_resize: size,
@@ -464,7 +483,11 @@ impl BrowserBody {
             cache_initial_layout: true,
             buttons: 0,
             native_scroll: None,
+            auto_scroll: AutoScroll::default(),
             placeholder,
+            context_menu_seq: 0,
+            pending_context_menu: None,
+            context_link: None,
         }
     }
 
@@ -484,6 +507,7 @@ impl BrowserBody {
     }
 
     pub fn attach_native_scroll(&mut self, scroll: ScrollHandle) {
+        self.bounds_scroll_y.set(scroll.offset().y);
         self.native_scroll = Some(scroll);
     }
 
@@ -515,7 +539,10 @@ impl BrowserBody {
             self.browser = self.prepared.start();
             self.error = None;
             self.buttons = 0;
+            self.auto_scroll.stop();
             self.last_resize = None;
+            self.pending_context_menu = None;
+            self.context_link = None;
             cx.notify();
         } else {
             self.retry(cx);
@@ -532,7 +559,10 @@ impl BrowserBody {
         self.layout_ready = false;
         self.cache_initial_layout = true;
         self.buttons = 0;
+        self.auto_scroll.stop();
         self.last_resize = None;
+        self.pending_context_menu = None;
+        self.context_link = None;
         cx.notify();
     }
 
@@ -540,6 +570,9 @@ impl BrowserBody {
         freeze_failure(&mut self.tiles, &mut self.height);
         self.error = Some(code);
         self.buttons = 0;
+        self.auto_scroll.stop();
+        self.pending_context_menu = None;
+        self.context_link = None;
         cx.notify();
     }
 
@@ -676,6 +709,25 @@ impl BrowserBody {
                         cx.open_url(&url);
                     }
                 }
+                BrowserEvent::ContextMenu {
+                    request_id,
+                    has_selection,
+                    has_content,
+                    link_url,
+                } => {
+                    if let Some(pending) = self
+                        .pending_context_menu
+                        .as_mut()
+                        .filter(|pending| pending.request_id == request_id)
+                    {
+                        pending.ready = Some(ContextMenuReady {
+                            has_selection,
+                            has_content,
+                            link_url,
+                        });
+                        cx.notify();
+                    }
+                }
                 BrowserEvent::Error(_) => unreachable!("errors handled before geometry"),
             }
         }
@@ -725,12 +777,137 @@ impl BrowserBody {
         .detach();
     }
 
+    fn effective_bounds(&self) -> Bounds<Pixels> {
+        let bounds = self.bounds.get();
+        match &self.native_scroll {
+            Some(scroll) => shifted_bounds(bounds, self.bounds_scroll_y.get(), scroll.offset().y),
+            None => bounds,
+        }
+    }
+
+    fn scroll_viewport(&self) -> Option<Bounds<Pixels>> {
+        self.native_scroll
+            .as_ref()
+            .map(ScrollHandle::bounds)
+            .filter(|bounds| bounds.size.height > px(0.))
+    }
+
     fn position(&self, position: Point<Pixels>) -> (f64, f64) {
-        local_position(position, self.bounds.get())
+        local_position(position, self.effective_bounds())
+    }
+
+    fn drag_position(&self, position: Point<Pixels>) -> (f64, f64) {
+        drag_local_position(
+            position,
+            self.effective_bounds(),
+            self.scroll_viewport(),
+            self.height,
+        )
+    }
+
+    fn on_window_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.buttons == 0 {
+            return;
+        }
+        if self.error.is_some() {
+            self.auto_scroll.stop();
+            return;
+        }
+        if self.buttons & 1 != 0 && event.pressed_button != Some(MouseButton::Left) {
+            self.release_mouse_button(MouseButton::Left, event.position, 1);
+            return;
+        }
+        if self.buttons & 1 != 0 {
+            self.auto_scroll.last_drag_position = Some(event.position);
+            let delta = self
+                .scroll_viewport()
+                .and_then(|viewport| AutoScroll::compute_delta(event.position.y, viewport));
+            self.auto_scroll.set(delta, cx, |delta, this, cx| {
+                this.tick_auto_scroll(delta, cx);
+            });
+            let (x, y) = self.drag_position(event.position);
+            self.browser
+                .mouse("mouseMoved", x, y, "none", self.buttons, 0);
+        } else {
+            let (x, y) = self.position(event.position);
+            self.browser
+                .mouse("mouseMoved", x, y, "none", self.buttons, 0);
+        }
+    }
+
+    fn tick_auto_scroll(&mut self, delta: Pixels, cx: &mut Context<Self>) {
+        if self.error.is_some() || self.buttons & 1 == 0 {
+            self.auto_scroll.stop();
+            return;
+        }
+        let Some(scroll) = self.native_scroll.as_ref() else {
+            self.auto_scroll.stop();
+            return;
+        };
+        let old = scroll.offset();
+        let Some(next_y) = next_scroll_y(old.y, scroll.max_offset().y, delta) else {
+            return;
+        };
+        scroll.set_offset(point(old.x, next_y));
+        if let Some(position) = self.auto_scroll.last_drag_position {
+            let (x, y) = self.drag_position(position);
+            self.browser
+                .mouse("mouseMoved", x, y, "none", self.buttons, 0);
+        }
+        cx.notify();
+    }
+
+    fn release_mouse_button(
+        &mut self,
+        button: MouseButton,
+        position: Point<Pixels>,
+        click_count: u32,
+    ) -> bool {
+        let (name, mask) = mouse_button(button);
+        // A scrollbar or another native control owns a drag unless
+        // this surface received its corresponding press.
+        if self.buttons & mask == 0 {
+            return false;
+        }
+        let was_left = mask == 1;
+        self.buttons &= !mask;
+        if self.buttons & 1 == 0 {
+            self.auto_scroll.stop();
+        }
+        let (x, y) = if was_left {
+            self.drag_position(position)
+        } else {
+            self.position(position)
+        };
+        self.browser
+            .mouse("mouseReleased", x, y, name, self.buttons, click_count);
+        true
+    }
+
+    fn request_context_menu(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        self.context_menu_seq = self.context_menu_seq.wrapping_add(1);
+        let request_id = self.context_menu_seq;
+        let (x, y) = self.position(position);
+        self.pending_context_menu = Some(PendingContextMenu {
+            request_id,
+            position,
+            ready: None,
+        });
+        self.browser.context_menu(x, y, request_id);
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(4))
+                .await;
+            let _ = this.update(cx, |view, cx| view.poll(cx));
+        })
+        .detach();
     }
 
     fn keyboard(&mut self, stroke: &Keystroke, down: bool) {
-        if down { self.cache_initial_layout = false; }
+        if down {
+            self.cache_initial_layout = false;
+            self.pending_context_menu = None;
+        }
         if self.error.is_some() { return; }
         if down && (stroke.modifiers.control || stroke.modifiers.platform) {
             match stroke.key.as_str() {
@@ -782,7 +959,31 @@ impl Focusable for BrowserBody {
 
 impl Render for BrowserBody {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self
+            .pending_context_menu
+            .as_ref()
+            .is_some_and(|pending| pending.ready.is_some())
+        {
+            if let Some(pending) = self.pending_context_menu.take() {
+                if let Some(ready) = pending.ready {
+                    self.context_link = ready.link_url.clone();
+                    let focus = self.focus.clone();
+                    let position = pending.position;
+                    let menu_state = crate::ui::context_menu::ReadOnlyEmailMenuState {
+                        has_selection: ready.has_selection,
+                        has_content: ready.has_content,
+                        has_link: ready.link_url.is_some(),
+                    };
+                    window.defer(cx, move |window, cx| {
+                        focus.focus(window, cx);
+                        menu_state.build().show(position, window, cx);
+                    });
+                }
+            }
+        }
         let bounds = self.bounds.clone();
+        let bounds_scroll_y = self.bounds_scroll_y.clone();
+        let prepaint_scroll = self.native_scroll.clone();
         let scale = self.scale.clone();
         let current_scale = f64::from(window.scale_factor());
         let visible = self.visible.clone();
@@ -825,12 +1026,44 @@ impl Render for BrowserBody {
             .h(px(self.height as f32))
             .overflow_hidden()
             .flex_shrink_0()
+            .key_context("TextView")
             .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &gpui_kit::component::input::Copy, _, cx| {
+                if this.error.is_none() {
+                    this.browser.copy_selection();
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(4))
+                            .await;
+                        let _ = this.update(cx, |view, cx| view.poll(cx));
+                    })
+                    .detach();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &gpui_kit::component::input::SelectAll, _, _| {
+                if this.error.is_none() {
+                    this.cache_initial_layout = false;
+                    this.browser.select_all();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &crate::ui::context_menu::OpenContextLink, _, cx| {
+                if let Some(url) = this.context_link.as_deref().filter(|url| allowed_url(url)) {
+                    cx.open_url(url);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &crate::ui::context_menu::CopyContextLink, _, cx| {
+                if let Some(url) = this.context_link.clone().filter(|url| allowed_url(url)) {
+                    cx.write_to_clipboard(ClipboardItem::new_string(url));
+                }
+            }))
             .child(content)
             .child(
                 canvas(
                     move |actual, window, _| {
                         bounds.set(actual);
+                        if let Some(scroll) = &prepaint_scroll {
+                            bounds_scroll_y.set(scroll.offset().y);
+                        }
                         scale.set(current_scale);
                         let range = visible_range(actual, window.content_mask().bounds, height);
                         visible.set(range);
@@ -842,7 +1075,19 @@ impl Render for BrowserBody {
                             browser.visible_range(range.0, range.1);
                         }
                     },
-                    |_, _, _, _| {},
+                    {
+                        let view = cx.entity().downgrade();
+                        move |_, _, window, _| {
+                            let view = view.clone();
+                            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                                if phase == DispatchPhase::Bubble {
+                                    let _ = view.update(cx, |this, cx| {
+                                        this.on_window_mouse_move(event, cx);
+                                    });
+                                }
+                            });
+                        }
+                    },
                 )
                 .absolute()
                 .inset_0(),
@@ -851,6 +1096,14 @@ impl Render for BrowserBody {
                 if this.error.is_some() { return; }
                 this.cache_initial_layout = false;
                 this.focus.focus(window, cx);
+                if event.button == MouseButton::Right {
+                    this.auto_scroll.stop();
+                    this.request_context_menu(event.position, cx);
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    return;
+                }
+                this.pending_context_menu = None;
                 let (button, mask) = mouse_button(event.button);
                 this.buttons |= mask;
                 let (x, y) = this.position(event.position);
@@ -867,28 +1120,17 @@ impl Render for BrowserBody {
             }))
             .capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, _, cx| {
                 if this.error.is_some() { return; }
-                let (button, mask) = mouse_button(event.button);
-                // A scrollbar or another native control owns a drag unless
-                // this surface received its corresponding press.
-                if this.buttons & mask == 0 { return; }
-                this.buttons &= !mask;
-                let (x, y) = this.position(event.position);
-                this.browser.mouse(
-                    "mouseReleased",
-                    x,
-                    y,
-                    button,
-                    this.buttons,
-                    event.click_count as u32,
-                );
-                cx.stop_propagation();
+                if this.release_mouse_button(event.button, event.position, event.click_count as u32) {
+                    cx.stop_propagation();
+                }
             }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, _| {
                 if this.error.is_some() { return; }
+                // Active drags (including outside the viewport) are tracked at the window level.
+                if this.buttons != 0 || event.pressed_button.is_some() { return; }
                 let (x, y) = this.position(event.position);
-                if event.pressed_button.is_some() && this.buttons == 0 { return; }
                 this.browser
-                    .mouse("mouseMoved", x, y, "none", this.buttons, 0);
+                    .mouse("mouseMoved", x, y, "none", 0, 0);
             }))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.error.is_some() || !this.focus.contains_focused(window, cx)
@@ -917,21 +1159,9 @@ impl Render for BrowserBody {
                 button,
                 cx.listener(|this, event: &MouseUpEvent, _, cx| {
                     if this.error.is_some() { return; }
-                    let (button, mask) = mouse_button(event.button);
-                    if this.buttons & mask == 0 {
-                        return;
+                    if this.release_mouse_button(event.button, event.position, event.click_count as u32) {
+                        cx.stop_propagation();
                     }
-                    this.buttons &= !mask;
-                    let (x, y) = this.position(event.position);
-                    this.browser.mouse(
-                        "mouseReleased",
-                        x,
-                        y,
-                        button,
-                        this.buttons,
-                        event.click_count as u32,
-                    );
-                    cx.stop_propagation();
                 }),
             );
         }
@@ -963,6 +1193,53 @@ fn local_position(position: Point<Pixels>, bounds: Bounds<Pixels>) -> (f64, f64)
         f64::from(f32::from(position.x - bounds.origin.x)),
         f64::from(f32::from(position.y - bounds.origin.y)),
     )
+}
+/// Adjusts cached prepaint bounds for scroll offset updates applied before the next frame.
+fn shifted_bounds(
+    bounds: Bounds<Pixels>,
+    prepaint_scroll_y: Pixels,
+    current_scroll_y: Pixels,
+) -> Bounds<Pixels> {
+    let shift = current_scroll_y - prepaint_scroll_y;
+    Bounds::new(point(bounds.origin.x, bounds.origin.y + shift), bounds.size)
+}
+/// Maps a drag pointer in window coordinates to document CSS coordinates clamped to the
+/// visible viewport (when known) and the document's bounds, so auto-scroll extends
+/// selection smoothly into newly revealed content instead of jumping offscreen.
+fn drag_local_position(
+    position: Point<Pixels>,
+    bounds: Bounds<Pixels>,
+    viewport: Option<Bounds<Pixels>>,
+    height: u32,
+) -> (f64, f64) {
+    let min_x = bounds.left();
+    let max_x = bounds.right().max(min_x);
+    let min_y = bounds.top();
+    let max_y = (bounds.top() + px(height as f32)).max(min_y);
+
+    let y = match viewport.filter(|v| v.size.height > px(0.)) {
+        Some(v) => position.y.clamp(v.top(), v.bottom()),
+        None => position.y,
+    }
+    .clamp(min_y, max_y);
+
+    // Dragging past the visible end/start of the document selects to the end/start of that line.
+    let x = if y == max_y && position.y > max_y {
+        max_x
+    } else if y == min_y && position.y < min_y {
+        min_x
+    } else {
+        position.x.clamp(min_x, max_x)
+    };
+
+    local_position(point(x, y), bounds)
+}
+/// Applies one auto-scroll delta (`> 0` scrolls down, `< 0` scrolls up) to a GPUI scroll
+/// offset (`0` at top, `-max_y` at bottom), returning the new Y offset if it moved.
+fn next_scroll_y(current_y: Pixels, max_y: Pixels, delta: Pixels) -> Option<Pixels> {
+    let floor = -max_y.max(px(0.));
+    let next = (current_y - delta).min(px(0.)).max(floor);
+    (next != current_y).then_some(next)
 }
 fn mouse_button(button: MouseButton) -> (&'static str, u32) {
     match button {
@@ -1464,6 +1741,55 @@ mod tests {
         assert_ne!(
             document_hash("a", false, false),
             document_hash("a", false, true)
+        );
+    }
+
+    #[test]
+    fn auto_scroll_offset_moves_within_bounds_and_stops_at_edges() {
+        assert_eq!(super::next_scroll_y(px(0.), px(500.), px(24.)), Some(px(-24.)));
+        assert_eq!(super::next_scroll_y(px(-490.), px(500.), px(24.)), Some(px(-500.)));
+        assert_eq!(super::next_scroll_y(px(-500.), px(500.), px(24.)), None);
+        assert_eq!(super::next_scroll_y(px(-15.), px(500.), px(-24.)), Some(px(0.)));
+        assert_eq!(super::next_scroll_y(px(0.), px(500.), px(-24.)), None);
+    }
+
+    #[test]
+    fn drag_position_clamps_to_viewport_and_advances_with_auto_scroll() {
+        let viewport = Bounds::new(point(px(100.), px(100.)), size(px(600.), px(500.)));
+        let bounds = Bounds::new(point(px(120.), px(100.)), size(px(560.), px(2000.)));
+
+        // Dragging past the bottom edge clamps to the visible bottom rather than jumping offscreen.
+        assert_eq!(
+            super::drag_local_position(point(px(300.), px(780.)), bounds, Some(viewport), 2000),
+            (180., 500.)
+        );
+
+        // One auto-scroll tick shifts the document up by 30px, extending selection 30px further.
+        let scrolled = super::shifted_bounds(bounds, px(0.), px(-30.));
+        assert_eq!(
+            super::drag_local_position(point(px(300.), px(780.)), scrolled, Some(viewport), 2000),
+            (180., 530.)
+        );
+
+        // Dragging past the top edge when scrolled down clamps to the visible top edge.
+        let mid_scroll = super::shifted_bounds(bounds, px(0.), px(-400.));
+        assert_eq!(
+            super::drag_local_position(point(px(300.), px(20.)), mid_scroll, Some(viewport), 2000),
+            (180., 400.)
+        );
+
+        // Once the bottom of the email is visible, dragging below it selects to the very end.
+        let at_bottom = Bounds::new(point(px(120.), px(-1450.)), size(px(560.), px(2000.)));
+        assert_eq!(
+            super::drag_local_position(point(px(130.), px(700.)), at_bottom, Some(viewport), 2000),
+            (560., 2000.)
+        );
+
+        // Once the top of the email is visible, dragging above it selects to the very beginning.
+        let with_header = Bounds::new(point(px(120.), px(220.)), size(px(560.), px(2000.)));
+        assert_eq!(
+            super::drag_local_position(point(px(500.), px(50.)), with_header, Some(viewport), 2000),
+            (0., 0.)
         );
     }
 }

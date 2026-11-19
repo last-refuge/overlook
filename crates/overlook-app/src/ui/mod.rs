@@ -7,6 +7,8 @@ mod calendar_setup;
 mod calendar_changes;
 mod composer;
 mod composer_window;
+pub(crate) mod context_menu;
+mod email_modal;
 mod folder_manage;
 mod folder_window;
 mod history;
@@ -663,6 +665,13 @@ pub struct MailWindow {
     pub(crate) inline_images: std::cell::RefCell<HashMap<AttachmentId, Option<String>>>,
     /// Live isolated message documents; released when their reader surface closes.
     pub(crate) browser_bodies: std::cell::RefCell<HashMap<String, (u64, usize, Entity<crate::browser_body::BrowserBody>)>>,
+    /// The focused email modal, opened by double-clicking an item in the message list.
+    pub(crate) email_modal: bool,
+    pub(crate) email_modal_focus: FocusHandle,
+    pub(crate) email_modal_size: email_modal::EmailModalSize,
+    pub(crate) email_modal_resize: Option<email_modal::EmailModalResize>,
+    /// Next conversation to select once the email modal closes, if this email left the list.
+    pub(crate) email_modal_next: Option<ConversationId>,
 
     composer: Option<Composer>,
     /// Set in a pop-out composer window: the main window it belongs to.
@@ -979,6 +988,11 @@ impl MailWindow {
             pdf_thumbs_pending: HashSet::new(),
             inline_images: std::cell::RefCell::new(HashMap::new()),
             browser_bodies: std::cell::RefCell::new(HashMap::new()),
+            email_modal: false,
+            email_modal_focus: cx.focus_handle(),
+            email_modal_size: email_modal::EmailModalSize::default(),
+            email_modal_resize: None,
+            email_modal_next: None,
             composer: None,
             composer_owner,
             detached_composers: HashMap::new(),
@@ -1369,6 +1383,9 @@ impl MailWindow {
 
     pub(crate) fn switch_account(&mut self, id: AccountId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(account) = self.accounts.iter().find(|a| a.id == id).cloned() else { return };
+        if self.email_modal && !self.close_email_modal(window, cx) {
+            return;
+        }
         if self.composer.is_some() {
             self.close_composer(window, cx);
         }
@@ -2471,9 +2488,26 @@ impl MailWindow {
         self.conversations.iter().find(|c| &c.id == id)
     }
 
+    /// Summary of the open conversation, falling back to `self.thread` when the
+    /// email has left the active list view (for example after archiving or moving
+    /// it while keeping it open in the email modal).
+    pub(super) fn active_summary(&self) -> Option<ConversationSummary> {
+        if let Some(summary) = self.selected_summary() {
+            return Some(summary.clone());
+        }
+        if self.thread.is_empty() {
+            return None;
+        }
+        let pending = BTreeSet::new();
+        ConversationSummary::from_messages(&self.thread, &self.account.email, &pending)
+    }
+
     // ------------------------------------------------------------ navigation
 
     fn select_view(&mut self, view: MailboxView, window: &mut Window, cx: &mut Context<Self>) {
+        if self.email_modal && !self.close_email_modal(window, cx) {
+            return;
+        }
         if !self.search_query.is_empty() {
             self.search_query.clear();
             let input = self.search_input.clone();
@@ -3145,6 +3179,16 @@ impl MailWindow {
     }
 
     fn select_after_removal(&mut self, next: Option<ConversationId>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.email_modal {
+            // Stay in the modal with this email until closed or sent, unless it was permanently deleted.
+            if self.thread.is_empty() {
+                self.email_modal_next = next;
+                self.close_email_modal(window, cx);
+            } else if self.email_modal_next.is_none() {
+                self.email_modal_next = next;
+            }
+            return;
+        }
         if self.marked.len() > 1 {
             // A bulk action is over: whatever is left is a plain selection again.
             self.marked.clear();
@@ -3182,11 +3226,17 @@ impl MailWindow {
         draft.body_text = m.body;
         self.apply_signature(&mut draft, self.default_signature_id(false).as_deref());
         self.set_module(Module::Mail, window, cx);
+        if self.email_modal && !self.close_email_modal(window, cx) {
+            return;
+        }
         self.outbox_selected = None;
         self.open_composer(draft, window, cx);
     }
 
     pub(crate) fn compose_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.email_modal && !self.close_email_modal(window, cx) {
+            return;
+        }
         let mut draft = Draft::new(self.account.id.clone(), DraftKind::New, now());
         self.apply_signature(&mut draft, self.default_signature_id(false).as_deref());
         self.outbox_selected = None;
@@ -3543,6 +3593,9 @@ impl MailWindow {
             return;
         }
         if self.module == Module::Calendar { self.open_palette(window, cx); return; }
+        if self.email_modal && !self.close_email_modal(window, cx) {
+            return;
+        }
         let input = if self.module == Module::Contacts { self.contact_search.clone() } else { self.search_input.clone() };
         input.update(cx, |s, cx| {
             s.focus(window, cx);
@@ -3581,6 +3634,8 @@ impl MailWindow {
             }
         } else if self.composer.is_some() {
             self.close_composer(window, cx);
+        } else if self.email_modal {
+            self.close_email_modal(window, cx);
         } else if self.contact_form.is_some() {
             self.cancel_contact_form(cx);
         } else if self.new_event.is_some() {
@@ -3737,6 +3792,13 @@ impl MailWindow {
         self.trash(ids, window, cx);
     }
     fn on_toggle_star(&mut self, _: &ToggleStar, window: &mut Window, cx: &mut Context<Self>) {
+        if self.marked.is_empty() && !self.thread.is_empty() {
+            let starred = self.thread.iter().any(|m| m.is_starred);
+            if let Some(latest) = self.thread.iter().max_by_key(|m| m.date) {
+                self.set_starred(vec![latest.id.clone()], !starred, window, cx);
+            }
+            return;
+        }
         let starred = self.selection_state().all_starred;
         let ids: Vec<MessageId> = self.target_rows().map(|c| c.latest_message_id.clone()).collect();
         self.set_starred(ids, !starred, window, cx);
@@ -4179,7 +4241,12 @@ impl MailWindow {
         // Keep the resize hit areas and cursors, with no painted pane dividers.
         let handles: gpui_kit::base::ResizeHandleRenderer = std::rc::Rc::new(|_, _, _| Some(Empty.into_any_element()));
         let list = mail_pane(self.render_list(cx), gutter, px(8.)).into_any_element();
-        let reader = mail_pane(self.render_reader(cx), gutter, px(0.)).into_any_element();
+        let reader_content = if self.email_modal {
+            div().size_full().bg(cx.palette().message_surface()).into_any_element()
+        } else {
+            self.render_reader(cx).into_any_element()
+        };
+        let reader = mail_pane(reader_content, gutter, px(0.)).into_any_element();
 
         let content = match self.reading_pane {
             ReadingPane::Right => h_resizable("content-h")
@@ -4402,6 +4469,7 @@ impl Render for MailWindow {
                             .child(div().flex_1().min_h_0().child(self.render_body(cx)))
                             .child(self.render_status_bar(cx)))),
             )
+            .when(self.email_modal, |d| d.child(self.render_email_modal(cx)))
             .when(self.settings.is_some(), |d| d.child(self.render_settings(cx)))
             .when(self.account_setup.is_some(), |d| d.child(self.render_account_setup(cx)))
             .when(self.module == Module::Calendar && self.new_event.as_ref().is_some_and(|f| f.dragged.is_some()), |d| d.child(self.render_event_modal(cx)))

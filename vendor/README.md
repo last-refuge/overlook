@@ -22,6 +22,9 @@ accepting means to the listener; any edit, caret movement, click, Enter, Escape 
 painter skips the covering fill when the caret ends a single-line field, because that field is not
 necessarily drawn on the editor background. Overlook's composer uses it for recipient completion.
 
+`InputBaseState::can_undo` and `can_redo` (`src/input/base/state.rs`, `src/input/base/undo_manager.rs`)
+report whether undo or redo history is available for editable text context menus.
+
 `RoundedFrameCover::top` keeps the mail panes' top corners rounded over their
 child backgrounds while leaving the bottom corners square (`src/scrollable_mask.rs`).
 
