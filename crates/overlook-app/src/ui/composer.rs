@@ -248,7 +248,14 @@ impl MailWindow {
     }
 
     pub(super) fn reuse_reply(&mut self, kind: DraftKind, source: &Message, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.activate_detached_reply(kind, source, cx) { return true; }
+        self.reuse_local_reply(kind, source, window, cx)
+            || self.activate_detached_reply(kind, source, cx)
+    }
+
+    /// Reuses an existing reply composer in this window only, without running cross-window
+    /// lookup (so callers activating a matched editor from another window never re-enter
+    /// the parent window's entity borrow).
+    pub(super) fn reuse_local_reply(&mut self, kind: DraftKind, source: &Message, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let replies = |kind| matches!(kind, DraftKind::Reply | DraftKind::ReplyAll);
         let Some(current) = self.composer.as_ref().filter(|c| c.draft.in_reply_to.as_ref() == Some(&source.id)
             && (c.draft.kind == kind || (replies(c.draft.kind) && replies(kind)))) else { return false };

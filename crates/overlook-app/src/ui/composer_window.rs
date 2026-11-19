@@ -132,7 +132,7 @@ impl MailWindow {
                     .window
                     .update(cx, |_, window, cx| {
                         parent.update(cx, |main, cx| {
-                            main.reuse_reply(kind, &source, window, cx);
+                            main.reuse_local_reply(kind, &source, window, cx);
                         });
                         window.activate_window();
                     })
@@ -175,7 +175,7 @@ impl MailWindow {
             .update(cx, |_, window, cx| {
                 editor
                     .update(cx, |this, cx| {
-                        this.reuse_reply(kind, source, window, cx);
+                        this.reuse_local_reply(kind, source, window, cx);
                     })
                     .ok();
                 window.activate_window();
