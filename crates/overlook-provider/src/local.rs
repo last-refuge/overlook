@@ -66,7 +66,20 @@ pub fn file_name(message: &Message) -> String {
     let subject: String = message.subject.chars().map(|c| if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { ' ' } else { c }).collect();
     let subject = subject.split_whitespace().collect::<Vec<_>>().join(" ");
     let subject = subject.trim_start_matches('.').trim();
-    let subject: String = if subject.is_empty() { "No subject".into() } else { subject.chars().take(80).collect::<String>().trim_end().to_owned() };
+    // File names are limited to 255 bytes, not characters: 80 characters of Chinese are
+    // 240 bytes. Keep the subject within 150 bytes so the date, tag and a " (2)" still fit.
+    let subject: String = if subject.is_empty() {
+        "No subject".into()
+    } else {
+        let mut out = String::new();
+        for c in subject.chars().take(80) {
+            if out.len() + c.len_utf8() > 150 {
+                break;
+            }
+            out.push(c);
+        }
+        out.trim_end().to_owned()
+    };
     let own = message.id.0.rsplit(':').next().unwrap_or(&message.id.0);
     let tag: String = own.chars().rev().filter(|c| c.is_ascii_alphanumeric()).take(8).collect::<Vec<_>>().into_iter().rev().collect();
     format!("{when} {subject} [{tag}].eml")
@@ -505,6 +518,9 @@ mod tests {
         assert_eq!(file_name(&blank), "1970-01-01 0000 No subject [x].eml");
         let long = message("offline:y", &"word ".repeat(40), 0);
         assert!(file_name(&long).chars().count() < 120);
+        let wide = message("offline:z", &"報告書".repeat(40), 0);
+        assert!(file_name(&wide).len() <= 200, "{} bytes", file_name(&wide).len());
+        assert!(file_name(&wide).contains("報告書"));
     }
 
     #[test]

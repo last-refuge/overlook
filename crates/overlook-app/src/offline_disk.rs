@@ -34,6 +34,14 @@ pub fn default_location() -> PathBuf {
         .join("Overlook Offline Folders")
 }
 
+/// Whether `dir` is, is inside, or holds a folder already open (the same files would then
+/// belong to two folders). Paths are compared resolved where they exist.
+fn overlaps_open(dir: &Path, labels: &[Label]) -> bool {
+    let resolve = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let dir = resolve(dir);
+    labels.iter().filter_map(local::dir_of).map(|open| resolve(&open)).any(|open| dir.starts_with(&open) || open.starts_with(&dir))
+}
+
 /// `path` for people: the home directory as `~`.
 pub fn shown_path(path: &Path) -> String {
     if let Some(home) = directories::UserDirs::new().map(|u| u.home_dir().to_path_buf()) {
@@ -76,7 +84,9 @@ fn write_manifest(root: &Label, labels: &[Label], places: &[MessagePlace]) -> st
 /// mail saved by the first version of offline folders (in `legacy_dir`) moves into its
 /// folder, and every folder's manifest is rewritten. Folders whose directory is missing (a
 /// drive not connected) are left alone.
-pub fn reconcile(store: &Store, offline: &AccountId, legacy_dir: &Path, doomed: &[PathBuf]) -> Result<(), String> {
+/// Returns the files in `doomed` that could not be deleted (a drive not connected, say), to
+/// try again after the next change.
+pub fn reconcile(store: &Store, offline: &AccountId, legacy_dir: &Path, doomed: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
     let _files = lock();
     let labels = store.labels(offline).map_err(|e| e.to_string())?;
     let mut places = store.message_places(offline).map_err(|e| e.to_string())?;
@@ -121,10 +131,12 @@ pub fn reconcile(store: &Store, offline: &AccountId, legacy_dir: &Path, doomed: 
         store.set_provider_ids(&moved).map_err(|e| e.to_string())?;
     }
     let used: HashSet<&str> = places.iter().filter_map(|p| p.provider_id.as_ref().map(|p| p.0.as_str())).collect();
+    let mut kept_back = Vec::new();
     for path in doomed.iter().filter(|p| !used.contains(p.to_string_lossy().as_ref())) {
         if let Err(e) = std::fs::remove_file(path) {
             if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!("offline folders: could not delete {}: {e}", path.display());
+                tracing::warn!("offline folders: could not delete {} (will try again): {e}", path.display());
+                kept_back.push(path.clone());
             }
         }
     }
@@ -133,7 +145,7 @@ pub fn reconcile(store: &Store, offline: &AccountId, legacy_dir: &Path, doomed: 
             tracing::warn!("offline folders: could not save the state of “{}”: {e}", root.name);
         }
     }
-    Ok(())
+    Ok(kept_back)
 }
 
 /// Gives top-level folders made by the first version of offline folders (which kept every
@@ -168,6 +180,9 @@ pub fn create_folder(store: &Store, offline: &AccountId, name: &str, parent: Opt
         Some(p) => local::dir_of(p).ok_or_else(|| ProviderError::Rejected("That folder has no place on disk.".into()))?.join(name.trim()),
         None => location.join(name.trim()),
     };
+    if parent.is_none() && overlaps_open(&dir, &labels) {
+        return Err(ProviderError::Rejected(format!("{} is inside or around an offline folder that is already open. Choose another place.", shown_path(&dir))));
+    }
     if dir.exists() && local::scan(&dir).is_ok_and(|s| !s.files.is_empty()) {
         return Err(ProviderError::Rejected(format!("{} already holds mail. Use Open Offline Folder… to add it.", shown_path(&dir))));
     }
@@ -201,9 +216,18 @@ pub fn rename_folder(store: &Store, offline: &AccountId, changed: &[RenamedFolde
     let renames: Vec<(LabelId, Label)> = changed.iter().map(|c| (c.old.id.clone(), c.new.clone())).collect();
     let sep = std::path::MAIN_SEPARATOR;
     let prefixes = vec![(format!("{}{sep}", from.display()), format!("{}{sep}", to.display()))];
-    store.rename_folders(offline, &renames, &prefixes).map_err(|e| ProviderError::Rejected(e.to_string()))?;
+    if let Err(e) = store.rename_folders(offline, &renames, &prefixes) {
+        // The store still names the old place: put the directory back, so every recorded
+        // path stays true.
+        if from != to {
+            if let Err(back) = std::fs::rename(&to, &from) {
+                tracing::error!("offline folders: could not move {} back to {} after a failed save: {back}", to.display(), from.display());
+            }
+        }
+        return Err(ProviderError::Rejected(format!("Couldn’t save the change: {e}")));
+    }
     drop(_files);
-    reconcile(store, offline, &crate::providers::offline_dir(), &[]).map_err(ProviderError::Rejected)
+    reconcile(store, offline, &crate::providers::offline_dir(), &[]).map(|_| ()).map_err(ProviderError::Rejected)
 }
 
 /// The mail files of the folders in `gone`, for deleting them.
@@ -246,12 +270,40 @@ pub fn delete_files(files: &[PathBuf], gone: &[Label], top: &Label) -> usize {
 
 /// Saves everything Overlook knows about a top-level folder beside its files before it is
 /// disconnected, so opening it again restores it.
+///
+/// Refused while any message of the folder has no file in it (a move that could not
+/// finish, a file deleted outside Overlook) or a message filed elsewhere still has its file
+/// here: after disconnecting, Overlook would forget mail that exists nowhere else, or the
+/// folder would come back with mail that left it.
 pub fn save_before_disconnect(store: &Store, offline: &AccountId, root: &Label) -> Result<(), String> {
     reconcile(store, offline, &crate::providers::offline_dir(), &[])?;
     let _files = lock();
     let labels = store.labels(offline).map_err(|e| e.to_string())?;
     let places = store.message_places(offline).map_err(|e| e.to_string())?;
+    let dir = local::dir_of(root).ok_or_else(|| "this folder has no place on disk".to_owned())?;
+    let mut unsaved = 0;
+    let mut strays = 0;
+    for place in &places {
+        let file = place.provider_id.as_ref().map(|p| PathBuf::from(&p.0)).filter(|p| p.is_absolute());
+        let mine = folder_of(place, &labels).and_then(|f| local::root_of(f, &labels)).is_some_and(|r| r.id == root.id);
+        let here = file.as_ref().is_some_and(|f| f.starts_with(&dir));
+        if mine && !(here && file.as_ref().is_some_and(|f| f.is_file())) {
+            unsaved += 1;
+        } else if !mine && here {
+            strays += 1;
+        }
+    }
+    if unsaved > 0 {
+        return Err(format!("{} in it {} no file in {} yet. Connect the drive and try again, or delete {} first.", messages_phrase(unsaved), if unsaved == 1 { "has" } else { "have" }, shown_path(&dir), if unsaved == 1 { "it" } else { "them" }));
+    }
+    if strays > 0 {
+        return Err(format!("{} moved out of it {} still on disk in {}. Try again once {} been moved.", messages_phrase(strays), if strays == 1 { "is" } else { "are" }, shown_path(&dir), if strays == 1 { "it has" } else { "they have" }));
+    }
     write_manifest(root, &labels, &places).map_err(|e| e.to_string())
+}
+
+fn messages_phrase(n: usize) -> String {
+    if n == 1 { "1 message".to_owned() } else { format!("{n} messages") }
 }
 
 /// What opening a folder from disk found.
@@ -273,11 +325,8 @@ pub fn open_folder(store: &Store, offline: &Account, dir: &Path) -> Result<Opene
         return Err(format!("{} is not a folder.", shown_path(&dir)));
     }
     let mut labels = store.labels(&offline.id).map_err(|e| e.to_string())?;
-    for open in labels.iter().filter_map(local::dir_of) {
-        let open = open.canonicalize().unwrap_or(open);
-        if dir.starts_with(&open) || open.starts_with(&dir) {
-            return Err(format!("{} is already open in Overlook.", shown_path(&dir)));
-        }
+    if overlaps_open(&dir, &labels) {
+        return Err(format!("{} is already open in Overlook, or inside or around a folder that is.", shown_path(&dir)));
     }
     let scanned = local::scan(&dir).map_err(|e| format!("{} can’t be read: {e}", shown_path(&dir)))?;
     let manifest = local::read_manifest(&dir);
@@ -534,6 +583,45 @@ mod tests {
         assert!(files_under(&base.join("Taxes")).is_empty());
         assert!(!base.join("Taxes/Year 2025").exists());
         assert!(base.join("Taxes/notes.txt").exists(), "a file the person put there stays, and so does its folder");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn overlapping_folders_unsaved_mail_and_stuck_deletions_are_caught() {
+        let base = temp_dir("guards");
+        let legacy = base.join("legacy");
+        let store = Store::open_in_memory().unwrap();
+        let offline = store.offline_account().unwrap();
+        let work = create_folder(&store, &offline.id, "Work", None, &base).unwrap();
+        assert!(create_folder(&store, &offline.id, "Receipts", None, &base.join("Work")).is_err(), "not inside an open folder");
+        assert!(create_folder(&store, &offline.id, "Receipts", None, &base).is_ok(), "beside it is fine");
+
+        // A message whose file is gone can't be disconnected away silently.
+        let raw = b"Subject: Hello\r\n\r\nHi.\r\n";
+        let dir = local::dir_of(&work).unwrap();
+        let path = local::write_durably(&dir, "hello.eml", raw).unwrap();
+        let m = message_from_rfc822(&offline, raw, MessageId::from("offline:1"), &MessageFlags { provider_id: Some(path_id(&path)), label_ids: [work.id.clone()].into_iter().collect(), ..Default::default() });
+        store.upsert_messages(&[Message { conversation_id: ConversationId::from("offline:c"), ..m }]).unwrap();
+        save_before_disconnect(&store, &offline.id, &work).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let refused = save_before_disconnect(&store, &offline.id, &work).unwrap_err();
+        assert!(refused.contains("1 message"), "{refused}");
+
+        // A file that can't be deleted yet comes back, to be tried again.
+        let locked = base.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        let stuck = locked.join("stuck.eml");
+        std::fs::write(&stuck, b"x").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+            let kept = reconcile(&store, &offline.id, &legacy, std::slice::from_ref(&stuck)).unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(kept, vec![stuck.clone()]);
+            assert!(reconcile(&store, &offline.id, &legacy, &kept).unwrap().is_empty(), "deleted once it can be");
+            assert!(!stuck.exists());
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 

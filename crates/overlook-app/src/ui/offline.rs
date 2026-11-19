@@ -272,11 +272,13 @@ impl MailWindow {
         let (store, offline) = (self.store.clone(), self.offline.id.clone());
         cx.spawn(async move |this, cx| {
             let result = cx.background_spawn(async move { offline_disk::reconcile(&store, &offline, &providers::offline_dir(), &doomed) }).await;
-            if let Err(e) = result {
-                tracing::warn!("offline folders: {e}");
-            }
-            // Files moved: the open messages read them from their new places.
             let _ = this.update(cx, |this, cx| {
+                match result {
+                    // Files that couldn't be deleted yet are tried again after the next change.
+                    Ok(kept_back) => this.offline_doomed.extend(kept_back),
+                    Err(e) => tracing::warn!("offline folders: {e}"),
+                }
+                // Files moved: the open messages read them from their new places.
                 if this.offline_active() {
                     this.reload(cx);
                 }
