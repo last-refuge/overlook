@@ -707,6 +707,16 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.selections.iter().any(|sel| !sel.is_empty()) && !self.masked
     }
 
+    /// Whether there is an edit on the undo stack that can be undone.
+    pub fn can_undo(&self) -> bool {
+        self.is_editable() && self.undo_manager.can_undo()
+    }
+
+    /// Whether there is an undone edit on the redo stack that can be redone.
+    pub fn can_redo(&self) -> bool {
+        self.is_editable() && self.undo_manager.can_redo()
+    }
+
     pub fn context_menu_capabilities(&self) -> InputContextMenuCapabilities {
         let (go_to_definition, code_actions) = self.extras.context_menu_capabilities();
         InputContextMenuCapabilities::new()

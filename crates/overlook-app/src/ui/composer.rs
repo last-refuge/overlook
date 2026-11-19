@@ -63,7 +63,8 @@ pub struct Composer {
     pub pending_saves: usize,
     pub _subscriptions: Vec<Subscription>,
     reveal: Option<ComposerReveal>,
-    scroll: ScrollHandle,
+    pub(super) scroll: ScrollHandle,
+    pub(super) preview_scroll: ScrollHandle,
     focused_header: Option<usize>,
 }
 
@@ -231,6 +232,7 @@ impl MailWindow {
             _subscriptions: subs,
             reveal: None,
             scroll: ScrollHandle::new(),
+            preview_scroll: ScrollHandle::new(),
             focused_header: None,
         });
         self.reveal_current_composer(window, cx);
@@ -532,7 +534,15 @@ impl MailWindow {
                     self.reload_drafts();
                 }
             }
-            self.list_focus.focus(window, cx);
+            if self.email_modal {
+                if !self.thread.is_empty() || self.outbox_selected.is_some() {
+                    self.email_modal_focus.focus(window, cx);
+                } else {
+                    self.close_email_modal(window, cx);
+                }
+            } else {
+                self.list_focus.focus(window, cx);
+            }
             self.schedule_draft_sync(window, cx);
             cx.notify();
         }
@@ -554,7 +564,15 @@ impl MailWindow {
             if self.composer_owner.is_some() { window.remove_window(); }
             else {
                 crate::ui::toast(window, cx, crate::notify::Level::Info, "Draft discarded.");
-                self.list_focus.focus(window, cx);
+                if self.email_modal {
+                    if !self.thread.is_empty() || self.outbox_selected.is_some() {
+                        self.email_modal_focus.focus(window, cx);
+                    } else {
+                        self.close_email_modal(window, cx);
+                    }
+                } else {
+                    self.list_focus.focus(window, cx);
+                }
             }
             cx.notify();
         }
@@ -604,6 +622,9 @@ impl MailWindow {
         match self.store.queue_send(&draft) {
             Ok(_) => {
                 self.composer = None;
+                if self.email_modal {
+                    self.close_email_modal(window, cx);
+                }
                 self.finish_queued_send(&draft, window, cx);
             }
             Err(e) => {
@@ -920,7 +941,7 @@ impl MailWindow {
                     .border_b_1()
                     .border_color(p.divider)
                     .child(field_label("To"))
-                    .child(div().relative().flex_1().min_w_0().child(Input::new(&c.to).appearance(false)))
+                    .child(div().relative().flex_1().min_w_0().child(Input::new(&c.to).appearance(false).context_menu(super::context_menu::editable_text_menu(c.to.clone()))))
                     .when(!c.show_cc, |d| {
                         d.child(Button::new("show-cc").ghost().xsmall().label("Cc").on_click(cx.listener(|this, _, _w, cx| {
                             if let Some(c) = this.composer.as_mut() { c.show_cc = true; }
@@ -942,11 +963,11 @@ impl MailWindow {
                         })))),
             )
             .when(suggestion_field == Some(RecipientField::To), |d| d.children(suggestions.take()))
-            .when(c.show_cc, |d| d.child(field_row("Cc", Input::new(&c.cc).appearance(false).into_any_element()))
+            .when(c.show_cc, |d| d.child(field_row("Cc", Input::new(&c.cc).appearance(false).context_menu(super::context_menu::editable_text_menu(c.cc.clone())).into_any_element()))
                 .when(suggestion_field == Some(RecipientField::Cc), |d| d.children(suggestions.take())))
-            .when(c.show_bcc, |d| d.child(field_row("Bcc", Input::new(&c.bcc).appearance(false).into_any_element()))
+            .when(c.show_bcc, |d| d.child(field_row("Bcc", Input::new(&c.bcc).appearance(false).context_menu(super::context_menu::editable_text_menu(c.bcc.clone())).into_any_element()))
                 .when(suggestion_field == Some(RecipientField::Bcc), |d| d.children(suggestions.take())))
-            .when(!inline || c.show_headers, |d| d.child(field_row("Subject", Input::new(&c.subject).appearance(false).into_any_element())))
+            .when(!inline || c.show_headers, |d| d.child(field_row("Subject", Input::new(&c.subject).appearance(false).context_menu(super::context_menu::editable_text_menu(c.subject.clone())).into_any_element())))
             .child(self.render_format_toolbar(c, &p, cx))
             .child(if c.preview {
                 div()
@@ -954,6 +975,7 @@ impl MailWindow {
                     .when(inline, |d| d.flex_none().h(editor_height))
                     .when(!inline, |d| d.flex_none().h(editor_height))
                     .overflow_y_scroll()
+                    .track_scroll(&c.preview_scroll)
                     .px(px(16.))
                     .py(px(12.))
                     .text_size(px(15.))
@@ -973,7 +995,16 @@ impl MailWindow {
                     .when(!inline, |d| d.flex_none().h(editor_height))
                     .px(px(10.))
                     .py(px(6.))
-                    .child(Editor::new(&c.body).appearance(false).bordered(false).h_full().font_family("Inter").text_size(px(14.)).line_height(px(22.)))
+                    .child(
+                        Editor::new(&c.body)
+                            .appearance(false)
+                            .bordered(false)
+                            .h_full()
+                            .font_family("Inter")
+                            .text_size(px(14.))
+                            .line_height(px(22.))
+                            .context_menu(super::context_menu::editable_text_menu(c.body.clone())),
+                    )
                     .into_any_element()
             })
             .children(self.render_signature_block(c, &p, cx))

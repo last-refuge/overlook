@@ -364,6 +364,15 @@ impl UndoManager {
         Some(replay)
     }
 
+    pub(super) fn can_undo(&self) -> bool {
+        !self.undo_transactions.is_empty()
+            || self.pending.as_ref().is_some_and(|p| !p.changes.is_empty())
+    }
+
+    pub(super) fn can_redo(&self) -> bool {
+        !self.redo_transactions.is_empty()
+    }
+
     #[cfg(test)]
     pub(super) fn has_undos(&self) -> bool {
         !self.undo_transactions.is_empty()
@@ -597,5 +606,28 @@ mod tests {
             [typing_change(0, &"a".repeat(MAX_CHANGES_PER_TRANSACTION))]
         );
         assert!(manager.undo().is_none());
+    }
+
+    #[test]
+    fn can_undo_and_can_redo_track_history_state() {
+        let mut manager = UndoManager::new();
+        assert!(!manager.can_undo());
+        assert!(!manager.can_redo());
+
+        manager.record_transaction(typing_change(0, "a"), EditIntent::Typing);
+        assert!(manager.can_undo());
+        assert!(!manager.can_redo());
+
+        assert!(manager.undo().is_some());
+        assert!(!manager.can_undo());
+        assert!(manager.can_redo());
+
+        assert!(manager.redo().is_some());
+        assert!(manager.can_undo());
+        assert!(!manager.can_redo());
+
+        manager.clear();
+        assert!(!manager.can_undo());
+        assert!(!manager.can_redo());
     }
 }

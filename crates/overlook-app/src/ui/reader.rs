@@ -56,7 +56,7 @@ impl MailWindow {
         let mut active = std::collections::HashSet::new();
         let reserved = self.composer.as_ref().map_or(0, |c| usize::from(c.preview) + usize::from(c.quote_shown));
         let reading = self.outbox_selected.is_none() && (self.composer.is_none() || self.composer_is_inline());
-        if let Some(summary) = self.selected_summary().filter(|_| reading) {
+        if let Some(summary) = self.active_summary().filter(|_| reading) {
             active.insert(format!("message-{}", summary.latest_message_id));
             if let Some(source) = self.composer.as_ref().and_then(|c| c.draft.in_reply_to.as_ref()).filter(|id| self.expanded.contains(id)) {
                 active.insert(format!("message-{source}"));
@@ -114,7 +114,19 @@ impl MailWindow {
             return (self.message_text_fallback(original, &key, cx), 0);
         }
         let (html, count) = self.browser_document(source, original, cx.palette());
-        let native_scroll = (key.starts_with("message-") || key.starts_with("outbox-")).then(|| self.reader_scroll.clone());
+        let native_scroll = if key.starts_with("message-") || key.starts_with("outbox-") {
+            Some(self.reader_scroll.clone())
+        } else if key.starts_with("preview-") {
+            self.composer.as_ref().map(|c| c.preview_scroll.clone())
+        } else if key.starts_with("quote-") {
+            if self.composer_is_inline() {
+                Some(self.reader_scroll.clone())
+            } else {
+                self.composer.as_ref().map(|c| c.scroll.clone())
+            }
+        } else {
+            None
+        };
         let view = cx.new(|cx| {
             let mut body = if key.starts_with("message-") {
                 // Start at the reader's width, reuse a finished render when there is one,
@@ -177,23 +189,12 @@ impl MailWindow {
     /// A plain-text message, drawn natively: no browser process, nothing to wait for.
     fn native_text_body(&self, m: &Message) -> AnyElement {
         let text = m.body.text.as_deref().unwrap_or_default();
-        email_paper(
-            div()
-                .px(px(8.))
-                .py(px(8.))
-                .text_size(px(14.))
-                .line_height(px(21.))
-                .child(
-                    gpui_kit::base::text::TextView::html(SharedString::from(format!("text-{}", m.id)), plain_text_html(text))
-                        .style(gpui_kit::base::text::TextViewStyle::default().with_foreground(rgb(crate::theme::EMAIL_INK).into()))
-                        .selectable(true)
-                        .on_link_click(|url, _, _, cx| {
-                            if crate::browser_body::allowed_url(url) {
-                                cx.open_url(url);
-                            }
-                        }),
-                ),
-        ).into_any_element()
+        email_paper(NativeTextBody {
+            id: SharedString::from(format!("text-{}", m.id)),
+            html: plain_text_html(text).into(),
+            has_content: !text.trim().is_empty(),
+        })
+        .into_any_element()
     }
 
     pub(super) fn render_reader(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -245,7 +246,7 @@ impl MailWindow {
                 .into_any_element();
         }
 
-        let Some(summary) = self.selected_summary() else {
+        let Some(summary) = self.active_summary() else {
             return container
                 .child(
                     v_flex()
@@ -301,7 +302,8 @@ impl MailWindow {
                             .child(summary.subject.clone()),
                     )
                     // The conversation as printed: its newest message, with the history it quotes.
-                    .children(newest.map(|m| {
+                    // Inside the email modal, Print lives in the modal's top action bar instead.
+                    .children((!self.email_modal).then_some(newest).flatten().map(|m| {
                         Button::new("print-conversation")
                             .ghost()
                             .small()
@@ -564,7 +566,7 @@ impl MailWindow {
         };
         let sender_email = if m.is_outgoing { self.account.email.clone() } else { m.from.email.clone() };
         let mid = m.id.clone();
-        let is_latest = self.selected_summary().is_some_and(|s| s.latest_message_id == m.id);
+        let is_latest = self.active_summary().is_some_and(|s| s.latest_message_id == m.id);
         let collapse_id = m.id.clone();
         let menu_message = m.clone();
         let t = cx.entity().downgrade();
@@ -1250,6 +1252,95 @@ fn plain_text_html(text: &str) -> String {
 /// White gutters belong to the native surface, outside sender-authored HTML. This
 /// keeps full-width tables, authored body backgrounds, fallbacks and loading frames
 /// inside the same readable paper without rewriting the message's own layout.
+#[derive(IntoElement)]
+struct NativeTextBody {
+    id: SharedString,
+    html: SharedString,
+    has_content: bool,
+}
+
+impl RenderOnce for NativeTextBody {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let initial_html = self.html.clone();
+        let state = window.use_keyed_state(
+            SharedString::from(format!("{}/state", self.id)),
+            cx,
+            move |_, cx| gpui_kit::base::text::TextViewState::html(initial_html.as_str(), cx),
+        );
+        state.update(cx, |s, cx| s.set_text(self.html.as_str(), cx));
+        let context_link = window.use_keyed_state(
+            SharedString::from(format!("{}/context-link", self.id)),
+            cx,
+            |_, _| None::<String>,
+        );
+        let has_content = self.has_content;
+        let menu_state = state.clone();
+        let menu_link = context_link.clone();
+        let open_link = context_link.clone();
+        let copy_link = context_link;
+        div()
+            .id(SharedString::from(format!("{}/wrap", self.id)))
+            .px(px(8.))
+            .py(px(8.))
+            .text_size(px(14.))
+            .line_height(px(21.))
+            .on_action(move |_: &super::context_menu::OpenContextLink, _, cx| {
+                if let Some(url) = open_link
+                    .read(cx)
+                    .as_deref()
+                    .filter(|u| crate::browser_body::allowed_url(u))
+                {
+                    cx.open_url(url);
+                }
+            })
+            .on_action(move |_: &super::context_menu::CopyContextLink, _, cx| {
+                if let Some(url) = copy_link.read(cx).as_deref() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(url.to_owned()));
+                }
+            })
+            .on_mouse_down(MouseButton::Right, move |event: &MouseDownEvent, window, cx| {
+                let (focus, link) = {
+                    let view = menu_state.read(cx);
+                    let link = view
+                        .link_at(event.position)
+                        .map(|u| u.to_string())
+                        .filter(|u| crate::browser_body::allowed_url(u));
+                    (view.focus_handle().clone(), link)
+                };
+                let has_link = link.is_some();
+                menu_link.update(cx, |slot, _| *slot = link);
+                let position = event.position;
+                let has_selection = !gpui_kit::base::TextSelection::selected_text(window, cx)
+                    .trim()
+                    .is_empty();
+                let menu = super::context_menu::ReadOnlyEmailMenuState {
+                    has_selection,
+                    has_content,
+                    has_link,
+                };
+                window.defer(cx, move |window, cx| {
+                    focus.focus(window, cx);
+                    menu.build().show(position, window, cx);
+                });
+                window.prevent_default();
+                cx.stop_propagation();
+            })
+            .child(
+                gpui_kit::base::text::TextView::new(&state)
+                    .style(
+                        gpui_kit::base::text::TextViewStyle::default()
+                            .with_foreground(rgb(crate::theme::EMAIL_INK).into()),
+                    )
+                    .selectable(true)
+                    .on_link_click(|url, _, _, cx| {
+                        if crate::browser_body::allowed_url(url) {
+                            cx.open_url(url);
+                        }
+                    }),
+            )
+    }
+}
+
 fn email_paper(body: impl IntoElement) -> Div {
     // The document brings its own top margin; a short inset above it keeps the first line
     // close to the header in light colorways, where the paper and the card are one white.

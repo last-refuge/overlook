@@ -831,6 +831,7 @@ impl Element for TextView {
         cx: &mut App,
     ) {
         let state = &request_layout.state;
+        state.read(cx).painted_links.borrow_mut().clear();
         if self.selectable {
             state.read(cx).selection_adapter.begin_frame();
         }

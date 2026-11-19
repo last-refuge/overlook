@@ -211,7 +211,7 @@ impl MailWindow {
         v_flex()
             .gap(px(8.))
             .child(toolbar)
-            .child(div().rounded(px(8.)).border_1().border_color(p.divider).h(px(170.)).child(Textarea::new(&state.signature).h_full().font_family("monospace").text_size(px(12.))))
+            .child(div().rounded(px(8.)).border_1().border_color(p.divider).h(px(170.)).child(Textarea::new(&state.signature).h_full().font_family("monospace").text_size(px(12.)).context_menu(super::context_menu::editable_text_menu(state.signature.clone()))))
             .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child("Preview"))
             .child(div().rounded(px(8.)).border_1().border_color(p.divider).px(px(14.)).py(px(10.)).min_h(px(64.)).text_size(px(14.)).line_height(px(22.)).child(preview))
             .when(has_remote_images(&signature.html), |d| d.child(div().text_size(px(11.)).text_color(p.muted).child("Pictures from the web are not loaded in the preview. They are sent as links, and many mail programs hold them back until the reader allows them.")))
