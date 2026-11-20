@@ -301,8 +301,7 @@ pub struct QuickLook {
 #[derive(Clone)]
 enum LocalWrite {
     Change(LocalChange),
-    FocusOverride { ids: Vec<MessageId>, focused: Option<bool> },
-    FocusRule { email: String, focused: Option<bool> },
+    MoveFocus { ids: Vec<MessageId>, focused: bool, sender: Option<String> },
 }
 
 /// The server-side part of a search.
@@ -2743,27 +2742,41 @@ impl MailWindow {
     /// Moves the selected conversation to Focused or Other. With `always`, future mail from
     /// the sender follows too.
     pub(crate) fn move_focus(&mut self, focused: bool, always: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let ids: Vec<MessageId> = self.thread.iter().map(|m| m.id.clone()).collect();
+        if let Some(conversation) = self.selected.clone() {
+            self.move_conversation_focus(&conversation, focused, always, window, cx);
+        }
+    }
+
+    fn move_conversation_focus(
+        &mut self,
+        conversation: &ConversationId,
+        focused: bool,
+        always: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ids = self.mail_index.message_ids_in(conversation);
         if ids.is_empty() {
             return;
         }
-        let sender = self.thread.iter().filter(|m| !m.is_outgoing).max_by_key(|m| m.date).map(|m| m.from.clone());
+        let sender = if always { self.mail_index.focus_sender(conversation, &self.view).cloned() } else { None };
+        let next = self.neighbour_after_removal_of(std::slice::from_ref(conversation));
         self.mail_index.set_focus_override(&ids, Some(focused));
-        self.queue_local_write(self.account.id.clone(), LocalWrite::FocusOverride { ids, focused: Some(focused) });
-        if always {
-            if let Some(sender) = &sender {
-                self.mail_index.set_focus_rule(&sender.email, Some(focused));
-                self.queue_local_write(self.account.id.clone(), LocalWrite::FocusRule { email: sender.email.clone(), focused: Some(focused) });
-            }
+        if let Some(sender) = &sender {
+            self.mail_index.set_focus_rule(&sender.email, Some(focused));
         }
+        self.queue_local_write(self.account.id.clone(), LocalWrite::MoveFocus {
+            ids,
+            focused,
+            sender: sender.as_ref().map(|sender| sender.email.clone()),
+        });
         self.mail_index_generation += 1;
         self.write_local_changes(window, cx);
         let target = if focused { "Focused" } else { "Other" };
-        let text = match (&sender, always) {
-            (Some(s), true) => format!("Moved to {target}. Messages from {} will go to {target}.", s.display_name()),
-            _ => format!("Moved to {target}."),
+        let text = match sender {
+            Some(s) => format!("Moved to {target}. Messages from {} will go to {target}.", s.display_name()),
+            None => format!("Moved to {target}."),
         };
-        let next = self.removal_neighbour();
         self.refresh_mail();
         self.select_after_removal(next, window, cx);
         crate::ui::toast(window, cx, crate::notify::Level::Info, text);
@@ -5318,8 +5331,9 @@ fn apply_local_writes(store: &Store, writes: Vec<(AccountId, LocalWrite)>) -> Ve
         .filter_map(|(acct, w)| {
             match w {
                 LocalWrite::Change(c) => store.apply_change(&acct, c).map(|_| ()),
-                LocalWrite::FocusOverride { ids, focused } => store.set_focus_override(&acct, &ids, focused),
-                LocalWrite::FocusRule { email, focused } => store.set_focus_rule(&acct, &email, focused),
+                LocalWrite::MoveFocus { ids, focused, sender } => {
+                    store.set_focus_override_and_rule(&acct, &ids, Some(focused), sender.as_deref())
+                }
             }
             .err()
             .map(|e| e.to_string())

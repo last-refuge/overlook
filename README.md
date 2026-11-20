@@ -60,8 +60,10 @@ and you can read, search, write, and file mail with no connection at all.
   close at hand, with crisp two-tone icons that follow your color scheme.
   Drag toolbar buttons into your preferred order or between the strip and More; each module remembers
   your layout. More → Customize toolbar also offers keyboard controls and a reset option.
-- **Focused Inbox.** The Inbox splits into Focused and Other from Gmail's own hints, who you write to, and
-  your choices: *Move to Other*, or *Always move messages from this sender*. Local, private, and reversible.
+- **Focused Inbox.** The Inbox splits into Focused and Other based on provider hints, who you write to,
+  and your choices. Right-click a conversation in Other and choose **Move to Focused Inbox** to move it
+  and send future Inbox mail from that sender to Focused. The toolbar also offers one-time moves and a
+  standing sender rule.
 - **Reading that respects you.** Received HTML uses isolated Chromium layout inside the native shell;
   scripts never run and remote images/fonts are blocked until you ask. Authored cards, panels and tables
   keep their browser layout, with smooth native scrolling and no blank flash during reflow.

@@ -841,6 +841,12 @@ impl MailWindow {
         })
     }
 
+    fn can_move_to_focused_inbox(&self, id: &ConversationId) -> bool {
+        self.inbox_focus() == Some(FocusTab::Other)
+            && self.search_query.trim().is_empty()
+            && self.position_of(id).is_some()
+    }
+
     /// The right-click menu of a conversation row. The row joins the selection first, so
     /// every item acts on the same rows the toolbar would.
     fn row_menu(
@@ -861,9 +867,10 @@ impl MailWindow {
                 Vec::new()
             };
             offline_folders.sort_by_cached_key(|(_, name)| name.to_lowercase());
-            (this.selection_state(), this.view == MailboxView::Kind(LabelKind::Sent), this.offline_active(), this.offers_offline(), offline_folders)
+            let focus_account = this.can_move_to_focused_inbox(id).then(|| this.account.id.clone());
+            (this.selection_state(), this.view == MailboxView::Kind(LabelKind::Sent), this.offline_active(), this.offers_offline(), offline_folders, focus_account)
         });
-        let Ok((state, in_sent, offline, offers_offline, offline_folders)) = state else { return menu };
+        let Ok((state, in_sent, offline, offers_offline, offline_folders, focus_account)) = state else { return menu };
         let multi = state.count > 1;
         let act = |me: &WeakEntity<Self>, f: fn(&mut Self, &mut Window, &mut Context<Self>)| {
             let me = me.clone();
@@ -915,6 +922,17 @@ impl MailWindow {
             this.on_toggle_star(&super::ToggleStar, window, cx);
         })));
         menu = menu.separator();
+        if let Some(account) = focus_account.filter(|_| !multi) {
+            let conversation = id.clone();
+            let me = me.clone();
+            menu = menu.item(PopupMenuItem::new("Move to Focused Inbox").icon(icon("inbox")).on_click(move |_, window, cx| {
+                me.update(cx, |this, cx| {
+                    if this.account.id == account && this.can_move_to_focused_inbox(&conversation) {
+                        this.move_conversation_focus(&conversation, true, true, window, cx);
+                    }
+                }).ok();
+            }));
+        }
         menu = menu.item(PopupMenuItem::new("Move to…").icon(icon("folder-input")).action(Box::new(super::MoveSelected)).on_click(act(&me, |this, window, cx| {
             this.open_move_palette(window, cx);
         })));

@@ -63,6 +63,17 @@ impl MailIndex {
         msgs.into_iter().map(|m| m.id.clone()).collect()
     }
 
+    /// The incoming sender that determines which Focused Inbox tab shows the conversation.
+    pub fn focus_sender(&self, conversation: &ConversationId, view: &MailboxView) -> Option<&Address> {
+        let trash = self.label_of_kind(LabelKind::Trash);
+        let trash_view = matches!(view, MailboxView::Kind(LabelKind::Trash));
+        let messages = self.by_conv.get(conversation)?;
+        let decisive = focus_message(messages.iter().filter(|m| {
+            trash.as_ref().is_some_and(|t| m.has_label(t)) == trash_view
+        }))?;
+        (!decisive.is_outgoing).then_some(&decisive.from)
+    }
+
     /// The messages that toggling the star of `conversations` in `view` changes. A
     /// conversation shows as starred while any of its messages is, so unstarring clears
     /// every starred message in it; starring marks only the newest one the view shows (not
@@ -159,11 +170,7 @@ impl MailIndex {
             if let Some(tab) = focus {
                 // A conversation follows its newest incoming message; threads with only our
                 // own mail count as Focused.
-                let decisive = msgs
-                    .iter()
-                    .filter(|m| in_trash(m) == trash_view && !m.is_outgoing)
-                    .max_by_key(|m| m.date)
-                    .or_else(|| msgs.iter().filter(|m| in_trash(m) == trash_view).max_by_key(|m| m.date));
+                let decisive = focus_message(msgs.iter().filter(|m| in_trash(m) == trash_view));
                 let focused = decisive.map(|m| classify_focus(m, &self.rules, &self.correspondents)).unwrap_or(true);
                 if focused != (tab == FocusTab::Focused) {
                     return None;
@@ -299,6 +306,10 @@ impl MailIndex {
         }
         self.pending.extend(ids);
     }
+}
+
+fn focus_message<'a>(visible: impl Iterator<Item = &'a Message>) -> Option<&'a Message> {
+    visible.max_by_key(|m| (!m.is_outgoing, m.date))
 }
 
 /// Applies a local change to one message in memory, mirroring the store's write.
