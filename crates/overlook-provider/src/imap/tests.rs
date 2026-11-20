@@ -491,7 +491,7 @@ fn server_failures_map_to_provider_errors() {
     // Calendar and contact operations have nowhere to go.
     let calendar = op(&acct, OperationKind::CreateEvent { event_id: EventId::from("e") });
     assert_eq!(block(p.apply(&acct, &calendar, &[], &[])), Err(ProviderError::Rejected("this account has no calendar".into())));
-    let contact = op(&acct, OperationKind::CreateContact { contact_id: "c".into() });
+    let contact = op(&acct, OperationKind::CreateContact { contact_id: "c".into(), target_book: None });
     assert_eq!(block(p.apply(&acct, &contact, &[], &[])), Err(ProviderError::Rejected("this account cannot store contacts".into())));
 }
 

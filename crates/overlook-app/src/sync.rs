@@ -1032,10 +1032,11 @@ async fn replay_operations(
             kind if kind.is_contact() => {
                 let contact = kind.contact_id().and_then(|id| store.contact_by_id(&acct, id).ok().flatten());
                 let result: Result<(), ProviderError> = match kind {
-                    OperationKind::CreateContact { contact_id } => match &contact {
+                    OperationKind::CreateContact { contact_id, target_book: None } => match &contact {
                         Some(c) => provider.create_contact(&account, c).await.and_then(|created| store.mark_contact_synced(&acct, contact_id, &created).map_err(|e| ProviderError::Temporary(e.to_string()))),
                         None => Ok(()),
                     },
+                    OperationKind::CreateContact { .. } => Err(ProviderError::Rejected("The selected CardDAV address book is no longer connected.".into())),
                     OperationKind::UpdateContact { contact_id } => match &contact {
                         Some(c) => provider.update_contact(&account, c).await.and_then(|updated| store.mark_contact_synced(&acct, contact_id, &updated).map_err(|e| ProviderError::Temporary(e.to_string()))),
                         None => Ok(()),

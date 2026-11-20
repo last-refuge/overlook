@@ -41,7 +41,7 @@ fn move_queued_edits_tx(tx: &Connection, account: &AccountId, local_id: &str, se
             e
         })?;
         let moved = match kind {
-            OperationKind::CreateContact { contact_id } | OperationKind::UpdateContact { contact_id } if contact_id == local_id => OperationKind::UpdateContact { contact_id: server_id.to_owned() },
+            OperationKind::CreateContact { contact_id, .. } | OperationKind::UpdateContact { contact_id } if contact_id == local_id => OperationKind::UpdateContact { contact_id: server_id.to_owned() },
             OperationKind::DeleteContact { contact_id, .. } if contact_id == local_id => {
                 deleted = true;
                 OperationKind::DeleteContact { contact_id: server_id.to_owned(), resource_name: Some(server_id.to_owned()) }
@@ -118,6 +118,19 @@ pub(crate) fn contact_card_conn(conn: &Connection, account: &AccountId, contact_
     ).optional()?.map(to_card).transpose()
 }
 
+pub(crate) fn contact_create_target(conn: &Connection, account: &AccountId, contact_id: &str) -> Result<Option<String>> {
+    Ok(conn.query_row(
+        "SELECT json_extract(kind_json,'$.target_book') FROM pending_operations
+         WHERE account_id=?1 AND state NOT IN ('applied','failed')
+           AND json_extract(kind_json,'$.op')='create-contact'
+           AND json_extract(kind_json,'$.contact_id')=?2
+           AND json_extract(kind_json,'$.target_book') IS NOT NULL
+         ORDER BY seq LIMIT 1",
+        params![account.0, contact_id],
+        |row| row.get(0),
+    ).optional()?)
+}
+
 impl Store {
     /// Reads contacts and their cached book memberships in one snapshot. Card versions
     /// also track uploads and deletions, so only memberships of visible contacts count.
@@ -129,8 +142,13 @@ impl Store {
                  JOIN people p ON p.account_id=c.account_id AND p.id=c.contact_id
                  WHERE c.account_id=?1 AND c.address_book<>''",
             )?;
-            let card_books = stmt.query_map([&account.0], |r| Ok((r.get(0)?, r.get(1)?)))?
+            let mut card_books = stmt.query_map([&account.0], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<std::result::Result<HashMap<_, _>, _>>()?;
+            for contact in contacts.iter().filter(|contact| contact.pending && contact.id.starts_with("local:")) {
+                if let Some(book) = contact_create_target(tx, account, &contact.id)? {
+                    card_books.insert(contact.id.clone(), book);
+                }
+            }
             let connection = contacts_connection_conn(tx, account)?
                 .map(|connection| (connection.credential, connection.default_book));
             Ok(ContactCacheSnapshot { contacts, card_books, connection })

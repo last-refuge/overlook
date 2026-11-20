@@ -1838,7 +1838,7 @@ impl Store {
     /// Saves a contact changed on this device and queues the push.
     pub fn save_contact_locally(&self, account: &AccountId, contact: &Contact) -> Result<PendingOperation> {
         let mut c = contact.clone();
-        self.with_tx(|tx| save_contact_edit_tx(tx, account, &mut c, true))
+        self.with_tx(|tx| save_contact_edit_tx(tx, account, &mut c, true, None))
             .map(|op| op.expect("queued contact save"))
     }
 
@@ -2235,7 +2235,7 @@ fn upsert_message_diff_tx(tx: &Connection, m: &Message, prev: Option<&Message>, 
     Ok(())
 }
 
-fn save_contact_edit_tx(tx: &Connection, account: &AccountId, contact: &mut Contact, queue: bool) -> Result<Option<PendingOperation>> {
+fn save_contact_edit_tx(tx: &Connection, account: &AccountId, contact: &mut Contact, queue: bool, target_book: Option<&str>) -> Result<Option<PendingOperation>> {
     ensure_same_account(&contact.account_id, account, "contact")?;
     let ts = now();
     let prev_updated: Option<Timestamp> = tx
@@ -2252,7 +2252,9 @@ fn save_contact_edit_tx(tx: &Connection, account: &AccountId, contact: &mut Cont
     }
     let contact_id = contact.id.clone();
     let kind = if contact_id.starts_with("local:") {
-        OperationKind::CreateContact { contact_id }
+        let target_book = contact_cards::contact_create_target(tx, account, &contact_id)?
+            .or_else(|| target_book.map(str::to_owned));
+        OperationKind::CreateContact { contact_id, target_book }
     } else {
         OperationKind::UpdateContact { contact_id }
     };

@@ -194,6 +194,10 @@ impl<'a> BookKey<'a> {
         matches!(self.source, Source::CardDav | Source::MicrosoftGraph)
     }
 
+    pub(in crate::mcp) fn carddav_book(self) -> Option<&'a str> {
+        (self.source == Source::CardDav).then_some(self.raw)
+    }
+
     pub(in crate::mcp) fn raw_key(self) -> String {
         format!("{}:{}", self.source.key(), self.raw)
     }

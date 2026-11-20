@@ -124,11 +124,11 @@ pub(super) fn execute(
                     ErrorCode::AccessDenied,
                     "Contact is unavailable for this account. Search the book again if the contact has synced.",
                 ))?;
-            let card = tx.contact_card(&contact.id).map_err(storage)?;
+            let stored_book = tx.contact_book(&contact.id).map_err(storage)?;
             let book = BookKey::for_contact(
                 ctx.account.provider,
                 &contact,
-                card.as_ref().map_or("", |card| card.address_book.as_str()),
+                stored_book.as_deref().unwrap_or_default(),
                 connection.as_ref(),
             );
             if !book.supports_write(default) {
@@ -241,7 +241,7 @@ fn save(
     book: BookKey<'_>,
 ) -> Result<Value, Failure> {
     let operation = tx
-        .save_mcp_contact(contact, book.remote())
+        .save_mcp_contact(contact, book.remote(), book.carddav_book())
         .map_err(storage)?;
     Ok(result(ctx, contact, book, operation.as_ref(), "saved"))
 }
