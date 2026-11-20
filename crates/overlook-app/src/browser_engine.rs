@@ -323,6 +323,8 @@ impl BrowserHandle {
                     actor.cdp.call("Page.stopScreencast", json!({}))?;
                     actor.refresh_layout(&emit)?;
                     let mut layout_dirty = false;
+                    let mut hover_dirty = false;
+                    let mut next_hover_repaint = Instant::now();
                     let mut next_measure = Instant::now();
                     while !stop.load(Ordering::Acquire) {
                         actor.cdp.poll()?;
@@ -341,17 +343,28 @@ impl BrowserHandle {
                             None => break,
                         };
                         for command in commands {
-                            layout_dirty |= actor.input(command, &emit)?;
+                            let hover = matches!(&command, Input::Mouse(kind, _, _, _, 0, _) if kind == "mouseMoved");
+                            let changed = actor.input(command, &emit)?;
+                            if hover {
+                                hover_dirty |= changed;
+                            } else {
+                                layout_dirty |= changed;
+                            }
                         }
-                        if layout_dirty {
+                        let now = Instant::now();
+                        let repaint = layout_dirty || (hover_dirty && now >= next_hover_repaint);
+                        if !repaint && now >= next_measure {
+                            // Measure only: no periodic screenshots on native scroll.
+                            layout_dirty = actor.measure_height()? != actor.document_height;
+                            next_measure = now + Duration::from_millis(250);
+                        }
+                        if repaint || layout_dirty {
                             actor.refresh_layout(&emit)?;
                             layout_dirty = false;
-                        } else if Instant::now() >= next_measure {
-                            // Measure only: no periodic screenshots on native scroll.
-                            if actor.measure_height()? != actor.document_height {
-                                actor.refresh_layout(&emit)?;
-                            }
-                            next_measure = Instant::now() + Duration::from_millis(250);
+                            hover_dirty = false;
+                            // Keep the latest hover state when sweeping across a message,
+                            // and let clicks, keyboard input and resizing repaint immediately.
+                            next_hover_repaint = Instant::now() + Duration::from_millis(100);
                         }
                         actor.capture_next_tile(&emit)?;
                         thread::sleep(Duration::from_millis(2));
@@ -1025,12 +1038,19 @@ impl Actor {
             document.head.append(style);
             globalThis.overlookApplyDarkPaper = undefined;
             globalThis.overlookPaperHoverTarget = null;
+            globalThis.overlookPaperHasHover = false;
             if (paper !== null) {{
                 const originals = new Map();
+                const hasHoverRule = rules => Array.from(rules ?? []).some(rule =>
+                    /:hover\b/i.test(rule.selectorText ?? '') || (rule.cssRules && hasHoverRule(rule.cssRules)));
                 globalThis.overlookApplyDarkPaper = () => {{
                     // Restore the sender's cascade before measuring current styles, so
                     // responsive, hover, focus, and disclosure rules can change the fill.
                     // Read all computed colors before writing any overrides.
+                    globalThis.overlookPaperHasHover = Array.from(document.styleSheets).some(sheet => {{
+                        try {{ return hasHoverRule(sheet.cssRules); }}
+                        catch {{ return true; }}
+                    }});
                     for (const [node, inline] of originals) {{
                         if (inline === null) node.removeAttribute('style');
                         else node.setAttribute('style', inline);
@@ -1155,7 +1175,7 @@ impl Actor {
                 if(root||/auto|scroll/.test(c.overflowX)){{s[2] ||= e.scrollLeft>1;s[3] ||= e.scrollLeft+e.clientWidth<e.scrollWidth-1;}}
             }};
             let e=document.elementFromPoint(x,y);
-            if (globalThis.overlookApplyDarkPaper) {{
+            if (globalThis.overlookPaperHasHover) {{
                 s.push(e !== globalThis.overlookPaperHoverTarget);
                 globalThis.overlookPaperHoverTarget = e;
             }}
@@ -2685,7 +2705,9 @@ mod tests {
             r##"
                 <style>
                     .button, summary { background: white; width: 160px; height: 40px; }
-                    .button:hover { background: #e86714 !important; }
+                    @media (prefers-color-scheme: dark) {
+                        .button:hover { background: #e86714 !important; }
+                    }
                     details[open] summary { background: #284563 !important; }
                 </style>
                 <a class="button" style="display:block" href="https://example.org/">Synthetic link</a>
@@ -2721,6 +2743,23 @@ mod tests {
         assert!(actor.input(enter, &|_| {}).unwrap());
         actor.refresh_layout(&|_| {}).unwrap();
         assert_eq!(color(&mut actor, "summary"), paper);
+    }
+
+    #[test]
+    #[ignore = "runs real sandboxed Chromium"]
+    fn chromium_email_paper_skips_hover_repaints_without_sender_hover_styles() {
+        let appearance = crate::theme::Palette::dark().email_body_appearance(true);
+        let document = appearance.prepare_document(
+            "<style>td { width: 80px; height: 40px; background: white; }</style><table><tr><td>One</td><td>Two</td></tr></table>",
+            &overlook_core::FontPrefs::default(),
+        );
+        let mut actor = Actor::start(Arc::new(AtomicBool::new(false)), false).unwrap();
+        actor.load(&document.html, appearance.dark_paper()).unwrap();
+        actor.refresh_layout(&|_| {}).unwrap();
+        for (x, y) in [(15., 10.), (100., 10.), (-1., -1.)] {
+            let moved = Input::Mouse("mouseMoved".into(), x, y, "none".into(), 0, 0);
+            assert!(!actor.input(moved, &|_| {}).unwrap(), "ordinary pointer movement keeps the existing tiles");
+        }
     }
 
     #[test]
