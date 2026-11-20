@@ -272,11 +272,10 @@ fn enqueue(store: &Store, account: &AccountId, ids: Vec<ProviderId>, only_missin
 fn enqueue_bodies(store: &Store, account: &AccountId, ids: Vec<ProviderId>) {
     let mut backlog = backlog(store, account);
     let mut seen: std::collections::HashSet<ProviderId> = backlog.iter().cloned().collect();
-    for pid in ids {
-        if seen.contains(&pid) {
-            continue;
-        }
-        if body_cached(store, account, &pid) != Some(true) && seen.insert(pid.clone()) {
+    let candidates: Vec<ProviderId> = ids.into_iter().filter(|pid| seen.insert(pid.clone())).collect();
+    let cached = store.cached_body_provider_ids(account, &candidates).unwrap_or_default();
+    for pid in candidates {
+        if !cached.contains(&pid) {
             backlog.push(pid);
         }
     }
@@ -404,7 +403,9 @@ fn split_redownloads(store: &Store, account: &AccountId) {
     if store.setting::<bool>(&marker).ok().flatten() == Some(true) {
         return;
     }
-    let (again, missing): (Vec<ProviderId>, Vec<ProviderId>) = backlog(store, account).into_iter().partition(|p| body_cached(store, account, p) == Some(true));
+    let current = backlog(store, account);
+    let cached = store.cached_body_provider_ids(account, &current).unwrap_or_default();
+    let (again, missing): (Vec<ProviderId>, Vec<ProviderId>) = current.into_iter().partition(|p| cached.contains(p));
     if !again.is_empty() {
         info!("{} queued re-downloads for {} moved to their own queue", again.len(), account.0);
         let mut queued = queue(store, &redownload_key(account));
@@ -430,24 +431,14 @@ fn enqueue_front(store: &Store, key: &str, ids: &[ProviderId]) {
     save_queue(store, key, &merged);
 }
 
-fn body_cached(store: &Store, account: &AccountId, pid: &ProviderId) -> Option<bool> {
-    let id = store.message_id_for_provider_id(account, pid).ok().flatten()?;
-    Some(store.message(&id).ok().flatten().is_some_and(|m| m.body.is_cached()))
-}
-
 /// Queues messages to download, ahead of older work. With a provider whose headers cost
 /// less (Gmail), more than [`DIRECT_DOWNLOAD`] are listed by their headers first, so the
 /// message list fills in quickly, and their bodies follow. `limit` keeps the first that many.
 fn queue_downloads(store: &Store, provider: &dyn MailProvider, account: &AccountId, ids: Vec<ProviderId>, limit: Option<usize>) {
     let mut seen = std::collections::HashSet::new();
-    let mut wanted: Vec<(ProviderId, bool)> = ids
-        .into_iter()
-        .filter(|p| seen.insert(p.clone()))
-        .filter_map(|p| match body_cached(store, account, &p) {
-            Some(true) => None,
-            stored => Some((p, stored.is_some())),
-        })
-        .collect();
+    let unique: Vec<ProviderId> = ids.into_iter().filter(|p| seen.insert(p.clone())).collect();
+    let cached = store.cached_body_provider_ids(account, &unique).unwrap_or_default();
+    let mut wanted: Vec<ProviderId> = unique.into_iter().filter(|p| !cached.contains(p)).collect();
     if let Some(limit) = limit {
         if wanted.len() > limit {
             info!("{} new messages for {}; downloading the newest {limit}", wanted.len(), account.0);
@@ -455,11 +446,14 @@ fn queue_downloads(store: &Store, provider: &dyn MailProvider, account: &Account
         }
     }
     if provider.has_cheap_headers() && wanted.len() > DIRECT_DOWNLOAD {
-        let unlisted: Vec<ProviderId> = wanted.iter().filter(|(_, stored)| !stored).map(|(p, _)| p.clone()).collect();
+        let unlisted: Vec<ProviderId> = wanted
+            .iter()
+            .filter(|p| store.message_id_for_provider_id(account, p).ok().flatten().is_none())
+            .cloned()
+            .collect();
         enqueue_front(store, &headers_key(account), &unlisted);
     }
-    let ids: Vec<ProviderId> = wanted.into_iter().map(|(p, _)| p).collect();
-    enqueue_front(store, &backlog_key(account), &ids);
+    enqueue_front(store, &backlog_key(account), &wanted);
 }
 
 /// Applies label changes the provider reported without content to the stored copies.
@@ -520,7 +514,7 @@ async fn drain_header_queue(store: &Store, provider: &dyn MailProvider, account:
         let mut take = 0;
         let mut batch = Vec::new();
         while batch.len() < HEADER_BATCH && take < ids.len() {
-            if !skip_stored || body_cached(store, acct, &ids[take]).is_none() {
+            if !skip_stored || store.message_id_for_provider_id(acct, &ids[take]).ok().flatten().is_none() {
                 batch.push(ids[take].clone());
             }
             take += 1;
@@ -580,11 +574,20 @@ async fn drain_body_queue(store: &Store, provider: &dyn MailProvider, account: &
         }
         let mut take = 0;
         let mut batch = Vec::new();
-        while batch.len() < DOWNLOAD_BATCH && take < ids.len() {
-            if !skip_cached || body_cached(store, acct, &ids[take]) != Some(true) {
-                batch.push(ids[take].clone());
+        if !skip_cached {
+            take = ids.len().min(DOWNLOAD_BATCH);
+            batch.extend_from_slice(&ids[..take]);
+        } else {
+            while batch.len() < DOWNLOAD_BATCH && take < ids.len() {
+                let end = (take + DOWNLOAD_BATCH * 4).min(ids.len());
+                let cached = store.cached_body_provider_ids(acct, &ids[take..end]).unwrap_or_default();
+                while batch.len() < DOWNLOAD_BATCH && take < end {
+                    if !cached.contains(&ids[take]) {
+                        batch.push(ids[take].clone());
+                    }
+                    take += 1;
+                }
             }
-            take += 1;
         }
         if batch.is_empty() {
             ids.drain(..take);

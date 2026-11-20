@@ -96,6 +96,7 @@ impl MailIndex {
         let trash = self.label_of_kind(LabelKind::Trash);
         let trash_view = matches!(view, MailboxView::Kind(LabelKind::Trash));
         let mut out = Vec::new();
+        let mut visible: Vec<&Message> = Vec::new();
         for msgs in self.matching_conversations(view, focus) {
             let is_visible = |m: &&Message| trash.as_ref().is_some_and(|t| m.has_label(t)) == trash_view;
             let keep = match filter {
@@ -106,8 +107,9 @@ impl MailIndex {
             if !keep {
                 continue;
             }
-            let visible: Vec<Message> = msgs.iter().filter(is_visible).cloned().collect();
-            if let Some(summary) = ConversationSummary::from_messages(&visible, owner_email, &self.pending) {
+            visible.clear();
+            visible.extend(msgs.iter().filter(is_visible));
+            if let Some(summary) = ConversationSummary::from_message_refs(&visible, owner_email, &self.pending) {
                 out.push(summary);
             }
         }
