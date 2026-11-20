@@ -29,6 +29,9 @@ const DEPTH_STEP: f32 = 16.;
 /// Where a row's icon starts, past the column for the disclosure arrow. Section titles start
 /// here too, so arrows, icons and titles each keep one left edge.
 const ICON_INSET: f32 = 18.;
+const ROW_ICON_SIZE: f32 = 16.;
+const ROW_ICON_GAP: f32 = 9.;
+const ACCOUNT_MARK_SIZE: f32 = 18.;
 
 const LABEL_SIZE: f32 = 13.;
 const LABEL_LINE_HEIGHT: f32 = 18.;
@@ -583,7 +586,7 @@ impl MailWindow {
                 })
                 .h_flex()
                 .items_center()
-                .gap(px(9.))
+                .gap(px(ROW_ICON_GAP))
                 .min_h(px(if in_favorites { m.row_height - 4. } else { m.row_height }))
                 .when(subtitle.is_some(), |d| d.py(px(m.header_padding)))
                 .pl(px(ICON_INSET + DEPTH_STEP * nav.depth as f32))
@@ -618,7 +621,7 @@ impl MailWindow {
                 .when(current, |d| d.bg(p.selection))
                 .when(!current, |d| d.hover(|d| d.bg(p.hover)))
                 // One shape for every folder; a label's color only tints it.
-                .child(icon(nav.icon).flex_none().size(px(16.)).text_color(color.unwrap_or(if current { p.accent } else { p.muted })))
+                .child(icon(nav.icon).flex_none().size(px(ROW_ICON_SIZE)).text_color(color.unwrap_or(if current { p.accent } else { p.muted })))
                 .child(
                     v_flex()
                         .flex_1()
@@ -814,10 +817,17 @@ impl MailWindow {
                 .text_color(p.muted)
                 .hover(|d| d.bg(p.hover))
                 .child(icon(if collapsed { "chevron-right" } else { "chevron-down" }).flex_none().size(px(12.)).text_color(p.muted))
-                // An account's service mark sits in the rows' icon column, its name in their
-                // label column.
+                // The service mark is wider than a folder icon. Reduce its gap so the
+                // account name still starts in the folder label column.
                 .child(match mark {
-                    Some(mark) => h_flex().flex_1().min_w_0().items_center().gap(px(9.)).child(mark).child(label).into_any_element(),
+                    Some(mark) => h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .items_center()
+                        .gap(px(ROW_ICON_SIZE + ROW_ICON_GAP - ACCOUNT_MARK_SIZE))
+                        .child(mark)
+                        .child(label)
+                        .into_any_element(),
                     None => label.into_any_element(),
                 })
                 .on_click(cx.listener(move |this, _, _window, cx| this.toggle_section(&key, cx)))
@@ -884,7 +894,7 @@ impl MailWindow {
             let drag = super::AccountDrag { account: a.id.clone(), name: name.clone() };
             // The first header sits right under the Favorites line, whose own margin is the gap.
             let top = if i == 0 { 0. } else { m.header_top };
-            let mark = self.account_mark(a).render(16., &p);
+            let mark = self.account_mark(a).render_sidebar(ACCOUNT_MARK_SIZE, &p);
             let header = section_header(key, name.clone(), collapsed, top, Some(mark), cx)
                 .when(a.id == self.account.id || !all_accounts, |d| d.text_color(p.foreground))
                 .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(name.clone()).build(window, cx))
@@ -937,7 +947,11 @@ impl MailWindow {
             let offline = self.offline.id.clone();
             let key = "offline".to_owned();
             let collapsed = self.collapsed_sections.contains(&key);
-            let mark = div().size(px(16.)).flex().items_center().justify_center().child(icon("hard-drive").size(px(15.)).text_color(p.muted)).into_any_element();
+            let mark = div()
+                .w(px(ACCOUNT_MARK_SIZE))
+                .flex_none()
+                .child(icon("hard-drive").size(px(ROW_ICON_SIZE)).text_color(p.muted))
+                .into_any_element();
             let header = section_header(key, "Offline Folders".into(), collapsed, m.header_top, Some(mark), cx)
                 .when(self.offline_active(), |d| d.text_color(p.foreground))
                 .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Mail kept only on this computer. Drag messages onto a folder to remove them from the server and keep them here.").build(window, cx));
@@ -951,7 +965,7 @@ impl MailWindow {
                             .id(id)
                             .h_flex()
                             .items_center()
-                            .gap(px(9.))
+                            .gap(px(ROW_ICON_GAP))
                             .min_h(px(m.row_height))
                             .pl(px(ICON_INSET))
                             .pr(px(10.))
@@ -961,7 +975,7 @@ impl MailWindow {
                             .line_height(ui_px(LABEL_LINE_HEIGHT))
                             .text_color(p.muted)
                             .hover(|d| d.bg(p.hover).text_color(p.foreground))
-                            .child(icon(glyph).flex_none().size(px(16.)).text_color(p.muted))
+                            .child(icon(glyph).flex_none().size(px(ROW_ICON_SIZE)).text_color(p.muted))
                             .child(div().flex_1().min_w_0().truncate().child(text))
                     };
                     column = column
