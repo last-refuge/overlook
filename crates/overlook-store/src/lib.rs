@@ -759,30 +759,42 @@ impl Store {
 
     /// Sets (or with `None` clears) the standing rule for a sender.
     pub fn set_focus_rule(&self, account: &AccountId, email: &str, focused: Option<bool>) -> Result<()> {
-        let email = email.to_ascii_lowercase();
-        self.with_conn(|c| {
-            match focused {
-                Some(f) => {
-                    c.execute(
-                        "INSERT INTO focus_rules(account_id, email, focused) VALUES(?1,?2,?3) ON CONFLICT(account_id, email) DO UPDATE SET focused=excluded.focused",
-                        params![account.0, email, f],
-                    )?;
-                }
-                None => {
-                    c.execute("DELETE FROM focus_rules WHERE account_id=?1 AND email=?2", params![account.0, email])?;
-                }
-            }
-            Ok(())
-        })
+        self.set_focus_override_and_rule(account, &[], focused, Some(email))
     }
 
     /// Per-message override for Focused Inbox (`None` clears it).
     pub fn set_focus_override(&self, account: &AccountId, ids: &[MessageId], focused: Option<bool>) -> Result<()> {
+        self.set_focus_override_and_rule(account, ids, focused, None)
+    }
+
+    /// Saves a Focused Inbox move and its optional sender rule in one transaction.
+    pub fn set_focus_override_and_rule(
+        &self,
+        account: &AccountId,
+        ids: &[MessageId],
+        focused: Option<bool>,
+        sender: Option<&str>,
+    ) -> Result<()> {
         self.with_tx(|tx| {
             ensure_owned(tx, Owned::Message, account, ids.iter().map(|i| i.0.as_str()))?;
-            let mut stmt = tx.prepare_cached("UPDATE messages SET focus_override=?2 WHERE id=?1")?;
-            for id in ids {
-                stmt.execute(params![id.0, focused])?;
+            if !ids.is_empty() {
+                let mut stmt = tx.prepare_cached("UPDATE messages SET focus_override=?2 WHERE id=?1")?;
+                for id in ids {
+                    stmt.execute(params![id.0, focused])?;
+                }
+            }
+            if let Some(email) = sender.map(str::to_ascii_lowercase) {
+                match focused {
+                    Some(f) => {
+                        tx.execute(
+                            "INSERT INTO focus_rules(account_id, email, focused) VALUES(?1,?2,?3) ON CONFLICT(account_id, email) DO UPDATE SET focused=excluded.focused",
+                            params![account.0, email, f],
+                        )?;
+                    }
+                    None => {
+                        tx.execute("DELETE FROM focus_rules WHERE account_id=?1 AND email=?2", params![account.0, email])?;
+                    }
+                }
             }
             Ok(())
         })
@@ -2875,6 +2887,8 @@ mod tests {
             not_owned(store.apply_change(&other, change).map(|_| ()));
         }
         not_owned(store.set_focus_override(&other, &[m1.clone()], Some(true)));
+        not_owned(store.set_focus_override_and_rule(&other, &[m1.clone()], Some(true), Some("maya@northstar.example")));
+        assert!(store.focus_rules(&other).unwrap().is_empty());
         let m1_now = store.message(&m1).unwrap().unwrap();
         assert!(!m1_now.is_read && !m1_now.is_starred && m1_now.focus_override.is_none());
         assert!(m1_now.label_ids.contains(&LabelId::from("label-inbox")));
@@ -3533,6 +3547,58 @@ mod tests {
         let other = store.conversations(&acct, "jason@example.com", &MailboxView::Kind(LabelKind::Inbox), ListFilter::All, Some(FocusTab::Other)).unwrap();
         assert_eq!(other.len(), 2);
         assert_eq!(store.view_count(&acct, "jason@example.com", &MailboxView::Kind(LabelKind::Inbox), Some(FocusTab::Focused)).unwrap(), 1);
+    }
+
+    #[test]
+    fn focused_inbox_move_learns_the_visible_incoming_sender() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overlook.sqlite");
+        let store = Store::open(&path).unwrap();
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+        let inbox = MailboxView::Kind(LabelKind::Inbox);
+        let promotion = |id, sender| {
+            let mut msg = message(id, "Sale", "A new offer", &["label-inbox"]);
+            msg.from = Address::named("Shop", sender);
+            msg.category = Some("promotions".into());
+            msg
+        };
+        let picked = promotion("sale", "DEALS@shop.example");
+        let mut reply = message("reply", "Re: Sale", "Thanks", &["label-sent"]);
+        reply.conversation_id = picked.conversation_id.clone();
+        reply.is_outgoing = true;
+        reply.date = picked.date + 1;
+        let mut trashed = message("trashed", "Old notice", "Discarded", &["label-trash"]);
+        trashed.conversation_id = picked.conversation_id.clone();
+        trashed.date = picked.date + 2;
+        store.upsert_messages(&[picked.clone(), reply, trashed]).unwrap();
+        let shows = |index: &MailIndex, tab, id: &ConversationId| {
+            index.conversations("jason@example.com", &inbox, ListFilter::All, Some(tab))
+                .iter()
+                .any(|c| &c.id == id)
+        };
+
+        let mut index = store.mail_index(&acct).unwrap();
+        assert!(shows(&index, FocusTab::Other, &picked.conversation_id));
+        let sender = index.focus_sender(&picked.conversation_id, &inbox).unwrap().email.clone();
+        assert_eq!(sender, picked.from.email);
+        let ids = index.message_ids_in(&picked.conversation_id);
+        index.set_focus_override(&ids, Some(true));
+        index.set_focus_rule(&sender, Some(true));
+        assert!(shows(&index, FocusTab::Focused, &picked.conversation_id));
+        assert!(!shows(&index, FocusTab::Other, &picked.conversation_id));
+
+        store.set_focus_override_and_rule(&acct, &ids, Some(true), Some(&sender)).unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let later = promotion("later", "deals@shop.example");
+        let another = promotion("another", "offers@shop.example");
+        store.upsert_messages(&[later.clone(), another.clone()]).unwrap();
+        let index = store.mail_index(&acct).unwrap();
+        assert!(shows(&index, FocusTab::Focused, &picked.conversation_id));
+        assert!(shows(&index, FocusTab::Focused, &later.conversation_id));
+        assert!(shows(&index, FocusTab::Other, &another.conversation_id));
+        assert_eq!(store.focus_rules(&acct).unwrap(), vec![FocusRule { email: sender.to_ascii_lowercase(), focused: true }]);
     }
 
     #[test]
