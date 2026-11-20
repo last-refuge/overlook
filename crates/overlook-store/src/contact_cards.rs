@@ -97,6 +97,27 @@ pub struct ContactCacheSnapshot {
     pub connection: Option<(ContactsCredential, Option<String>)>,
 }
 
+pub(crate) fn contacts_connection_conn(conn: &Connection, account: &AccountId) -> Result<Option<ContactsConnection>> {
+    Ok(conn.query_row("SELECT server_url, username, default_book, credential, created_at FROM contact_connections WHERE account_id=?1", [&account.0], |r| {
+        Ok(ContactsConnection {
+            account_id: account.clone(),
+            server_url: r.get(0)?,
+            username: r.get(1)?,
+            default_book: r.get(2)?,
+            credential: ContactsCredential::from_key(&r.get::<_, String>(3)?),
+            connected_at: r.get(4)?,
+        })
+    }).optional()?)
+}
+
+pub(crate) fn contact_card_conn(conn: &Connection, account: &AccountId, contact_id: &str) -> Result<Option<ContactCard>> {
+    conn.query_row(
+        "SELECT contact_id, address_book, url, etag, base_json FROM contact_cards WHERE account_id=?1 AND contact_id=?2",
+        params![account.0, contact_id],
+        read_card,
+    ).optional()?.map(to_card).transpose()
+}
+
 impl Store {
     /// Reads contacts and their cached book memberships in one snapshot. Card versions
     /// also track uploads and deletions, so only memberships of visible contacts count.
@@ -110,29 +131,14 @@ impl Store {
             )?;
             let card_books = stmt.query_map([&account.0], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<std::result::Result<HashMap<_, _>, _>>()?;
-            let connection = tx.query_row(
-                "SELECT credential, default_book FROM contact_connections WHERE account_id=?1",
-                [&account.0],
-                |r| Ok((ContactsCredential::from_key(&r.get::<_, String>(0)?), r.get(1)?)),
-            ).optional()?;
+            let connection = contacts_connection_conn(tx, account)?
+                .map(|connection| (connection.credential, connection.default_book));
             Ok(ContactCacheSnapshot { contacts, card_books, connection })
         })
     }
 
     pub fn contacts_connection(&self, account: &AccountId) -> Result<Option<ContactsConnection>> {
-        self.with_read(|c| {
-            Ok(c.query_row("SELECT server_url, username, default_book, credential, created_at FROM contact_connections WHERE account_id=?1", [&account.0], |r| {
-                Ok(ContactsConnection {
-                    account_id: account.clone(),
-                    server_url: r.get(0)?,
-                    username: r.get(1)?,
-                    default_book: r.get(2)?,
-                    credential: ContactsCredential::from_key(&r.get::<_, String>(3)?),
-                    connected_at: r.get(4)?,
-                })
-            })
-            .optional()?)
-        })
+        self.with_read(|c| contacts_connection_conn(c, account))
     }
 
     /// Saves a connection the person agreed to. Saving it again keeps the cards already read
@@ -196,16 +202,37 @@ impl Store {
     /// made on this device and never sent stay.
     pub fn remove_contacts_connection(&self, account: &AccountId) -> Result<()> {
         self.with_tx(|tx| {
-            let mut stmt = tx.prepare("SELECT id, kind_json FROM pending_operations WHERE account_id=?1 AND state != 'applied'")?;
-            let ops = stmt.query_map([&account.0], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?.collect::<std::result::Result<Vec<_>, _>>()?;
-            drop(stmt);
-            for (id, json) in ops {
-                let kind: OperationKind = serde_json::from_str(&json).map_err(|e| {
+            let mut stmt = tx.prepare(
+                "SELECT p.id, p.kind_json, m.id IS NOT NULL FROM pending_operations p
+                 LEFT JOIN mcp_operation_status m ON m.id=p.id
+                 WHERE p.account_id=?1 AND p.state != 'applied'",
+            )?;
+            let rows = stmt.query_map([&account.0], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, bool>(2)?))
+            })?;
+            let mut ops = Vec::new();
+            for row in rows {
+                let (id, json, mcp) = row?;
+                let kind = serde_json::from_str::<OperationKind>(&json).map_err(|e| {
                     tracing::warn!(account = %account.0, op_id = %id, error = %e, "unparseable pending_operations.kind_json in remove_contacts_connection");
                     e
                 })?;
-                if kind.contact_id().is_some_and(from_server) {
-                    tx.execute("DELETE FROM pending_operations WHERE id=?1", [&id])?;
+                ops.push((id, kind, mcp));
+            }
+            drop(stmt);
+            // An upload queued through MCP is authorized for this connection. Preserve the
+            // draft contact on the device when the connection is removed, including edits
+            // made through the UI while the upload was still queued.
+            let local_mcp: HashSet<&str> = ops.iter()
+                .filter(|(_, _, mcp)| *mcp)
+                .filter_map(|(_, kind, _)| kind.contact_id().filter(|id| id.starts_with("local:")))
+                .collect();
+            for contact_id in &local_mcp {
+                tx.execute("UPDATE people SET pending=0 WHERE account_id=?1 AND id=?2", params![account.0, contact_id])?;
+            }
+            for (id, kind, _) in &ops {
+                if kind.contact_id().is_some_and(|id| from_server(id) || local_mcp.contains(id)) {
+                    tx.execute("DELETE FROM pending_operations WHERE id=?1", [id])?;
                 }
             }
             tx.execute(&format!("DELETE FROM people WHERE account_id=?1 AND {FROM_SERVER}"), [&account.0])?;
@@ -224,12 +251,7 @@ impl Store {
     }
 
     pub fn contact_card(&self, account: &AccountId, contact_id: &str) -> Result<Option<ContactCard>> {
-        self.with_read(|c| {
-            c.query_row("SELECT contact_id, address_book, url, etag, base_json FROM contact_cards WHERE account_id=?1 AND contact_id=?2", params![account.0, contact_id], read_card)
-                .optional()?
-                .map(to_card)
-                .transpose()
-        })
+        self.with_read(|c| contact_card_conn(c, account, contact_id))
     }
 
     /// The server of `connection` accepted an edit made here: the card's new version, and the
@@ -268,6 +290,20 @@ impl Store {
                             return upsert_card_tx(tx, account, card);
                         }
                     }
+                }
+            } else {
+                // An upload of an existing contact can finish after a local delete.
+                // Keep the latest server version for the queued deletion without reviving the row.
+                let deleting: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pending_operations
+                     WHERE account_id=?1 AND state NOT IN ('applied','failed')
+                       AND json_extract(kind_json,'$.op')='delete-contact'
+                       AND json_extract(kind_json,'$.contact_id')=?2)",
+                    params![account.0, contact.id],
+                    |r| r.get(0),
+                )?;
+                if deleting {
+                    return upsert_card_tx(tx, account, card);
                 }
             }
             // A contact edited again while this edit was on its way keeps the newer edit.

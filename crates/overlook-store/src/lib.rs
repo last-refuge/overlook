@@ -1837,33 +1837,15 @@ impl Store {
 
     /// Saves a contact changed on this device and queues the push.
     pub fn save_contact_locally(&self, account: &AccountId, contact: &Contact) -> Result<PendingOperation> {
-        ensure_same_account(&contact.account_id, account, "contact")?;
-        let ts = now();
         let mut c = contact.clone();
-        c.pending = true;
-        let kind = if c.id.starts_with("local:") { OperationKind::CreateContact { contact_id: c.id.clone() } } else { OperationKind::UpdateContact { contact_id: c.id.clone() } };
-        self.with_tx(|tx| {
-            let prev_updated: Option<Timestamp> = tx
-                .query_row("SELECT updated FROM people WHERE account_id=?1 AND id=?2", params![account.0, c.id], |r| r.get(0))
-                .optional()?;
-            // Strictly monotonic per-contact timestamp so same-ms edits or backward clock
-            // skew can never collide with an in-flight sync's `sent` marker.
-            c.updated = prev_updated.map_or(ts, |prev| ts.max(prev + 1));
-            upsert_contact_tx(tx, &c)?;
-            tx.prepare_cached("UPDATE people SET edit_revision = edit_revision + 1 WHERE account_id=?1 AND id=?2")?
-                .execute(params![account.0, c.id])?;
-            insert_operation_tx(tx, account, kind, ts)
-        })
+        self.with_tx(|tx| save_contact_edit_tx(tx, account, &mut c, true))
+            .map(|op| op.expect("queued contact save"))
     }
 
     /// Removes a contact locally and queues its deletion.
     pub fn delete_contact_locally(&self, account: &AccountId, contact: &Contact) -> Result<PendingOperation> {
-        let ts = now();
-        self.with_tx(|tx| {
-            tx.execute("DELETE FROM people WHERE account_id=?1 AND id=?2", params![account.0, contact.id])?;
-            let resource_name = (!contact.id.starts_with("local:")).then(|| contact.id.clone());
-            insert_operation_tx(tx, account, OperationKind::DeleteContact { contact_id: contact.id.clone(), resource_name }, ts)
-        })
+        self.with_tx(|tx| delete_contact_edit_tx(tx, account, contact, true))
+            .map(|op| op.expect("queued contact deletion"))
     }
 
     /// The provider accepted a local change: the row takes the provider's copy (and id).
@@ -2251,6 +2233,42 @@ fn upsert_message_diff_tx(tx: &Connection, m: &Message, prev: Option<&Message>, 
         }
     }
     Ok(())
+}
+
+fn save_contact_edit_tx(tx: &Connection, account: &AccountId, contact: &mut Contact, queue: bool) -> Result<Option<PendingOperation>> {
+    ensure_same_account(&contact.account_id, account, "contact")?;
+    let ts = now();
+    let prev_updated: Option<Timestamp> = tx
+        .query_row("SELECT updated FROM people WHERE account_id=?1 AND id=?2", params![account.0, contact.id], |r| r.get(0))
+        .optional()?;
+    // An edit must advance even if the clock hasn't moved past an in-flight sync's sent marker.
+    contact.updated = prev_updated.map_or(ts, |prev| ts.max(prev + 1));
+    contact.pending = queue;
+    upsert_contact_tx(tx, contact)?;
+    tx.prepare_cached("UPDATE people SET edit_revision = edit_revision + 1 WHERE account_id=?1 AND id=?2")?
+        .execute(params![account.0, contact.id])?;
+    if !queue {
+        return Ok(None);
+    }
+    let contact_id = contact.id.clone();
+    let kind = if contact_id.starts_with("local:") {
+        OperationKind::CreateContact { contact_id }
+    } else {
+        OperationKind::UpdateContact { contact_id }
+    };
+    Ok(Some(insert_operation_tx(tx, account, kind, ts)?))
+}
+
+fn delete_contact_edit_tx(tx: &Connection, account: &AccountId, contact: &Contact, queue: bool) -> Result<Option<PendingOperation>> {
+    ensure_same_account(&contact.account_id, account, "contact")?;
+    tx.execute("DELETE FROM people WHERE account_id=?1 AND id=?2", params![account.0, contact.id])?;
+    if !queue {
+        return Ok(None);
+    }
+    let contact_id = contact.id.clone();
+    let resource_name = (!contact_id.starts_with("local:")).then(|| contact_id.clone());
+    let kind = OperationKind::DeleteContact { contact_id, resource_name };
+    Ok(Some(insert_operation_tx(tx, account, kind, now())?))
 }
 
 fn upsert_contact_tx(tx: &Connection, c: &Contact) -> Result<()> {

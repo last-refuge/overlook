@@ -2,6 +2,7 @@
 
 use super::{parse, storage, Failure, ReadContext, ReadTool};
 use crate::mcp::contract::ErrorCode;
+use crate::mcp::write::contact_revision;
 use overlook_core::{Account, Contact, ContactsCredential, ProviderKind};
 use overlook_provider::microsoft::contacts::GRAPH_CONTACTS_URL;
 use overlook_store::Store;
@@ -113,7 +114,7 @@ impl Source {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct BookKey<'a> {
+pub(in crate::mcp) struct BookKey<'a> {
     source: Source,
     raw: &'a str,
 }
@@ -123,30 +124,90 @@ impl<'a> BookKey<'a> {
         Self { source, raw }
     }
 
-    fn for_contact(provider: ProviderKind, contact: &Contact, card_book: &'a str) -> Self {
+    pub(in crate::mcp) fn default_for(
+        provider: ProviderKind,
+        connection: Option<&'a (ContactsCredential, Option<String>)>,
+    ) -> Option<Self> {
+        match (provider, connection) {
+            (ProviderKind::Sample, _) => Some(Self::new(Source::Sample, "")),
+            (ProviderKind::Gmail, _) => Some(Self::new(Source::Google, "")),
+            (ProviderKind::Local, _) => Some(Self::new(Source::Device, "")),
+            (_, Some((ContactsCredential::Microsoft, _))) => {
+                Some(Self::new(Source::MicrosoftGraph, GRAPH_CONTACTS_URL))
+            }
+            (_, Some((_, book))) => book
+                .as_deref()
+                .filter(|book| !book.is_empty())
+                .map(|book| Self::new(Source::CardDav, book)),
+            (_, None) => Some(Self::new(Source::Device, "")),
+        }
+    }
+
+    pub(in crate::mcp) fn for_contact(
+        provider: ProviderKind,
+        contact: &Contact,
+        card_book: &'a str,
+        connection: Option<&'a (ContactsCredential, Option<String>)>,
+    ) -> Self {
         if !contact.in_address_book {
             Self::new(Source::Inferred, "")
         } else if contact.id.starts_with("carddav:") {
             Self::new(Source::CardDav, card_book)
         } else if contact.id.starts_with("graph:") {
             Self::new(Source::MicrosoftGraph, card_book)
-        } else if contact.id.starts_with("local:") {
-            Self::new(Source::Device, "")
+        } else if provider == ProviderKind::Sample {
+            Self::new(Source::Sample, "")
+        } else if contact.id.starts_with("local:") && contact.pending {
+            match connection {
+                Some((ContactsCredential::Microsoft, _)) if provider != ProviderKind::Local => {
+                    Self::new(Source::MicrosoftGraph, GRAPH_CONTACTS_URL)
+                }
+                Some((_, book)) if provider != ProviderKind::Local => Self::new(
+                    Source::CardDav,
+                    if card_book.is_empty() {
+                        book.as_deref().unwrap_or_default()
+                    } else {
+                        card_book
+                    },
+                ),
+                _ => Self::new(Source::Device, ""),
+            }
         } else {
-            let source = match provider {
-                ProviderKind::Sample => Source::Sample,
-                ProviderKind::Gmail => Source::Google,
-                _ => Source::Device,
+            let source = if provider == ProviderKind::Gmail && !contact.id.starts_with("local:") {
+                Source::Google
+            } else {
+                Source::Device
             };
             Self::new(source, "")
         }
     }
 
+    pub(in crate::mcp) fn supports_write(self, default: Option<Self>) -> bool {
+        match self.source {
+            Source::Sample | Source::Device => true,
+            Source::CardDav | Source::MicrosoftGraph => Some(self) == default,
+            Source::Google | Source::Inferred => false,
+        }
+    }
+
+    pub(in crate::mcp) fn remote(self) -> bool {
+        matches!(self.source, Source::CardDav | Source::MicrosoftGraph)
+    }
+
+    pub(in crate::mcp) fn raw_key(self) -> String {
+        format!("{}:{}", self.source.key(), self.raw)
+    }
+
+    fn read_only(self, default: Option<Self>) -> Option<bool> {
+        if self.remote() && self.supports_write(default) {
+            Some(false)
+        } else {
+            self.source.read_only()
+        }
+    }
+
     fn id(self, ctx: &ReadContext<'_>) -> String {
-        ctx.id(
-            "address_book",
-            &format!("{}:{}", self.source.key(), self.raw),
-        )
+        ctx.id("address_book", &self.raw_key())
     }
 }
 
@@ -156,6 +217,7 @@ struct BookSummary {
     name: String,
     source: Source,
     read_only: Option<bool>,
+    is_default: bool,
     cached_contacts: usize,
 }
 
@@ -171,12 +233,17 @@ struct ContactSummary {
 }
 
 impl ContactSummary {
-    fn new(ctx: &ReadContext<'_>, contact: &Contact, book: BookKey<'_>) -> Self {
+    fn new(
+        ctx: &ReadContext<'_>,
+        contact: &Contact,
+        book: BookKey<'_>,
+        default: Option<BookKey<'_>>,
+    ) -> Self {
         Self {
             contact_id: ctx.id("contact", &contact.id),
             address_book_id: book.id(ctx),
             source: book.source,
-            read_only: book.source.read_only(),
+            read_only: book.read_only(default),
             display_name: bounded(&contact.display_name(), DISPLAY_LIMIT),
             email: display_field(Some(&contact.email)),
             organization: display_field(contact.organization.as_deref()),
@@ -195,10 +262,16 @@ struct ContactDetails {
     title: Option<String>,
     notes: Option<String>,
     pending: bool,
+    revision: String,
 }
 
 impl ContactDetails {
-    fn new(ctx: &ReadContext<'_>, contact: &Contact, book: BookKey<'_>) -> Self {
+    fn new(
+        ctx: &ReadContext<'_>,
+        contact: &Contact,
+        book: BookKey<'_>,
+        default: Option<BookKey<'_>>,
+    ) -> Self {
         let mut emails: Vec<String> = Vec::new();
         for email in std::iter::once(&contact.email).chain(&contact.emails) {
             let Some(email) = display_field(Some(email)) else {
@@ -215,7 +288,7 @@ impl ContactDetails {
             }
         }
         Self {
-            summary: ContactSummary::new(ctx, contact, book),
+            summary: ContactSummary::new(ctx, contact, book, default),
             given_name: display_field(contact.given_name.as_deref()),
             family_name: display_field(contact.family_name.as_deref()),
             emails,
@@ -226,6 +299,7 @@ impl ContactDetails {
                 .as_deref()
                 .map(|notes| bounded(notes, NOTES_LIMIT)),
             pending: contact.pending,
+            revision: contact_revision(ctx.key, ctx.account_id, contact),
         }
     }
 }
@@ -240,9 +314,10 @@ pub(super) fn execute(
         .contact_cache_snapshot(&ctx.account.id)
         .map_err(storage)?;
     let provider = ctx.account.provider;
+    let default_book = BookKey::default_for(provider, cache.connection.as_ref());
     let book_of = |contact: &Contact| {
         let book = cache.card_books.get(&contact.id).map_or("", String::as_str);
-        BookKey::for_contact(provider, contact, book)
+        BookKey::for_contact(provider, contact, book, cache.connection.as_ref())
     };
     let coverage = coverage(provider, cache.connection.as_ref().map(|(kind, _)| *kind));
 
@@ -259,29 +334,14 @@ pub(super) fn execute(
                 )
             })?;
         return Ok(json!({
-            "contact": ContactDetails::new(ctx, contact, book_of(contact)),
+            "contact": ContactDetails::new(ctx, contact, book_of(contact), default_book),
             "coverage": coverage
         }));
     }
 
     let mut books = BTreeMap::new();
-    match (&cache.connection, provider) {
-        (_, ProviderKind::Sample) => {
-            books.insert(BookKey::new(Source::Sample, ""), 0);
-        }
-        (_, ProviderKind::Gmail) => {
-            books.insert(BookKey::new(Source::Google, ""), 0);
-        }
-        (Some((ContactsCredential::Microsoft, _)), _) => {
-            books.insert(BookKey::new(Source::MicrosoftGraph, GRAPH_CONTACTS_URL), 0);
-        }
-        (Some((_, Some(default_book))), _) if !default_book.is_empty() => {
-            books.insert(BookKey::new(Source::CardDav, default_book), 0);
-        }
-        (None, _) => {
-            books.insert(BookKey::new(Source::Device, ""), 0);
-        }
-        _ => {}
+    if let Some(book) = default_book {
+        books.insert(book, 0);
     }
     for contact in &cache.contacts {
         *books.entry(book_of(contact)).or_insert(0) += 1;
@@ -307,7 +367,8 @@ pub(super) fn execute(
                         address_book_id: book.id(ctx),
                         name,
                         source: book.source,
-                        read_only: book.source.read_only(),
+                        read_only: book.read_only(default_book),
+                        is_default: Some(book) == default_book,
                         cached_contacts,
                     }
                 })
@@ -353,7 +414,9 @@ pub(super) fn execute(
             });
             let items = matches
                 .into_iter()
-                .map(|(_, contact)| ContactSummary::new(ctx, contact, book_of(contact)))
+                .map(|(_, contact)| {
+                    ContactSummary::new(ctx, contact, book_of(contact), default_book)
+                })
                 .collect();
             ctx.page(items, name, args)?
         }

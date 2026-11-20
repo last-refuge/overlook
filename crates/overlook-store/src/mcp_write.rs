@@ -1,5 +1,6 @@
 //! The MCP receipt and outbound operations commit with the local mutation.
 
+mod contacts;
 mod delivery;
 mod drafts;
 mod organization;

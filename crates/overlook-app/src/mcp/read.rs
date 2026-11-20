@@ -1,7 +1,7 @@
 //! Shared account, cursor and result handling for the MCP read tools.
 
 mod calendar;
-mod contacts;
+pub(super) mod contacts;
 pub(super) mod mail;
 mod mail_records;
 
@@ -449,7 +449,7 @@ pub fn eligible_account(store: &Store, account: &Account) -> Result<bool, Failur
     }
 }
 
-fn eligible_url(url: &str) -> bool {
+pub(super) fn eligible_url(url: &str) -> bool {
     url::Url::parse(url)
         .ok()
         .is_some_and(|url| url.host_str().is_some_and(eligible_host))

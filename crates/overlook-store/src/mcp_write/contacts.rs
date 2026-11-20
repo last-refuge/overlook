@@ -1,0 +1,35 @@
+use super::*;
+use crate::contact_cards::{contact_card_conn, contacts_connection_conn};
+
+impl McpWriteTxn<'_, '_> {
+    pub fn find_contact(&self, matches: impl FnMut(&str) -> bool) -> Result<Option<Contact>> {
+        let Some(id) = find_id(self.tx, "people", self.account, matches)? else {
+            return Ok(None);
+        };
+        Ok(contacts_where_conn(self.tx, self.account, "AND id=?2", &[&id])?.pop())
+    }
+
+    pub fn contacts_connection(&self) -> Result<Option<ContactsConnection>> {
+        contacts_connection_conn(self.tx, self.account)
+    }
+
+    pub fn contact_card(&self, contact_id: &str) -> Result<Option<ContactCard>> {
+        contact_card_conn(self.tx, self.account, contact_id)
+    }
+
+    pub fn save_mcp_contact(
+        &self,
+        contact: &mut Contact,
+        queue: bool,
+    ) -> Result<Option<OperationId>> {
+        Ok(save_contact_edit_tx(self.tx, self.account, contact, queue)?.map(|op| op.id))
+    }
+
+    pub fn delete_mcp_contact(
+        &self,
+        contact: &Contact,
+        queue: bool,
+    ) -> Result<Option<OperationId>> {
+        Ok(delete_contact_edit_tx(self.tx, self.account, contact, queue)?.map(|op| op.id))
+    }
+}
