@@ -2837,11 +2837,12 @@ impl MailWindow {
                         if this.remote_allowed.contains(&m.id) || this.prefs.remote_images == RemoteImages::Allow {
                             return None;
                         }
-                        let (html, _) = this.browser_document(&Self::message_source(&m), Some(&m), cx.palette());
-                        if crate::browser_body::is_rendered(&html, false, false, size) {
+                        let appearance = cx.palette().email_body_appearance(this.prefs.dark_message_body);
+                        let (html, _) = this.browser_document(&Self::message_source(&m), Some(&m), appearance);
+                        if crate::browser_body::is_rendered(&html, false, appearance.dark, size) {
                             return None;
                         }
-                        Some(crate::browser_body::prerender(html, false, false, size, cx))
+                        Some(crate::browser_body::prerender(html, false, appearance.dark, size, cx))
                     })
                     .ok()
                     .flatten();

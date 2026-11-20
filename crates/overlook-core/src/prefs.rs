@@ -264,6 +264,8 @@ pub struct Prefs {
     // Mail
     pub show_avatars: bool,
     pub show_previews: bool,
+    /// Use dark message bodies when the app's active theme is dark.
+    pub dark_message_body: bool,
     pub mark_as_read: MarkAsRead,
     pub mark_as_read_delay_secs: u32,
     pub reply_all_by_default: bool,
@@ -306,6 +308,7 @@ impl Default for Prefs {
             keep_running: false,
             show_avatars: true,
             show_previews: true,
+            dark_message_body: false,
             mark_as_read: MarkAsRead::WhenSelected,
             mark_as_read_delay_secs: 3,
             reply_all_by_default: false,
@@ -454,9 +457,15 @@ mod tests {
         assert_eq!(p.sync_interval_secs, 30);
         assert_eq!(p.new_mail_notifications, NewMailNotifications::FocusedOnly);
         assert_eq!(p.time_zone, None);
-        let custom = Prefs { time_zone: Some(crate::tz::ZoneDefinition::Named("America/Toronto".into())), ..p };
+        assert!(!p.dark_message_body);
+        let custom = Prefs {
+            time_zone: Some(crate::tz::ZoneDefinition::Named("America/Toronto".into())),
+            dark_message_body: true,
+            ..p
+        };
         let restored: Prefs = serde_json::from_str(&serde_json::to_string(&custom).unwrap()).unwrap();
         assert_eq!(restored.time_zone, custom.time_zone);
+        assert!(restored.dark_message_body);
     }
 
     #[test]

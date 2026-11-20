@@ -42,9 +42,23 @@ pub struct Palette {
 
 impl Global for Palette {}
 
-/// Email paper is independent of the app chrome, including its Dark color scheme.
+/// The default paper and ink of the light message body.
 pub const EMAIL_PAPER: u32 = 0xFFFFFF;
 pub const EMAIL_INK: u32 = 0x20242B;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct EmailBodyAppearance {
+    pub dark: bool,
+    pub paper: u32,
+    pub ink: u32,
+}
+
+impl EmailBodyAppearance {
+    pub fn prepare_document(self, source: &str, fonts: &overlook_core::FontPrefs) -> overlook_core::BrowserDocument {
+        let typography = overlook_core::browser::BrowserTypography::from_prefs(fonts);
+        overlook_core::browser::prepare_document_with_options(source, self.paper, self.ink, &typography)
+    }
+}
 
 fn c(hex: u32) -> Hsla {
     Rgba::from(gpui_kit::rgb(hex)).into()
@@ -241,20 +255,12 @@ impl Palette {
         if self.is_dark() { self.background } else { self.surface }
     }
 
-    /// Keep mail on light paper in every shell theme; sender-authored colors still win.
-    #[cfg(test)]
-    pub fn prepare_browser_document(&self, source: &str) -> overlook_core::BrowserDocument {
-        overlook_core::browser::prepare_document_with_colors(source, EMAIL_PAPER, EMAIL_INK)
-    }
-
-    /// Keep mail on light paper in every shell theme, applying the user's reading typography.
-    pub fn prepare_browser_document_with_fonts(
-        &self,
-        source: &str,
-        fonts: &overlook_core::FontPrefs,
-    ) -> overlook_core::BrowserDocument {
-        let typography = overlook_core::browser::BrowserTypography::from_prefs(fonts);
-        overlook_core::browser::prepare_document_with_options(source, EMAIL_PAPER, EMAIL_INK, &typography)
+    pub(crate) fn email_body_appearance(&self, follow_dark_theme: bool) -> EmailBodyAppearance {
+        if follow_dark_theme && self.is_dark() {
+            EmailBodyAppearance { dark: true, paper: color_rgb(self.message_surface()), ink: color_rgb(self.foreground) }
+        } else {
+            EmailBodyAppearance { dark: false, paper: EMAIL_PAPER, ink: EMAIL_INK }
+        }
     }
 
     pub fn is_dark(&self) -> bool {
@@ -822,13 +828,24 @@ magenta = "#ad8ee6"
     }
 
     #[test]
-    fn email_paper_is_independent_of_shell_appearance() {
+    fn email_body_follows_dark_themes_only_when_enabled() {
+        let fonts = overlook_core::FontPrefs::default();
         for source in ["<p>Fictional message</p>", "<body bgcolor='#203040' text='#fafafa'><p>Authored colors</p></body>"] {
             let expected = overlook_core::browser::prepare_document_with_colors(source, EMAIL_PAPER, EMAIL_INK);
             for pref in AppearancePreference::ALL {
                 for system in [SystemAppearance::Light, SystemAppearance::Dark] {
                     let palette = Palette::for_theme(pref.resolve(system));
-                    assert_eq!(palette.prepare_browser_document(source), expected, "{pref:?}, {system:?}");
+                    let light = palette.email_body_appearance(false);
+                    assert!(!light.dark);
+                    assert_eq!(light.prepare_document(source, &fonts), expected, "{pref:?}, {system:?}");
+                    let following = palette.email_body_appearance(true);
+                    assert_eq!(following.dark, palette.is_dark());
+                    if following.dark {
+                        assert_eq!(following.paper, color_rgb(palette.message_surface()));
+                        assert_eq!(following.ink, color_rgb(palette.foreground));
+                    } else {
+                        assert_eq!(following, light);
+                    }
                 }
             }
         }
