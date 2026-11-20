@@ -89,7 +89,36 @@ fn queued_contact_ids(tx: &Connection, account: &AccountId) -> Result<HashSet<St
     Ok(out)
 }
 
+/// The visible contact rows and the address-book metadata retained by the cache.
+pub struct ContactCacheSnapshot {
+    pub contacts: Vec<Contact>,
+    pub card_books: HashMap<String, String>,
+    /// The kind of connected contacts service and its known default book, if any.
+    pub connection: Option<(ContactsCredential, Option<String>)>,
+}
+
 impl Store {
+    /// Reads contacts and their cached book memberships in one snapshot. Card versions
+    /// also track uploads and deletions, so only memberships of visible contacts count.
+    pub fn contact_cache_snapshot(&self, account: &AccountId) -> Result<ContactCacheSnapshot> {
+        self.with_read_tx(|tx| {
+            let contacts = contacts_where_conn(tx, account, "", &[])?;
+            let mut stmt = tx.prepare(
+                "SELECT c.contact_id, c.address_book FROM contact_cards c
+                 JOIN people p ON p.account_id=c.account_id AND p.id=c.contact_id
+                 WHERE c.account_id=?1 AND c.address_book<>''",
+            )?;
+            let card_books = stmt.query_map([&account.0], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<std::result::Result<HashMap<_, _>, _>>()?;
+            let connection = tx.query_row(
+                "SELECT credential, default_book FROM contact_connections WHERE account_id=?1",
+                [&account.0],
+                |r| Ok((ContactsCredential::from_key(&r.get::<_, String>(0)?), r.get(1)?)),
+            ).optional()?;
+            Ok(ContactCacheSnapshot { contacts, card_books, connection })
+        })
+    }
+
     pub fn contacts_connection(&self, account: &AccountId) -> Result<Option<ContactsConnection>> {
         self.with_read(|c| {
             Ok(c.query_row("SELECT server_url, username, default_book, credential, created_at FROM contact_connections WHERE account_id=?1", [&account.0], |r| {
