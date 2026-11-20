@@ -61,6 +61,8 @@ impl CalendarServer {
                     }
                     Err(e) => panic!("calendar fixture accept failed: {e}"),
                 };
+                // Accepted sockets can inherit the listener's nonblocking mode.
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(3)))
                     .unwrap();

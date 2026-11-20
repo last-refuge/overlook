@@ -1,5 +1,8 @@
 //! The MCP receipt and outbound operations commit with the local mutation.
 
+pub use calendar::{McpCalDavResolution, McpCalendar};
+
+mod calendar;
 mod contacts;
 mod delivery;
 mod drafts;

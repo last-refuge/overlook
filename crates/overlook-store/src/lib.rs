@@ -28,7 +28,7 @@ pub use draft_sync::{DraftEditGuard, DraftSyncEntry, DraftUpload, same_draft_con
 
 pub use index::{apply_to_message, MailIndex};
 pub use mcp_mail_read::McpMailSelection;
-pub use mcp_write::{McpWriteKey, McpWriteOutcome, McpWriteTxn};
+pub use mcp_write::{McpCalDavResolution, McpCalendar, McpWriteKey, McpWriteOutcome, McpWriteTxn};
 
 use overlook_core::focus::{FocusRule, FocusTab};
 use overlook_core::sanitize::html_to_text;
@@ -934,15 +934,17 @@ impl Store {
 
     /// Writes a local event change and its pending operation atomically.
     pub fn apply_event_change(&self, account: &AccountId, event: &Event, kind: OperationKind) -> Result<PendingOperation> {
+        self.with_tx(|tx| Self::apply_event_change_tx(tx, account, event, kind))
+    }
+
+    fn apply_event_change_tx(tx: &Connection, account: &AccountId, event: &Event, kind: OperationKind) -> Result<PendingOperation> {
         let ts = now();
         ensure_same_account(&event.account_id, account, "event")?;
-        self.with_tx(|tx| {
-            ensure_owned(tx, Owned::Calendar, account, [event.calendar_id.0.as_str()])?;
-            ensure_owned(tx, Owned::Event, account, [event.id.0.as_str()])?;
-            caldav::reject_caldav_write(tx, &event.calendar_id)?;
-            upsert_event_tx(tx, event)?;
-            insert_operation_tx(tx, account, kind, ts)
-        })
+        ensure_owned(tx, Owned::Calendar, account, [event.calendar_id.0.as_str()])?;
+        ensure_owned(tx, Owned::Event, account, [event.id.0.as_str()])?;
+        caldav::reject_caldav_write(tx, &event.calendar_id)?;
+        upsert_event_tx(tx, event)?;
+        insert_operation_tx(tx, account, kind, ts)
     }
 
     /// Removes an event locally and queues its deletion.
@@ -953,7 +955,7 @@ impl Store {
     /// The local occurrences of `event`'s series that `scope` covers, `event` included.
     fn series_members_tx(tx: &Connection, account: &AccountId, event: &Event, scope: RecurrenceScope) -> Result<Vec<Event>> {
         let Some(master) = event.recurring_event_id.as_deref().filter(|_| scope != RecurrenceScope::This) else { return Ok(vec![event.clone()]) };
-        let mut members = load_events(tx, "WHERE e.account_id=?1 AND e.recurring_event_id=?2 ORDER BY e.start", params![account.0, master])?;
+        let mut members = load_events(tx, "WHERE e.account_id=?1 AND e.calendar_id=?2 AND e.recurring_event_id=?3 ORDER BY e.start", params![account.0, event.calendar_id.0, master])?;
         if scope == RecurrenceScope::Following {
             let split = event.split_point();
             members.retain(|m| m.id == event.id || m.split_point() >= split);
@@ -966,65 +968,69 @@ impl Store {
 
     /// Removes an event, or the part of its series `scope` names, and queues one deletion.
     pub fn delete_event_locally_scoped(&self, account: &AccountId, event: &Event, scope: RecurrenceScope) -> Result<PendingOperation> {
+        self.with_tx(|tx| Self::delete_event_locally_scoped_tx(tx, account, event, scope))
+    }
+
+    fn delete_event_locally_scoped_tx(tx: &Connection, account: &AccountId, event: &Event, scope: RecurrenceScope) -> Result<PendingOperation> {
         let ts = now();
-        self.with_tx(|tx| {
-            ensure_owned(tx, Owned::Calendar, account, [event.calendar_id.0.as_str()])?;
-            ensure_owned(tx, Owned::Event, account, [event.id.0.as_str()])?;
-            caldav::reject_caldav_write(tx, &event.calendar_id)?;
-            for member in Self::series_members_tx(tx, account, event, scope)? {
-                tx.execute("DELETE FROM events WHERE id=?1", [&member.id.0])?;
-            }
-            insert_operation_tx(
-                tx,
-                account,
-                OperationKind::DeleteEvent {
-                    event_id: event.id.clone(),
-                    calendar_id: event.calendar_id.clone(),
-                    provider_id: event.provider_id.clone(),
-                    scope,
-                    recurring_event_id: event.recurring_event_id.clone(),
-                    original_start: Some(event.split_point()),
-                },
-                ts,
-            )
-        })
+        ensure_owned(tx, Owned::Calendar, account, [event.calendar_id.0.as_str()])?;
+        ensure_owned(tx, Owned::Event, account, [event.id.0.as_str()])?;
+        caldav::reject_caldav_write(tx, &event.calendar_id)?;
+        for member in Self::series_members_tx(tx, account, event, scope)? {
+            tx.execute("DELETE FROM events WHERE id=?1", [&member.id.0])?;
+        }
+        insert_operation_tx(
+            tx,
+            account,
+            OperationKind::DeleteEvent {
+                event_id: event.id.clone(),
+                calendar_id: event.calendar_id.clone(),
+                provider_id: event.provider_id.clone(),
+                scope,
+                recurring_event_id: event.recurring_event_id.clone(),
+                original_start: Some(event.split_point()),
+            },
+            ts,
+        )
     }
 
     /// Saves an edited occurrence and, for a wider scope, applies the same edit to the other
     /// local occurrences the scope covers: texts and settings as given, times shifted by the
     /// same amount, with the duration of the edited one. One operation carries the scope.
     pub fn apply_series_change(&self, account: &AccountId, event: &Event, scope: RecurrenceScope) -> Result<PendingOperation> {
+        self.with_tx(|tx| Self::apply_series_change_tx(tx, account, event, scope))
+    }
+
+    fn apply_series_change_tx(tx: &Connection, account: &AccountId, event: &Event, scope: RecurrenceScope) -> Result<PendingOperation> {
         let ts = now();
         ensure_same_account(&event.account_id, account, "event")?;
         let duration = event.end - event.start;
-        self.with_tx(|tx| {
-            ensure_owned(tx, Owned::Calendar, account, [event.calendar_id.0.as_str()])?;
-            ensure_owned(tx, Owned::Event, account, [event.id.0.as_str()])?;
-            caldav::reject_caldav_write(tx, &event.calendar_id)?;
-            let before = load_events(tx, "WHERE e.id=?1", params![event.id.0])?.pop();
-            let delta = before.as_ref().map(|b| event.start - b.start).unwrap_or(0);
-            let members = before.as_ref().map(|b| Self::series_members_tx(tx, account, b, scope)).transpose()?.unwrap_or_default();
-            for member in members {
-                if member.id == event.id {
-                    continue;
-                }
-                let mut m = member;
-                m.summary = event.summary.clone();
-                m.description = event.description.clone();
-                m.location = event.location.clone();
-                m.color = event.color.clone();
-                m.reminders = event.reminders.clone();
-                m.attendees = event.attendees.clone();
-                m.wants_conference = event.wants_conference;
-                m.start += delta;
-                m.end = m.start + duration;
-                m.all_day = event.all_day;
-                m.updated = ts;
-                upsert_event_tx(tx, &m)?;
+        ensure_owned(tx, Owned::Calendar, account, [event.calendar_id.0.as_str()])?;
+        ensure_owned(tx, Owned::Event, account, [event.id.0.as_str()])?;
+        caldav::reject_caldav_write(tx, &event.calendar_id)?;
+        let before = load_events(tx, "WHERE e.id=?1", params![event.id.0])?.pop();
+        let delta = before.as_ref().map(|b| event.start - b.start).unwrap_or(0);
+        let members = before.as_ref().map(|b| Self::series_members_tx(tx, account, b, scope)).transpose()?.unwrap_or_default();
+        for member in members {
+            if member.id == event.id {
+                continue;
             }
-            upsert_event_tx(tx, event)?;
-            insert_operation_tx(tx, account, OperationKind::UpdateEvent { event_id: event.id.clone(), scope }, ts)
-        })
+            let mut m = member;
+            m.summary = event.summary.clone();
+            m.description = event.description.clone();
+            m.location = event.location.clone();
+            m.color = event.color.clone();
+            m.reminders = event.reminders.clone();
+            m.attendees = event.attendees.clone();
+            m.wants_conference = event.wants_conference;
+            m.start += delta;
+            m.end = m.start + duration;
+            m.all_day = event.all_day;
+            m.updated = ts;
+            upsert_event_tx(tx, &m)?;
+        }
+        upsert_event_tx(tx, event)?;
+        insert_operation_tx(tx, account, OperationKind::UpdateEvent { event_id: event.id.clone(), scope }, ts)
     }
 
     /// Provider ids of messages that carry a calendar attachment but no parsed invitation
