@@ -12,6 +12,8 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::mcp::write::WritePermission;
+
 const STATE: &str = ".mcp";
 const TOKEN_BYTES: usize = 32;
 const KEY_BYTES: usize = 32;
@@ -44,9 +46,11 @@ impl Drop for Endpoint {
 }
 
 #[derive(Deserialize, Serialize)]
-struct Grant {
+pub(super) struct Grant {
     token_digest: [u8; 32],
-    account_ids: BTreeSet<String>,
+    pub account_ids: BTreeSet<String>,
+    #[serde(default)]
+    pub permissions: BTreeSet<WritePermission>,
 }
 
 impl Profile {
@@ -119,11 +123,27 @@ impl Profile {
         }
     }
 
-    pub(super) fn grant(&self, client: &str, account_ids: &[String]) -> anyhow::Result<String> {
+    pub(super) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(super) fn sample_database(&self) -> anyhow::Result<PathBuf> {
+        let path = self.state.join("sample.sqlite");
+        private_file(&path, true)?;
+        Ok(path)
+    }
+
+    pub(super) fn grant(
+        &self,
+        client: &str,
+        account_ids: &[String],
+        permissions: BTreeSet<WritePermission>,
+    ) -> anyhow::Result<String> {
         let token = URL_SAFE_NO_PAD.encode(random_bytes::<TOKEN_BYTES>()?);
         let grant = Grant {
             token_digest: self.token_digest(client, &token),
             account_ids: account_ids.iter().cloned().collect(),
+            permissions,
         };
         self.write_private(&self.grant_path(client), &serde_json::to_vec(&grant)?)?;
         Ok(token)
@@ -137,7 +157,7 @@ impl Profile {
         }
     }
 
-    pub(super) fn authorize(&self, client: &str, token: &str) -> Option<BTreeSet<String>> {
+    pub(super) fn authorize(&self, client: &str, token: &str) -> Option<Grant> {
         if !valid_client(client) || !valid_token(token) {
             return None;
         }
@@ -155,7 +175,7 @@ impl Profile {
             .iter()
             .zip(grant.token_digest)
             .fold(0, |diff, (left, right)| diff | (left ^ right));
-        (std::hint::black_box(difference) == 0).then_some(grant.account_ids)
+        (std::hint::black_box(difference) == 0).then_some(grant)
     }
 
     fn token_digest(&self, client: &str, token: &str) -> [u8; 32] {

@@ -4,8 +4,44 @@ use rusqlite::Connection;
 
 const MIGRATIONS: &[&str] = &[
     V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17, V18, V19, V20,
-    V21, V22, V23,
+    V21, V22, V23, V24,
 ];
+
+const V24: &str = r#"
+CREATE TABLE mcp_write_receipts (
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    client TEXT NOT NULL,
+    key_digest BLOB NOT NULL,
+    request_digest BLOB NOT NULL,
+    receipt_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (account_id, client, key_digest)
+);
+CREATE INDEX mcp_write_receipts_activity ON mcp_write_receipts(account_id, created_at, receipt_id);
+
+CREATE TABLE mcp_operation_status (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    action TEXT NOT NULL,
+    state TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX mcp_operation_status_account ON mcp_operation_status(account_id);
+
+CREATE TRIGGER mcp_operation_status_update AFTER UPDATE OF state, updated_at ON pending_operations
+BEGIN
+    UPDATE mcp_operation_status SET state = new.state, updated_at = new.updated_at WHERE id = new.id;
+END;
+CREATE TRIGGER mcp_operation_status_delete AFTER DELETE ON pending_operations
+WHEN old.state != 'applied'
+BEGIN
+    UPDATE mcp_operation_status SET state = CASE WHEN old.state IN ('uncertain','in-flight')
+        THEN 'discarded' ELSE 'cancelled' END, updated_at = CAST(unixepoch('subsec') * 1000 AS INTEGER)
+    WHERE id = old.id;
+END;
+"#;
 
 /// Split message bodies out of `messages`, add `WHEN`-guarded FTS5 triggers, add
 /// `message_references` and missing indexes, and add monotonic counters for contacts.

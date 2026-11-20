@@ -11,6 +11,8 @@ const DRAFTS: &str = "mail_drafts_list";
 const OUTBOX: &str = "mail_outbox_list";
 const GET: &str = "mail_draft_get";
 const HISTORY: &str = "mail_history_list";
+const ACTIVITY: &str = "mail_write_activity_list";
+const OPERATION: &str = "mail_operation_get";
 const HISTORY_WINDOW: usize = overlook_store::HISTORY_MAX_ENTRIES;
 
 pub(super) fn tools() -> Vec<ReadTool> {
@@ -28,7 +30,17 @@ pub(super) fn tools() -> Vec<ReadTool> {
         ReadTool::new(
             HISTORY,
             "List recent local mail changes for this account.",
+            paged.clone(),
+        ),
+        ReadTool::new(
+            ACTIVITY,
+            "List committed MCP changes and their client names for this account.",
             paged,
+        ),
+        ReadTool::new(
+            OPERATION,
+            "Read the latest durable status of an MCP mail operation.",
+            json!({"type":"object","properties":{"operation_id":{"type":"string"}},"required":["operation_id"]}),
         ),
         ReadTool::new(
             GET,
@@ -85,6 +97,14 @@ pub(super) fn execute(
             entry["recipients_truncated"] = json!([&draft.to, &draft.cc, &draft.bcc]
                 .iter()
                 .any(|items| items.len() > 20));
+            let attachments: Vec<_> = draft.attachments.iter().filter(|a| a.is_listed()).collect();
+            entry["attachments_truncated"] = json!(attachments.len() > 24);
+            entry["attachments"] = json!(attachments.into_iter().take(24).map(|attachment| json!({
+                "attachment_id":ctx.id("draft_attachment", attachment.id.as_str()),
+                "filename":bounded(&overlook_core::attachment_policy::sanitize_filename(&attachment.filename), 160),
+                "mime_type":bounded(&attachment.mime_type, 80),
+                "size_bytes":attachment.size_bytes
+            })).collect::<Vec<_>>());
             Ok(json!({"draft":entry}))
         }
         HISTORY => {
@@ -103,6 +123,48 @@ pub(super) fn execute(
                 json!({"scope":"local_history","partial":partial,"maximum_entries":HISTORY_WINDOW});
             Ok(result)
         }
+        ACTIVITY => {
+            let mut rows = ctx
+                .store
+                .mcp_write_activity(account, HISTORY_WINDOW + 1)
+                .map_err(storage)?;
+            let partial = rows.len() > HISTORY_WINDOW;
+            rows.truncate(HISTORY_WINDOW);
+            let mut result = ctx.page(rows.into_iter().map(|entry| json!({
+                "write_id":ctx.id("write_receipt",&entry.receipt_id),
+                "client":entry.client,"action":entry.action,"created_at_ms":entry.created_at,"status":"committed"
+            })).collect(), name, args)?;
+            result["coverage"] = json!({"scope":"mcp_writes","partial":partial});
+            Ok(result)
+        }
+        OPERATION => {
+            #[derive(Deserialize)]
+            struct Args {
+                operation_id: String,
+            }
+            let input: Args = parse(args)?;
+            let entry = ctx
+                .store
+                .mcp_operation_status(account, |raw| {
+                    ctx.id("operation", raw) == input.operation_id
+                })
+                .map_err(storage)?
+                .ok_or_else(|| {
+                    Failure::new(
+                        ErrorCode::NotCached,
+                        "Operation is unavailable for this account",
+                    )
+                })?;
+            let status = match (entry.state.as_str(), entry.action.as_str()) {
+                ("pending", _) => "queued",
+                ("in-flight", _) => "in_flight",
+                ("applied", "send-draft") => "provider_confirmed",
+                ("applied", _) => "synced",
+                (state, _) => state,
+            };
+            Ok(json!({"operation_id":ctx.id("operation",entry.id.as_str()),
+                "action":entry.action,"status":status,"updated_at_ms":entry.updated_at}))
+        }
         _ => Err(super::invalid("Unknown mail record tool")),
     }
 }
@@ -117,6 +179,7 @@ fn summary(ctx: &ReadContext<'_>, draft: &Draft) -> Value {
         DraftState::Sent => "sent",
     };
     json!({"draft_id":ctx.id("draft", draft.id.as_str()),"subject":bounded(&draft.subject, 500),
+        "revision":crate::mcp::write::draft_revision(ctx.key, ctx.account_id, draft),
         "updated_at_ms":draft.updated_at,"state":state,"attachment_count":draft.attachments.iter().filter(|item| item.is_listed()).count()})
 }
 

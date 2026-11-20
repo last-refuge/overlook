@@ -13,6 +13,7 @@
 //! evict their messages. Any eviction routine must check [`Store::is_local_primary`] first.
 
 mod mcp_mail_read;
+mod mcp_write;
 mod index;
 mod calendar_connections;
 mod contact_cards;
@@ -27,6 +28,7 @@ pub use draft_sync::{DraftEditGuard, DraftSyncEntry, DraftUpload, same_draft_con
 
 pub use index::{apply_to_message, MailIndex};
 pub use mcp_mail_read::McpMailSelection;
+pub use mcp_write::{McpWriteKey, McpWriteOutcome, McpWriteTxn};
 
 use overlook_core::focus::{FocusRule, FocusTab};
 use overlook_core::sanitize::html_to_text;

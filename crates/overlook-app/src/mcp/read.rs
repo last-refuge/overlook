@@ -166,9 +166,12 @@ impl ReadContext<'_> {
                 value
             }
             "mail_refresh" => self.refresh_mail()?,
-            "mail_drafts_list" | "mail_outbox_list" | "mail_draft_get" | "mail_history_list" => {
-                mail_records::execute(self, name, args)?
-            }
+            "mail_drafts_list"
+            | "mail_outbox_list"
+            | "mail_draft_get"
+            | "mail_history_list"
+            | "mail_operation_get"
+            | "mail_write_activity_list" => mail_records::execute(self, name, args)?,
             _ => match domain {
                 "mail" => mail::execute(self, name, args)?,
                 "calendar" => calendar::execute(self, name, args)?,
@@ -285,16 +288,7 @@ impl ReadContext<'_> {
     }
 
     pub fn id(&self, namespace: &str, raw: &str) -> String {
-        let digest = Sha256::new()
-            .chain_update(b"overlook-mcp-record\0")
-            .chain_update(self.account_id.as_bytes())
-            .chain_update([0])
-            .chain_update(namespace.as_bytes())
-            .chain_update([0])
-            .chain_update(raw.as_bytes())
-            .chain_update(self.key)
-            .finalize();
-        URL_SAFE_NO_PAD.encode(digest)
+        record_id(self.key, self.account_id, namespace, raw)
     }
 
     pub fn page<T: Serialize>(
@@ -402,6 +396,19 @@ impl ReadContext<'_> {
             json!({"status":"updated_cache","downloaded":downloaded,"queued_downloads":queued,"partial":queued > 0}),
         )
     }
+}
+
+pub(super) fn record_id(key: &[u8; 32], account_id: &str, namespace: &str, raw: &str) -> String {
+    let digest = Sha256::new()
+        .chain_update(b"overlook-mcp-record\0")
+        .chain_update(account_id.as_bytes())
+        .chain_update([0])
+        .chain_update(namespace.as_bytes())
+        .chain_update([0])
+        .chain_update(raw.as_bytes())
+        .chain_update(key)
+        .finalize();
+    URL_SAFE_NO_PAD.encode(digest)
 }
 
 fn refresh_key(account: &Account) -> String {

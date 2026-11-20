@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
@@ -15,6 +15,12 @@ pub enum Request {
         name: String,
         account_ids: Vec<String>,
         batch: bool,
+        args: serde_json::Map<String, serde_json::Value>,
+    },
+    Write {
+        name: String,
+        account_id: String,
+        idempotency_key: String,
         args: serde_json::Map<String, serde_json::Value>,
     },
 }
@@ -63,6 +69,7 @@ pub enum ErrorCode {
     Unsupported,
     NotCached,
     ProviderUnavailable,
+    Conflict,
     Internal,
 }
 

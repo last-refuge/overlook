@@ -272,7 +272,7 @@ impl MailProvider for SampleProvider {
             if self.inner.drop_next_send.swap(false, Ordering::SeqCst) {
                 return Err(ProviderError::Uncertain);
             }
-            let provider_id = self.next_id("sent");
+            let provider_id = ProviderId(format!("sent-{}", DraftId::generate()));
             let message = sent_message_with_font(&account, &draft, in_reply_to.as_ref(), &provider_id, &rfc_id, sent_label.as_ref(), overlook_core::time::now(), outgoing_font.as_ref());
             Ok(SentReceipt { provider_id, rfc_message_id: Some(rfc_id), message })
         })
@@ -285,7 +285,7 @@ impl MailProvider for SampleProvider {
             self.sleep().await;
             let rfc_id = format!("<{}@overlook.sample>", draft.id);
             if self.inner.accepted.lock().unwrap().contains(&rfc_id) {
-                Ok(SendOutcome::Delivered(self.next_id("sent")))
+                Ok(SendOutcome::Delivered(ProviderId(format!("sent-{}", DraftId::generate()))))
             } else {
                 Ok(SendOutcome::NotDelivered)
             }

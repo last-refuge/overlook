@@ -11,7 +11,7 @@ use rmcp::ErrorData;
 use serde_json::{json, Value};
 
 use super::contract::{ErrorCode, Failure, Reply, Request};
-use super::read;
+use super::{read, write};
 
 const MODERN: ProtocolVersion = ProtocolVersion::V_2026_07_28;
 const LEGACY: ProtocolVersion = ProtocolVersion::V_2025_11_25;
@@ -320,6 +320,17 @@ fn list_tools(modern: bool) -> ListToolsResult {
                 .open_world(tool.name == "mail_search")
         });
     }
+    catalog.extend(write::tools().map(|entry| {
+        let mut tool = Tool::new(entry.name, entry.description, entry.schema.clone());
+        tool.annotations = Some(
+            ToolAnnotations::new()
+                .read_only(false)
+                .destructive(entry.permission != write::WritePermission::Modify)
+                .idempotent(true)
+                .open_world(true),
+        );
+        tool
+    }));
     let mut tools = ListToolsResult::with_all_items(catalog);
     if modern {
         tools.ttl_ms = Some(0);
@@ -368,6 +379,23 @@ fn tool_request(mut params: JsonObject) -> Result<Result<Request, Failure>, Erro
             }
             _ => invalid("account_capabilities requires one non-empty string argument, account_id"),
         },
+        _ if write::tools().any(|tool| tool.name == name) => {
+            let Some(Value::String(account_id)) = arguments.remove("account_id") else {
+                return invalid("Choose one account_id for a mail write");
+            };
+            if account_id.is_empty() || account_id.len() > 128 {
+                return invalid("Invalid account selector");
+            }
+            let Some(Value::String(idempotency_key)) = arguments.remove("idempotency_key") else {
+                return invalid("Provide an idempotency_key for a mail write");
+            };
+            Ok(Ok(Request::Write {
+                name,
+                account_id,
+                idempotency_key,
+                args: arguments,
+            }))
+        }
         _ if read::tools().any(|tool| tool.name == name) => {
             let batch = arguments.contains_key("account_ids");
             let ids = match (

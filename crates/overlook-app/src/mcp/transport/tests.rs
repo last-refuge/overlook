@@ -66,6 +66,7 @@ fn sample_call(request: Request) -> Reply {
             Err(Failure::new(ErrorCode::AccessDenied, "Account unavailable"))
         }
         Request::Read { .. } => panic!("unexpected read tool"),
+        Request::Write { .. } => panic!("unexpected write tool"),
     }
 }
 

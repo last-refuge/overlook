@@ -174,6 +174,10 @@ fn send_to(path: &Path, line: &str) -> bool {
 /// Queues a line for the UI to pick up, and wakes it.
 pub fn push(line: String) {
     PENDING.lock().unwrap().push(line);
+    wake();
+}
+
+pub(crate) fn wake() {
     if let Some(wake) = WAKE.get() {
         let _ = wake.send(());
     }

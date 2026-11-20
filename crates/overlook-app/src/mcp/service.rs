@@ -21,12 +21,13 @@ use std::thread;
 
 use overlook_core::Account as LocalAccount;
 use overlook_provider::sample::SampleProvider;
-use overlook_store::Store;
+use overlook_store::{McpWriteOutcome, Store};
 use serde_json::{json, Map, Value};
 use tokio::runtime::{Builder, Runtime};
 
 use super::contract::{Account, ErrorCode, Failure, Reply, Request, Response};
 use super::read::{self, ReadContext};
+use super::write::{self, WriteContext, WritePermission};
 use files::{Endpoint, Profile};
 
 const READ_WORKERS: usize = 3;
@@ -103,7 +104,12 @@ pub fn call(profile: &Path, client: &str, token: &str, request: Request) -> Repl
     wire::call(&mut stream, client, token, request)
 }
 
-pub fn grant(profile: &Path, client: &str, account_ids: &[String]) -> anyhow::Result<String> {
+pub fn grant(
+    profile: &Path,
+    client: &str,
+    account_ids: &[String],
+    permissions: BTreeSet<WritePermission>,
+) -> anyhow::Result<String> {
     anyhow::ensure!(files::valid_client(client), "Invalid client name");
     // Grants can be provisioned before startup. The owner checks current
     // account identity, connection, and data eligibility at execution.
@@ -120,7 +126,11 @@ pub fn grant(profile: &Path, client: &str, account_ids: &[String]) -> anyhow::Re
             }),
         "Use explicit sample, IMAP, or POP3 account IDs"
     );
-    Profile::open(profile)?.grant(client, account_ids)
+    Profile::open(profile)?.grant(client, account_ids, permissions)
+}
+
+pub fn sample_database(profile: &Path) -> anyhow::Result<std::path::PathBuf> {
+    Profile::open(profile)?.sample_database()
 }
 
 pub fn revoke(profile: &Path, client: &str) -> anyhow::Result<()> {
@@ -191,7 +201,9 @@ impl Owner {
             .accounts()
             .map_err(|_| Failure::new(ErrorCode::Internal, "Account discovery failed"))?
         {
-            if grant.contains(&account.id.0) && read::eligible_account(&self.store, &account)? {
+            if grant.account_ids.contains(&account.id.0)
+                && read::eligible_account(&self.store, &account)?
+            {
                 eligible.push((files::public_id(&self.key, account.id.as_str()), account));
             }
         }
@@ -215,10 +227,13 @@ impl Owner {
                     })
                     .collect(),
             }),
-            Request::AccountCapabilities { account_id } => Ok(Response::Capabilities(
-                self.context(lookup(&account_id)?, &account_id)
-                    .capabilities()?,
-            )),
+            Request::AccountCapabilities { account_id } => {
+                let mut capabilities = self
+                    .context(lookup(&account_id)?, &account_id)
+                    .capabilities()?;
+                capabilities.details["mail"]["write_permissions"] = json!(grant.permissions);
+                Ok(Response::Capabilities(capabilities))
+            }
             Request::Read {
                 name,
                 account_ids,
@@ -249,6 +264,37 @@ impl Owner {
                     return contexts.remove(0).execute(tool, &args).map(Response::Read);
                 }
                 self.batch(contexts, tool, &args).map(Response::Read)
+            }
+            Request::Write {
+                name,
+                account_id,
+                idempotency_key,
+                args,
+            } => {
+                let account = lookup(&account_id)?;
+                let tool = write::tools()
+                    .find(|tool| tool.name == name)
+                    .ok_or_else(|| read::invalid("Unknown write tool"))?;
+                if !grant.permissions.contains(&tool.permission) {
+                    return Err(denied());
+                }
+                let ctx = WriteContext {
+                    account,
+                    account_id: &account_id,
+                    profile: self.profile.path(),
+                    key: &self.key,
+                };
+                match ctx.execute(&self.store, client, tool, &idempotency_key, &args)? {
+                    McpWriteOutcome::Applied { data, queued } => {
+                        super::note_write(&account.id, queued);
+                        Ok(Response::Read(data))
+                    }
+                    McpWriteOutcome::Replayed(data) => Ok(Response::Read(data)),
+                    McpWriteOutcome::KeyConflict => Err(Failure::new(
+                        ErrorCode::Conflict,
+                        "This idempotency key was committed for a different request",
+                    )),
+                }
             }
         }
     }

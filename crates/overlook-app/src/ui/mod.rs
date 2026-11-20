@@ -2325,6 +2325,34 @@ impl MailWindow {
         cx.notify();
     }
 
+    pub(crate) fn mcp_mail_changed(
+        &mut self,
+        changes: std::collections::BTreeMap<AccountId, bool>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.mark_counts_stale(changes.keys().cloned());
+        self.reload_account_labels();
+        if changes.contains_key(&self.account.id) {
+            self.reload_mail(cx);
+        }
+        self.reload_folder_windows(changes.keys().cloned(), cx);
+        let undo_delay = self.prefs.undo_send_secs;
+        for (account, queued) in changes {
+            if !queued || !self.connected(&account) {
+                continue;
+            }
+            self.sync_account(account.clone(), window, cx);
+            if undo_delay > 0 {
+                cx.spawn_in(window, async move |this, cx| {
+                    cx.background_executor().timer(Duration::from_millis(u64::from(undo_delay) * 1000 + 300)).await;
+                    this.update_in(cx, |this, window, cx| this.sync_account(account, window, cx)).ok();
+                }).detach();
+            }
+        }
+        cx.notify();
+    }
+
     fn reload_mail_inner(&mut self, reload_all_labels: bool, cx: &mut Context<Self>) {
         let acct = self.account.id.clone();
         if self.mail_index_account.as_ref() != Some(&acct) {
