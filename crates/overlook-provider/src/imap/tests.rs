@@ -363,19 +363,26 @@ fn changes_report_new_mail_flags_and_deletions() {
     assert_eq!(changes.deleted_provider_ids, vec![pid("INBOX", 1760400000, 3)]);
     assert_eq!(changes.message_ids, vec![pid("INBOX", 1760400000, 6)], "only new mail needs a body");
     let subjects: Vec<(&str, bool, bool)> = changes.upserts.iter().map(|m| (m.subject.as_str(), m.is_read, m.body.is_cached())).collect();
-    assert_eq!(subjects, vec![("Fresh", false, false), ("Re: Plain hello", true, false)], "new mail first, then the flag change, both header-only");
+    assert_eq!(subjects, vec![("Fresh", false, false)], "only new mail fetches headers");
     assert_eq!(changes.upserts[0].rfc_message_id.as_deref(), Some("<fresh@example.com>"));
-    assert_eq!(changes.upserts[1].provider_id, Some(pid("INBOX", 1760400000, 2)));
+    assert_eq!(changes.relabeled.len(), 1);
+    assert_eq!(changes.relabeled[0].provider_id, pid("INBOX", 1760400000, 2));
+    assert_eq!(changes.relabeled[0].state.as_ref().map(|s| (s.is_read, s.is_starred)), Some((true, false)));
     let parsed = Checkpoint::parse(changes.checkpoint.as_deref().unwrap()).unwrap();
     let inbox = &parsed.folders["INBOX"];
     assert_eq!((inbox.known.as_str(), inbox.seen.as_str(), inbox.flagged.as_str(), inbox.highest_uid), ("1:2,4:6", "1:2", "", 6));
     assert_eq!(parsed.folders["Work/Clients"].flagged, "", "not refreshed this cycle");
 
-    // Cycle 10 refreshes flags everywhere.
+    // Cycle 10 refreshes flags everywhere without re-downloading headers.
     let mut cp10 = parsed.clone();
     cp10.cycle = 9;
+    let mark = server.lock().log.len();
     let changes = block(p.fetch_changes(&acct, &cp10.to_json())).unwrap();
-    assert_eq!(changes.upserts.iter().map(|m| (m.subject.as_str(), m.is_starred)).collect::<Vec<_>>(), vec![("Contract", true)]);
+    assert!(changes.upserts.is_empty());
+    assert_eq!(changes.relabeled.len(), 1);
+    assert_eq!(changes.relabeled[0].provider_id, pid("Work/Clients", 1760400002, 1));
+    assert_eq!(changes.relabeled[0].state.as_ref().map(|s| (s.is_read, s.is_starred)), Some((false, true)));
+    assert!(!server.lock().log[mark..].iter().any(|l| l.contains("BODY.PEEK[HEADER]")), "flag-only changes must not fetch headers");
     assert!(changes.message_ids.is_empty());
     assert_eq!(Checkpoint::parse(changes.checkpoint.as_deref().unwrap()).unwrap().folders["Work/Clients"].flagged, "1");
 }
@@ -995,7 +1002,19 @@ fn qresync_changes_come_from_changedsince_and_vanished() {
     assert_eq!(changes.deleted_provider_ids, vec![pid("INBOX", 1760400000, 3)], "VANISHED reported the expunge");
     assert_eq!(changes.message_ids, vec![pid("INBOX", 1760400000, 6)]);
     let subjects: Vec<(&str, bool, bool)> = changes.upserts.iter().map(|m| (m.subject.as_str(), m.is_read, m.is_starred)).collect();
-    assert_eq!(subjects, vec![("Fresh", false, false), ("Re: Plain hello", true, false), ("Contract", false, true)], "new mail, then flipped flags, in every folder every cycle");
+    assert_eq!(subjects, vec![("Fresh", false, false)], "only new mail downloads headers");
+    let relabeled: Vec<(ProviderId, bool, bool)> = changes.relabeled.iter().map(|r| {
+        let s = r.state.as_ref().unwrap();
+        (r.provider_id.clone(), s.is_read, s.is_starred)
+    }).collect();
+    assert_eq!(
+        relabeled,
+        vec![
+            (pid("INBOX", 1760400000, 2), true, false),
+            (pid("Work/Clients", 1760400002, 1), false, true),
+        ],
+        "flipped flags in every folder are emitted directly as relabels"
+    );
     {
         let state = server.lock();
         assert_eq!(state.commands("UID SEARCH ALL"), searches_before, "deletions came from VANISHED");
@@ -1033,7 +1052,10 @@ fn condstore_without_qresync_keeps_the_uid_diff_for_deletions() {
     }
     let changes = block(p.fetch_changes(&acct, &cp)).unwrap();
     assert_eq!(changes.deleted_provider_ids, vec![pid("INBOX", 1760400000, 3)]);
-    assert_eq!(changes.upserts.iter().map(|m| m.subject.as_str()).collect::<Vec<_>>(), vec!["Re: Plain hello"]);
+    assert!(changes.upserts.is_empty());
+    assert_eq!(changes.relabeled.len(), 1);
+    assert_eq!(changes.relabeled[0].provider_id, pid("INBOX", 1760400000, 2));
+    assert_eq!(changes.relabeled[0].state.as_ref().map(|s| (s.is_read, s.is_starred)), Some((true, false)));
     let state = server.lock();
     assert_eq!(state.commands("UID SEARCH ALL"), searches_before + 1, "the changed folder still gets the diff that finds deletions; STATUS shows the others unchanged");
     assert!(state.log.iter().any(|l| l.contains("(CHANGEDSINCE") && !l.contains("VANISHED")), "{:?}", state.log);
@@ -1053,7 +1075,10 @@ fn a_checkpoint_without_modseq_takes_the_plain_path_once() {
     server.lock().folder_mut("INBOX").set_flags(2, &["\\Seen"]);
     let before = server.lock().commands("UID SEARCH ALL");
     let changes = block(p.fetch_changes(&acct, &cp.to_json())).unwrap();
-    assert_eq!(changes.upserts.iter().map(|m| m.subject.as_str()).collect::<Vec<_>>(), vec!["Re: Plain hello"]);
+    assert!(changes.upserts.is_empty());
+    assert_eq!(changes.relabeled.len(), 1);
+    assert_eq!(changes.relabeled[0].provider_id, pid("INBOX", 1760400000, 2));
+    assert_eq!(changes.relabeled[0].state.as_ref().map(|s| s.is_read), Some(true));
     assert_eq!(server.lock().commands("UID SEARCH ALL"), before + 3, "an old checkpoint is read the slow way");
     let parsed = Checkpoint::parse(changes.checkpoint.as_deref().unwrap()).unwrap();
     assert!(parsed.folders.values().all(|c| c.highest_modseq > 0), "and records MODSEQ for the next cycle");
@@ -1205,7 +1230,7 @@ fn real_imap_server_write_round_trip() {
         block(p.apply(&acct, &ops(OperationKind::SetStarred { message_ids: vec![message.id.clone()], starred: true }), std::slice::from_ref(&message), &labels)).map_err(|e| format!("star: {e}"))?;
         block(p.apply(&acct, &ops(OperationKind::SetRead { message_ids: vec![message.id.clone()], read: true }), std::slice::from_ref(&message), &labels)).map_err(|e| format!("read: {e}"))?;
         let changes = block(p.fetch_changes(&acct, snap.checkpoint.as_deref().unwrap())).map_err(|e| format!("changes: {e}"))?;
-        let seen = changes.upserts.iter().find(|m| m.rfc_message_id.as_deref() == Some(rfc_id.as_str())).ok_or("the flag changes were not reported back")?;
+        let seen = changes.relabeled.iter().find(|r| Some(&r.provider_id) == message.provider_id.as_ref()).and_then(|r| r.state.as_ref()).ok_or("the flag changes were not reported back")?;
         if !(seen.is_read && seen.is_starred) {
             return Err(format!("flags did not stick: read {} starred {}", seen.is_read, seen.is_starred));
         }
@@ -1320,6 +1345,14 @@ fn folders_are_created_renamed_and_deleted_on_the_server() {
     block(p.delete_folder(&acct, &receipts)).unwrap();
     let s = server.lock();
     assert!(!s.has_folder("Receipts") && !s.subscribed.contains("Receipts"), "{:?}", s.log);
+    drop(s);
+
+    // A non-idempotent folder mutation that drops on a reused session must NOT be retried.
+    let temp_folder = block(p.create_folder(&acct, "DropOnce", None, &labels)).unwrap();
+    let before_deletes = server.lock().commands("DELETE");
+    server.lock().drop_after_next = Some("DELETE".into());
+    assert_eq!(block(p.delete_folder(&acct, &temp_folder)), Err(ProviderError::Offline));
+    assert_eq!(server.lock().commands("DELETE"), before_deletes + 1, "DELETE must not be retried after dropping on a reused session");
 }
 
 /// A message for a folder made in the middle of a test.

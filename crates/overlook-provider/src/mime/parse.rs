@@ -32,12 +32,21 @@ pub struct MessageFlags {
 /// Snippet length in characters, after whitespace is collapsed.
 const SNIPPET_CHARS: usize = 160;
 
+/// Cap on fallback raw bytes copied into `body.text` when a message cannot be parsed.
+const MAX_FALLBACK_TEXT_BYTES: usize = 64 * 1024;
+
 /// Parses a raw message. Never fails: unreadable input yields a message that says so, so a
 /// broken message in a folder is shown rather than silently dropped.
 pub fn message_from_rfc822(account: &Account, bytes: &[u8], local_id: MessageId, flags: &MessageFlags) -> Message {
     let parsed = MessageParser::default().parse(bytes);
+    message_from_parsed(account, bytes, parsed.as_ref(), local_id, flags)
+}
+
+/// Builds a [`Message`] from an already-parsed `mail_parser::Message`, avoiding re-parsing
+/// when the caller needs both the parsed AST and the mapped [`Message`].
+pub(crate) fn message_from_parsed(account: &Account, bytes: &[u8], parsed: Option<&mail_parser::Message<'_>>, local_id: MessageId, flags: &MessageFlags) -> Message {
     let mut collected = Collected::default();
-    let (from, to, cc, bcc, reply_to, subject, header_date, rfc_message_id, in_reply_to, references) = match &parsed {
+    let (from, to, cc, bcc, reply_to, subject, header_date, rfc_message_id, in_reply_to, references) = match parsed {
         Some(m) => {
             walk(&m.parts, 0, None, &mut collected, &local_id);
             (
@@ -60,11 +69,12 @@ pub fn message_from_rfc822(account: &Account, bytes: &[u8], local_id: MessageId,
     if text.is_none() {
         text = html.as_deref().map(html_to_text);
     }
-    // Nothing recognisable at all: show the bytes rather than an empty message.
+    // Nothing recognisable at all: show a bounded prefix of the bytes rather than an empty message.
     let blank = |t: &Option<String>| t.as_deref().is_none_or(|t| t.trim().is_empty());
     let unreadable = parsed.is_none() || (subject.is_empty() && from.email.is_empty() && blank(&text) && blank(&html) && attachments.is_empty());
     if unreadable && blank(&text) && !bytes.is_empty() {
-        text = Some(String::from_utf8_lossy(bytes).into_owned());
+        let slice = &bytes[..bytes.len().min(MAX_FALLBACK_TEXT_BYTES)];
+        text = Some(String::from_utf8_lossy(slice).into_owned());
     }
     let snippet = match text.as_deref().map(snippet_of) {
         Some(s) if !s.is_empty() => s,
@@ -119,6 +129,11 @@ pub fn headers_from_rfc822(account: &Account, bytes: &[u8], local_id: MessageId,
 /// part. Lets POP3 (and anything holding the whole message) serve attachments from disk.
 pub fn part_bytes(bytes: &[u8], path: &str) -> Option<Vec<u8>> {
     let parsed = MessageParser::default().parse(bytes)?;
+    part_bytes_from_parsed(&parsed, path)
+}
+
+/// Extracts part bytes from an already-parsed `mail_parser::Message`.
+pub(crate) fn part_bytes_from_parsed(parsed: &mail_parser::Message<'_>, path: &str) -> Option<Vec<u8>> {
     let mut id = 0u32;
     if path != "1" || matches!(parsed.parts.first().map(|p| &p.body), Some(PartType::Multipart(_))) {
         for index in path.split('.') {
@@ -493,6 +508,11 @@ Content-Disposition: attachment; filename*=UTF-8''r%C3%A9sum%C3%A9.pdf
         // A header line without any line ending is not a header; the bytes are still shown.
         let unterminated = message_from_rfc822(&acct, b"Subject: Only a subject", MessageId::from("s2"), &f);
         assert!(unterminated.snippet.contains("Only a subject"), "{unterminated:?}");
+
+        // Huge unreadable garbage is capped rather than copied whole into body.text.
+        let huge_garbage = vec![b'X'; MAX_FALLBACK_TEXT_BYTES * 4];
+        let huge = message_from_rfc822(&acct, &huge_garbage, MessageId::from("huge"), &f);
+        assert_eq!(huge.body.text.as_deref().map(str::len), Some(MAX_FALLBACK_TEXT_BYTES));
     }
 
     #[test]

@@ -20,9 +20,14 @@ use crate::ProviderError;
 use imap_proto::types::ResponseCode;
 use overlook_core::{Security, ServerEndpoint};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Maximum length of a single plaintext STARTTLS/STLS handshake line (16 KiB).
+pub(crate) const MAX_HANDSHAKE_LINE_BYTES: usize = 16 * 1024;
+/// Maximum untagged lines read before the tagged STARTTLS reply.
+const MAX_STARTTLS_LINES: usize = 64;
 
 /// A TCP stream that may be wrapped in TLS. One `Session<Stream>` type serves every
 /// security mode.
@@ -91,9 +96,26 @@ pub(crate) fn tcp_connect(endpoint: &ServerEndpoint, timeout: Duration) -> Resul
         return Err(ProviderError::Rejected("no incoming server is set for this account".into()));
     }
     // Each address in turn, as a name like `localhost` may list `::1` before the 127.0.0.1
-    // a server listens on.
-    let addrs = (host, endpoint.port).to_socket_addrs().map_err(|_| ProviderError::Offline)?;
-    let tcp = addrs.into_iter().find_map(|addr| TcpStream::connect_timeout(&addr, timeout).ok()).ok_or(ProviderError::Offline)?;
+    // a server listens on. Bound total connect time across all resolved addresses so an
+    // unreachable IPv6 record cannot multiply the timeout or starve IPv4.
+    let addrs: Vec<SocketAddr> = (host, endpoint.port).to_socket_addrs().map_err(|_| ProviderError::Offline)?.collect();
+    if addrs.is_empty() {
+        return Err(ProviderError::Offline);
+    }
+    let deadline = Instant::now() + timeout;
+    let mut connected = None;
+    for (i, addr) in addrs.iter().enumerate() {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
+            break;
+        };
+        let left_count = (addrs.len() - i) as u32;
+        let attempt = (remaining / left_count).max(Duration::from_millis(250)).min(remaining);
+        if let Ok(tcp) = TcpStream::connect_timeout(addr, attempt) {
+            connected = Some(tcp);
+            break;
+        }
+    }
+    let tcp = connected.ok_or(ProviderError::Offline)?;
     tcp.set_read_timeout(Some(timeout)).map_err(|_| ProviderError::Offline)?;
     tcp.set_write_timeout(Some(timeout)).map_err(|_| ProviderError::Offline)?;
     let _ = tcp.set_nodelay(true);
@@ -137,23 +159,32 @@ pub(crate) fn unencrypted_refusal(endpoint: &ServerEndpoint, e: ProviderError) -
     }
 }
 
+/// Reads a single LF-terminated line up to `max_bytes` bytes into `buf`, preventing
+/// unbounded memory allocation on untrusted pre-TLS server output.
+pub(crate) fn read_bounded_line(reader: &mut BufReader<TcpStream>, buf: &mut Vec<u8>, max_bytes: usize, host: &str) -> Result<String, ProviderError> {
+    buf.clear();
+    let n = reader.by_ref().take((max_bytes + 1) as u64).read_until(b'\n', buf).map_err(|_| ProviderError::Offline)?;
+    if n == 0 {
+        return Err(ProviderError::Offline);
+    }
+    if buf.len() > max_bytes {
+        return Err(ProviderError::Rejected(format!("{host} sent an overly long greeting or STARTTLS response")));
+    }
+    Ok(String::from_utf8_lossy(buf).into_owned())
+}
+
 /// Reads the greeting, sends `STARTTLS`, and returns the socket once the server says OK.
 pub(crate) fn starttls_by_hand(host: &str, tcp: TcpStream) -> Result<TcpStream, ProviderError> {
     let mut reader = BufReader::new(tcp.try_clone().map_err(|_| ProviderError::Offline)?);
     let mut writer = tcp;
-    let mut line = String::new();
-    if reader.read_line(&mut line).map_err(|_| ProviderError::Offline)? == 0 {
-        return Err(ProviderError::Offline);
-    }
+    let mut buf = Vec::new();
+    let line = read_bounded_line(&mut reader, &mut buf, MAX_HANDSHAKE_LINE_BYTES, host)?;
     if !line.starts_with("* OK") && !line.starts_with("* PREAUTH") {
         return Err(ProviderError::Rejected(format!("{host} did not greet like an IMAP server: {}", line.trim_end())));
     }
     writer.write_all(b"s1 STARTTLS\r\n").and_then(|_| writer.flush()).map_err(|_| ProviderError::Offline)?;
-    loop {
-        line.clear();
-        if reader.read_line(&mut line).map_err(|_| ProviderError::Offline)? == 0 {
-            return Err(ProviderError::Offline);
-        }
+    for _ in 0..MAX_STARTTLS_LINES {
+        let line = read_bounded_line(&mut reader, &mut buf, MAX_HANDSHAKE_LINE_BYTES, host)?;
         if line.starts_with("s1 OK") {
             return Ok(writer);
         }
@@ -161,6 +192,7 @@ pub(crate) fn starttls_by_hand(host: &str, tcp: TcpStream) -> Result<TcpStream, 
             return Err(ProviderError::Rejected(format!("{host} refused STARTTLS: {}", line.trim_end().trim_start_matches("s1 "))));
         }
     }
+    Err(ProviderError::Rejected(format!("{host} sent too many lines before completing STARTTLS")))
 }
 
 /// The IDLE thread's read timeout is set through the `imap` crate's trait; the TLS stream
@@ -290,6 +322,12 @@ fn strip_code(information: &str) -> String {
     }
     .trim_end_matches('.')
     .to_owned()
+}
+
+/// Whether `e` may have left the underlying TCP/TLS stream closed or desynchronized,
+/// meaning the `imap::Session` must be dropped rather than reused.
+pub(crate) fn is_stream_error(e: &imap::Error) -> bool {
+    !matches!(e, imap::Error::No(_) | imap::Error::Bad(_) | imap::Error::Validate(_))
 }
 
 /// Maps a command failure. Use [`login_error`] for `LOGIN`, where any `NO` means the

@@ -72,7 +72,8 @@ impl IdleWatcher {
     /// returns at once. Waits for the thread to finish.
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Ok(guard) = self.socket.lock() {
+        {
+            let guard = self.socket.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(sock) = guard.as_ref() {
                 let _ = sock.shutdown(Shutdown::Both);
             }
@@ -144,7 +145,14 @@ fn run(endpoint: ServerEndpoint, credential: Credential, timeout: Duration, stop
             }
         };
         let sock_for_timeouts = sock.try_clone().ok();
-        if let Ok(mut slot) = socket.lock() {
+        {
+            let mut slot = socket.lock().unwrap_or_else(|p| p.into_inner());
+            if stop.load(Ordering::SeqCst) {
+                let _ = sock.shutdown(Shutdown::Both);
+                drop(slot);
+                drop(session);
+                return;
+            }
             *slot = Some(sock);
         }
         let ended = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| serve(&mut session, sock_for_timeouts.as_ref(), timeout, &stop, &on_event))) {
@@ -155,7 +163,8 @@ fn run(endpoint: ServerEndpoint, credential: Credential, timeout: Duration, stop
             let _ = session.logout();
         }
         drop(session);
-        if let Ok(mut slot) = socket.lock() {
+        {
+            let mut slot = socket.lock().unwrap_or_else(|p| p.into_inner());
             *slot = None;
         }
         match ended {
@@ -185,12 +194,18 @@ fn run(endpoint: ServerEndpoint, credential: Credential, timeout: Duration, stop
 /// Runs IDLE on one connection until it is stopped or fails.
 fn serve(session: &mut connection::Session, sock: Option<&TcpStream>, timeout: Duration, stop: &AtomicBool, on_event: &impl Fn(IdleEvent)) -> Ended {
     let lost = |error: ProviderError, worked: bool| if stop.load(Ordering::SeqCst) { Ended::Stopped } else { Ended::Lost { error, worked } };
+    if stop.load(Ordering::SeqCst) {
+        return Ended::Stopped;
+    }
     let caps = match session.capabilities() {
         Ok(caps) => caps,
         Err(e) => return lost(map_error(&e), false),
     };
     if !caps.has_str("IDLE") {
         return Ended::Unsupported;
+    }
+    if stop.load(Ordering::SeqCst) {
+        return Ended::Stopped;
     }
     if let Err(e) = session.examine("INBOX") {
         return match map_error(&e) {

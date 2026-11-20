@@ -459,3 +459,33 @@ fn oauth_accounts_sign_in_with_xoauth2() {
         assert_eq!(block(p.probe()), Err(ProviderError::SignInRequired));
     }
 }
+
+#[test]
+fn restart_backlog_drain_before_changes_keeps_same_id_and_allows_retention() {
+    let env = make_env("restart-ledger", maildrop());
+    let policy = Some(Pop3Policy { leave_on_server: false, ..Default::default() });
+    let p1 = provider(&env, policy.clone());
+    let acct = account();
+    // Run 1: snapshot lists messages (TOP creates header row for UIDL-3), then app restarts before RETR.
+    let snap = block(p1.fetch_snapshot(&acct)).unwrap();
+    let cp_json = snap.checkpoint.unwrap();
+    let header_id = snap.messages[0].id.clone();
+
+    // Run 2: fresh provider with empty in-memory ledger drains backlog BEFORE fetch_changes.
+    let p2 = provider(&env, policy);
+    let messages = block(p2.fetch_messages(&acct, &snap.message_ids, &[])).unwrap();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0].id, header_id, "restarted fetch_messages must not mint a duplicate UUID");
+    for m in &messages {
+        assert!(p2.raw_path(&m.id).exists());
+    }
+    // No leftover .part files from durable write_raw.
+    let entries: Vec<String> = std::fs::read_dir(&env.raw_dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(entries.len(), 3);
+    assert!(entries.iter().all(|n| n.ends_with(".eml")), "{entries:?}");
+
+    // Now fetch_changes runs with the persisted checkpoint: retention sees all 3 files on disk and deletes them.
+    let changes = block(p2.fetch_changes(&acct, &cp_json)).unwrap();
+    assert!(changes.message_ids.is_empty());
+    assert!(env.server.lock().uidls().is_empty(), "all 3 durably saved messages should be deleted on server by retention");
+}

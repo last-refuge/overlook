@@ -82,8 +82,11 @@ const LIST_INTERVAL_MS: i64 = 60 * 60 * 1000;
 /// Every nth change cycle refreshes flags in folders other than the Inbox.
 const FLAG_REFRESH_EVERY: u64 = 10;
 
-/// UIDs per `UID FETCH` command.
+/// UIDs per `UID FETCH` command (also caps expanded `COPYUID` ranges).
 const FETCH_CHUNK: usize = 400;
+
+/// Maximum bytes downloaded in a single raw message or attachment `UID FETCH` (50 MiB).
+const MAX_IMAP_FETCH_BYTES: usize = 50 * 1024 * 1024;
 
 const SEP: char = '\u{1f}';
 
@@ -272,6 +275,8 @@ struct Selected {
 struct Conn {
     session: Option<Session>,
     selected: Option<Selected>,
+    /// Set when a parse or protocol error may have left the TCP/TLS stream desynchronized.
+    desynced: bool,
     caps: Capabilities,
     /// A write created a folder; the next change cycle must re-list so the checkpoint
     /// tracks it. Survives reconnects.
@@ -282,6 +287,8 @@ struct Conn {
     renamed: Vec<(String, String)>,
     /// The Sent folder path from the last listing, for `APPEND` and `reconcile_send`.
     sent_path: Option<String>,
+    /// The Drafts folder path from the last listing, cached to avoid repeated `LIST`+`LSUB`.
+    drafts_path: Option<String>,
     /// Every selectable folder from the last listing with its label kind, for search.
     folders: Vec<(String, LabelKind)>,
     /// Folders the server lists as selectable but refuses to open (Dovecot keeps the name
@@ -295,9 +302,20 @@ impl Conn {
         self.session.as_mut().expect("with_session connects before use")
     }
 
+    fn err(&mut self, e: &imap::Error) -> ProviderError {
+        if connection::is_stream_error(e) {
+            self.desynced = true;
+        }
+        map_error(e)
+    }
+
     fn open(&mut self, path: &str, writable: bool) -> Result<imap::types::Mailbox, ProviderError> {
         self.selected = None;
-        let mailbox = if writable { self.session().select(path) } else { self.session().examine(path) }.map_err(|e| map_error(&e))?;
+        let result = if writable { self.session().select(path) } else { self.session().examine(path) };
+        let mailbox = match result {
+            Ok(m) => m,
+            Err(e) => return Err(self.err(&e)),
+        };
         self.selected = Some(Selected { path: path.to_owned(), uidvalidity: mailbox.uid_validity.unwrap_or(0), writable });
         Ok(mailbox)
     }
@@ -340,7 +358,10 @@ impl Conn {
     /// `UID SEARCH HEADER Message-ID` in the open folder; the lowest matching UID.
     fn find_by_message_id(&mut self, rfc_id: &str) -> Result<Option<u32>, ProviderError> {
         let clean: String = rfc_id.chars().filter(|c| !matches!(c, '"' | '\\' | '\r' | '\n')).collect();
-        let hits = self.session().uid_search(format!("HEADER Message-ID \"{clean}\"")).map_err(|e| map_error(&e))?;
+        let hits = match self.session().uid_search(format!("HEADER Message-ID \"{clean}\"")) {
+            Ok(h) => h,
+            Err(e) => return Err(self.err(&e)),
+        };
         Ok(hits.into_iter().min())
     }
 
@@ -360,18 +381,24 @@ impl Conn {
                 Ok(())
             }
             Err(imap::Error::No(no)) if no.information.to_ascii_uppercase().contains("ALREADYEXISTS") => Ok(()),
-            Err(e) => Err(map_error(&e)),
+            Err(e) => Err(self.err(&e)),
         }
     }
 
     fn uid_search_all(&mut self) -> Result<BTreeSet<u32>, ProviderError> {
-        Ok(self.session().uid_search("ALL").map_err(|e| map_error(&e))?.into_iter().collect())
+        match self.session().uid_search("ALL") {
+            Ok(s) => Ok(s.into_iter().collect()),
+            Err(e) => Err(self.err(&e)),
+        }
     }
 
     /// UIDs above `highest` in the open folder (`UID FETCH <highest+1>:* (UID)`). A server
     /// answers `n:*` with its highest message even when that is below `n`, hence the filter.
     fn uids_above(&mut self, highest: u32) -> Result<BTreeSet<u32>, ProviderError> {
-        let fetches = self.session().uid_fetch(format!("{}:*", highest.saturating_add(1)), "(UID)").map_err(|e| map_error(&e))?;
+        let fetches = match self.session().uid_fetch(format!("{}:*", highest.saturating_add(1)), "(UID)") {
+            Ok(f) => f,
+            Err(e) => return Err(self.err(&e)),
+        };
         Ok(fetches.iter().filter_map(|f| f.uid).filter(|u| *u > highest).collect())
     }
 
@@ -382,7 +409,10 @@ impl Conn {
         let mut out = ChangedSince::default();
         let modifier = if vanished { format!("(CHANGEDSINCE {modseq} VANISHED)") } else { format!("(CHANGEDSINCE {modseq})") };
         for chunk in uidset::chunks(uids, FETCH_CHUNK) {
-            let fetches = self.session().uid_fetch(&chunk, format!("(UID FLAGS) {modifier}")).map_err(|e| map_error(&e))?;
+            let fetches = match self.session().uid_fetch(&chunk, format!("(UID FLAGS) {modifier}")) {
+                Ok(f) => f,
+                Err(e) => return Err(self.err(&e)),
+            };
             for f in fetches.iter() {
                 let Some(uid) = f.uid else { continue };
                 out.changed.insert(uid);
@@ -394,10 +424,8 @@ impl Conn {
                 }
             }
             for response in self.session().take_all_unsolicited() {
-                if let UnsolicitedResponse::Vanished { uids, .. } = response {
-                    for range in uids {
-                        out.vanished.extend(range);
-                    }
+                if let UnsolicitedResponse::Vanished { uids: vanished_ranges, .. } = response {
+                    collect_vanished(&vanished_ranges, uids, &mut out.vanished);
                 }
             }
         }
@@ -414,7 +442,10 @@ impl Conn {
     fn flags_for(&mut self, uids: &BTreeSet<u32>) -> Result<(BTreeSet<u32>, BTreeSet<u32>, BTreeSet<u32>), ProviderError> {
         let (mut present, mut seen, mut flagged) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
         for chunk in uidset::chunks(uids, FETCH_CHUNK) {
-            let fetches = self.session().uid_fetch(&chunk, "(UID FLAGS)").map_err(|e| map_error(&e))?;
+            let fetches = match self.session().uid_fetch(&chunk, "(UID FLAGS)") {
+                Ok(f) => f,
+                Err(e) => return Err(self.err(&e)),
+            };
             for f in fetches.iter() {
                 let Some(uid) = f.uid else { continue };
                 present.insert(uid);
@@ -432,7 +463,10 @@ impl Conn {
     /// `LIST` and `LSUB`, read from the raw lines so a name the server sends as a literal
     /// is kept as is while a quoted one is unescaped (see [`folders::decode_name`]).
     fn list_folders(&mut self) -> Result<Vec<FolderInfo>, ProviderError> {
-        let (data, _) = self.session().run("LIST \"\" \"*\"").map_err(|e| map_error(&e))?;
+        let (data, _) = match self.session().run("LIST \"\" \"*\"") {
+            Ok(r) => r,
+            Err(e) => return Err(self.err(&e)),
+        };
         let (mut folders, _) = parse_list_status(&data).ok_or_else(|| ProviderError::Temporary("could not read the LIST response".into()))?;
         // Subscriptions are informational; a server without LSUB support is not an error.
         if let Ok((data, _)) = self.session().run("LSUB \"\" \"*\"") {
@@ -463,7 +497,7 @@ impl Conn {
                 self.caps.list_status = false;
                 return Ok(None);
             }
-            Err(e) => return Err(map_error(&e)),
+            Err(e) => return Err(self.err(&e)),
         };
         // A partial list would make every folder after the bad line look deleted, so a
         // response this parser can't read in full falls back to plain LIST.
@@ -490,7 +524,17 @@ impl Conn {
         match self.session().run(&command) {
             Ok((data, _)) => Ok(parse_list_status(&data).and_then(|(_, mut statuses)| statuses.remove(path))),
             Err(imap::Error::No(_)) | Err(imap::Error::Bad(_)) => Ok(None),
-            Err(e) => Err(map_error(&e)),
+            Err(e) => Err(self.err(&e)),
+        }
+    }
+}
+
+/// Intersects `VANISHED` UID ranges directly against `known` using `BTreeSet::range` so
+/// arbitrarily large server ranges (e.g. `1:4294967295`) never expand into memory.
+fn collect_vanished(ranges: &[std::ops::RangeInclusive<u32>], known: &BTreeSet<u32>, out: &mut BTreeSet<u32>) {
+    for range in ranges {
+        if range.start() <= range.end() {
+            out.extend(known.range(range.clone()).copied());
         }
     }
 }
@@ -592,7 +636,7 @@ impl ImapProvider {
             outgoing_password: None,
             inbox_limit: 100,
             timeout: DEFAULT_TIMEOUT,
-            conn: Mutex::new(Conn { session: None, selected: None, caps: Capabilities::default(), relist_pending: false, renamed: Vec::new(), sent_path: None, folders: Vec::new(), unopenable: HashSet::new() }),
+            conn: Mutex::new(Conn { session: None, selected: None, desynced: false, caps: Capabilities::default(), relist_pending: false, renamed: Vec::new(), sent_path: None, drafts_path: None, folders: Vec::new(), unopenable: HashSet::new() }),
             send_phases: Mutex::new(HashMap::new()),
             server_copy_wait: SERVER_COPY_WAIT,
         }
@@ -719,6 +763,7 @@ impl ImapProvider {
         conn.caps = capabilities;
         conn.session = Some(session);
         conn.selected = None;
+        conn.desynced = false;
         Ok(())
     }
 
@@ -730,29 +775,49 @@ impl ImapProvider {
     /// Runs `f` on the account's connection, opening it when needed. A connection that was
     /// reused and turns out dead is reopened once; the closure must therefore be safe to run
     /// twice (build results locally, return them).
-    fn with_session<T>(&self, mut f: impl FnMut(&mut Conn) -> Result<T, ProviderError>) -> Result<T, ProviderError> {
+    fn with_session<T>(&self, f: impl FnMut(&mut Conn) -> Result<T, ProviderError>) -> Result<T, ProviderError> {
+        self.with_session_inner(true, f)
+    }
+
+    /// Like [`Self::with_session`], but never automatically retries a reused session on
+    /// `Offline` (used for non-idempotent folder mutations).
+    fn with_session_once<T>(&self, f: impl FnMut(&mut Conn) -> Result<T, ProviderError>) -> Result<T, ProviderError> {
+        self.with_session_inner(false, f)
+    }
+
+    fn with_session_inner<T>(&self, retry: bool, mut f: impl FnMut(&mut Conn) -> Result<T, ProviderError>) -> Result<T, ProviderError> {
         let mut guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let reused = guard.session.is_some();
         self.ensure_connected(&mut guard)?;
         let drop_session = |g: &mut Conn| {
             g.session = None;
             g.selected = None;
+            g.desynced = false;
         };
-        match f(&mut guard) {
-            Err(ProviderError::Offline) if reused => {
+        let needs_drop = |g: &Conn, result: &Result<T, ProviderError>| {
+            g.desynced
+                || matches!(result, Err(ProviderError::Offline))
+                || matches!(result, Err(ProviderError::Temporary(msg)) if msg.starts_with("the server's reply could not be read:"))
+        };
+        guard.desynced = false;
+        let result = f(&mut guard);
+        match result {
+            Err(ProviderError::Offline) if reused && retry => {
                 drop_session(&mut guard);
                 self.ensure_connected(&mut guard)?;
+                guard.desynced = false;
                 let result = f(&mut guard);
-                if matches!(result, Err(ProviderError::Offline)) {
+                if needs_drop(&guard, &result) {
                     drop_session(&mut guard);
                 }
                 result
             }
-            Err(ProviderError::Offline) => {
-                drop_session(&mut guard);
-                Err(ProviderError::Offline)
+            other => {
+                if needs_drop(&guard, &other) {
+                    drop_session(&mut guard);
+                }
+                other
             }
-            other => other,
         }
     }
 
@@ -787,7 +852,10 @@ impl ImapProvider {
         let mut rows = Vec::new();
         let (mut seen, mut flagged) = (BTreeSet::new(), BTreeSet::new());
         for chunk in uidset::chunks(uids, FETCH_CHUNK / 4) {
-            let fetches = conn.session().uid_fetch(&chunk, "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER])").map_err(|e| map_error(&e))?;
+            let fetches = match conn.session().uid_fetch(&chunk, "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER])") {
+                Ok(f) => f,
+                Err(e) => return Err(conn.err(&e)),
+            };
             for f in fetches.iter() {
                 if f.flags().contains(&Flag::Draft) { continue; }
                 let Some(uid) = f.uid else { continue };
@@ -820,7 +888,10 @@ impl ImapProvider {
         let mut out = Vec::new();
         let mut sizes: HashMap<u32, u32> = HashMap::new();
         for chunk in uidset::chunks(uids, FETCH_CHUNK) {
-            let fetches = conn.session().uid_fetch(&chunk, "(UID FLAGS RFC822.SIZE)").map_err(|e| map_error(&e))?;
+            let fetches = match conn.session().uid_fetch(&chunk, "(UID FLAGS RFC822.SIZE)") {
+                Ok(f) => f,
+                Err(e) => return Err(conn.err(&e)),
+            };
             for f in fetches.iter() {
                 if f.flags().contains(&Flag::Draft) { continue; }
                 if let Some(uid) = f.uid {
@@ -833,7 +904,10 @@ impl ImapProvider {
         let mut large: Vec<u32> = sizes.iter().filter(|(_, s)| **s >= structure::LARGE_MESSAGE_BYTES).map(|(u, _)| *u).collect();
         large.sort_unstable();
         for chunk in uidset::chunks(&small, 20) {
-            let fetches = conn.session().uid_fetch(&chunk, "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[])").map_err(|e| map_error(&e))?;
+            let fetches = match conn.session().uid_fetch(&chunk, "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[])") {
+                Ok(f) => f,
+                Err(e) => return Err(conn.err(&e)),
+            };
             for f in fetches.iter() {
                 let (Some(uid), Some(body)) = (f.uid, f.body()) else { continue };
                 if f.flags().contains(&Flag::Draft) { continue; }
@@ -870,7 +944,10 @@ impl ImapProvider {
     }
 
     fn fetch_large(conn: &mut Conn, account: &Account, path: &str, uidvalidity: u32, uid: u32, label: &LabelId) -> Result<Option<Message>, ProviderError> {
-        let fetches = conn.session().uid_fetch(uid.to_string(), "(UID FLAGS INTERNALDATE RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER])").map_err(|e| map_error(&e))?;
+        let fetches = match conn.session().uid_fetch(uid.to_string(), "(UID FLAGS INTERNALDATE RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER])") {
+            Ok(f) => f,
+            Err(e) => return Err(conn.err(&e)),
+        };
         let Some(f) = fetches.iter().find(|f| f.uid == Some(uid)) else { return Ok(None) };
         if f.flags().contains(&Flag::Draft) { return Ok(None); }
         let header = f.header().unwrap_or_default().to_vec();
@@ -889,7 +966,10 @@ impl ImapProvider {
                 let items: Vec<String> = sections.iter().map(|s| format!("BODY.PEEK[{s}]<0.{}> BODY.PEEK[{s}.MIME]", structure::TEXT_PART_LIMIT)).collect();
                 format!("(UID {})", items.join(" "))
             };
-            let fetched = conn.session().uid_fetch(uid.to_string(), query).map_err(|e| map_error(&e))?;
+            let fetched = match conn.session().uid_fetch(uid.to_string(), query) {
+                Ok(f) => f,
+                Err(e) => return Err(conn.err(&e)),
+            };
             if let Some(f) = fetched.iter().find(|f| f.uid == Some(uid)) {
                 if plan.single_part {
                     parts.push((Vec::new(), f.text().unwrap_or_default().to_vec()));
@@ -927,7 +1007,10 @@ impl ImapProvider {
     /// Headers for one large message whose `BODYSTRUCTURE` fetch failed. The
     /// structure is left out: that is the response that could not be read.
     fn fetch_header_only(conn: &mut Conn, account: &Account, path: &str, uidvalidity: u32, uid: u32, label: &LabelId) -> Result<Option<Message>, ProviderError> {
-        let fetches = conn.session().uid_fetch(uid.to_string(), "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER])").map_err(|e| map_error(&e))?;
+        let fetches = match conn.session().uid_fetch(uid.to_string(), "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER])") {
+            Ok(f) => f,
+            Err(e) => return Err(conn.err(&e)),
+        };
         let Some(f) = fetches.iter().find(|f| f.uid == Some(uid)) else { return Ok(None) };
         if f.flags().contains(&Flag::Draft) { return Ok(None); }
         let flags = Self::flags_of(f, label, MessageRef::provider_id(path, uidvalidity, uid));
@@ -977,6 +1060,7 @@ impl ImapProvider {
         }
         cp.folders = next;
         cp.listed_at = now();
+        conn.drafts_path = folders::drafts_folder(listed).map(|f| f.path.clone());
         conn.remember_folders(&classified);
         conn.relist_pending = false;
         (labels, deleted)
@@ -1183,14 +1267,29 @@ impl ImapProvider {
                     flagged.extend(new_flagged);
                 }
                 let old: BTreeSet<u32> = known.difference(&new).copied().collect();
+                let folder_label = folders::label_id(&account.id, &path);
+                let is_sent = cursor.label_kind() == LabelKind::Sent;
+                let emit_relabels = |relabels: &mut Vec<crate::Relabel>, uids: &BTreeSet<u32>, seen_set: &BTreeSet<u32>, flagged_set: &BTreeSet<u32>| {
+                    for &uid in uids {
+                        relabels.push(crate::Relabel {
+                            provider_id: MessageRef::provider_id(&path, uidvalidity, uid),
+                            state: Some(crate::LabelState {
+                                label_ids: [folder_label.clone()].into_iter().collect(),
+                                is_read: seen_set.contains(&uid),
+                                is_starred: flagged_set.contains(&uid),
+                                is_important: false,
+                                category: None,
+                                is_sent,
+                            }),
+                        });
+                    }
+                };
                 if fast {
-                    // Flag changes: only what CHANGEDSINCE reported, re-fetched when the
-                    // \Seen or \Flagged state actually differs from the cursor.
+                    // Flag changes: emit relabel updates directly without re-downloading headers.
                     let touched: BTreeSet<u32> = since.changed.intersection(&old).copied().collect();
                     let flipped: BTreeSet<u32> = touched.iter().filter(|u| seen.contains(u) != since.seen.contains(u) || flagged.contains(u) != since.flagged.contains(u)).copied().collect();
                     if !flipped.is_empty() {
-                        let (rows, _, _) = Self::fetch_headers(conn, account, &path, uidvalidity, &flipped)?;
-                        changes.upserts.extend(rows);
+                        emit_relabels(&mut changes.relabeled, &flipped, &since.seen, &since.flagged);
                     }
                     for uid in &touched {
                         if since.seen.contains(uid) {
@@ -1211,8 +1310,7 @@ impl ImapProvider {
                         let (_, now_seen, now_flagged) = conn.flags_for(&old)?;
                         let changed: BTreeSet<u32> = old.iter().filter(|u| seen.contains(u) != now_seen.contains(u) || flagged.contains(u) != now_flagged.contains(u)).copied().collect();
                         if !changed.is_empty() {
-                            let (rows, _, _) = Self::fetch_headers(conn, account, &path, uidvalidity, &changed)?;
-                            changes.upserts.extend(rows);
+                            emit_relabels(&mut changes.relabeled, &changed, &now_seen, &now_flagged);
                         }
                         seen = seen.difference(&old).copied().chain(now_seen).collect();
                         flagged = flagged.difference(&old).copied().chain(now_flagged).collect();
@@ -1326,7 +1424,7 @@ impl ImapProvider {
                         warn!("imap: search in {path} rejected: {}", bad.information);
                         continue;
                     }
-                    Err(e) => return Err(map_error(&e)),
+                    Err(e) => return Err(conn.err(&e)),
                 };
                 let mut hits: Vec<u32> = hits.into_iter().collect();
                 hits.sort_unstable_by(|a, b| b.cmp(a));
@@ -1347,13 +1445,22 @@ impl ImapProvider {
             if !conn.examine_for(&r.folder, r.uidvalidity)? {
                 return Err(ProviderError::Rejected("the message is no longer in that folder; sync and try again".into()));
             }
-            let fetches = conn.session().uid_fetch(r.uid.to_string(), format!("(UID BODY.PEEK[{section}] BODY.PEEK[{section}.MIME])")).map_err(|e| map_error(&e))?;
+            let fetches = match conn.session().uid_fetch(
+                r.uid.to_string(),
+                format!("(UID BODY.PEEK[{section}]<0.{}> BODY.PEEK[{section}.MIME])", MAX_IMAP_FETCH_BYTES + 1),
+            ) {
+                Ok(f) => f,
+                Err(e) => return Err(conn.err(&e)),
+            };
             let Some(f) = fetches.iter().find(|f| f.uid == Some(r.uid)) else {
                 return Err(ProviderError::Rejected("the message is no longer on the server".into()));
             };
             let Some(body) = f.section(&SectionPath::Part(section_path.clone(), None)) else {
                 return Err(ProviderError::Rejected("the server returned no data for this attachment".into()));
             };
+            if body.len() > MAX_IMAP_FETCH_BYTES {
+                return Err(ProviderError::Rejected("this attachment exceeds the 50 MB size limit".into()));
+            }
             let mime = f.section(&SectionPath::Part(section_path.clone(), Some(MessageSection::Mime))).unwrap_or_default();
             Ok(decode_part(mime, body))
         })
@@ -1412,7 +1519,9 @@ impl ImapProvider {
                 }
                 let uids: BTreeSet<u32> = items.iter().map(|i| i.uid).collect();
                 for chunk in uidset::chunks(&uids, FETCH_CHUNK) {
-                    conn.session().uid_store(&chunk, format!("{}FLAGS.SILENT ({flag})", if on { '+' } else { '-' })).map_err(|e| map_error(&e))?;
+                    if let Err(e) = conn.session().uid_store(&chunk, format!("{}FLAGS.SILENT ({flag})", if on { '+' } else { '-' })) {
+                        return Err(conn.err(&e));
+                    }
                 }
             }
             Ok(AppliedChanges::default())
@@ -1559,7 +1668,9 @@ impl ImapProvider {
     /// every folder that changed, `label` first. The next listing keeps their cursors.
     fn rename_path(conn: &mut Conn, account: &Account, label: &Label, (old, new): (&str, &str), delimiter: &str, folders: &[FolderInfo], labels: &[Label]) -> Result<Vec<RenamedFolder>, ProviderError> {
         Self::leave_folder(conn, old)?;
-        conn.session().rename(old, new).map_err(|e| map_error(&e))?;
+        if let Err(e) = conn.session().rename(old, new) {
+            return Err(conn.err(&e));
+        }
         let _ = conn.session().unsubscribe(old);
         let _ = conn.session().subscribe(new);
         let sort_order = labels.iter().find(|l| l.id == label.id).map(|l| l.sort_order).unwrap_or(label.sort_order);
@@ -1575,13 +1686,14 @@ impl ImapProvider {
             paths.push((f.path.clone(), moved));
         }
         conn.renamed.extend(paths);
+        conn.drafts_path = None;
         conn.relist_pending = true;
         Ok(changed)
     }
 
     fn make_folder(&self, account: &Account, name: &str, parent: Option<&Label>, labels: &[Label]) -> Result<Label, ProviderError> {
         let parent_path = parent.and_then(|p| p.provider_id.as_ref()).map(|p| p.0.clone());
-        self.with_session(|conn| {
+        self.with_session_once(|conn| {
             let (delimiter, folders) = Self::delimiter_for(conn, parent_path.as_deref())?;
             if let Some(problem) = folder_name_problem(name, &delimiter) {
                 return Err(ProviderError::Rejected(problem));
@@ -1598,7 +1710,9 @@ impl ImapProvider {
             if folders.iter().any(|f| f.path.eq_ignore_ascii_case(&path)) {
                 return Err(ProviderError::Rejected(format!("There is already a folder called “{name}” there.")));
             }
-            conn.session().create(&path).map_err(|e| map_error(&e))?;
+            if let Err(e) = conn.session().create(&path) {
+                return Err(conn.err(&e));
+            }
             // Most servers list new folders without a subscription, but some clients
             // (and some servers' LIST) only show subscribed ones.
             let _ = conn.session().subscribe(&path);
@@ -1618,7 +1732,7 @@ impl ImapProvider {
             Some(_) => return Err(ProviderError::Rejected("folders can go only inside your own folders, folder-only parents, the Inbox or Trash".into())),
             None => None,
         };
-        self.with_session(|conn| {
+        self.with_session_once(|conn| {
             let (delimiter, folders) = Self::delimiter_for(conn, Some(&old))?;
             let leaf = old.rsplit_once(delimiter.as_str()).map(|(_, leaf)| leaf).unwrap_or(&old).to_owned();
             if let Some(p) = &parent_path {
@@ -1650,7 +1764,7 @@ impl ImapProvider {
         let Some(old) = label.provider_id.as_ref().filter(|_| label.kind == LabelKind::User).map(|p| p.0.clone()) else {
             return Err(ProviderError::Rejected("only your own folders can be renamed".into()));
         };
-        self.with_session(|conn| {
+        self.with_session_once(|conn| {
             let (delimiter, folders) = Self::delimiter_for(conn, Some(&old))?;
             if let Some(problem) = folder_name_problem(name, &delimiter) {
                 return Err(ProviderError::Rejected(problem));
@@ -1676,10 +1790,13 @@ impl ImapProvider {
         let Some(path) = label.provider_id.as_ref().filter(|_| label.kind == LabelKind::User).map(|p| p.0.clone()) else {
             return Err(ProviderError::Rejected("only your own folders can be deleted".into()));
         };
-        self.with_session(|conn| {
+        self.with_session_once(|conn| {
             Self::leave_folder(conn, &path)?;
-            conn.session().delete(&path).map_err(|e| map_error(&e))?;
+            if let Err(e) = conn.session().delete(&path) {
+                return Err(conn.err(&e));
+            }
             let _ = conn.session().unsubscribe(&path);
+            conn.drafts_path = None;
             conn.relist_pending = true;
             info!("imap: deleted folder {path}");
             Ok(())
@@ -1724,8 +1841,12 @@ impl ImapProvider {
         self.with_session(|conn| {
             let mailbox = conn.select(path)?;
             if mailbox.exists > 0 {
-                conn.session().uid_store("1:*", "+FLAGS.SILENT (\\Deleted)").map_err(|e| map_error(&e))?;
-                conn.session().expunge().map_err(|e| map_error(&e))?;
+                if let Err(e) = conn.session().uid_store("1:*", "+FLAGS.SILENT (\\Deleted)") {
+                    return Err(conn.err(&e));
+                }
+                if let Err(e) = conn.session().expunge() {
+                    return Err(conn.err(&e));
+                }
             }
             Ok(AppliedChanges::default())
         })
@@ -1735,13 +1856,19 @@ impl ImapProvider {
     fn delete_and_expunge(conn: &mut Conn, uids: &BTreeSet<u32>) -> Result<(), ProviderError> {
         let uidplus = conn.caps.uidplus;
         for chunk in uidset::chunks(uids, FETCH_CHUNK) {
-            conn.session().uid_store(&chunk, "+FLAGS.SILENT (\\Deleted)").map_err(|e| map_error(&e))?;
+            if let Err(e) = conn.session().uid_store(&chunk, "+FLAGS.SILENT (\\Deleted)") {
+                return Err(conn.err(&e));
+            }
             if uidplus {
-                conn.session().uid_expunge(&chunk).map_err(|e| map_error(&e))?;
+                if let Err(e) = conn.session().uid_expunge(&chunk) {
+                    return Err(conn.err(&e));
+                }
             }
         }
         if !uidplus {
-            conn.session().expunge().map_err(|e| map_error(&e))?;
+            if let Err(e) = conn.session().expunge() {
+                return Err(conn.err(&e));
+            }
         }
         Ok(())
     }
@@ -1762,9 +1889,12 @@ impl ImapProvider {
                 Ok(c) => c,
                 Err(imap::Error::No(no)) if may_create && no.code == Some(ResponseCode::TryCreate) => {
                     conn.create_folder(dest)?;
-                    conn.run_copyuid(&command).map_err(|e| map_error(&e))?
+                    match conn.run_copyuid(&command) {
+                        Ok(c) => c,
+                        Err(e) => return Err(conn.err(&e)),
+                    }
                 }
-                Err(e) => return Err(map_error(&e)),
+                Err(e) => return Err(conn.err(&e)),
             };
             if !conn.caps.move_ {
                 let set: BTreeSet<u32> = uidset::decode(&chunk);
@@ -1835,50 +1965,60 @@ impl ImapProvider {
         self.set_phase(draft, SendPhase::Accepted);
 
         // The Sent copy: APPEND the same bytes; APPENDUID names the server copy. A server
-        // that files its own copy gets a few seconds to do so first.
+        // that files its own copy gets a few seconds to do so first. Release `self.conn`
+        // between poll sleeps so other IMAP operations aren't blocked during the wait.
         let from_labels = Self::kind_path(&context.labels, LabelKind::Sent).map(str::to_owned);
         let server_files_sent = self.server_files_sent();
-        let appended = self.with_session(|conn| {
+        let appended: Result<Option<ProviderId>, ProviderError> = (|| {
             let path = match from_labels.clone() {
                 Some(p) => Some(p),
-                None => self.sent_folder(conn)?,
+                None => self.with_session(|conn| self.sent_folder(conn))?,
             };
             let Some(path) = path else { return Ok(None) };
-            // This closure may run twice (a dropped connection is reopened once): an APPEND
-            // whose reply was lost must not be repeated.
-            let mut validity = conn.select(&path)?.uid_validity.unwrap_or(0);
-            if let Some(uid) = conn.find_by_message_id(&rfc_id)? {
-                return Ok(Some(MessageRef::provider_id(&path, validity, uid)));
+            let find_in_sent = || {
+                self.with_session(|conn| {
+                    let validity = conn.select(&path)?.uid_validity.unwrap_or(0);
+                    Ok(conn.find_by_message_id(&rfc_id)?.map(|uid| MessageRef::provider_id(&path, validity, uid)))
+                })
+            };
+            if let Some(pid) = find_in_sent()? {
+                return Ok(Some(pid));
             }
             if server_files_sent {
                 let deadline = std::time::Instant::now() + self.server_copy_wait;
                 while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()).filter(|d| !d.is_zero()) {
                     std::thread::sleep(left.min(SERVER_COPY_POLL));
-                    // A fresh SELECT shows what arrived since.
-                    validity = conn.select(&path)?.uid_validity.unwrap_or(0);
-                    if let Some(uid) = conn.find_by_message_id(&rfc_id)? {
+                    if let Some(pid) = find_in_sent()? {
                         debug!("imap: {} filed its own Sent copy", self.servers.outgoing.host);
-                        return Ok(Some(MessageRef::provider_id(&path, validity, uid)));
+                        return Ok(Some(pid));
                     }
                 }
                 info!("imap: no Sent copy from {} after {:?}; appending one", self.servers.outgoing.host, self.server_copy_wait);
             }
-            let result = conn.session().append(&path, &raw).flag(Flag::Seen).finish();
-            match result {
-                Ok(appended) => {
-                    let uid = appended.uids.as_ref().and_then(|u| u.first()).map(|m| match m {
-                        UidSetMember::Uid(u) => *u,
-                        UidSetMember::UidRange(r) => *r.start(),
-                    });
-                    match (appended.uid_validity, uid) {
-                        (Some(validity), Some(uid)) => Ok(Some(MessageRef::provider_id(&path, validity, uid))),
-                        // No UIDPLUS: look the copy up by its Message-ID.
-                        _ => Ok(conn.find_by_message_id(&rfc_id)?.map(|uid| MessageRef::provider_id(&path, validity, uid))),
-                    }
+            self.with_session(|conn| {
+                // Re-check before APPEND so a reopened session never duplicates a message
+                // whose APPEND reply was lost.
+                let validity = conn.select(&path)?.uid_validity.unwrap_or(0);
+                if let Some(uid) = conn.find_by_message_id(&rfc_id)? {
+                    return Ok(Some(MessageRef::provider_id(&path, validity, uid)));
                 }
-                Err(e) => Err(map_error(&e)),
-            }
-        });
+                let result = conn.session().append(&path, &raw).flag(Flag::Seen).finish();
+                match result {
+                    Ok(appended) => {
+                        let uid = appended.uids.as_ref().and_then(|u| u.first()).map(|m| match m {
+                            UidSetMember::Uid(u) => *u,
+                            UidSetMember::UidRange(r) => *r.start(),
+                        });
+                        match (appended.uid_validity, uid) {
+                            (Some(validity), Some(uid)) => Ok(Some(MessageRef::provider_id(&path, validity, uid))),
+                            // No UIDPLUS: look the copy up by its Message-ID.
+                            _ => Ok(conn.find_by_message_id(&rfc_id)?.map(|uid| MessageRef::provider_id(&path, validity, uid))),
+                        }
+                    }
+                    Err(e) => Err(conn.err(&e)),
+                }
+            })
+        })();
         let provider_id = match appended {
             Ok(Some(pid)) => pid,
             Ok(None) => {
@@ -1924,8 +2064,19 @@ impl ImapProvider {
             if !conn.examine_for(&r.folder, r.uidvalidity)? {
                 return Err(ProviderError::Rejected("the message is no longer in that folder".into()));
             }
-            let fetches = conn.session().uid_fetch(r.uid.to_string(), "(UID BODY.PEEK[])").map_err(|e| map_error(&e))?;
-            fetches.iter().find(|f| f.uid == Some(r.uid)).and_then(|f| f.body().map(<[u8]>::to_vec)).ok_or_else(|| ProviderError::Rejected("the message is no longer on the server".into()))
+            let fetches = match conn.session().uid_fetch(r.uid.to_string(), format!("(UID BODY.PEEK[]<0.{}>)", MAX_IMAP_FETCH_BYTES + 1)) {
+                Ok(f) => f,
+                Err(e) => return Err(conn.err(&e)),
+            };
+            let body = fetches
+                .iter()
+                .find(|f| f.uid == Some(r.uid))
+                .and_then(|f| f.body())
+                .ok_or_else(|| ProviderError::Rejected("the message is no longer on the server".into()))?;
+            if body.len() > MAX_IMAP_FETCH_BYTES {
+                return Err(ProviderError::Rejected("this message exceeds the 50 MB size limit".into()));
+            }
+            Ok(body.to_vec())
         })
     }
 }
@@ -1986,9 +2137,17 @@ pub fn search_criteria(words: &[String], literal_plus: bool) -> String {
 fn expand_uid_set(set: &[UidSetMember]) -> Vec<u32> {
     let mut out = Vec::new();
     for m in set {
+        if out.len() >= FETCH_CHUNK {
+            break;
+        }
         match m {
             UidSetMember::Uid(u) => out.push(*u),
-            UidSetMember::UidRange(r) => out.extend(r.clone()),
+            UidSetMember::UidRange(r) => {
+                if r.start() <= r.end() {
+                    let remaining = FETCH_CHUNK - out.len();
+                    out.extend(r.clone().take(remaining));
+                }
+            }
         }
     }
     out
@@ -2014,17 +2173,47 @@ pub fn parse_copyuid(mut lines: &[u8]) -> Option<(u32, Vec<u32>, Vec<u32>)> {
 /// Decodes a fetched body part using its MIME headers (transfer encoding, charset) through
 /// the shared parser. Falls back to the raw bytes when the headers are unusable.
 pub fn decode_part(mime_headers: &[u8], body: &[u8]) -> Vec<u8> {
-    if mime_headers.trim_ascii().is_empty() {
+    let headers = mime_headers.trim_ascii_end();
+    if headers.trim_ascii().is_empty() {
         return body.to_vec();
     }
-    let mut raw = mime_headers.trim_ascii_end().to_vec();
+    // Fast path for non-text binary parts: avoid concatenating headers+body and parsing a
+    // multi-megabyte attachment through `mail_parser`.
+    let header_text = String::from_utf8_lossy(headers);
+    let mut is_text = false;
+    let mut encoding: Option<&str> = None;
+    for line in header_text.lines() {
+        if let Some((name, value)) = line.split_once(':') {
+            let name = name.trim();
+            if name.eq_ignore_ascii_case("Content-Type") {
+                is_text = value.trim().to_ascii_lowercase().starts_with("text/");
+            } else if name.eq_ignore_ascii_case("Content-Transfer-Encoding") {
+                encoding = Some(value.trim());
+            }
+        }
+    }
+    if !is_text {
+        if let Some(enc) = encoding {
+            if enc.eq_ignore_ascii_case("base64") {
+                use base64::Engine;
+                let cleaned: Vec<u8> = body.iter().copied().filter(|b| !b.is_ascii_whitespace()).collect();
+                if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&cleaned) {
+                    return decoded;
+                }
+            } else if enc.eq_ignore_ascii_case("7bit") || enc.eq_ignore_ascii_case("8bit") || enc.eq_ignore_ascii_case("binary") {
+                return body.to_vec();
+            }
+        }
+    }
+    let mut raw = Vec::with_capacity(headers.len() + 4 + body.len());
+    raw.extend_from_slice(headers);
     raw.extend_from_slice(b"\r\n\r\n");
     raw.extend_from_slice(body);
     let Some(parsed) = mail_parser::MessageParser::default().parse(&raw) else { return body.to_vec() };
-    match parsed.parts.first().map(|p| &p.body) {
-        Some(mail_parser::PartType::Binary(b)) | Some(mail_parser::PartType::InlineBinary(b)) => b.to_vec(),
-        Some(mail_parser::PartType::Text(t)) | Some(mail_parser::PartType::Html(t)) => t.as_bytes().to_vec(),
-        Some(mail_parser::PartType::Message(m)) => m.raw_message.to_vec(),
+    match parsed.parts.into_iter().next().map(|p| p.body) {
+        Some(mail_parser::PartType::Binary(b)) | Some(mail_parser::PartType::InlineBinary(b)) => b.into_owned(),
+        Some(mail_parser::PartType::Text(t)) | Some(mail_parser::PartType::Html(t)) => t.into_owned().into_bytes(),
+        Some(mail_parser::PartType::Message(m)) => m.raw_message.into_owned(),
         _ => body.to_vec(),
     }
 }
@@ -2079,7 +2268,12 @@ impl MailProvider for ImapProvider {
     }
 
     fn probe(&self) -> BoxFuture<'_, Result<(), ProviderError>> {
-        Box::pin(async move { self.with_session(|conn| conn.session().noop().map_err(|e| map_error(&e))) })
+        Box::pin(async move {
+            self.with_session(|conn| match conn.session().noop() {
+                Ok(()) => Ok(()),
+                Err(e) => Err(conn.err(&e)),
+            })
+        })
     }
 
     fn fetch_snapshot(&self, account: &Account) -> BoxFuture<'_, Result<MailboxSnapshot, ProviderError>> {
@@ -2238,7 +2432,29 @@ mod unit {
     #[test]
     fn decodes_parts_by_their_mime_headers() {
         assert_eq!(decode_part(b"Content-Type: application/pdf\r\nContent-Transfer-Encoding: base64\r\n\r\n", b"JVBERi0xLjQK"), b"%PDF-1.4\n");
+        assert_eq!(decode_part(b"Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: binary\r\n", b"\x00\x01\xff"), b"\x00\x01\xff");
         assert_eq!(decode_part(b"Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n", b"Caf=C3=A9"), "Café".as_bytes());
         assert_eq!(decode_part(b"", b"raw"), b"raw");
+    }
+
+    #[test]
+    fn vanished_huge_ranges_only_intersect_known_uids() {
+        let known: BTreeSet<u32> = [5, 42, 10_000, u32::MAX - 1].into_iter().collect();
+        let mut vanished = BTreeSet::new();
+        collect_vanished(&[1..=u32::MAX, 500..=100], &known, &mut vanished);
+        assert_eq!(vanished, known);
+
+        let mut partial = BTreeSet::new();
+        collect_vanished(&[10..=100, 1_000_000..=u32::MAX], &known, &mut partial);
+        assert_eq!(partial, [42, u32::MAX - 1].into_iter().collect());
+    }
+
+    #[test]
+    fn expand_uid_set_caps_adversarial_ranges() {
+        let huge = vec![UidSetMember::UidRange(1..=u32::MAX)];
+        let expanded = expand_uid_set(&huge);
+        assert_eq!(expanded.len(), FETCH_CHUNK);
+        assert_eq!(expanded[0], 1);
+        assert_eq!(*expanded.last().unwrap(), FETCH_CHUNK as u32);
     }
 }

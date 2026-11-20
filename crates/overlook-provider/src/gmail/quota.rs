@@ -54,7 +54,7 @@ impl QuotaBudget {
         }
         loop {
             let wait = {
-                let mut s = self.state.lock().unwrap();
+                let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
                 let now = Instant::now();
                 s.tokens = refilled(s.tokens, now.duration_since(s.updated));
                 s.updated = now;
@@ -72,7 +72,7 @@ impl QuotaBudget {
 
     /// Google said the minute's quota is spent: everything waits for the bucket to refill.
     pub fn exhausted(&self) {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
         s.tokens = s.tokens.min(0.);
         s.updated = Instant::now();
     }

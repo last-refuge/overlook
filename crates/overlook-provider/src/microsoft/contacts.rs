@@ -315,6 +315,8 @@ impl GraphContacts {
 
     fn pages<T: DeserializeOwned>(&self, first: &str, limit: usize) -> Result<Vec<T>, GraphError> {
         let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(first.to_owned());
         let mut next = Some(first.to_owned());
         while let Some(url) = next.take() {
             let (status, text) = self.send("GET", &url, None)?;
@@ -326,6 +328,9 @@ impl GraphContacts {
             }
             if let Some(link) = page.next_link {
                 self.ensure_ours(&link)?;
+                if !seen.insert(link.clone()) {
+                    return Err(GraphError::InvalidResponse);
+                }
                 next = Some(link);
             }
         }

@@ -45,11 +45,6 @@ impl LocalProvider {
             _ => raw_path_in(&self.legacy_dir, &message.id),
         }
     }
-
-    fn raw(&self, message: &Message) -> Result<Vec<u8>, ProviderError> {
-        let path = self.file_of(message);
-        std::fs::read(&path).map_err(|e| ProviderError::Rejected(format!("the message’s file can’t be read ({}): {e}", path.display())))
-    }
 }
 
 /// Where the first version of offline folders saved message `id` in `dir`.
@@ -196,13 +191,21 @@ pub fn read_manifest(root: &Path) -> Manifest {
 /// Replaces the manifest of the folder at `root`.
 pub fn write_manifest(root: &Path, manifest: &Manifest) -> std::io::Result<()> {
     let bytes = serde_json::to_vec_pretty(manifest).map_err(std::io::Error::other)?;
-    let tmp = root.join(format!("{MANIFEST}.part"));
-    {
+    let tmp = root.join(format!("{MANIFEST}.{}.part", MessageId::generate().0));
+    let written = (|| {
         let mut file = std::fs::File::create(&tmp)?;
         file.write_all(&bytes)?;
-        file.sync_all()?;
+        file.sync_all()
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    std::fs::rename(&tmp, root.join(MANIFEST))
+    if let Err(e) = std::fs::rename(&tmp, root.join(MANIFEST)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    sync_dir(root)
 }
 
 /// `path` inside `root`, with "/" between parts, as the manifest names it.
@@ -410,21 +413,27 @@ impl MailProvider for LocalProvider {
     }
 
     fn fetch_raw(&self, _account: &Account, message: &Message) -> BoxFuture<'_, Result<Vec<u8>, ProviderError>> {
-        let result = self.raw(message);
-        Box::pin(async move { result })
+        let path = self.file_of(message);
+        Box::pin(async move {
+            std::fs::read(&path).map_err(|e| ProviderError::Rejected(format!("the message’s file can’t be read ({}): {e}", path.display())))
+        })
     }
 
     fn fetch_original(&self, _account: &Account, message: &Message) -> BoxFuture<'_, Result<Vec<u8>, ProviderError>> {
-        let result = self.raw(message);
-        Box::pin(async move { result })
+        let path = self.file_of(message);
+        Box::pin(async move {
+            std::fs::read(&path).map_err(|e| ProviderError::Rejected(format!("the message’s file can’t be read ({}): {e}", path.display())))
+        })
     }
 
     fn fetch_attachment(&self, _account: &Account, message: &Message, attachment: &Attachment) -> BoxFuture<'_, Result<Vec<u8>, ProviderError>> {
-        let result = self.raw(message).and_then(|bytes| {
-            let section = attachment.provider_id.as_ref().map(|p| p.0.clone()).ok_or_else(|| ProviderError::Rejected("this attachment has no part number".into()))?;
+        let path = self.file_of(message);
+        let section = attachment.provider_id.as_ref().map(|p| p.0.clone());
+        Box::pin(async move {
+            let bytes = std::fs::read(&path).map_err(|e| ProviderError::Rejected(format!("the message’s file can’t be read ({}): {e}", path.display())))?;
+            let section = section.ok_or_else(|| ProviderError::Rejected("this attachment has no part number".into()))?;
             crate::mime::part_bytes(&bytes, &section).ok_or_else(|| ProviderError::Rejected(format!("the saved message has no part {section}")))
-        });
-        Box::pin(async move { result })
+        })
     }
 
     /// Folders are made, renamed and deleted by the window, on disk; this only says the
@@ -546,6 +555,15 @@ mod tests {
         let provider = LocalProvider::new(root.join("legacy"));
         assert_eq!(block(provider.fetch_original(&Account::offline(), &message)).unwrap(), raw.to_vec());
         assert_eq!(block(provider.fetch_attachment(&Account::offline(), &message, &message.attachments[0])).unwrap(), b"%PDF-".to_vec());
+
+        // Creating the future must not read the file synchronously before it is polled.
+        let deferred_path = root.join("2025/deferred.eml");
+        let mut deferred_msg = message.clone();
+        deferred_msg.provider_id = Some(ProviderId(deferred_path.to_string_lossy().into_owned()));
+        let fut = provider.fetch_original(&Account::offline(), &deferred_msg);
+        std::fs::write(&deferred_path, b"Subject: Deferred\r\n\r\nLate write").unwrap();
+        assert_eq!(block(fut).unwrap(), b"Subject: Deferred\r\n\r\nLate write".to_vec());
+        std::fs::remove_file(&deferred_path).unwrap();
 
         let moved = move_file(&first, &root.join("2026")).unwrap();
         assert_eq!(moved, root.join("2026/a.eml"));

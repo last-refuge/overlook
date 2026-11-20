@@ -136,7 +136,7 @@ fn token_response(mut response: ureq::http::Response<ureq::Body>, previous_refre
         access_token,
         refresh_token,
         expires_at: overlook_core::time::now() + expires_in * 1000,
-        scope: body.get("scope").and_then(|v| v.as_str()).map(str::to_owned),
+        scope: body.get("scope").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()).map(str::to_owned),
         // A refresh keeps the original sign-in time (see `GmailClient::accept_refresh`).
         signed_in_at: overlook_core::time::now(),
     })
