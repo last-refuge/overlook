@@ -89,10 +89,12 @@ printing projection; it is not yet guaranteed to match the new inline surface.
 Email paper defaults to white with dark text. In a dark theme, the reading pane's
 sun/moon button switches message bodies between light paper and the theme's dark
 colors. The choice is saved across messages and windows. Chromium uses the chosen
-color scheme for message HTML and adapts light sender styles in dark mode. Native
-gutters, plain text, and loading and fallback content use matching colors. Compose
-previews, reply quote previews, and Outbox previews use light paper. Fonts depend
-on installed system fonts and consent for authored remote fonts.
+color scheme for message HTML. In dark mode, flat white and near-black sections
+take on the theme's background, with an outline and the same padding as light
+paper. Native gutters, plain text, and loading and fallback content use matching
+colors. Compose previews, reply quote previews, and Outbox previews use light
+paper. Fonts depend on installed system fonts and consent for authored remote
+fonts.
 Animation/transition playback is suppressed. Full DOM accessibility
 bridging is not implemented yet.
 

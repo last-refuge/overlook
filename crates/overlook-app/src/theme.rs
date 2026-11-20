@@ -54,6 +54,10 @@ pub(crate) struct EmailBodyAppearance {
 }
 
 impl EmailBodyAppearance {
+    pub fn dark_paper(self) -> Option<u32> {
+        self.dark.then_some(self.paper)
+    }
+
     pub fn prepare_document(self, source: &str, fonts: &overlook_core::FontPrefs) -> overlook_core::BrowserDocument {
         let typography = overlook_core::browser::BrowserTypography::from_prefs(fonts);
         overlook_core::browser::prepare_document_with_options(source, self.paper, self.ink, &typography)

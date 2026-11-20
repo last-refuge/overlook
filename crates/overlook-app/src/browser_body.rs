@@ -225,16 +225,16 @@ fn remember_render(render: FinishedRender) {
 }
 
 /// Whether a document is already rendered at this size (pre-rendering skips it).
-pub fn is_rendered(document: &str, allow_remote: bool, dark: bool, size: (u32, f64)) -> bool {
-    let key = render_key(document_hash(document, allow_remote, dark), size);
+pub fn is_rendered(document: &str, allow_remote: bool, dark_paper: Option<u32>, size: (u32, f64)) -> bool {
+    let key = render_key(document_hash(document, allow_remote, dark_paper), size);
     FINISHED.with(|f| f.borrow().iter().any(|r| r.key == key))
 }
 
 /// Renders a document off-screen at `size` and keeps the first screenful, so opening
 /// it later shows it at once. The Chromium process is released when done.
-pub fn prerender(document: String, allow_remote: bool, dark: bool, size: (u32, f64), cx: &mut App) -> Task<()> {
-    let key = render_key(document_hash(&document, allow_remote, dark), size);
-    let browser = BrowserHandle::new_sized(document, allow_remote, dark, Some(size));
+pub fn prerender(document: String, allow_remote: bool, dark_paper: Option<u32>, size: (u32, f64), cx: &mut App) -> Task<()> {
+    let key = render_key(document_hash(&document, allow_remote, dark_paper), size);
+    let browser = BrowserHandle::new_sized(document, allow_remote, dark_paper, Some(size));
     browser.visible_range(0, VIEWPORT_HEIGHT);
     cx.spawn(async move |cx| {
         let started = std::time::Instant::now();
@@ -374,16 +374,16 @@ fn decode_frame(bytes: &[u8]) -> image::ImageResult<Arc<RenderImage>> {
 struct RetryDocument {
     html: Arc<str>,
     allow_remote: bool,
-    dark: bool,
+    dark_paper: Option<u32>,
 }
 
 impl RetryDocument {
-    fn new(html: String, allow_remote: bool, dark: bool) -> Self {
-        Self { html: Arc::from(html), allow_remote, dark }
+    fn new(html: String, allow_remote: bool, dark_paper: Option<u32>) -> Self {
+        Self { html: Arc::from(html), allow_remote, dark_paper }
     }
 
     fn start(&self) -> BrowserHandle {
-        BrowserHandle::new(self.html.to_string(), self.allow_remote, self.dark)
+        BrowserHandle::new(self.html.to_string(), self.allow_remote, self.dark_paper)
     }
 }
 
@@ -427,8 +427,8 @@ pub struct BrowserBody {
 }
 
 impl BrowserBody {
-    pub fn new(document: String, allow_remote: bool, dark: bool, cx: &mut Context<Self>) -> Self {
-        Self::new_sized(document, allow_remote, dark, None, None, cx)
+    pub fn new(document: String, allow_remote: bool, dark_paper: Option<u32>, cx: &mut Context<Self>) -> Self {
+        Self::new_sized(document, allow_remote, dark_paper, None, None, cx)
     }
 
     /// Starts the document at `size` (the reader's width and scale) and shows a finished
@@ -436,7 +436,7 @@ impl BrowserBody {
     pub fn new_sized(
         document: String,
         allow_remote: bool,
-        dark: bool,
+        dark_paper: Option<u32>,
         size: Option<(u32, f64)>,
         placeholder: Option<SharedString>,
         cx: &mut Context<Self>,
@@ -452,8 +452,8 @@ impl BrowserBody {
             }
         })
         .detach();
-        let document_hash = document_hash(&document, allow_remote, dark);
-        let prepared = RetryDocument::new(document, allow_remote, dark);
+        let document_hash = document_hash(&document, allow_remote, dark_paper);
+        let prepared = RetryDocument::new(document, allow_remote, dark_paper);
         let mut tiles = Tiles::new();
         let mut height = 300;
         let finished = size.and_then(|size| finished_render(render_key(document_hash, size)));
@@ -465,7 +465,7 @@ impl BrowserBody {
         }
         Self {
             document_hash,
-            browser: BrowserHandle::new_sized(prepared.html.to_string(), allow_remote, dark, size),
+            browser: BrowserHandle::new_sized(prepared.html.to_string(), allow_remote, dark_paper, size),
             prepared,
             focus: cx.focus_handle(),
             bounds: Rc::new(Cell::new(Bounds::default())),
@@ -517,18 +517,18 @@ impl BrowserBody {
         &mut self,
         document: String,
         allow_remote: bool,
-        dark: bool,
+        dark_paper: Option<u32>,
         cx: &mut Context<Self>,
     ) {
-        let hash = document_hash(&document, allow_remote, dark);
+        let hash = document_hash(&document, allow_remote, dark_paper);
         if hash == self.document_hash {
             return;
         }
         self.document_hash = hash;
         self.layout_ready = false;
         self.cache_initial_layout = true;
-        let retain_paint = allow_remote == self.prepared.allow_remote && dark == self.prepared.dark;
-        self.prepared = RetryDocument::new(document, allow_remote, dark);
+        let retain_paint = allow_remote == self.prepared.allow_remote && dark_paper == self.prepared.dark_paper;
+        self.prepared = RetryDocument::new(document, allow_remote, dark_paper);
         if retain_paint {
             // CID completion/preview edits replace the same entity's document.
             // Consent or theme changes deliberately use the clearing path below.
@@ -1128,10 +1128,19 @@ impl Render for BrowserBody {
                 if this.error.is_some() { return; }
                 // Active drags (including outside the viewport) are tracked at the window level.
                 if this.buttons != 0 || event.pressed_button.is_some() { return; }
+                // A later opening should not reuse tiles with sender hover styles.
+                if this.prepared.dark_paper.is_some() { this.cache_initial_layout = false; }
                 let (x, y) = this.position(event.position);
                 this.browser
                     .mouse("mouseMoved", x, y, "none", 0, 0);
             }))
+            .when(self.prepared.dark_paper.is_some(), |surface| {
+                surface.on_hover(cx.listener(|this, hovered: &bool, _, _| {
+                    if !hovered && this.buttons == 0 && this.error.is_none() {
+                        this.browser.mouse("mouseMoved", -1., -1., "none", 0, 0);
+                    }
+                }))
+            })
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.error.is_some() || !this.focus.contains_focused(window, cx)
                     || !browser_handles_key(&event.keystroke)
@@ -1183,9 +1192,9 @@ fn browser_handles_key(stroke: &Keystroke) -> bool {
             ))
 }
 
-fn document_hash(document: &str, allow_remote: bool, dark: bool) -> u64 {
+fn document_hash(document: &str, allow_remote: bool, dark_paper: Option<u32>) -> u64 {
     let mut hasher = DefaultHasher::new();
-    (document, allow_remote, dark).hash(&mut hasher);
+    (document, allow_remote, dark_paper).hash(&mut hasher);
     hasher.finish()
 }
 fn local_position(position: Point<Pixels>, bounds: Bounds<Pixels>) -> (f64, f64) {
@@ -1308,21 +1317,23 @@ mod tests {
     #[test]
     fn finished_renders_are_found_by_document_and_size_and_bounded() {
         let size = (760, 1.25);
-        assert!(!super::is_rendered("<p>a</p>", false, false, size));
-        let key = super::render_key(document_hash("<p>a</p>", false, false), size);
+        assert!(!super::is_rendered("<p>a</p>", false, None, size));
+        let key = super::render_key(document_hash("<p>a</p>", false, None), size);
         super::remember_render(super::FinishedRender { key, height: 640, tiles: vec![(0, 512, tiny_frame())] });
-        assert!(super::is_rendered("<p>a</p>", false, false, size));
+        assert!(super::is_rendered("<p>a</p>", false, None, size));
         // Another width, theme or consent is another render.
-        assert!(!super::is_rendered("<p>a</p>", false, false, (900, 1.25)));
-        assert!(!super::is_rendered("<p>a</p>", false, true, size));
-        assert!(!super::is_rendered("<p>a</p>", true, false, size));
+        assert!(!super::is_rendered("<p>a</p>", false, None, (900, 1.25)));
+        assert!(!super::is_rendered("<p>a</p>", false, Some(0x17242C), size));
+        assert!(!super::is_rendered("<p>a</p>", true, None, size));
+        let dark_key = super::render_key(document_hash("<p>a</p>", false, Some(0x17242C)), size);
+        assert_ne!(dark_key, super::render_key(document_hash("<p>a</p>", false, Some(0x292238)), size));
         assert_eq!(super::finished_render(key).map(|r| r.height), Some(640));
         for i in 0..super::FINISHED_LIMIT {
             let doc = format!("<p>{i}</p>");
-            let key = super::render_key(document_hash(&doc, false, false), size);
+            let key = super::render_key(document_hash(&doc, false, None), size);
             super::remember_render(super::FinishedRender { key, height: 1, tiles: Vec::new() });
         }
-        assert!(!super::is_rendered("<p>a</p>", false, false, size), "oldest render is evicted");
+        assert!(!super::is_rendered("<p>a</p>", false, None, size), "oldest render is evicted");
     }
 
     fn tile(top: u32, revision: u64, value: u8) -> super::EncodedTile {
@@ -1344,7 +1355,7 @@ mod tests {
         let handle = super::BrowserHandle::new(
             format!("<html><head><style>html,body{{margin:0;padding:0}}</style></head><body>{sections}</body></html>"),
             false,
-            false,
+            None,
         );
         handle.resize(400, 900, 1.0);
         // The worker adds one overscan tile: exactly twelve offsets, 0..=5632.
@@ -1528,8 +1539,8 @@ mod tests {
     #[test]
     fn browser_body_retry_resets_generation_and_preserves_prepared_consent() {
         for allow_remote in [false, true] {
-            for dark in [false, true] {
-                let prepared = super::RetryDocument::new("<p>original</p>".into(), allow_remote, dark);
+            for dark_paper in [None, Some(0x17242C)] {
+                let prepared = super::RetryDocument::new("<p>original</p>".into(), allow_remote, dark_paper);
                 let html = prepared.html.clone();
                 let mut tiles = super::Tiles::<u32>::new();
                 tiles.offer(tile(0, 1, 0));
@@ -1542,7 +1553,7 @@ mod tests {
                 assert!(std::sync::Arc::ptr_eq(&html, &prepared.html));
                 assert_eq!(&*prepared.html, "<p>original</p>");
                 assert_eq!(prepared.allow_remote, allow_remote);
-                assert_eq!(prepared.dark, dark);
+                assert_eq!(prepared.dark_paper, dark_paper);
             }
         }
     }
@@ -1735,12 +1746,12 @@ mod tests {
     #[test]
     fn options_restart_engine() {
         assert_ne!(
-            document_hash("a", false, false),
-            document_hash("a", true, false)
+            document_hash("a", false, None),
+            document_hash("a", true, None)
         );
         assert_ne!(
-            document_hash("a", false, false),
-            document_hash("a", false, true)
+            document_hash("a", false, None),
+            document_hash("a", false, Some(0x17242C))
         );
     }
 

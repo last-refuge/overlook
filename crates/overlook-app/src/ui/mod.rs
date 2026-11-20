@@ -2839,10 +2839,10 @@ impl MailWindow {
                         }
                         let appearance = cx.palette().email_body_appearance(this.prefs.dark_message_body);
                         let (html, _) = this.browser_document(&Self::message_source(&m), Some(&m), appearance);
-                        if crate::browser_body::is_rendered(&html, false, appearance.dark, size) {
+                        if crate::browser_body::is_rendered(&html, false, appearance.dark_paper(), size) {
                             return None;
                         }
-                        Some(crate::browser_body::prerender(html, false, appearance.dark, size, cx))
+                        Some(crate::browser_body::prerender(html, false, appearance.dark_paper(), size, cx))
                     })
                     .ok()
                     .flatten();
