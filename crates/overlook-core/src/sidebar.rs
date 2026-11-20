@@ -211,15 +211,13 @@ pub fn shift_item<T: PartialEq>(order: &mut [T], item: &T, up: bool) -> bool {
     true
 }
 
-/// Display names for Favorites rows. `rows` is `(folder name, account name)`; a folder name
-/// that appears more than once (ignoring case) gets " · account name" so the rows differ.
-pub fn favorite_names(rows: &[(String, String)]) -> Vec<String> {
-    rows.iter()
-        .map(|(folder, account)| {
-            let shared = rows.iter().filter(|(other, _)| other.eq_ignore_ascii_case(folder)).count() > 1;
-            if shared { format!("{folder} · {account}") } else { folder.clone() }
-        })
-        .collect()
+/// The account name to show beside each favorite. Only folders that share a name
+/// (ignoring case) need to show their account.
+pub fn favorite_account_labels(rows: &[(String, String)]) -> impl Iterator<Item = Option<&str>> {
+    rows.iter().map(|(folder, account)| {
+        let shared = rows.iter().filter(|(other, _)| other.eq_ignore_ascii_case(folder)).nth(1).is_some();
+        shared.then_some(account.as_str())
+    })
 }
 
 #[cfg(test)]
@@ -356,13 +354,13 @@ mod tests {
     #[test]
     fn only_shared_folder_names_get_the_account() {
         let rows = vec![("Inbox".into(), "Work".into()), ("Inbox".into(), "Personal".into()), ("Receipts".into(), "Work".into())];
-        assert_eq!(favorite_names(&rows), vec!["Inbox · Work", "Inbox · Personal", "Receipts"]);
+        assert_eq!(favorite_account_labels(&rows).collect::<Vec<_>>(), vec![Some("Work"), Some("Personal"), None]);
     }
 
     #[test]
     fn names_differing_only_in_case_count_as_shared() {
         let rows = vec![("Archive".into(), "Work".into()), ("archive".into(), "Home".into())];
-        assert_eq!(favorite_names(&rows), vec!["Archive · Work", "archive · Home"]);
+        assert_eq!(favorite_account_labels(&rows).collect::<Vec<_>>(), vec![Some("Work"), Some("Home")]);
     }
 
     #[test]

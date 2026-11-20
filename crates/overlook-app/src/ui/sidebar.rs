@@ -2,6 +2,7 @@
 
 use super::widgets::*;
 use super::{MailWindow, Nav};
+use super::ui_px;
 use std::collections::HashMap;
 use crate::assets::icon;
 use crate::theme::ActivePalette;
@@ -28,6 +29,11 @@ const DEPTH_STEP: f32 = 16.;
 /// Where a row's icon starts, past the column for the disclosure arrow. Section titles start
 /// here too, so arrows, icons and titles each keep one left edge.
 const ICON_INSET: f32 = 18.;
+
+const LABEL_SIZE: f32 = 13.;
+const LABEL_LINE_HEIGHT: f32 = 18.;
+const DETAIL_SIZE: f32 = 11.5;
+const DETAIL_LINE_HEIGHT: f32 = 15.;
 
 /// Name and icon of a mailbox that is not a user label; `None` for user labels.
 pub(super) fn system_folder(kind: LabelKind) -> Option<(&'static str, &'static str)> {
@@ -58,6 +64,7 @@ struct Metrics {
     row_height: f32,
     row_gap: f32,
     header_top: f32,
+    folders_top: f32,
     header_bottom: f32,
     header_padding: f32,
     /// Space on each side of the line under Favorites.
@@ -69,8 +76,8 @@ struct Metrics {
 impl Metrics {
     fn for_density(density: Density) -> Self {
         match density {
-            Density::Comfortable => Self { row_height: 32., row_gap: 2., header_top: 14., header_bottom: 4., header_padding: 4., divider_gap: 12., footer_top: 16., bottom: 14. },
-            Density::Compact => Self { row_height: 26., row_gap: 1., header_top: 8., header_bottom: 2., header_padding: 2., divider_gap: 8., footer_top: 10., bottom: 8. },
+            Density::Comfortable => Self { row_height: 32., row_gap: 2., header_top: 14., folders_top: 8., header_bottom: 4., header_padding: 4., divider_gap: 12., footer_top: 16., bottom: 14. },
+            Density::Compact => Self { row_height: 26., row_gap: 1., header_top: 8., folders_top: 5., header_bottom: 2., header_padding: 2., divider_gap: 8., footer_top: 10., bottom: 8. },
         }
     }
 }
@@ -424,7 +431,7 @@ impl MailWindow {
 
     /// Favorites rows with their accounts; a folder name shared by several rows carries the
     /// account name. Pins of removed accounts or deleted labels are skipped.
-    fn favorite_rows(&self, favorites: &[Favorite], p: &crate::theme::Palette) -> Vec<(AccountId, Nav)> {
+    fn favorite_rows(&self, favorites: &[Favorite], p: &crate::theme::Palette) -> Vec<(AccountId, Nav, Option<SharedString>)> {
         let mut rows: Vec<(AccountId, Nav)> = Vec::new();
         for f in favorites.iter().cloned() {
             if self.known_account(&f.account).is_none() || (self.is_offline(&f.account) && !self.offers_offline()) {
@@ -442,11 +449,11 @@ impl MailWindow {
             };
             rows.push((f.account, nav));
         }
-        let names = overlook_core::sidebar::favorite_names(&rows.iter().map(|(a, n)| (n.label.to_string(), self.account_name(a))).collect::<Vec<_>>());
-        for ((_, nav), name) in rows.iter_mut().zip(names) {
-            nav.label = name.into();
-        }
-        rows
+        let names: Vec<_> = rows.iter().map(|(account, nav)| (nav.label.to_string(), self.account_name(account))).collect();
+        rows.into_iter()
+            .zip(overlook_core::sidebar::favorite_account_labels(&names))
+            .map(|((account, nav), subtitle)| (account, nav, subtitle.map(SharedString::from)))
+            .collect()
     }
 
     pub(super) fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -458,10 +465,13 @@ impl MailWindow {
         // Read once per render, not per row: every row consults the pinned list.
         let pinned_list: std::rc::Rc<Vec<Favorite>> = std::rc::Rc::new(self.favorites());
         let ordered_accounts = self.sidebar_accounts();
+        let count_features = FontFeatures(std::sync::Arc::new(vec![("tnum".into(), 1)]));
 
         // `section` and `account` keep element ids unique: a folder can be in Favorites and
         // in its account's list, and every account has an Inbox.
-        let nav_button = |this: &Self, section: &str, account: &AccountId, nav: Nav, favorites: &std::rc::Rc<Vec<Favorite>>, cx: &mut Context<Self>| {
+        let nav_button = |section: &str, account: &AccountId, nav: Nav, subtitle: Option<SharedString>, cx: &mut Context<Self>| {
+            let this = self;
+            let favorites = &pinned_list;
             let in_active = account == &this.account.id;
             let current = in_active && this.view == nav.view && this.search_query.is_empty();
             // The active account counts from its live index; the others from their last
@@ -495,7 +505,11 @@ impl MailWindow {
             let place = favorites.iter().position(|f| f == &favorite);
             let (can_up, can_down) = (place.is_some_and(|i| i > 0), place.is_some_and(|i| i + 1 < favorites.len()));
             let order = favorites.clone();
-            let fav_drag = super::FavoriteDrag { favorite: favorite.clone(), name: nav.label.to_string() };
+            let favorite_title = subtitle.as_ref().map(|account| format!("{} · {account}", nav.label));
+            let fav_drag = super::FavoriteDrag {
+                favorite: favorite.clone(),
+                name: favorite_title.clone().unwrap_or_else(|| nav.label.to_string()),
+            };
             let drop_target = favorite.clone();
             let (menu_account, menu_view) = (account.clone(), nav.view.clone());
             // Drafts and the Outbox hold drafts, not received mail; a container holds folders.
@@ -522,7 +536,7 @@ impl MailWindow {
                 MailboxView::Label(id) if this.is_offline(account) => this.offline_folder(id).map(|l| (l.id.clone(), !l.name.contains('/'))),
                 _ => None,
             };
-            let tooltip = nav.tooltip.clone();
+            let tooltip = nav.tooltip.clone().or_else(|| favorite_title.map(SharedString::from));
             // Folders are dragged and dropped in the account tree; Favorites rows reorder.
             let folder_drag = user_folder.clone().filter(|_| !in_favorites).map(|label| super::FolderDrag { account: account.clone(), label });
             let folder_target = new_inside.clone().filter(|_| !in_favorites);
@@ -571,6 +585,7 @@ impl MailWindow {
                 .items_center()
                 .gap(px(9.))
                 .min_h(px(if in_favorites { m.row_height - 4. } else { m.row_height }))
+                .when(subtitle.is_some(), |d| d.py(px(m.header_padding)))
                 .pl(px(ICON_INSET + DEPTH_STEP * nav.depth as f32))
                 .pr(px(10.))
                 .when_some(expander, |d, (key, collapsed)| {
@@ -595,40 +610,54 @@ impl MailWindow {
                 })
                 .rounded(px(7.))
                 .cursor_pointer()
-                .text_size(crate::ui::ui_px(13.))
-                .text_color(if current { p.accent } else if container { p.muted } else { p.foreground })
+                .text_size(ui_px(LABEL_SIZE))
+                .line_height(ui_px(LABEL_LINE_HEIGHT))
+                .text_color(if current { p.selection_text } else if container { p.muted } else { p.foreground })
                 .when(container, |d| d.tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Holds folders only. Mail cannot be stored here. Right-click to learn more.").build(window, cx)))
                 .when_some(tooltip, |d, text| d.tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(text.clone()).build(window, cx)))
-                .font_weight(if current { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
                 .when(current, |d| d.bg(p.selection))
                 .when(!current, |d| d.hover(|d| d.bg(p.hover)))
                 // One shape for every folder; a label's color only tints it.
                 .child(icon(nav.icon).flex_none().size(px(16.)).text_color(color.unwrap_or(if current { p.accent } else { p.muted })))
-                .child(div().flex_1().truncate().child(nav.label.clone()))
-                // Unread mail in the Inbox is a filled pill; the unread in other folders is
-                // set in the action colour; totals (Starred, Drafts, Outbox) stay quiet.
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().truncate().font_weight(if current { FontWeight::SEMIBOLD } else { FontWeight::NORMAL }).child(nav.label))
+                        .children(subtitle.map(|text| {
+                            div()
+                                .truncate()
+                                .text_size(ui_px(DETAIL_SIZE))
+                                .line_height(ui_px(DETAIL_LINE_HEIGHT))
+                                .text_color(if current { p.selection_text.opacity(0.85) } else { p.muted })
+                                .child(text)
+                        })),
+                )
+                // Inbox unread counts get a pill. Other unread counts carry more weight
+                // than totals such as Starred or Drafts.
                 .when(count > 0, |d| {
                     let unread = matches!(nav.view, MailboxView::Kind(LabelKind::Inbox) | MailboxView::Label(_)) && !container;
                     let inbox = nav.view == MailboxView::Kind(LabelKind::Inbox);
                     d.child(
                         div()
                             .flex_none()
-                            .text_size(crate::ui::ui_px(11.))
+                            .text_size(ui_px(DETAIL_SIZE))
+                            .line_height(ui_px(DETAIL_LINE_HEIGHT))
+                            .font_features(count_features.clone())
+                            .font_weight(if unread { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
+                            .text_color(if current { p.selection_text } else if unread { p.foreground } else { p.muted })
                             .when(inbox, |d| {
                                 let (fill, ink) = count_pill(&p);
                                 d.min_w(px(20.))
-                                    .h(px(18.))
+                                    .min_h(ui_px(18.))
                                     .px(px(6.))
-                                    .rounded(px(9.))
+                                    .rounded_full()
                                     .flex()
                                     .items_center()
                                     .justify_center()
                                     .bg(fill)
                                     .text_color(ink)
-                                    .font_weight(FontWeight::BOLD)
                             })
-                            .when(!inbox && unread, |d| d.font_weight(FontWeight::SEMIBOLD).text_color(if current { p.accent } else { p.foreground }))
-                            .when(!unread, |d| d.text_color(if current { p.accent } else { p.muted }))
                             .child(count.to_string()),
                     )
                 })
@@ -761,6 +790,12 @@ impl MailWindow {
         // Puts a 12px arrow in the same column as the rows' arrows.
         const HEADER_ARROW_INSET: f32 = 3.;
         let section_header = |key: String, text: String, collapsed: bool, top: f32, mark: Option<AnyElement>, cx: &mut Context<Self>| {
+            let (size, line_height) = if mark.is_some() {
+                (LABEL_SIZE, LABEL_LINE_HEIGHT)
+            } else {
+                (DETAIL_SIZE, DETAIL_LINE_HEIGHT)
+            };
+            let label = div().flex_1().min_w_0().truncate().child(text);
             div()
                 .id(SharedString::from(format!("section-{key}")))
                 .h_flex()
@@ -773,16 +808,17 @@ impl MailWindow {
                 .py(px(m.header_padding))
                 .rounded(px(6.))
                 .cursor_pointer()
-                .text_size(crate::ui::ui_px(11.))
-                .font_weight(FontWeight::MEDIUM)
+                .text_size(ui_px(size))
+                .line_height(ui_px(line_height))
+                .font_weight(FontWeight::SEMIBOLD)
                 .text_color(p.muted)
                 .hover(|d| d.bg(p.hover))
-                .child(icon(if collapsed { "chevron-right" } else { "chevron-down" }).size(px(12.)).text_color(p.muted))
+                .child(icon(if collapsed { "chevron-right" } else { "chevron-down" }).flex_none().size(px(12.)).text_color(p.muted))
                 // An account's service mark sits in the rows' icon column, its name in their
                 // label column.
                 .child(match mark {
-                    Some(mark) => h_flex().flex_1().min_w_0().items_center().gap(px(9.)).child(mark).child(div().flex_1().min_w_0().truncate().child(text)).into_any_element(),
-                    None => div().flex_1().min_w_0().truncate().child(text).into_any_element(),
+                    Some(mark) => h_flex().flex_1().min_w_0().items_center().gap(px(9.)).child(mark).child(label).into_any_element(),
+                    None => label.into_any_element(),
                 })
                 .on_click(cx.listener(move |this, _, _window, cx| this.toggle_section(&key, cx)))
         };
@@ -819,7 +855,10 @@ impl MailWindow {
         let favorites: Vec<AnyElement> = if favorites_collapsed {
             Vec::new()
         } else {
-            self.favorite_rows(&pinned_list, &p).into_iter().map(|(account, nav)| nav_button(self, "favorites", &account, nav, &pinned_list, cx).into_any_element()).collect()
+            self.favorite_rows(&pinned_list, &p)
+                .into_iter()
+                .map(|(account, nav, subtitle)| nav_button("favorites", &account, nav, subtitle, cx).into_any_element())
+                .collect()
         };
 
         // The account tree: every account in the saved order, or just the one in use.
@@ -846,22 +885,22 @@ impl MailWindow {
             // The first header sits right under the Favorites line, whose own margin is the gap.
             let top = if i == 0 { 0. } else { m.header_top };
             let mark = self.account_mark(a).render(16., &p);
-            let header = section_header(key, name, collapsed, top, Some(mark), cx)
-                .font_weight(FontWeight::SEMIBOLD)
-                .when(a.id == self.account.id && all_accounts, |d| d.text_color(p.foreground))
+            let header = section_header(key, name.clone(), collapsed, top, Some(mark), cx)
+                .when(a.id == self.account.id || !all_accounts, |d| d.text_color(p.foreground))
+                .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(name.clone()).build(window, cx))
                 .when(reorderable, |d| d.on_drag(drag, |d: &super::AccountDrag, _pos, _window, cx| cx.new(|_| super::DragPreview { label: d.name.clone() })));
             let header = top_level_target(header, &a.id, cx);
             let folders = (!collapsed).then(|| {
                 let (mailboxes, folders) = self.account_folders(&a.id, &p);
-                let mailboxes = v_flex().gap(px(m.row_gap)).children(mailboxes.into_iter().map(|nav| nav_button(self, "account", &a.id, nav, &pinned_list, cx)));
+                let mailboxes = v_flex().gap(px(m.row_gap)).children(mailboxes.into_iter().map(|nav| nav_button("account", &a.id, nav, None, cx)));
                 let mut column = v_flex().child(mailboxes);
                 if !folders.is_empty() {
                     let key = format!("folders:{}", a.id.0);
                     let folded = self.collapsed_sections.contains(&key);
-                    let title = section_header(key, "Folders".into(), folded, m.header_top, None, cx);
+                    let title = section_header(key, "Folders".into(), folded, m.folders_top, None, cx);
                     column = column.child(top_level_target(title, &a.id, cx));
                     if !folded {
-                        column = column.child(v_flex().gap(px(m.row_gap)).children(folders.into_iter().map(|nav| nav_button(self, "account", &a.id, nav, &pinned_list, cx))));
+                        column = column.child(v_flex().gap(px(m.row_gap)).children(folders.into_iter().map(|nav| nav_button("account", &a.id, nav, None, cx))));
                     }
                 }
                 column
@@ -900,7 +939,6 @@ impl MailWindow {
             let collapsed = self.collapsed_sections.contains(&key);
             let mark = div().size(px(16.)).flex().items_center().justify_center().child(icon("hard-drive").size(px(15.)).text_color(p.muted)).into_any_element();
             let header = section_header(key, "Offline Folders".into(), collapsed, m.header_top, Some(mark), cx)
-                .font_weight(FontWeight::SEMIBOLD)
                 .when(self.offline_active(), |d| d.text_color(p.foreground))
                 .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Mail kept only on this computer. Drag messages onto a folder to remove them from the server and keep them here.").build(window, cx));
             let header = top_level_target(header, &offline, cx);
@@ -908,7 +946,6 @@ impl MailWindow {
             if !collapsed {
                 let (_, folders) = self.account_folders(&offline, &p);
                 if folders.is_empty() {
-                    // Lettered like the section title above them.
                     let action = |id: &'static str, glyph: &'static str, text: &'static str| {
                         div()
                             .id(id)
@@ -920,13 +957,12 @@ impl MailWindow {
                             .pr(px(10.))
                             .rounded(px(7.))
                             .cursor_pointer()
-                            .font_family(SharedString::from(crate::theme::current_fonts(cx).effective_ui_family().to_owned()))
-                            .text_size(crate::ui::ui_px(11.))
-                            .font_weight(FontWeight::MEDIUM)
+                            .text_size(ui_px(LABEL_SIZE))
+                            .line_height(ui_px(LABEL_LINE_HEIGHT))
                             .text_color(p.muted)
                             .hover(|d| d.bg(p.hover).text_color(p.foreground))
-                            .child(icon(glyph).flex_none().size(px(14.)).text_color(p.muted))
-                            .child(div().flex_1().truncate().child(text))
+                            .child(icon(glyph).flex_none().size(px(16.)).text_color(p.muted))
+                            .child(div().flex_1().min_w_0().truncate().child(text))
                     };
                     column = column
                         .child(action("offline-new-folder", "folder-plus", "New Offline Folder…").on_click(cx.listener(move |this, _, window, cx| {
@@ -941,7 +977,7 @@ impl MailWindow {
                             MailboxView::Label(id) => self.offline_folder(id).and_then(|l| self.offline_tooltip(&offline, &l)),
                             _ => None,
                         };
-                        nav_button(self, "offline", &offline, nav, &pinned_list, cx)
+                        nav_button("offline", &offline, nav, None, cx)
                     })));
                 }
             }
@@ -985,19 +1021,20 @@ impl MailWindow {
                     .child(owner_avatar(&owner, 30., &p))
                     .child(
                         v_flex()
+                            .flex_1()
                             .min_w_0()
-                            .child(div().text_size(crate::ui::ui_px(13.)).font_weight(FontWeight::MEDIUM).truncate().child(owner.display_name()))
+                            .child(div().text_size(ui_px(LABEL_SIZE)).line_height(ui_px(LABEL_LINE_HEIGHT)).font_weight(FontWeight::SEMIBOLD).truncate().child(owner.display_name()))
                             .child(
                                 h_flex()
                                     .items_center()
                                     .gap(px(5.))
-                                    .text_size(crate::ui::ui_px(11.))
+                                    .text_size(ui_px(DETAIL_SIZE))
+                                    .line_height(ui_px(DETAIL_LINE_HEIGHT))
                                     .text_color(p.muted)
-                                    .child(div().size(px(6.)).rounded_full().bg(state_color))
-                                    .child(format!("{} · {}", self.account.provider.label(), status.state.label())),
+                                    .child(div().flex_none().size(px(6.)).rounded_full().bg(state_color))
+                                    .child(div().min_w_0().truncate().child(format!("{} · {}", self.account.provider.label(), status.state.label()))),
                             ),
                     )
-                    .child(div().flex_1())
                     .child(
                         Button::new("account-menu")
                             .ghost()
