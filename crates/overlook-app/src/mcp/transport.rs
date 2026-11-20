@@ -13,11 +13,11 @@ use serde_json::{json, Value};
 use super::contract::{ErrorCode, Failure, Reply, Request};
 use super::{read, write};
 
-const MODERN: ProtocolVersion = ProtocolVersion::V_2026_07_28;
-const LEGACY: ProtocolVersion = ProtocolVersion::V_2025_11_25;
-const SUPPORTED_VERSIONS: &[ProtocolVersion] = &[MODERN, LEGACY];
-const VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
-const CLIENT_CAPABILITIES_KEY: &str = "io.modelcontextprotocol/clientCapabilities";
+pub(super) const MODERN: ProtocolVersion = ProtocolVersion::V_2026_07_28;
+pub(super) const LEGACY: ProtocolVersion = ProtocolVersion::V_2025_11_25;
+pub(super) const SUPPORTED_VERSIONS: &[ProtocolVersion] = &[MODERN, LEGACY];
+pub(super) const VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+pub(super) const CLIENT_CAPABILITIES_KEY: &str = "io.modelcontextprotocol/clientCapabilities";
 const SERVER_INFO_KEY: &str = "io.modelcontextprotocol/serverInfo";
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 
@@ -77,6 +77,22 @@ fn write_response(output: &mut impl Write, response: &Value) -> anyhow::Result<(
     Ok(())
 }
 
+pub(super) fn handle_http(
+    message: Value,
+    legacy_after_initialize: bool,
+    call: impl Fn(Request) -> Reply,
+) -> Option<Value> {
+    Server {
+        legacy: if legacy_after_initialize {
+            LegacyState::Ready
+        } else {
+            LegacyState::New
+        },
+        call,
+    }
+    .handle_message(message)
+}
+
 #[derive(PartialEq, Eq)]
 enum LegacyState {
     New,
@@ -91,16 +107,19 @@ struct Server<F> {
 
 impl<F: Fn(Request) -> Reply> Server<F> {
     fn handle_frame(&mut self, frame: &[u8]) -> Option<Value> {
-        let mut message: JsonObject = match serde_json::from_slice::<Value>(frame) {
-            Ok(Value::Object(message)) => message,
-            Ok(_) => {
-                let error = ErrorData::invalid_request("Expected one JSON-RPC message", None);
-                return Some(self.error_response(None, error));
-            }
+        match serde_json::from_slice(frame) {
+            Ok(message) => self.handle_message(message),
             Err(_) => {
                 let error = ErrorData::parse_error("Invalid JSON", None);
-                return Some(self.error_response(None, error));
+                Some(self.error_response(None, error))
             }
+        }
+    }
+
+    fn handle_message(&mut self, message: Value) -> Option<Value> {
+        let Value::Object(mut message) = message else {
+            let error = ErrorData::invalid_request("Expected one JSON-RPC message", None);
+            return Some(self.error_response(None, error));
         };
         let raw_id = message.remove("id");
         let id = raw_id
