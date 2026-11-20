@@ -3099,6 +3099,105 @@ mod tests {
     }
 
     #[test]
+    fn imap_archive_excludes_unrelated_user_folders_while_gmail_keeps_archived_labels() {
+        let store = Store::open_in_memory().unwrap();
+        let owner = "jason@example.com";
+
+        // 1. IMAP / M365 account with a real server-backed Archive folder and custom folders.
+        let imap = AccountId::from("imap-m365");
+        store
+            .upsert_account(&Account {
+                id: imap.clone(),
+                provider: ProviderKind::Imap,
+                display_name: "Work".into(),
+                email: owner.into(),
+                created_at: 1,
+            })
+            .unwrap();
+        for (id, kind, name, pid) in [
+            ("imap-inbox", LabelKind::Inbox, "Inbox", Some("INBOX")),
+            ("imap-archive", LabelKind::Archive, "Archive", Some("Archive")),
+            ("imap-sent", LabelKind::Sent, "Sent", Some("Sent Items")),
+            ("imap-trash", LabelKind::Trash, "Trash", Some("Deleted Items")),
+            ("imap-clients", LabelKind::User, "Clients", Some("Clients")),
+        ] {
+            store
+                .upsert_label(&Label {
+                    id: LabelId::from(id),
+                    account_id: imap.clone(),
+                    kind,
+                    name: name.into(),
+                    provider_id: pid.map(ProviderId::from),
+                    color: None,
+                    sort_order: 0,
+                })
+                .unwrap();
+        }
+        let mk = |acct: &AccountId, id: &str, labels: &[&str]| {
+            let mut m = message(id, id, id, labels);
+            m.account_id = acct.clone();
+            m
+        };
+        store
+            .upsert_messages(&[
+                mk(&imap, "m-archive", &["imap-archive"]),
+                mk(&imap, "m-clients", &["imap-clients"]),
+                mk(&imap, "m-pending", &["imap-inbox"]),
+            ])
+            .unwrap();
+        // Archiving locally removes Inbox (label_ids becomes empty until IMAP sync moves it).
+        store.apply_change(&imap, LocalChange::Archive { message_ids: vec![MessageId::from("m-pending")] }).unwrap();
+
+        let imap_index = store.mail_index(&imap).unwrap();
+        let imap_archive: Vec<String> = imap_index
+            .conversations(owner, &MailboxView::Kind(LabelKind::Archive), ListFilter::All, None)
+            .into_iter()
+            .map(|c| c.subject)
+            .collect();
+        assert!(imap_archive.contains(&"m-archive".to_owned()), "server Archive mail is shown: {imap_archive:?}");
+        assert!(imap_archive.contains(&"m-pending".to_owned()), "locally archived mail is shown: {imap_archive:?}");
+        assert!(!imap_archive.contains(&"m-clients".to_owned()), "unrelated custom folder mail must not leak into Archive: {imap_archive:?}");
+
+        // 2. Gmail account without a LabelKind::Archive folder keeps archived labeled mail in Archive.
+        let gmail = AccountId::from("gmail-acct");
+        store
+            .upsert_account(&Account {
+                id: gmail.clone(),
+                provider: ProviderKind::Gmail,
+                display_name: "Personal".into(),
+                email: owner.into(),
+                created_at: 2,
+            })
+            .unwrap();
+        for (id, kind, name, pid) in [
+            ("g-inbox", LabelKind::Inbox, "Inbox", Some("INBOX")),
+            ("g-sent", LabelKind::Sent, "Sent", Some("SENT")),
+            ("g-trash", LabelKind::Trash, "Trash", Some("TRASH")),
+            ("g-work", LabelKind::User, "Work", Some("Label_1")),
+        ] {
+            store
+                .upsert_label(&Label {
+                    id: LabelId::from(id),
+                    account_id: gmail.clone(),
+                    kind,
+                    name: name.into(),
+                    provider_id: pid.map(ProviderId::from),
+                    color: None,
+                    sort_order: 0,
+                })
+                .unwrap();
+        }
+        store.upsert_messages(&[mk(&gmail, "g-labeled", &["g-work"])]).unwrap();
+        let gmail_index = store.mail_index(&gmail).unwrap();
+        let gmail_archive: Vec<String> = gmail_index
+            .conversations(owner, &MailboxView::Kind(LabelKind::Archive), ListFilter::All, None)
+            .into_iter()
+            .map(|c| c.subject)
+            .collect();
+        assert_eq!(gmail_archive, vec!["g-labeled"]);
+    }
+
+    #[test]
     fn delete_forever_removes_the_rows_and_keeps_the_provider_ids_for_the_server() {
         let store = Store::open_in_memory().unwrap();
         seeded(&store);

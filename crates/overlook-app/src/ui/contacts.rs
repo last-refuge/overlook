@@ -271,7 +271,11 @@ impl MailWindow {
         let old_len = self.filtered_contacts.borrow().len();
         let new_len = next.len();
         *self.filtered_contacts.borrow_mut() = next;
-        self.contact_list_state.splice(0..old_len, new_len);
+        if old_len == 0 && new_len > 0 {
+            self.contact_list_state.reset(new_len);
+        } else {
+            self.contact_list_state.splice(0..old_len, new_len);
+        }
     }
 
     pub(crate) fn select_first_filtered_contact(&mut self, cx: &mut Context<Self>) {

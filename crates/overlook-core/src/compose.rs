@@ -219,11 +219,21 @@ pub fn outgoing_bodies_with_font(
         );
     }
     // The signature goes under what was written and above the quoted message. Its plain-text
-    // form follows the "-- " line that mail readers know to fold away.
+    // form follows the "-- " line that mail readers know to fold away. When an outgoing font
+    // is configured, apply it on the outer signature wrapper too so signatures without their
+    // own font inherit it while explicit per-signature styles inside still take precedence.
     if let Some(signature) = draft.signature_html.as_deref().filter(|s| !s.trim().is_empty()) {
         let signature = clean_only(signature, RemoteContent::Allowed);
         text = format!("{}\n\n-- \n{}", text.trim_end(), html_to_text(&signature));
-        html = format!("{html}<br><div class=\"overlook_signature\">{signature}</div>");
+        if let Some(font) = font {
+            html = format!(
+                "{html}<br><div class=\"overlook_signature\" style=\"font-family: {}; font-size: {}px;\">{signature}</div>",
+                font.css_family(),
+                font.clamped_size()
+            );
+        } else {
+            html = format!("{html}<br><div class=\"overlook_signature\">{signature}</div>");
+        }
     }
     let Some(source) = source.filter(|_| draft.include_quote) else {
         return OutgoingBodies { text, html };
@@ -567,6 +577,25 @@ mod tests {
         assert!(out.html.contains("font-size: 17px;"));
         assert!(out.html.contains("<strong>world</strong>"));
         assert_eq!(out.text, "Hello world");
+
+        // Signatures inherit the outgoing font, while per-signature styles stay nested inside.
+        draft.signature_html = Some("<p>Jason</p>".into());
+        let with_sig = outgoing_bodies_with_font(&draft, None, Some(&font));
+        assert!(with_sig.html.contains("<div class=\"overlook_signature\" style=\"font-family: 'Georgia',"));
+        assert!(with_sig.html.contains("font-size: 17px;\"><p>Jason</p></div>"));
+
+        let custom_sig = crate::prefs::Signature {
+            html: "<p>Jason</p>".into(),
+            font_family: Some("Verdana".into()),
+            font_size: Some(13),
+            ..Default::default()
+        };
+        draft.signature_html = Some(custom_sig.styled_html());
+        let with_custom = outgoing_bodies_with_font(&draft, None, Some(&font));
+        assert!(with_custom.html.contains("class=\"overlook_signature\" style=\"font-family: 'Georgia',"));
+        // `clean_only` normalizes inline style declarations to lowercase without spaces after `:`.
+        assert!(with_custom.html.contains("font-family:'verdana',"), "{}", with_custom.html);
+        assert!(with_custom.html.contains("font-size:13px"), "{}", with_custom.html);
     }
 
     #[test]
