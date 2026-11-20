@@ -179,6 +179,8 @@ pub fn reference_client(address: SocketAddr) -> CalDavClient {
         .max_redirects(0)
         .http_status_as_error(false)
         .proxy(None)
+        // The loopback fixtures close their sockets server-side after each request.
+        .max_idle_connections(0)
         .timeout_global(Some(Duration::from_secs(3)))
         .tls_config(tls)
         .build();

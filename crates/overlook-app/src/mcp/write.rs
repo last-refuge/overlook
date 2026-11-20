@@ -7,6 +7,8 @@ mod drafts;
 mod invitations;
 mod organization;
 
+pub(super) use calendar::conflict_details;
+
 use std::{fmt::Display, path::Path, sync::OnceLock};
 
 use overlook_core::{Account, Contact, Draft, Event};
@@ -207,7 +209,10 @@ pub(super) fn draft_revision(key: &[u8; 32], account_id: &str, draft: &Draft) ->
 }
 
 pub(super) fn event_revision(key: &[u8; 32], account_id: &str, event: &Event) -> String {
-    revision(key, account_id, "calendar_event_revision", event)
+    // The read path can overlay a pending operation without changing the saved event.
+    let mut content = event.clone();
+    content.pending = false;
+    revision(key, account_id, "calendar_event_revision", &content)
 }
 
 pub(super) fn contact_revision(key: &[u8; 32], account_id: &str, contact: &Contact) -> String {

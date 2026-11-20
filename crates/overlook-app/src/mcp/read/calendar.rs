@@ -18,6 +18,7 @@ const EVENTS: &str = "calendar_events_list";
 const EVENT: &str = "calendar_event_get";
 const AVAILABILITY: &str = "calendar_availability";
 const CHANGES: &str = "calendar_changes_list";
+const CONFLICT: &str = "calendar_conflict_get";
 const MAX_PAGE: u64 = 50;
 const MAX_QUERY: usize = 200;
 const MAX_ID: usize = 256;
@@ -52,6 +53,8 @@ pub(super) fn tools() -> Vec<ReadTool> {
             "limit":{"type":"integer","minimum":1,"maximum":MAX_PAGE},
             "cursor":{"type":"string"}
         }), &[]),
+        tool(CONFLICT, "Review the local and provider versions of a queued CalDAV conflict.",
+            json!({"operation_id":{"type":"string","maxLength":MAX_ID}}), &["operation_id"]),
         tool(EVENTS, "List cached events and recurrence instances overlapping an explicit time range. Coverage describes where the local cache can account for missing events.", events, &["start", "end"]),
         tool(EVENT, "Read a cached event or recurrence instance by the opaque event ID from calendar_events_list. UTC times and any available all-day dates have exclusive ends.",
             json!({"event_id": {"type": "string", "maxLength": MAX_ID}}), &["event_id"]),
@@ -82,6 +85,7 @@ pub(super) fn execute(
     match name {
         CALENDARS => calendars_list(ctx, args),
         CHANGES => changes_list(ctx, args),
+        CONFLICT => crate::mcp::write::conflict_details(ctx, args),
         EVENTS | AVAILABILITY => range_read(ctx, name, args),
         EVENT => event_get(ctx, args),
         _ => Err(Failure::new(

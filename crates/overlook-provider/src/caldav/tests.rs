@@ -64,6 +64,7 @@ impl Server {
                         Err(e) => panic!("fixture expected a request: {e}"),
                     }
                 };
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(3)))
                     .unwrap();
@@ -513,6 +514,7 @@ fn actual_tls_discovery_checks_trust_and_hostname_before_sending_credentials() {
                     Err(e) => panic!("TLS fixture expected a connection: {e}"),
                 }
             };
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();

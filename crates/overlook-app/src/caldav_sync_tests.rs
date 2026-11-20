@@ -156,7 +156,9 @@ fn reference_server_round_trip() {
                 synchronize_using(&other, &account, &other_connection, from, to, || Ok(
                     reference_client(address)
                 )),
-                0
+                0,
+                "{:?}",
+                crate::sync::calendar_status(&other, &account.id),
             )
         };
         sync_other();

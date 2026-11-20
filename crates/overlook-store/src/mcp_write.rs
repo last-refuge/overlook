@@ -204,7 +204,23 @@ impl Store {
         ).map_err(StoreError::from)?;
         let mut caldav_queued = false;
         if let Some(before) = before_caldav {
-            for (id, revision) in caldav_revisions(&tx, key.account)? {
+            let after = caldav_revisions(&tx, key.account)?;
+            // Taking the remote version clears the outbox row and invalidates coverage.
+            // Schedule a refresh even when reconciliation leaves no pending upload.
+            for id in before.keys().filter(|id| !after.contains_key(*id)) {
+                let state = if key.action == "calendar_conflict_resolve" {
+                    "discarded"
+                } else {
+                    "cancelled"
+                };
+                tx.execute(
+                    "INSERT OR IGNORE INTO mcp_operation_status(id,account_id,action,state,updated_at,source)
+                     VALUES(?1,?2,?3,?4,?5,'caldav')",
+                    params![id, key.account.0, key.action, state, now()],
+                ).map_err(StoreError::from)?;
+                caldav_queued = true;
+            }
+            for (id, revision) in after {
                 if before.get(&id) == Some(&revision) {
                     continue;
                 }

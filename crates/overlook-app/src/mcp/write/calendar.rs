@@ -8,7 +8,7 @@ mod tests;
 pub(in crate::mcp) use conflicts::conflict_details;
 
 use overlook_core::{
-    new_provider_event_id, time::now, CalDavEdit, Event, EventId, EventStatus, ProviderId,
+    new_provider_event_id, time::now, Address, CalDavEdit, Event, EventId, EventStatus, ProviderId,
     ProviderKind, RecurrenceScope,
 };
 use overlook_store::{McpCalendar, McpWriteTxn, StoreError};
@@ -115,7 +115,8 @@ fn create(
         end: 0,
         all_day: false,
         status: EventStatus::Confirmed,
-        organizer: None,
+        organizer: (backend == Backend::Sample)
+            .then(|| Address::new(Some(ctx.account.display_name.clone()), &ctx.account.email)),
         attendees: vec![],
         html_link: None,
         conference_url: None,
@@ -161,15 +162,7 @@ fn change(
         .find_calendar(|raw| raw == before.calendar_id.0)?
         .ok_or_else(|| not_cached("Calendar"))?;
     let backend = backend(ctx, &calendar)?;
-    // Native read results overlay pending operations. Replay may clear this
-    // indicator while the event content and its saved timestamp stay the same.
-    let revision_matches = revision == ctx.event_revision(&before)
-        || (backend == Backend::Sample && {
-            let mut equivalent = before.clone();
-            equivalent.pending = !equivalent.pending;
-            revision == ctx.event_revision(&equivalent)
-        });
-    if !revision_matches {
+    if revision != ctx.event_revision(&before) {
         return Err(Failure::new(
             ErrorCode::Conflict,
             "The event changed. Read the current event before retrying.",

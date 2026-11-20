@@ -639,6 +639,230 @@ fn mailbox_actions_are_visible_to_reads_and_can_be_undone() {
     quit_owner(&profile, &mut online);
 }
 
+#[test]
+fn sample_scheduling_requires_its_own_scope_and_survives_restart() {
+    use overlook_core::{time::now, tz};
+
+    let root = fixture();
+    let profile = root.path().join("profile");
+    let mut owner = start_sample_owner(&profile, true);
+    let calendar_token = grant_scopes(&profile, "calendar", &[PRIMARY], &["calendar"]);
+    let scheduler_token = grant_scopes(&profile, "scheduler", &[PRIMARY, SECONDARY], &["invite"]);
+    let mut calendar = Mcp::start(&profile, "calendar", &calendar_token, LEGACY);
+    let mut scheduler = Mcp::start(&profile, "scheduler", &scheduler_token, MODERN);
+    let accounts = scheduler.accounts();
+    let primary = account_id(&accounts, "Jason Alexander", "jason@example.com");
+    let secondary = account_id(&accounts, "Sample Secondary", "secondary@example.com");
+    let now = now();
+    let start = tz::to_rfc3339(now - 8 * 86_400_000);
+    let end = tz::to_rfc3339(now + 15 * 86_400_000);
+    let invited = scheduler.read(
+        "calendar_events_list",
+        json!({
+            "account_id":primary,"start":start,"end":end,"query":"Launch day go/no-go"
+        }),
+    )["items"][0]
+        .clone();
+    assert_eq!(invited["my_response"], "needs-action");
+    let respond = json!({
+        "account_id":primary,"idempotency_key":"sample-rsvp","event_id":invited["event_id"],
+        "if_revision":invited["revision"],"response":"accepted","confirmed":true
+    });
+    assert_failure(
+        &calendar.tool("calendar_invitation_respond", respond.clone()),
+        "access_denied",
+    );
+    let mut foreign = respond.clone();
+    foreign["account_id"] = json!(secondary);
+    assert_failure(
+        &scheduler.tool("calendar_invitation_respond", foreign),
+        "access_denied",
+    );
+    let mut unconfirmed = respond.clone();
+    unconfirmed["confirmed"] = json!(false);
+    assert_failure(
+        &scheduler.tool("calendar_invitation_respond", unconfirmed),
+        "invalid_request",
+    );
+    let receipt = scheduler.read("calendar_invitation_respond", respond.clone());
+    assert_eq!(receipt["status"], "queued");
+    assert_eq!(receipt["delivery"], "sample_simulated");
+    assert_eq!(receipt["response"], "accepted");
+    let lookup = json!({"account_id":primary,"operation_id":receipt["operation_id"]});
+    assert_eq!(
+        calendar.read("operation_get", lookup.clone())["status"],
+        "queued"
+    );
+    let detail = json!({"account_id":primary,"event_id":invited["event_id"]});
+    assert_eq!(
+        calendar.read("calendar_event_get", detail.clone())["my_response"],
+        "accepted"
+    );
+
+    let hosted = scheduler.read(
+        "calendar_events_list",
+        json!({
+            "account_id":primary,"start":start,"end":end,"query":"Executive meeting"
+        }),
+    )["items"][0]
+        .clone();
+    let guests = scheduler.read(
+        "calendar_event_guests_set",
+        json!({
+            "account_id":primary,"idempotency_key":"sample-guests","event_id":hosted["event_id"],
+            "if_revision":hosted["revision"],"guest_emails":["guest@example.test"],"confirmed":true
+        }),
+    );
+    assert_eq!(guests["status"], "queued");
+    let guest_lookup = json!({"account_id":primary,"operation_id":guests["operation_id"]});
+    let hosted_detail = json!({"account_id":primary,"event_id":hosted["event_id"]});
+    calendar.finish();
+    scheduler.finish();
+    quit_owner(&profile, &mut owner);
+
+    let mut online = start_owner(&profile);
+    let mut scheduler = Mcp::start(&profile, "scheduler", &scheduler_token, MODERN);
+    assert_eq!(scheduler.read("operation_get", lookup)["status"], "synced");
+    assert_eq!(
+        scheduler.read("operation_get", guest_lookup)["status"],
+        "synced"
+    );
+    assert_eq!(
+        scheduler.read("calendar_invitation_respond", respond),
+        receipt
+    );
+    assert_eq!(
+        scheduler.read("calendar_event_get", detail)["my_response"],
+        "accepted"
+    );
+    let hosted = scheduler.read("calendar_event_get", hosted_detail);
+    let guest_addresses: Vec<_> = hosted["attendees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|attendee| attendee["email"].as_str())
+        .collect();
+    assert_eq!(guest_addresses, ["jason@example.com", "guest@example.test"]);
+    scheduler.finish();
+    quit_owner(&profile, &mut online);
+}
+
+#[test]
+fn calendar_and_contact_edits_target_only_the_selected_account_and_collection() {
+    use overlook_core::{time::now, tz};
+
+    let root = fixture();
+    let profile = root.path().join("profile");
+    let mut owner = start_owner(&profile);
+    let ids = &[PRIMARY, SECONDARY];
+    let editor_token = grant_scopes(&profile, "editor", ids, &["calendar"]);
+    let address_token = grant_scopes(&profile, "address", ids, &["contacts"]);
+    let mut editor = Mcp::start(&profile, "editor", &editor_token, MODERN);
+    let mut address = Mcp::start(&profile, "address", &address_token, LEGACY);
+    let accounts = editor.accounts();
+    let primary = account_id(&accounts, "Jason Alexander", "jason@example.com");
+    let secondary = account_id(&accounts, "Sample Secondary", "secondary@example.com");
+    let work =
+        editor.read("calendar_calendars_list", json!({"account_id":primary}))["items"][0].clone();
+    let personal =
+        editor.read("calendar_calendars_list", json!({"account_id":secondary}))["items"][0].clone();
+    assert_eq!(work["can_edit"], true);
+    assert_eq!(personal["can_edit"], false);
+    let start = now() + 86_400_000;
+    let create_event = json!({
+        "account_id":primary,"idempotency_key":"create-event","calendar_id":work["calendar_id"],
+        "title":"Calendar MCP rehearsal","start":tz::to_rfc3339(start),"end":tz::to_rfc3339(start+3_600_000)
+    });
+    assert_failure(
+        &address.tool("calendar_event_create", create_event.clone()),
+        "access_denied",
+    );
+    let mut read_only = create_event.clone();
+    read_only["account_id"] = json!(secondary);
+    read_only["calendar_id"] = personal["calendar_id"].clone();
+    assert_failure(
+        &editor.tool("calendar_event_create", read_only),
+        "access_denied",
+    );
+    let event = editor.read("calendar_event_create", create_event.clone());
+    assert_eq!(editor.read("calendar_event_create", create_event), event);
+    assert_eq!(event["status"], "queued");
+    assert_eq!(event["calendar_id"], work["calendar_id"]);
+    let event_lookup = json!({"account_id":primary,"event_id":event["event_id"]});
+    let cached_event = editor.read("calendar_event_get", event_lookup.clone());
+    assert_eq!(cached_event["title"], "Calendar MCP rehearsal");
+    assert_eq!(cached_event["organizer"]["email"], "jason@example.com");
+    let mut foreign_event = event_lookup.clone();
+    foreign_event["account_id"] = json!(secondary);
+    assert_failure(
+        &editor.tool("calendar_event_get", foreign_event),
+        "not_cached",
+    );
+
+    let books = address.read(
+        "contacts_address_books_list",
+        json!({"account_id":secondary}),
+    );
+    let book = books["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|book| book["is_default"] == true)
+        .unwrap();
+    let create_contact = json!({
+        "account_id":secondary,"idempotency_key":"create-contact","address_book_id":book["address_book_id"],
+        "given_name":"Casey","family_name":"Example","email":"casey@example.test"
+    });
+    assert_failure(
+        &editor.tool("contacts_create", create_contact.clone()),
+        "access_denied",
+    );
+    let mut foreign_book = create_contact.clone();
+    foreign_book["account_id"] = json!(primary);
+    assert_failure(
+        &address.tool("contacts_create", foreign_book),
+        "access_denied",
+    );
+    let contact = address.read("contacts_create", create_contact.clone());
+    assert_eq!(address.read("contacts_create", create_contact), contact);
+    assert_eq!(contact["status"], "saved");
+    assert!(contact["operation_id"].is_null());
+    let contact_lookup = json!({"account_id":secondary,"contact_id":contact["contact_id"]});
+    let cached_contact = editor.read("contacts_get", contact_lookup.clone());
+    assert_eq!(cached_contact["contact"]["revision"], contact["revision"]);
+    let updated = address.read("contacts_update", json!({
+        "account_id":secondary,"idempotency_key":"update-contact","contact_id":contact["contact_id"],
+        "if_revision":contact["revision"],"organization":"Sample Studio"
+    }));
+    assert_eq!(updated["status"], "saved");
+    assert_eq!(
+        editor.read("contacts_get", contact_lookup)["contact"]["organization"],
+        "Sample Studio"
+    );
+    let mut delete_contact = json!({
+        "account_id":secondary,"idempotency_key":"delete-contact","contact_id":contact["contact_id"],
+        "if_revision":contact["revision"]
+    });
+    assert_failure(
+        &address.tool("contacts_delete", delete_contact.clone()),
+        "conflict",
+    );
+    delete_contact["if_revision"] = updated["revision"].clone();
+    assert_eq!(
+        address.read("contacts_delete", delete_contact)["status"],
+        "deleted"
+    );
+    let removed = editor.read(
+        "contacts_search",
+        json!({"account_id":secondary,"query":"casey@example.test"}),
+    );
+    assert!(removed["items"].as_array().unwrap().is_empty());
+
+    address.finish();
+    editor.finish();
+    quit_owner(&profile, &mut owner);
+}
+
 fn assert_tool_catalog(client: &mut Mcp) {
     let catalog = client.request("tools/list", json!({}));
     let tools = catalog["tools"].as_array().expect("tools/list tools array");

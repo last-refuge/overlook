@@ -26,7 +26,10 @@ impl McpWriteTxn<'_, '_> {
         queue: bool,
         target_book: Option<&str>,
     ) -> Result<Option<OperationId>> {
-        Ok(save_contact_edit_tx(self.tx, self.account, contact, queue, target_book)?.map(|op| op.id))
+        Ok(
+            save_contact_edit_tx(self.tx, self.account, contact, queue, target_book)?
+                .map(|op| op.id),
+        )
     }
 
     pub fn delete_mcp_contact(

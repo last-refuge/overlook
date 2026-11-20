@@ -57,6 +57,21 @@ Choose one `account_id` and a new `idempotency_key` for each write. Reuse that k
 
 Use `mail_operation_get` with the returned operation ID to distinguish queued, cancelled, uncertain, failed, and provider-confirmed delivery. A committed write receipt and provider acceptance are separate events. `mail_write_activity_list` shows the client, tool name, and commit time for local writes. The desktop uses its normal sync and Outbox recovery paths. To try offline replay safely, start the sample owner with `overlook mcp sample --offline`, queue a fictional send, stop it, then start `overlook mcp sample` again with the same profile.
 
+### Calendar and contact writes
+
+Grant `--allow calendar`, `--allow invite`, and `--allow contacts` independently. Each write takes an explicit `account_id` and an `idempotency_key`. Use IDs from the chosen account and pass the latest `revision` as `if_revision` when editing or deleting an existing record. `account_capabilities` lists the granted scopes by domain.
+
+| Permission | Tools | Supported paths |
+| --- | --- | --- |
+| `calendar` | `calendar_event_create`, `calendar_event_update`, `calendar_event_delete` | Personal events on writable Sample and connected CalDAV calendars. CalDAV supports individual occurrence edits and deletions, and whole-series deletion. |
+| `calendar` | `calendar_conflict_resolve` | CalDAV conflicts. Find the operation in `calendar_changes_list`, inspect both versions with `calendar_conflict_get`, and use its revision with `resolution: "keep-local"` or `"take-remote"`. |
+| `invite` | `calendar_invitation_respond`, `calendar_event_guests_set` | Simulated Sample scheduling. The account must be the verified attendee or organizer, respectively. Both take `confirmed: true`. Guest replacement takes `guest_emails`, with an empty list clearing the guests. |
+| `contacts` | `contacts_create`, `contacts_update`, `contacts_delete` | Sample and app-managed contacts, the connected CardDAV default book, and the Microsoft Graph default Contacts folder. Inferred contacts and other provider books have no MCP write path. |
+
+For a timed event use `start` and `end` in RFC 3339 with offsets. For an all-day event use `start_date`, `end_date`, and an IANA `time_zone`. Both forms use an exclusive end. A CalDAV event can receive a new ID after the provider confirms it. Set a contact's `address_book_id` when creating it. Contact updates may set a field to `null` to clear it. After a provider contact create syncs, search the book for the new provider-linked contact ID.
+
+Use `operation_get` to follow queued work and `write_activity_list` to audit local commits. Sample scheduling simulates changes without sending invitations. CalDAV supports personal edits, with meeting scheduling and conferencing unavailable through MCP. Gmail and recognized Google endpoints remain ineligible pending the Google data release review.
+
 ## Architecture
 
 1. **MCP adapter.** The stdio adapter uses the official `rmcp` protocol types and bounds each input frame to 64 KiB. Its stdout carries JSON-RPC in both the 2026-07-28 discovery protocol and the 2025-11-25 initialization protocol. The transport and tool schemas are separate from the service operations so a future Streamable HTTP adapter can use the same service. [MCP transports](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports) · [stdio binding](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio) · [Official Rust SDK](https://github.com/modelcontextprotocol/rust-sdk)
