@@ -276,7 +276,7 @@ impl MailWindow {
         };
 
         let body: AnyElement = if no_rows {
-            let nothing_local = !self.is_sample(&self.account.id) && self.store.message_count(&self.account.id).unwrap_or(0) == 0;
+            let nothing_local = !self.is_sample(&self.account.id) && self.account_message_count == 0;
             let paused_hint: String = match &self.status.state {
                 SyncState::SyncFailed(reason) | SyncState::Paused(reason) if nothing_local && !self.is_syncing_active() => reason.clone(),
                 _ => "Your inbox will appear here in a moment.".to_owned(),
@@ -825,25 +825,20 @@ impl MailWindow {
         row
     }
 
-    /// The calendar event behind an invitation in the list, from memory after the first
-    /// look. Rows of the open account only, so the account is checked.
+    /// The calendar event behind an invitation in the list, read purely from memory
+    /// (`self.invite_events` is populated on mail/thread/calendar refresh, never in render).
     fn invite_row(&self, account: &AccountId, uid: &str) -> Option<InviteRow> {
         if account != &self.account.id {
             return None;
         }
-        if let Some(found) = self.invite_rows.borrow().get(uid) {
-            return found.clone();
-        }
-        let found = self.store.event_by_ical_uid(account, uid).ok().flatten().map(|e| InviteRow {
+        self.invite_events.get(uid).and_then(|e| e.as_ref()).map(|e| InviteRow {
             event: e.id.clone(),
             start: e.start,
             end: e.end,
             all_day: e.all_day,
             can_respond: e.is_invitation(),
             response: e.my_response(),
-        });
-        self.invite_rows.borrow_mut().insert(uid.to_owned(), found.clone());
-        found
+        })
     }
 
     /// The right-click menu of a conversation row. The row joins the selection first, so

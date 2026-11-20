@@ -16,11 +16,41 @@ use overlook_core::sanitize::text_to_html;
 use overlook_core::time::format_full;
 use overlook_core::*;
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PreparedDocKey {
+    pub content_rev: u64,
+    pub allow_remote: bool,
+    pub appearance: EmailBodyAppearance,
+    pub fonts: FontPrefs,
+    pub inline_rev: u64,
+}
+
+pub(crate) struct PreparedDoc {
+    pub key: PreparedDocKey,
+    pub html: String,
+    pub remote_resources: usize,
+    pub placeholder: Option<SharedString>,
+}
+
+pub(super) struct OutboxPreview {
+    pub draft_id: DraftId,
+    pub updated_at: i64,
+    pub font: Option<overlook_core::prefs::OutgoingFont>,
+    pub allow_remote_pref: bool,
+    pub source: Option<Message>,
+    pub html: String,
+    pub allow_remote: bool,
+    pub revision: u64,
+}
+
 impl MailWindow {
     pub(super) fn prepare_thread_history(&mut self, cx: &mut Context<Self>) {
         use overlook_core::thread_history::{HistoryBody, HistoryMessage, MAX_MESSAGES, MAX_THREAD_BYTES};
         self.thread_history_task = None;
-        self.thread_history.clear();
+        if !self.thread_history.is_empty() {
+            self.thread_history.clear();
+            self.thread_history_revision = self.thread_history_revision.wrapping_add(1);
+        }
         self.thread_history_pending = false;
         let generation = self.thread_history_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         let token = self.thread_history_generation.clone();
@@ -45,6 +75,7 @@ impl MailWindow {
             this.update(cx, |this, cx| {
                 if this.thread_history_generation.load(std::sync::atomic::Ordering::Relaxed) == generation {
                     this.thread_history = result;
+                    this.thread_history_revision = this.thread_history_revision.wrapping_add(1);
                     this.thread_history_pending = false;
                     cx.notify();
                 }
@@ -73,87 +104,171 @@ impl MailWindow {
         }
         if let Some(id) = &self.outbox_selected { active.insert(format!("outbox-{id}")); }
         self.browser_bodies.borrow_mut().retain(|key, _| active.contains(key));
+        self.prepared_docs.borrow_mut().retain(|key, _| active.contains(key));
+        self.preparing_docs.borrow_mut().retain(|key, _| active.contains(key));
     }
 
     /// Browser layout starts from stored original HTML, not the lossy native
-    /// presentation projection. Sanitized documents are cached only in memory.
+    /// presentation projection. Sanitized documents are prepared off the UI thread
+    /// and cached in memory keyed by cheap metadata so `render()` never hashes,
+    /// clones, sanitizes, or reads inline images synchronously.
     pub(super) fn browser_message_body(
-        &self, key: String, source: &str, original: Option<&Message>,
-        allow_remote: bool, cx: &mut Context<Self>,
+        &self,
+        key: String,
+        content_rev: u64,
+        source_fn: impl FnOnce() -> String,
+        original: Option<&Message>,
+        allow_remote: bool,
+        cx: &mut Context<Self>,
     ) -> (AnyElement, usize) {
         let reading = key.starts_with("message-");
         let appearance = cx.palette().email_body_appearance(reading && self.prefs.dark_message_body);
         if reading && !self.live_browser_messages.borrow().contains(&key) {
             return (self.message_text_fallback(original, &key, appearance, cx), 0);
         }
-        use std::hash::{Hash, Hasher};
-        let mut hash = std::collections::hash_map::DefaultHasher::new();
         let mut fonts = self.prefs.fonts.clone();
         // Compose and Outbox previews represent authored outgoing mail, not received messages:
         // do not let the reading override replace the compose font and size.
         if key.starts_with("preview-") || key.starts_with("outbox-") {
             fonts.override_email_fonts = false;
         }
-        source.hash(&mut hash);
-        allow_remote.hash(&mut hash);
-        fonts.reading_family.hash(&mut hash);
-        fonts.reading_size.hash(&mut hash);
-        fonts.mono_family.hash(&mut hash);
-        fonts.mono_size.hash(&mut hash);
-        fonts.override_email_fonts.hash(&mut hash);
-        appearance.hash(&mut hash);
-        if source.as_bytes().windows(4).any(|chunk| chunk.eq_ignore_ascii_case(b"cid:")) {
-            if let Some(m) = original {
-                // Downloading a PDF or other non-inline attachment does not
-                // change browser content and must not reload the message.
-                for part in m.attachments.iter().filter(|part| part.is_inline_image()) {
-                    part.id.hash(&mut hash);
-                    part.local_path.hash(&mut hash);
+        let inline_rev = if original.is_some() { self.inline_images_revision } else { 0 };
+        let doc_key = PreparedDocKey {
+            content_rev,
+            allow_remote,
+            appearance,
+            fonts: fonts.clone(),
+            inline_rev,
+        };
+        {
+            let cache = self.browser_bodies.borrow();
+            if let Some((old, count, view)) = cache.get(&key) {
+                if *old == doc_key {
+                    return (email_paper(view.clone(), appearance, cx).into_any_element(), *count);
                 }
             }
         }
-        let fingerprint = hash.finish();
-        let mut cache = self.browser_bodies.borrow_mut();
-        if let Some((old, count, view)) = cache.get_mut(&key) {
-            if *old != fingerprint {
-                let (html, resources) = self.browser_document_with_fonts(source, original, appearance, &fonts);
-                *count = resources;
-                *old = fingerprint;
-                view.update(cx, |body, cx| body.set_document(html, allow_remote, appearance.dark_paper(), cx));
+        // Check if background preparation already produced this exact document.
+        let ready = self
+            .prepared_docs
+            .borrow_mut()
+            .remove_entry(&key)
+            .and_then(|(k, doc)| {
+                if doc.key == doc_key {
+                    Some(doc)
+                } else {
+                    // Put back only if still useful? Stale key can be dropped.
+                    let _ = k;
+                    None
+                }
+            });
+        if let Some(doc) = ready {
+            let mut cache = self.browser_bodies.borrow_mut();
+            if let Some((old, count, view)) = cache.get_mut(&key) {
+                *count = doc.remote_resources;
+                *old = doc_key;
+                view.update(cx, |body, cx| body.set_document(doc.html, allow_remote, appearance.dark_paper(), cx));
+                return (email_paper(view.clone(), appearance, cx).into_any_element(), *count);
             }
+            if cache.len() >= 4 {
+                return (self.message_text_fallback(original, &key, appearance, cx), 0);
+            }
+            let native_scroll = if reading || key.starts_with("outbox-") {
+                Some(self.reader_scroll.clone())
+            } else if key.starts_with("preview-") {
+                self.composer.as_ref().map(|c| c.preview_scroll.clone())
+            } else if key.starts_with("quote-") {
+                if self.composer_is_inline() {
+                    Some(self.reader_scroll.clone())
+                } else {
+                    self.composer.as_ref().map(|c| c.scroll.clone())
+                }
+            } else {
+                None
+            };
+            let count = doc.remote_resources;
+            let html = doc.html;
+            let placeholder = doc.placeholder;
+            let view = cx.new(|cx| {
+                let mut body = if reading {
+                    crate::browser_body::BrowserBody::new_sized(html, allow_remote, appearance.dark_paper(), crate::browser_body::reader_size(), placeholder, cx)
+                } else {
+                    crate::browser_body::BrowserBody::new(html, allow_remote, appearance.dark_paper(), cx)
+                };
+                if let Some(scroll) = native_scroll { body.attach_native_scroll(scroll); }
+                body
+            });
+            cache.insert(key, (doc_key, count, view.clone()));
+            return (email_paper(view, appearance, cx).into_any_element(), count);
+        }
+
+        // Not prepared yet: kick off background preparation (deduped by doc_key).
+        let already_preparing = self.preparing_docs.borrow().get(&key) == Some(&doc_key);
+        if !already_preparing {
+            self.preparing_docs.borrow_mut().insert(key.clone(), doc_key.clone());
+            let source = source_fn();
+            let mut inline_pairs: Vec<(String, String)> = Vec::new();
+            let mut missing_inline: Vec<(String, String, std::path::PathBuf)> = Vec::new();
+            if let Some(m) = original {
+                for a in m.attachments.iter().filter(|a| a.is_inline_image()) {
+                    let Some(cid) = a.content_id.as_deref() else { continue };
+                    if let Some(cached) = self.inline_images.get(&a.id) {
+                        if let Some(url) = cached {
+                            inline_pairs.push((cid.to_owned(), url.clone()));
+                        }
+                    } else if let Some(path) = a.local_path.as_deref() {
+                        missing_inline.push((cid.to_owned(), a.mime_type.clone(), std::path::PathBuf::from(path)));
+                    }
+                }
+            }
+            let task_key = key.clone();
+            let task_doc_key = doc_key.clone();
+            cx.spawn(async move |this, cx| {
+                let prepared = cx
+                    .background_spawn(async move {
+                        let mut doc = appearance.prepare_document(&source, &fonts);
+                        if !missing_inline.is_empty() && doc.html.contains("cid:") {
+                            for (cid, mime_type, path) in missing_inline {
+                                if let Some(url) = encode_inline_image_file(&path, &mime_type) {
+                                    inline_pairs.push((cid, url));
+                                }
+                            }
+                        }
+                        if !inline_pairs.is_empty() {
+                            doc.html = apply_inline_image_urls(doc.html, &inline_pairs);
+                        }
+                        let placeholder = reading.then(|| SharedString::from(placeholder_text(&source)));
+                        PreparedDoc {
+                            key: task_doc_key,
+                            html: doc.html,
+                            remote_resources: doc.remote_resources,
+                            placeholder,
+                        }
+                    })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    let still_wanted = this.preparing_docs.borrow().get(&task_key) == Some(&prepared.key);
+                    if still_wanted {
+                        this.preparing_docs.borrow_mut().remove(&task_key);
+                        this.prepared_docs.borrow_mut().insert(task_key, prepared);
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+
+        // While waiting a few milliseconds for background preparation, keep the existing
+        // browser view visible (zero flicker) or show a lightweight paper placeholder.
+        let cache = self.browser_bodies.borrow();
+        if let Some((_, count, view)) = cache.get(&key) {
             return (email_paper(view.clone(), appearance, cx).into_any_element(), *count);
         }
         if cache.len() >= 4 {
             return (self.message_text_fallback(original, &key, appearance, cx), 0);
         }
-        let (html, count) = self.browser_document_with_fonts(source, original, appearance, &fonts);
-        let native_scroll = if reading || key.starts_with("outbox-") {
-            Some(self.reader_scroll.clone())
-        } else if key.starts_with("preview-") {
-            self.composer.as_ref().map(|c| c.preview_scroll.clone())
-        } else if key.starts_with("quote-") {
-            if self.composer_is_inline() {
-                Some(self.reader_scroll.clone())
-            } else {
-                self.composer.as_ref().map(|c| c.scroll.clone())
-            }
-        } else {
-            None
-        };
-        let view = cx.new(|cx| {
-            let mut body = if reading {
-                // Start at the reader's width, reuse a finished render when there is one,
-                // and show the text until Chromium's first tiles arrive.
-                let placeholder = SharedString::from(placeholder_text(source));
-                crate::browser_body::BrowserBody::new_sized(html, allow_remote, appearance.dark_paper(), crate::browser_body::reader_size(), Some(placeholder), cx)
-            } else {
-                crate::browser_body::BrowserBody::new(html, allow_remote, appearance.dark_paper(), cx)
-            };
-            if let Some(scroll) = native_scroll { body.attach_native_scroll(scroll); }
-            body
-        });
-        cache.insert(key, (fingerprint, count, view.clone()));
-        (email_paper(view, appearance, cx).into_any_element(), count)
+        let hint = original.map(|m| m.snippet.clone()).unwrap_or_default();
+        (email_paper(div().min_h(px(120.)).px(px(8.)).py(px(8.)).text_size(crate::ui::ui_px(14.)).child(hint), appearance, cx).into_any_element(), 0)
     }
 
     fn message_text_fallback(
@@ -185,24 +300,6 @@ impl MailWindow {
         Some(1 + index + usize::from(composer_before))
     }
 
-    /// The document Chromium renders for a body: prepared, with inline images resolved.
-    /// Opening and pre-rendering must agree on it exactly to share a finished render.
-    pub(super) fn browser_document(&self, source: &str, original: Option<&Message>, appearance: EmailBodyAppearance) -> (String, usize) {
-        self.browser_document_with_fonts(source, original, appearance, &self.prefs.fonts)
-    }
-
-    fn browser_document_with_fonts(
-        &self,
-        source: &str,
-        original: Option<&Message>,
-        appearance: EmailBodyAppearance,
-        fonts: &FontPrefs,
-    ) -> (String, usize) {
-        let mut doc = appearance.prepare_document(source, fonts);
-        if let Some(m) = original { doc.html = self.resolve_inline_images(m, doc.html); }
-        (doc.html, doc.remote_resources)
-    }
-
     /// The HTML Chromium is given for a message (plain text is converted).
     pub(super) fn message_source(m: &Message) -> String {
         match (&m.body.html, &m.body.text) {
@@ -213,11 +310,34 @@ impl MailWindow {
     }
 
     /// A plain-text message, drawn natively: no browser process, nothing to wait for.
+    /// `plain_text_html` is memoized per message so `render()` does not rebuild it every frame.
     fn native_text_body(&self, m: &Message, appearance: EmailBodyAppearance, cx: &App) -> AnyElement {
         let text = m.body.text.as_deref().unwrap_or_default();
+        let html = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            text.len().hash(&mut h);
+            text.as_bytes().get(..256).hash(&mut h);
+            text.as_bytes().get(text.len().saturating_sub(256)..).hash(&mut h);
+            let fp = h.finish();
+            let mut cache = self.plain_text_html_cache.borrow_mut();
+            if let Some((old_fp, cached)) = cache.get(&m.id) {
+                if *old_fp == fp {
+                    cached.clone()
+                } else {
+                    let built: SharedString = plain_text_html(text).into();
+                    cache.insert(m.id.clone(), (fp, built.clone()));
+                    built
+                }
+            } else {
+                let built: SharedString = plain_text_html(text).into();
+                cache.insert(m.id.clone(), (fp, built.clone()));
+                built
+            }
+        };
         let body = NativeTextBody {
             id: SharedString::from(format!("text-{}", m.id)),
-            html: plain_text_html(text).into(),
+            html,
             has_content: !text.trim().is_empty(),
             font_family: SharedString::from(self.prefs.fonts.effective_native_reading_family().to_owned()),
             font_size: self.prefs.fonts.native_reading_size(),
@@ -610,8 +730,15 @@ impl MailWindow {
         let (body_view, remote_resources) = if m.body.html.is_none() && m.body.text.as_deref().is_some_and(|t| !t.trim().is_empty()) {
             (self.native_text_body(m, p.email_body_appearance(self.prefs.dark_message_body), cx), 0)
         } else {
-            let html = self.thread_history.get(&m.id).cloned().unwrap_or_else(|| Self::message_source(m));
-            self.browser_message_body(format!("message-{}", m.id), &html, Some(m), allow_remote, cx)
+            let content_rev = self.thread_revision.wrapping_mul(31) ^ self.thread_history_revision;
+            self.browser_message_body(
+                format!("message-{}", m.id),
+                content_rev,
+                || self.thread_history.get(&m.id).cloned().unwrap_or_else(|| Self::message_source(m)),
+                Some(m),
+                allow_remote,
+                cx,
+            )
         };
         let sender_email = if m.is_outgoing { self.account.email.clone() } else { m.from.email.clone() };
         let mid = m.id.clone();
@@ -751,7 +878,7 @@ impl MailWindow {
                                 .xsmall()
                                 .label("Load remote content")
                                 .on_click(cx.listener(move |this, _, _window, cx| {
-                                    this.remote_allowed.insert(mid.clone());
+                                    this.allow_remote_for(mid.clone());
                                     cx.notify();
                                 })),
                         ),
@@ -829,51 +956,107 @@ impl MailWindow {
         })).into_any_element()
     }
 
-    /// Replaces `cid:` image references with the downloaded attachment as a `data:` URL,
-    /// which the HTML view decodes inline. Images not downloaded yet stay as they are.
-    pub(super) fn resolve_inline_images(&self, m: &Message, html: String) -> String {
-        if !html.contains("cid:") {
-            return html;
+    /// Loads and base64-encodes downloaded inline images for the open thread off the UI thread.
+    pub(super) fn prepare_inline_images(&mut self, cx: &mut Context<Self>) {
+        let wanted: Vec<(AttachmentId, String, std::path::PathBuf)> = self
+            .thread
+            .iter()
+            .flat_map(|m| m.attachments.iter())
+            .filter(|a| a.is_inline_image() && !self.inline_images.contains_key(&a.id) && !self.inline_images_loading.contains(&a.id))
+            .filter_map(|a| {
+                let path = a.local_path.as_deref().map(std::path::PathBuf::from)?;
+                Some((a.id.clone(), a.mime_type.clone(), path))
+            })
+            .collect();
+        if wanted.is_empty() {
+            return;
         }
-        let mut out = html;
-        for a in m.attachments.iter().filter(|a| a.is_inline_image()) {
-            let Some(cid) = a.content_id.as_deref() else { continue };
-            let needle = format!("src=\"cid:{cid}\"");
-            if !out.contains(&needle) {
-                continue;
-            }
-            if let Some(url) = self.inline_image_data_url(a) {
-                let replacement = format!("src=\"{url}\"");
-                let count = out.matches(&needle).count();
-                let growth = replacement.len().saturating_sub(needle.len()).checked_mul(count);
-                if growth.and_then(|n| out.len().checked_add(n)).is_some_and(|n| n <= 8 * 1024 * 1024) {
-                    out = out.replace(&needle, &replacement);
+        for (id, _, _) in &wanted {
+            self.inline_images_loading.insert(id.clone());
+        }
+        cx.spawn(async move |this, cx| {
+            let loaded: Vec<(AttachmentId, Option<String>)> = cx
+                .background_spawn(async move {
+                    wanted
+                        .into_iter()
+                        .map(|(id, mime_type, path)| (id, encode_inline_image_file(&path, &mime_type)))
+                        .collect()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let mut any_url = false;
+                for (id, url) in loaded {
+                    this.inline_images_loading.remove(&id);
+                    if let Some(u) = &url {
+                        any_url = true;
+                        let current_bytes: usize = this.inline_images.values().filter_map(|s| s.as_ref()).map(String::len).sum();
+                        if current_bytes + u.len() > 16 * 1024 * 1024 {
+                            this.inline_images.clear();
+                        }
+                    }
+                    this.inline_images.insert(id, url);
                 }
-            }
-        }
-        out
+                if any_url {
+                    this.inline_images_revision = this.inline_images_revision.wrapping_add(1);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
-    fn inline_image_data_url(&self, a: &Attachment) -> Option<String> {
-        if let Some(cached) = self.inline_images.borrow().get(&a.id) {
-            return cached.clone();
+    /// Prepares the selected Outbox item's source message and resolved HTML off the UI thread
+    /// so `render_outbox_item` never touches SQLite or disk on every frame.
+    pub(super) fn prepare_outbox_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(draft) = self.outbox_selected.as_ref().and_then(|id| self.outbox.iter().find(|d| &d.id == id)).cloned() else {
+            self.outbox_preview = None;
+            return;
+        };
+        let font = self.prefs.fonts.outgoing_font();
+        let allow_remote_pref = self.prefs.remote_images == RemoteImages::Allow;
+        if let Some(cached) = self.outbox_preview.as_mut() {
+            if cached.draft_id == draft.id && cached.updated_at == draft.updated_at && cached.font == font && cached.allow_remote_pref == allow_remote_pref {
+                cached.allow_remote = allow_remote_pref || cached.source.as_ref().is_some_and(|m| self.remote_allowed.contains(&m.id));
+                return;
+            }
         }
-        let path = a.local_path.as_deref().map(std::path::PathBuf::from).filter(|p| p.exists())?;
-        use std::io::Read;
-        const MAX_INLINE_BYTES: usize = 3 * 1024 * 1024;
-        let file = std::fs::File::open(&path).ok()?;
-        if file.metadata().ok()?.len() > MAX_INLINE_BYTES as u64 { return None; }
-        let mut bytes = Vec::new();
-        file.take((MAX_INLINE_BYTES + 1) as u64).read_to_end(&mut bytes).ok()?;
-        if bytes.len() > MAX_INLINE_BYTES { return None; }
-        let mime = a.mime_type.split(';').next().unwrap_or("image/png").trim();
-        let url = format!("data:{mime};base64,{}", base64_encode(&bytes));
-        let mut cache = self.inline_images.borrow_mut();
-        if cache.values().filter_map(|s| s.as_ref()).map(String::len).sum::<usize>() + url.len() > 16 * 1024 * 1024 {
-            cache.clear();
-        }
-        cache.insert(a.id.clone(), Some(url.clone()));
-        Some(url)
+        self.outbox_preview_gen = self.outbox_preview_gen.wrapping_add(1);
+        let gen = self.outbox_preview_gen;
+        let store = self.store.clone();
+        let draft_id = draft.id.clone();
+        let updated_at = draft.updated_at;
+        cx.spawn(async move |this, cx| {
+            let (source, html) = cx
+                .background_spawn({
+                    let font = font.clone();
+                    async move {
+                        let source = draft.in_reply_to.as_ref().and_then(|id| store.message(id).ok().flatten());
+                        let html = super::signature::resolve_draft_images(
+                            &overlook_core::compose::outgoing_bodies_with_font(&draft, source.as_ref(), font.as_ref()).html,
+                            &draft.attachments,
+                        );
+                        (source, html)
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.outbox_preview_gen == gen && this.outbox_selected.as_ref() == Some(&draft_id) {
+                    let allow_remote = allow_remote_pref || source.as_ref().is_some_and(|m| this.remote_allowed.contains(&m.id));
+                    this.outbox_preview = Some(OutboxPreview {
+                        draft_id,
+                        updated_at,
+                        font,
+                        allow_remote_pref,
+                        source,
+                        html,
+                        allow_remote,
+                        revision: gen,
+                    });
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// The image attachment shown over the window, with Open and Save.
@@ -971,15 +1154,16 @@ impl MailWindow {
     fn render_attachment(&self, a: &Attachment, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *cx.palette();
         let downloading = self.downloading.contains(&a.id);
+        let downloaded = self.downloaded_attachments.contains(&a.id);
         let open = a.clone();
         let save = a.clone();
         let thumb = if a.is_image() {
-            a.local_path.as_deref().map(std::path::PathBuf::from).filter(|p| p.exists())
+            downloaded.then(|| a.local_path.as_deref().map(std::path::PathBuf::from)).flatten()
         } else {
             self.pdf_thumbs.get(&a.id).cloned()
         };
         let tip: SharedString = attachment_tooltip(a).into();
-        attachment_card(a, &p, downloading, thumb)
+        attachment_card(a, &p, downloading, downloaded, thumb)
             .id(SharedString::from(format!("att-{}", a.id)))
             .cursor_pointer()
             .hover(|d| d.bg(p.hover))
@@ -999,9 +1183,10 @@ impl MailWindow {
     }
 
     /// Invitation card for messages that carry a `text/calendar` part.
+    /// Reads the resolved event from `self.invite_events` (populated off `render()`).
     fn render_invitation_card(&self, inv: &overlook_core::ics::Invitation, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *cx.palette();
-        let event = self.store.event_by_ical_uid(&self.account.id, &inv.uid).ok().flatten();
+        let event = self.invite_events.get(&inv.uid).and_then(|e| e.clone());
         let title = event.as_ref().map(|e| e.display_title()).or_else(|| inv.summary.clone()).unwrap_or_else(|| "Invitation".into());
         let when = match &event {
             Some(e) if e.all_day => format!("{} · All day", overlook_core::tz::format_day(e.start)),
@@ -1139,22 +1324,80 @@ impl MailWindow {
                     .text_size(crate::ui::ui_px(15.))
                     .line_height(crate::ui::ui_px(24.))
                     .max_w(px(760.))
-                    .child({
-                        let source = d.in_reply_to.as_ref().and_then(|id| self.store.message(id).ok().flatten());
-                        let allow_remote = self.prefs.remote_images == RemoteImages::Allow || source.as_ref().is_some_and(|m| self.remote_allowed.contains(&m.id));
-                        let html = super::signature::resolve_draft_images(
-                            &overlook_core::compose::outgoing_bodies_with_font(
-                                d,
-                                source.as_ref(),
-                                self.prefs.fonts.outgoing_font().as_ref(),
+                    .child(match self.outbox_preview.as_ref().filter(|p| p.draft_id == d.id) {
+                        Some(preview) => self
+                            .browser_message_body(
+                                format!("outbox-{}", d.id),
+                                preview.revision,
+                                || preview.html.clone(),
+                                preview.source.as_ref(),
+                                preview.allow_remote,
+                                cx,
                             )
-                            .html,
-                            &d.attachments,
-                        );
-                        self.browser_message_body(format!("outbox-{}", d.id), &html, source.as_ref(), allow_remote, cx).0
+                            .0,
+                        None => div().min_h(px(120.)).into_any_element(),
                     }),
             )
     }
+}
+
+/// Replaces `cid:` image references with already-encoded `data:` URLs.
+fn apply_inline_image_urls(html: String, pairs: &[(String, String)]) -> String {
+    if !html.contains("cid:") {
+        return html;
+    }
+    let mut out = html;
+    for (cid, url) in pairs {
+        let needle = format!("src=\"cid:{cid}\"");
+        if !out.contains(&needle) {
+            continue;
+        }
+        let replacement = format!("src=\"{url}\"");
+        let count = out.matches(&needle).count();
+        let growth = replacement.len().saturating_sub(needle.len()).checked_mul(count);
+        if growth.and_then(|n| out.len().checked_add(n)).is_some_and(|n| n <= 8 * 1024 * 1024) {
+            out = out.replace(&needle, &replacement);
+        }
+    }
+    out
+}
+
+/// Reads a single inline image attachment from disk (up to 3 MiB) and base64-encodes it.
+/// Blocking: call only on background threads.
+fn encode_inline_image_file(path: &std::path::Path, mime_type: &str) -> Option<String> {
+    use std::io::Read;
+    const MAX_INLINE_BYTES: usize = 3 * 1024 * 1024;
+    let file = std::fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() > MAX_INLINE_BYTES as u64 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take((MAX_INLINE_BYTES + 1) as u64).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > MAX_INLINE_BYTES {
+        return None;
+    }
+    let mime = mime_type.split(';').next().unwrap_or("image/png").trim();
+    Some(format!("data:{mime};base64,{}", base64_encode(&bytes)))
+}
+
+/// Resolves `cid:` inline images directly from disk. Blocking: call only off the UI thread
+/// (e.g. from `print_message` or `schedule_prerender`).
+pub(super) fn resolve_inline_images_blocking(m: &Message, html: String) -> String {
+    if !html.contains("cid:") {
+        return html;
+    }
+    let pairs: Vec<(String, String)> = m
+        .attachments
+        .iter()
+        .filter(|a| a.is_inline_image())
+        .filter_map(|a| {
+            let cid = a.content_id.as_deref()?;
+            let path = a.local_path.as_deref().map(std::path::Path::new)?;
+            let url = encode_inline_image_file(path, &a.mime_type)?;
+            Some((cid.to_owned(), url))
+        })
+        .collect();
+    apply_inline_image_urls(html, &pairs)
 }
 
 /// Keep actual files and orphaned inline parts available. A referenced logo is
@@ -1165,7 +1408,7 @@ fn embedded_in_body(attachment: &Attachment, body: &Body) -> bool {
     ["\"", "'"].iter().any(|quote| html.contains(&format!("src={quote}cid:{cid}{quote}")))
 }
 
-fn attachment_card(a: &Attachment, p: &crate::theme::Palette, downloading: bool, thumbnail: Option<std::path::PathBuf>) -> Div {
+fn attachment_card(a: &Attachment, p: &crate::theme::Palette, downloading: bool, downloaded: bool, thumbnail: Option<std::path::PathBuf>) -> Div {
     use overlook_core::attachment_policy::{risk, Risk};
     let risk = risk(&a.filename);
     let badge_bg = p.file_badge(&a.filename);
@@ -1222,7 +1465,7 @@ fn attachment_card(a: &Attachment, p: &crate::theme::Palette, downloading: bool,
                         .text_color(p.muted)
                         .child(if downloading {
                             format!("{} · Downloading…", a.human_size())
-                        } else if a.is_downloaded() {
+                        } else if downloaded {
                             format!("{} · {}", a.human_size(), if a.is_image() || (a.is_pdf() && crate::pdf_preview::available()) { "Preview" } else { "Open" })
                         } else {
                             format!("{} · Click to download", a.human_size())
@@ -1319,12 +1562,22 @@ struct NativeTextBody {
 impl RenderOnce for NativeTextBody {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let initial_html = self.html.clone();
+        let initial_last = self.html.clone();
         let state = window.use_keyed_state(
             SharedString::from(format!("{}/state", self.id)),
             cx,
             move |_, cx| gpui_kit::base::text::TextViewState::html(initial_html.as_str(), cx),
         );
-        state.update(cx, |s, cx| s.set_text(self.html.as_str(), cx));
+        let last_html = window.use_keyed_state(
+            SharedString::from(format!("{}/last-html", self.id)),
+            cx,
+            move |_, _| initial_last,
+        );
+        if *last_html.read(cx) != self.html {
+            let next = self.html.clone();
+            last_html.update(cx, |slot, _| *slot = next);
+            state.update(cx, |s, cx| s.set_text(self.html.as_str(), cx));
+        }
         let context_link = window.use_keyed_state(
             SharedString::from(format!("{}/context-link", self.id)),
             cx,

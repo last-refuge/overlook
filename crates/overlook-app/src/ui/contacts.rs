@@ -9,6 +9,7 @@ use crate::theme::ActivePalette;
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
+use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -81,16 +82,16 @@ impl MailWindow {
 
     /// The contacts service `account`'s mail is with, when Overlook knows it (Fastmail,
     /// iCloud, Yahoo, AOL, or Microsoft for an account that signs in with Microsoft). Reads
-    /// its server settings.
+    /// from cached server metadata (never queries SQLite in render paths).
     pub(crate) fn known_contacts_service(&self, account: &Account) -> Option<&'static str> {
         if !matches!(account.provider, ProviderKind::Imap | ProviderKind::Pop3) {
             return None;
         }
-        let servers = self.store.servers(&account.id).ok().flatten()?;
+        let servers = self.account_servers.get(&account.id).and_then(|s| s.as_ref())?;
         if servers.oauth == Some(OAuthIssuer::Microsoft) {
             return Some(MICROSOFT);
         }
-        crate::carddav_sync::contacts_service(&servers).map(|s| s.name)
+        crate::carddav_sync::contacts_service(servers).map(|s| s.name)
     }
 
     pub(crate) fn reload_contacts(&mut self) {
@@ -102,6 +103,8 @@ impl MailWindow {
                 self.contact_selected = None;
             }
         }
+        self.rebuild_filtered_contacts();
+        self.refresh_settings_cache();
     }
 
     /// Builds a flat `(AccountId, Contact)` table and lower-cased email lookup index from
@@ -183,6 +186,10 @@ impl MailWindow {
         }
         self.other_contacts_generation += 1;
         let generation = self.other_contacts_generation;
+        for id in &missing {
+            let entry = self.other_contacts_for_generation.entry(id.clone()).or_insert(0);
+            *entry = entry.wrapping_add(1);
+        }
         let store = self.store.clone();
         cx.spawn(async move |this, cx| {
             let loaded: Vec<(AccountId, Vec<Contact>)> = cx
@@ -212,11 +219,15 @@ impl MailWindow {
     }
 
     /// Refreshes a single non-active account's cached contacts on a background thread after
-    /// its sync finishes, leaving unchanged accounts untouched.
+    /// its sync finishes, leaving unchanged accounts untouched. Uses a per-account generation
+    /// counter so stale loads cannot overwrite newer data.
     pub(crate) fn refresh_other_contacts_for(&mut self, account_id: AccountId, cx: &mut Context<Self>) {
         if account_id == self.account.id || !self.accounts.iter().any(|a| a.id == account_id) {
             return;
         }
+        let gen_entry = self.other_contacts_for_generation.entry(account_id.clone()).or_insert(0);
+        *gen_entry = gen_entry.wrapping_add(1);
+        let generation = *gen_entry;
         let store = self.store.clone();
         let id = account_id.clone();
         cx.spawn(async move |this, cx| {
@@ -224,7 +235,8 @@ impl MailWindow {
                 .background_spawn(async move { store.contacts(&id).unwrap_or_default() })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                if account_id != this.account.id && this.accounts.iter().any(|a| a.id == account_id) {
+                let current = this.other_contacts_for_generation.get(&account_id).copied() == Some(generation);
+                if current && account_id != this.account.id && this.accounts.iter().any(|a| a.id == account_id) {
                     this.other_contacts_by_account.insert(account_id, list);
                     this.rebuild_other_contact_index();
                     cx.notify();
@@ -234,27 +246,73 @@ impl MailWindow {
         .detach();
     }
 
-    fn visible_contacts(&self) -> Vec<&Contact> {
+    /// Recomputes cached filtered contact indices and updates the virtualized list state.
+    pub(crate) fn rebuild_filtered_contacts(&mut self) {
+        self.contacts_book_count = self.contacts.iter().filter(|c| c.in_address_book).count();
         let q = self.contact_query.trim().to_lowercase();
-        self.contacts
+        let next: Vec<usize> = self
+            .contacts
             .iter()
-            .filter(|c| match self.contact_filter {
+            .enumerate()
+            .filter(|(_, c)| match self.contact_filter {
                 ContactFilter::All => true,
                 ContactFilter::AddressBook => c.in_address_book,
                 ContactFilter::Other => !c.in_address_book,
             })
-            .filter(|c| {
+            .filter(|(_, c)| {
                 q.is_empty()
                     || c.display_name().to_lowercase().contains(&q)
                     || c.emails.iter().any(|e| e.to_lowercase().contains(&q))
                     || c.email.to_lowercase().contains(&q)
                     || c.organization.as_deref().is_some_and(|o| o.to_lowercase().contains(&q))
             })
-            .collect()
+            .map(|(idx, _)| idx)
+            .collect();
+        let old_len = self.filtered_contacts.borrow().len();
+        let new_len = next.len();
+        *self.filtered_contacts.borrow_mut() = next;
+        self.contact_list_state.splice(0..old_len, new_len);
+    }
+
+    pub(crate) fn select_first_filtered_contact(&mut self, cx: &mut Context<Self>) {
+        let first = self
+            .filtered_contacts
+            .borrow()
+            .first()
+            .and_then(|&idx| self.contacts.get(idx))
+            .map(|c| c.id.clone());
+        if let Some(id) = first {
+            self.contact_form = None;
+            self.contact_selected = Some(id);
+            self.contact_list_state.scroll_to_reveal_item(0);
+            cx.notify();
+        }
+    }
+
+    fn move_contact_selection(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let filtered = self.filtered_contacts.borrow().clone();
+        if filtered.is_empty() {
+            return;
+        }
+        let current = self.contact_selected.as_deref().and_then(|sel| {
+            filtered.iter().position(|&idx| self.contacts.get(idx).is_some_and(|c| c.id == sel))
+        });
+        let next_pos = match current {
+            Some(i) => (i as i32 + delta).clamp(0, filtered.len() as i32 - 1) as usize,
+            None if delta >= 0 => 0,
+            None => filtered.len() - 1,
+        };
+        if let Some(c) = self.contacts.get(filtered[next_pos]) {
+            self.contact_form = None;
+            self.contact_selected = Some(c.id.clone());
+            self.contact_list_state.scroll_to_reveal_item(next_pos);
+            cx.notify();
+        }
     }
 
     pub(crate) fn set_contact_filter(&mut self, filter: ContactFilter, cx: &mut Context<Self>) {
         self.contact_filter = filter;
+        self.rebuild_filtered_contacts();
         cx.notify();
     }
 
@@ -466,8 +524,8 @@ impl MailWindow {
     pub(crate) fn render_contacts_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().navigation_palette();
         let total = self.contacts.len();
-        let book = self.contacts.iter().filter(|c| c.in_address_book).count();
-        let other = total - book;
+        let book = self.contacts_book_count;
+        let other = total.saturating_sub(book);
         let writable = self.contacts_writable();
         let item = |label: SharedString, count: usize, filter: ContactFilter, icon_name: &'static str, cx: &mut Context<Self>| {
             let active = self.contact_filter == filter;
@@ -534,73 +592,117 @@ impl MailWindow {
             })
     }
 
+    fn render_contact_row(&self, c: &Contact, cx: &mut Context<Self>) -> AnyElement {
+        let p = *cx.palette();
+        let id = c.id.clone();
+        let active = self.contact_selected.as_deref() == Some(&c.id);
+        v_flex()
+            .w_full()
+            .child(
+                h_flex()
+                    .id(SharedString::from(format!("contact-{}", c.id)))
+                    .w_full()
+                    .items_center()
+                    .gap(px(12.))
+                    .px(px(14.))
+                    .py(px(9.))
+                    .cursor_pointer()
+                    .border_b_1()
+                    .border_color(p.divider)
+                    .when(active, |d| d.bg(p.selection))
+                    .when(!active, |d| d.hover(|d| d.bg(p.hover)))
+                    .child(avatar(&c.address(), 32., &p))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().truncate().text_size(crate::ui::ui_px(13.)).font_weight(FontWeight::MEDIUM).child(c.display_name()))
+                            .child(div().truncate().text_size(crate::ui::ui_px(11.)).text_color(p.muted).child(if c.email.is_empty() { c.organization.clone().unwrap_or_default() } else { c.email.clone() })),
+                    )
+                    .when(c.pending, |d| d.child(icon("cloud-off").size(px(13.)).text_color(p.warning)))
+                    .when(!c.in_address_book, |d| d.child(div().text_size(crate::ui::ui_px(10.)).text_color(p.muted).child("other")))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.contact_form = None;
+                        this.contact_selected = Some(id.clone());
+                        this.contact_list_focus.focus(window, cx);
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
     pub(crate) fn render_contacts_main(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *cx.palette();
-        let visible = self.visible_contacts();
+        let visible_len = self.filtered_contacts.borrow().len();
         let selected = self.contact_selected.clone();
-        let list = v_flex()
+        let list_body: AnyElement = if visible_len == 0 {
+            div()
+                .p(px(20.))
+                .text_size(crate::ui::ui_px(13.))
+                .text_color(p.muted)
+                .child(match (self.contacts.is_empty(), self.contacts_source) {
+                    (true, ContactsSource::Device) => "No contacts yet. Contacts you add stay on this device.",
+                    (true, _) => "No contacts yet. They arrive with the next sync, or add one.",
+                    (false, _) => "No contacts match.",
+                })
+                .into_any_element()
+        } else {
+            let view = cx.entity();
+            let filtered = self.filtered_contacts.clone();
+            div()
+                .relative()
+                .size_full()
+                .child(
+                    list(self.contact_list_state.clone(), move |ix, _window, cx| {
+                        let contact_idx = filtered.borrow().get(ix).copied();
+                        match contact_idx {
+                            Some(ci) => view.update(cx, |this, cx| {
+                                match this.contacts.get(ci) {
+                                    Some(c) => this.render_contact_row(c, cx),
+                                    None => v_flex().w_full().into_any_element(),
+                                }
+                            }),
+                            None => v_flex().w_full().into_any_element(),
+                        }
+                    })
+                    .size_full(),
+                )
+                .vertical_scrollbar(&self.contact_list_state)
+                .into_any_element()
+        };
+        let list_pane = v_flex()
+            .id("contact-list")
+            .track_focus(&self.contact_list_focus)
             .w(px(340.))
             .flex_none()
             .h_full()
             .border_r_1()
             .border_color(p.divider)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                let s = &event.keystroke;
+                if s.modifiers.control || s.modifiers.platform || s.modifiers.alt || s.modifiers.shift {
+                    return;
+                }
+                match s.key.as_str() {
+                    "down" | "j" => {
+                        this.move_contact_selection(1, cx);
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    }
+                    "up" | "k" => {
+                        this.move_contact_selection(-1, cx);
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
+            }))
             .child(h_flex().items_center().h(px(52.)).px(px(16.)).gap(px(8.)).border_b_1().border_color(p.divider)
                 .child(div().flex_1().text_size(crate::ui::ui_px(15.)).font_weight(FontWeight::SEMIBOLD).child(match self.contact_filter {
                     ContactFilter::All => "All contacts", ContactFilter::AddressBook => "Address book", ContactFilter::Other => "Other contacts",
                 }))
-                .child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(visible.len().to_string())))
-            .child(
-                div()
-                    .id("contact-list")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(if visible.is_empty() {
-                        div()
-                            .p(px(20.))
-                            .text_size(crate::ui::ui_px(13.))
-                            .text_color(p.muted)
-                            .child(match (self.contacts.is_empty(), self.contacts_source) {
-                                (true, ContactsSource::Device) => "No contacts yet. Contacts you add stay on this device.",
-                                (true, _) => "No contacts yet. They arrive with the next sync, or add one.",
-                                (false, _) => "No contacts match.",
-                            })
-                            .into_any_element()
-                    } else {
-                        v_flex()
-                            .children(visible.iter().map(|c| {
-                                let id = c.id.clone();
-                                let active = selected.as_deref() == Some(&c.id);
-                                h_flex()
-                                    .id(SharedString::from(format!("contact-{}", c.id)))
-                                    .items_center()
-                                    .gap(px(12.))
-                                    .px(px(14.))
-                                    .py(px(9.))
-                                    .cursor_pointer()
-                                    .border_b_1()
-                                    .border_color(p.divider)
-                                    .when(active, |d| d.bg(p.selection))
-                                    .when(!active, |d| d.hover(|d| d.bg(p.hover)))
-                                    .child(avatar(&c.address(), 32., &p))
-                                    .child(
-                                        v_flex()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .child(div().truncate().text_size(crate::ui::ui_px(13.)).font_weight(FontWeight::MEDIUM).child(c.display_name()))
-                                            .child(div().truncate().text_size(crate::ui::ui_px(11.)).text_color(p.muted).child(if c.email.is_empty() { c.organization.clone().unwrap_or_default() } else { c.email.clone() })),
-                                    )
-                                    .when(c.pending, |d| d.child(icon("cloud-off").size(px(13.)).text_color(p.warning)))
-                                    .when(!c.in_address_book, |d| d.child(div().text_size(crate::ui::ui_px(10.)).text_color(p.muted).child("other")))
-                                    .on_click(cx.listener(move |this, _, _w, cx| {
-                                        this.contact_form = None;
-                                        this.contact_selected = Some(id.clone());
-                                        cx.notify();
-                                    }))
-                            }))
-                            .into_any_element()
-                    }),
-            );
+                .child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(visible_len.to_string())))
+            .child(div().flex_1().min_h_0().child(list_body));
         let detail: AnyElement = if self.contact_form.is_some() {
             self.render_contact_form(cx).into_any_element()
         } else if let Some(c) = selected.as_deref().and_then(|id| self.contacts.iter().find(|c| c.id == id)) {
@@ -615,7 +717,7 @@ impl MailWindow {
                 .child(div().text_size(crate::ui::ui_px(14.)).text_color(p.muted).child("Select a contact, or add one."))
                 .into_any_element()
         };
-        h_flex().size_full().bg(p.surface).child(list).child(div().flex_1().min_w_0().h_full().child(detail))
+        h_flex().size_full().bg(p.surface).child(list_pane).child(div().flex_1().min_w_0().h_full().child(detail))
     }
 
     fn render_contact_detail(&self, c: &Contact, cx: &mut Context<Self>) -> impl IntoElement {

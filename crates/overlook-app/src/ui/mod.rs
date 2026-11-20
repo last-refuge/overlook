@@ -545,10 +545,138 @@ pub struct UpdateState {
     pub dismissed: Option<String>,
 }
 
+/// Runs a blocking synchronous job on a dedicated OS thread so GPUI's fixed
+/// background executor pool stays free for UI-latency work (tile decoding,
+/// draft autosaves, index rebuilds).
+pub(super) async fn spawn_blocking_io<T, F>(f: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name("overlook-io".into())
+        .spawn(move || {
+            let result = f();
+            let _ = tx.send(result);
+        });
+    if let Err(e) = spawned {
+        tracing::warn!("could not spawn blocking io thread: {e}");
+        return None;
+    }
+    rx.await.ok()
+}
+
+/// Drives `fut` to completion on the current OS thread without entering a Tokio runtime
+/// context, so blocking keyring/credential helpers that call their own `Runtime::block_on`
+/// never panic with "Cannot start a runtime from within a runtime".
+fn block_on_thread<F: std::future::Future>(fut: F) -> F::Output {
+    use std::sync::Condvar;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct Signal {
+        ready: Mutex<bool>,
+        cv: Condvar,
+    }
+    impl Wake for Signal {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            let mut ready = self.ready.lock().unwrap_or_else(|e| e.into_inner());
+            *ready = true;
+            self.cv.notify_one();
+        }
+    }
+
+    let signal = Arc::new(Signal {
+        ready: Mutex::new(false),
+        cv: Condvar::new(),
+    });
+    let waker = Waker::from(signal.clone());
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        if let Poll::Ready(out) = fut.as_mut().poll(&mut cx) {
+            return out;
+        }
+        let mut ready = signal.ready.lock().unwrap_or_else(|e| e.into_inner());
+        while !*ready {
+            ready = signal.cv.wait(ready).unwrap_or_else(|e| e.into_inner());
+        }
+        *ready = false;
+    }
+}
+
+/// Runs an async job that performs blocking network/disk/SQLite I/O on a
+/// dedicated OS thread instead of GPUI's background executor pool.
+pub(super) async fn spawn_blocking_async<T, Fut>(fut: Fut) -> Option<T>
+where
+    T: Send + 'static,
+    Fut: std::future::Future<Output = T> + Send + 'static,
+{
+    spawn_blocking_io(move || block_on_thread(fut)).await
+}
+
+/// Writes `bytes` to `dest` via a temporary file in `dir` followed by an atomic rename.
+pub(super) fn write_file_atomic(dir: &std::path::Path, dest: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    std::fs::create_dir_all(dir)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = tmp.as_file().set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    tmp.persist(dest).map(|_| ()).map_err(|e| e.error)
+}
+
+/// Prunes old unencrypted source/print temporary copies on startup.
+fn prune_temp_cache_dirs() {
+    const MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+    const MAX_FILES: usize = 32;
+    let now_sys = std::time::SystemTime::now();
+    for subdir in ["source", "print"] {
+        let dir = crate::updater::cache_dir().join(subdir);
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let mut kept: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            let expired = now_sys.duration_since(modified).is_ok_and(|age| age > MAX_AGE);
+            if expired {
+                let _ = std::fs::remove_file(&path);
+            } else {
+                kept.push((modified, path));
+            }
+        }
+        if kept.len() > MAX_FILES {
+            kept.sort_by_key(|(t, _)| *t);
+            let drop_count = kept.len() - MAX_FILES;
+            for (_, path) in kept.into_iter().take(drop_count) {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
+
+const MAX_OTHER_INDEXES: usize = 4;
+const MAX_PDF_THUMBS: usize = 128;
+const MAX_REMOTE_ALLOWED: usize = 512;
+const MAX_NOTIFIED_REMINDERS: usize = 1024;
+const MAX_SNOOZED_REMINDERS: usize = 256;
+const REMINDER_RETENTION_MS: i64 = 24 * 3_600_000;
+
 /// Set once the first main window has opened; a later one is the window coming back.
 static MAIN_WINDOW_OPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Reminder state handed from a closing main window to the next one.
-type ReminderMemory = (HashSet<(EventId, i32)>, HashMap<EventId, i64>);
+type ReminderMemory = (HashMap<(EventId, i32), i64>, HashMap<EventId, i64>);
 static REMINDER_MEMORY: std::sync::Mutex<Option<ReminderMemory>> = std::sync::Mutex::new(None);
 
 pub struct MailWindow {
@@ -558,6 +686,12 @@ pub struct MailWindow {
     sample: SampleProvider,
     accounts: Vec<Account>,
     providers: HashMap<AccountId, providers::AccountProviders>,
+    /// Accounts whose startup keyring/provider initialization is still running off the UI thread.
+    providers_loading: HashSet<AccountId>,
+    /// Monotonic generation per account, bumped on sign-out, re-sign-in, removal, or provider replacement.
+    provider_generation: HashMap<AccountId, u64>,
+    /// Cached per-account server settings (refreshed on account/server changes, never read from SQLite in render).
+    account_servers: HashMap<AccountId, Option<MailServers>>,
     /// Why an account has no provider (shown as “Sign-in required”).
     provider_issues: HashMap<AccountId, String>,
     removing_accounts: HashSet<AccountId>,
@@ -598,6 +732,10 @@ pub struct MailWindow {
     search_input: Entity<InputState>,
     search_query: String,
     search_coverage: String,
+    /// Cached local search coverage sentence for the active query.
+    local_search_coverage: String,
+    /// Local FTS search hits computed off the UI thread, keyed by `search_generation`.
+    local_search_hits: Option<(u64, BTreeSet<MessageId>)>,
     /// The server-side half of a search: bumped per query so stale results are dropped.
     search_generation: u64,
     online_search: OnlineSearch,
@@ -605,13 +743,16 @@ pub struct MailWindow {
     labels: Vec<Label>,
     conversations: Vec<ConversationSummary>,
     counts: HashMap<MailboxView, usize>,
+    /// Cached message count for the active account, updated on reload/index refresh.
+    account_message_count: usize,
     /// Headers of every message of the current account, for building the list and the
     /// counts without the database. A local change lands here first so the list updates
     /// at once; the store write and a fresh copy follow on a background thread.
     mail_index: MailIndex,
     mail_index_account: Option<AccountId>,
-    /// Indexes of the other accounts, so switching back shows them at once.
+    /// Indexes of the other accounts, so switching back shows them at once (bounded LRU).
     other_indexes: HashMap<AccountId, MailIndex>,
+    other_indexes_lru: VecDeque<AccountId>,
     /// Bumped whenever the index changes; a background rebuild started earlier is dropped.
     mail_index_generation: u64,
     /// Local changes waiting to be written, in order, and the batch being written now.
@@ -646,9 +787,9 @@ pub struct MailWindow {
     rows_unread: std::cell::Cell<usize>,
     /// Unread conversations in the Other tab of the Inbox, for its tab label.
     other_unread: usize,
-    /// The calendar event behind each invitation shown in the list, by its iCalendar UID:
-    /// looked up when a row first shows it, forgotten when mail or the calendar reloads.
-    invite_rows: std::cell::RefCell<HashMap<String, Option<list::InviteRow>>>,
+    /// The calendar event behind each invitation in the list/reader, by iCalendar UID:
+    /// populated on thread/mail/calendar refresh, never queried synchronously in render.
+    invite_events: HashMap<String, Option<Event>>,
     /// The row layout the list's cached heights were measured with.
     row_layout: std::cell::RefCell<Option<RowLayout>>,
     drafts: Vec<Draft>,
@@ -664,14 +805,24 @@ pub struct MailWindow {
     /// them. Empty for a plain single selection. Bulk actions act on these rows.
     marked: BTreeSet<ConversationId>,
     outbox_selected: Option<DraftId>,
+    outbox_preview: Option<reader::OutboxPreview>,
+    outbox_preview_gen: u64,
     thread: Vec<Message>,
+    thread_revision: u64,
     thread_history: HashMap<MessageId, String>,
+    thread_history_revision: u64,
     thread_history_generation: Arc<AtomicU64>,
     thread_history_task: Option<Task<()>>,
     thread_history_pending: bool,
     live_browser_messages: std::cell::RefCell<HashSet<String>>,
     expanded: BTreeSet<MessageId>,
     remote_allowed: BTreeSet<MessageId>,
+    remote_allowed_order: VecDeque<MessageId>,
+    /// Attachment ids confirmed present on disk for the open thread.
+    downloaded_attachments: HashSet<AttachmentId>,
+    attachment_presence_gen: u64,
+    /// Cached plain-text HTML per message in the open thread.
+    plain_text_html_cache: std::cell::RefCell<HashMap<MessageId, (u64, SharedString)>>,
     /// The message whose sender's contact card is open.
     /// The name whose card is pinned under a message header: the message and the lower-cased
     /// address.
@@ -687,8 +838,14 @@ pub struct MailWindow {
     other_contacts: Vec<(AccountId, Contact)>,
     other_contact_index: HashMap<String, usize>,
     other_contacts_generation: u64,
+    other_contacts_for_generation: HashMap<AccountId, u64>,
     // Contacts module state.
     pub(crate) contacts: Vec<Contact>,
+    /// Cached filtered indices into `contacts` and virtualized list state.
+    pub(crate) filtered_contacts: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
+    pub(crate) contact_list_state: ListState,
+    pub(crate) contact_list_focus: FocusHandle,
+    pub(crate) contacts_book_count: usize,
     /// Where the open account's contacts live; set with the contacts.
     pub(crate) contacts_source: contacts::ContactsSource,
     pub(crate) contact_selected: Option<String>,
@@ -698,13 +855,18 @@ pub struct MailWindow {
     pub(crate) contact_form: Option<contacts::ContactForm>,
     /// An image or PDF attachment shown over the window.
     pub(crate) quick_look: Option<QuickLook>,
-    /// First-page thumbnails of PDF attachments, rendered in the background.
+    /// First-page thumbnails of PDF attachments, rendered in the background (bounded).
     pub(crate) pdf_thumbs: HashMap<AttachmentId, PathBuf>,
+    pub(crate) pdf_thumbs_order: VecDeque<AttachmentId>,
     pub(crate) pdf_thumbs_pending: HashSet<AttachmentId>,
-    /// Inline images already encoded as `data:` URLs, by attachment.
-    pub(crate) inline_images: std::cell::RefCell<HashMap<AttachmentId, Option<String>>>,
+    /// Inline images already encoded as `data:` URLs, prepared off the UI thread.
+    pub(crate) inline_images: HashMap<AttachmentId, Option<String>>,
+    pub(crate) inline_images_loading: HashSet<AttachmentId>,
+    pub(crate) inline_images_revision: u64,
     /// Live isolated message documents; released when their reader surface closes.
-    pub(crate) browser_bodies: std::cell::RefCell<HashMap<String, (u64, usize, Entity<crate::browser_body::BrowserBody>)>>,
+    pub(crate) browser_bodies: std::cell::RefCell<HashMap<String, (reader::PreparedDocKey, usize, Entity<crate::browser_body::BrowserBody>)>>,
+    pub(crate) prepared_docs: std::cell::RefCell<HashMap<String, reader::PreparedDoc>>,
+    pub(crate) preparing_docs: std::cell::RefCell<HashMap<String, reader::PreparedDocKey>>,
     composer: Option<Composer>,
     /// Set in a pop-out composer window: the main window it belongs to.
     composer_owner: Option<composer_window::WindowOwner>,
@@ -796,10 +958,13 @@ pub struct MailWindow {
     /// The left button just went down on an event, for the column underneath to see.
     pub(crate) cal_press_on_event: bool,
     pub(crate) reminders_enabled: bool,
-    /// Reminders already shown this session: (event, minutes before).
-    pub(crate) notified: HashSet<(EventId, i32)>,
+    pub(crate) checking_reminders: bool,
+    /// Reminders already shown this session: (event, minutes before) → event start timestamp.
+    pub(crate) notified: HashMap<(EventId, i32), i64>,
     /// Reminders put off from the toast: event → when to show it again.
     pub(crate) snoozed_reminders: HashMap<EventId, i64>,
+    /// Memoized sanitized event description for the currently viewed calendar event.
+    pub(crate) cal_desc_cache: std::cell::RefCell<Option<(EventId, String, String)>>,
     pub(crate) prefs: Prefs,
     pub(crate) account_prefs: HashMap<AccountId, AccountPrefs>,
     pub(crate) settings: Option<SettingsState>,
@@ -815,11 +980,13 @@ pub struct MailWindow {
     sidebar_width: f32,
     list_width: f32,
     list_height: f32,
+    pane_save_task: Option<Task<()>>,
     panes: Entity<ResizableState>,
     content_panes_h: Entity<ResizableState>,
     content_panes_v: Entity<ResizableState>,
 
-    syncing: HashSet<AccountId>,
+    /// In-flight sync runs keyed by account → provider generation at sync start.
+    syncing: HashMap<AccountId, u64>,
     sync_requested: HashSet<AccountId>,
     /// Accounts whose next sync checks everything against the server and repairs drift:
     /// all of them at start-up, and every one when the Sync button is pressed.
@@ -837,8 +1004,9 @@ impl Drop for MailWindow {
     fn drop(&mut self) {
         // Only the main window checks reminders; its state outlives it (see `new`).
         if self.composer_owner.is_none() && self.folder_owner.is_none() && self.message_owner.is_none() {
+            self.prune_reminder_memory(now());
             let memory = (std::mem::take(&mut self.notified), std::mem::take(&mut self.snoozed_reminders));
-            *REMINDER_MEMORY.lock().unwrap() = Some(memory);
+            *REMINDER_MEMORY.lock().unwrap_or_else(|e| e.into_inner()) = Some(memory);
             tracing::info!("main window state released");
         }
     }
@@ -885,15 +1053,15 @@ impl MailWindow {
             None => account,
         };
         let mut providers: HashMap<AccountId, providers::AccountProviders> = shared_providers.unwrap_or_default();
-        let mut provider_issues = HashMap::new();
+        let provider_issues = HashMap::new();
+        let mut providers_loading = HashSet::new();
+        let mut accounts_to_load: Vec<Account> = Vec::new();
         for a in accounts.iter().filter(|_| !detached) {
-            match providers::providers_for(a, &sample, &store) {
-                Ok(p) => {
-                    providers.insert(a.id.clone(), p);
-                }
-                Err(providers::ProviderIssue::SignInRequired(reason)) => {
-                    provider_issues.insert(a.id.clone(), reason);
-                }
+            if a.provider == ProviderKind::Sample {
+                providers.insert(a.id.clone(), providers::AccountProviders::new(Arc::new(sample.clone()), Some(Arc::new(sample.clone()))));
+            } else {
+                providers_loading.insert(a.id.clone());
+                accounts_to_load.push(a.clone());
             }
         }
         if !detached {
@@ -903,12 +1071,19 @@ impl MailWindow {
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search mail"));
         let contact_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search contacts"));
         let mut subs = Vec::new();
-        tracing::debug!("startup: accounts and sign-ins loaded after {} ms", crate::since_start_ms());
+        tracing::debug!("startup: accounts loaded after {} ms", crate::since_start_ms());
         let (idle_tx, idle_rx) = tokio::sync::mpsc::unbounded_channel::<AccountId>();
         subs.push(cx.subscribe_in(&contact_search, window, |this, state, event: &InputEvent, _window, cx| {
-            if matches!(event, InputEvent::Change) {
-                this.contact_query = state.read(cx).value().to_string();
-                cx.notify();
+            match event {
+                InputEvent::Change => {
+                    this.contact_query = state.read(cx).value().to_string();
+                    this.rebuild_filtered_contacts();
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } => {
+                    this.select_first_filtered_contact(cx);
+                }
+                _ => {}
             }
         }));
         subs.push(cx.subscribe_in(&search_input, window, |this, state, event: &InputEvent, window, cx| match event {
@@ -964,6 +1139,9 @@ impl MailWindow {
             sample,
             accounts,
             providers,
+            providers_loading,
+            provider_generation: HashMap::new(),
+            account_servers: HashMap::new(),
             idle_watchers: HashMap::new(),
             idle_events: idle_tx,
             provider_issues,
@@ -986,14 +1164,18 @@ impl MailWindow {
             search_input,
             search_query: String::new(),
             search_coverage: String::new(),
+            local_search_coverage: String::new(),
+            local_search_hits: None,
             search_generation: 0,
             online_search: OnlineSearch::Idle,
             labels: Vec::new(),
             conversations: Vec::new(),
             counts: HashMap::new(),
+            account_message_count: 0,
             mail_index: MailIndex::default(),
             mail_index_account: None,
             other_indexes: HashMap::new(),
+            other_indexes_lru: VecDeque::new(),
             mail_index_generation: 0,
             local_writes: Arc::new(Mutex::new(VecDeque::new())),
             local_in_flight: Vec::new(),
@@ -1011,7 +1193,7 @@ impl MailWindow {
             rows_total: Default::default(),
             rows_unread: Default::default(),
             other_unread: 0,
-            invite_rows: Default::default(),
+            invite_events: HashMap::new(),
             row_layout: Default::default(),
             drafts: Vec::new(),
             outbox: Vec::new(),
@@ -1021,14 +1203,22 @@ impl MailWindow {
             selected: None,
             marked: BTreeSet::new(),
             outbox_selected: None,
+            outbox_preview: None,
+            outbox_preview_gen: 0,
             thread: Vec::new(),
+            thread_revision: 0,
             thread_history: HashMap::new(),
+            thread_history_revision: 0,
             thread_history_generation: Arc::new(AtomicU64::new(0)),
             thread_history_task: None,
             thread_history_pending: false,
             live_browser_messages: Default::default(),
             expanded: BTreeSet::new(),
             remote_allowed: BTreeSet::new(),
+            remote_allowed_order: VecDeque::new(),
+            downloaded_attachments: HashSet::new(),
+            attachment_presence_gen: 0,
+            plain_text_html_cache: std::cell::RefCell::new(HashMap::new()),
             quick_look: None,
             contact_card: None,
             recipients_expanded: BTreeSet::new(),
@@ -1037,17 +1227,27 @@ impl MailWindow {
             other_contacts: Vec::new(),
             other_contact_index: HashMap::new(),
             other_contacts_generation: 0,
+            other_contacts_for_generation: HashMap::new(),
             contacts_source: Default::default(),
             contacts: Vec::new(),
+            filtered_contacts: Default::default(),
+            contact_list_state: ListState::new(0, ListAlignment::Top, px(600.)),
+            contact_list_focus: cx.focus_handle(),
+            contacts_book_count: 0,
             contact_selected: None,
             contact_search,
             contact_query: String::new(),
             contact_filter: contacts::ContactFilter::All,
             contact_form: None,
             pdf_thumbs: HashMap::new(),
+            pdf_thumbs_order: VecDeque::new(),
             pdf_thumbs_pending: HashSet::new(),
-            inline_images: std::cell::RefCell::new(HashMap::new()),
+            inline_images: HashMap::new(),
+            inline_images_loading: HashSet::new(),
+            inline_images_revision: 0,
             browser_bodies: std::cell::RefCell::new(HashMap::new()),
+            prepared_docs: std::cell::RefCell::new(HashMap::new()),
+            preparing_docs: std::cell::RefCell::new(HashMap::new()),
             composer: None,
             composer_owner,
             detached_composers: HashMap::new(),
@@ -1108,8 +1308,10 @@ impl MailWindow {
             cal_range_drag: None,
             cal_press_on_event: false,
             reminders_enabled,
-            notified: HashSet::new(),
+            checking_reminders: false,
+            notified: HashMap::new(),
             snoozed_reminders: HashMap::new(),
+            cal_desc_cache: std::cell::RefCell::new(None),
             update: UpdateState {
                 install: InstallKind::detect(),
                 latest: None,
@@ -1129,10 +1331,11 @@ impl MailWindow {
             sidebar_width,
             list_width,
             list_height,
+            pane_save_task: None,
             panes: cx.new(|_| ResizableState::default()),
             content_panes_h: cx.new(|_| ResizableState::default()),
             content_panes_v: cx.new(|_| ResizableState::default()),
-            syncing: HashSet::new(),
+            syncing: HashMap::new(),
             sync_requested: HashSet::new(),
             verify_pending: HashSet::new(),
             verify_announce: HashSet::new(),
@@ -1140,6 +1343,7 @@ impl MailWindow {
             retry_attempts: HashMap::new(),
             _subscriptions: subs,
         };
+        this.refresh_account_metadata();
         this.load_recent_moves();
         this.count_kept_offline_mail();
         // Main and folder windows can own composers too. Native close and explicit Quit
@@ -1184,9 +1388,10 @@ impl MailWindow {
         let first_start = !MAIN_WINDOW_OPENED.swap(true, std::sync::atomic::Ordering::Relaxed);
         let hidden = cx.graphical_environment().is_none();
         // Reminders already shown stay shown, and snoozes run on, across a reopened window.
-        if let Some((notified, snoozed)) = REMINDER_MEMORY.lock().unwrap().take() {
+        if let Some((notified, snoozed)) = REMINDER_MEMORY.lock().unwrap_or_else(|e| e.into_inner()).take() {
             this.notified = notified;
             this.snoozed_reminders = snoozed;
+            this.prune_reminder_memory(now());
         }
         // The watchdog reports any stall of this thread (see `watchdog.rs`).
         crate::watchdog::start();
@@ -1204,10 +1409,12 @@ impl MailWindow {
         this.refresh_other_contacts(cx);
         // A fresh process has not reached any provider yet: say so until a probe succeeds.
         for a in this.accounts.clone().into_iter().filter(|_| first_start) {
-            if this.provider_issues.contains_key(&a.id) {
-                let _ = this.store.set_sync_state(&a.id, &SyncState::SignInRequired, None);
-            } else if !this.connected(&a.id) {
-                let _ = this.store.set_sync_state(&a.id, &SyncState::Offline, None);
+            if !this.providers_loading.contains(&a.id) {
+                if this.provider_issues.contains_key(&a.id) {
+                    let _ = this.store.set_sync_state(&a.id, &SyncState::SignInRequired, None);
+                } else if !this.connected(&a.id) {
+                    let _ = this.store.set_sync_state(&a.id, &SyncState::Offline, None);
+                }
             }
         }
         this.reload(cx);
@@ -1223,6 +1430,57 @@ impl MailWindow {
         // A fresh start checks every account's folders and messages against the server once.
         if first_start {
             this.verify_pending = this.accounts.iter().map(|a| a.id.clone()).collect();
+            cx.spawn(async move |_, _| {
+                spawn_blocking_io(prune_temp_cache_dirs).await;
+            })
+            .detach();
+        }
+        // Load system keyring credentials & providers off the UI thread so startup never stalls.
+        if !accounts_to_load.is_empty() {
+            let store = this.store.clone();
+            let sample = this.sample.clone();
+            cx.spawn_in(window, async move |this, cx| {
+                let loaded = spawn_blocking_io(move || {
+                    accounts_to_load
+                        .into_iter()
+                        .map(|a| {
+                            let res = providers::providers_for(&a, &sample, &store);
+                            (a, res)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await
+                .unwrap_or_default();
+                let _ = this.update_in(cx, |this, window, cx| {
+                    tracing::debug!("startup: sign-ins loaded asynchronously after {} ms", crate::since_start_ms());
+                    for (a, res) in loaded {
+                        this.providers_loading.remove(&a.id);
+                        let still_exists = this.accounts.iter().any(|x| x.id == a.id) && !this.removing_accounts.contains(&a.id);
+                        let untouched = this.provider_generation.get(&a.id).copied().unwrap_or(0) == 0 && !this.providers.contains_key(&a.id);
+                        if !still_exists || !untouched {
+                            continue;
+                        }
+                        match res {
+                            Ok(p) => {
+                                this.providers.insert(a.id.clone(), p);
+                                this.provider_issues.remove(&a.id);
+                            }
+                            Err(providers::ProviderIssue::SignInRequired(reason)) => {
+                                this.provider_issues.insert(a.id.clone(), reason);
+                                if first_start {
+                                    let _ = this.store.set_sync_state(&a.id, &SyncState::SignInRequired, None);
+                                }
+                            }
+                        }
+                    }
+                    this.refresh_idle_watchers();
+                    this.refresh_settings_cache();
+                    this.sync_all(window, cx);
+                    this.fetch_conversation_extras(window, cx);
+                    cx.notify();
+                });
+            })
+            .detach();
         }
         this.sync_all(window, cx);
         if first_start {
@@ -1345,12 +1603,93 @@ impl MailWindow {
     fn load_sample_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match crate::seed_sample_account(&self.store) {
             Ok(sample) => {
+                self.bump_provider_generation(&sample.id);
                 self.providers.insert(sample.id.clone(), providers::AccountProviders::new(Arc::new(self.sample.clone()), Some(Arc::new(self.sample.clone()))));
                 self.accounts = self.store.accounts().unwrap_or_default();
-                self.account_marks.borrow_mut().clear();
+                self.refresh_account_metadata();
                 self.switch_account(sample.id, window, cx);
             }
             Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t load the sample mailbox: {e}")),
+        }
+    }
+
+    pub(crate) fn bump_provider_generation(&mut self, id: &AccountId) -> u64 {
+        let entry = self.provider_generation.entry(id.clone()).or_insert(0);
+        *entry = entry.wrapping_add(1);
+        *entry
+    }
+
+    pub(crate) fn refresh_account_metadata(&mut self) {
+        self.account_servers.clear();
+        for a in &self.accounts {
+            if matches!(a.provider, ProviderKind::Imap | ProviderKind::Pop3) {
+                let servers = self.store.servers(&a.id).ok().flatten();
+                self.account_servers.insert(a.id.clone(), servers);
+            }
+        }
+        self.account_marks.borrow_mut().clear();
+    }
+
+    pub(crate) fn allow_remote_for(&mut self, id: MessageId) {
+        if self.remote_allowed.insert(id.clone()) {
+            self.remote_allowed_order.push_back(id);
+            while self.remote_allowed.len() > MAX_REMOTE_ALLOWED {
+                if let Some(oldest) = self.remote_allowed_order.pop_front() {
+                    self.remote_allowed.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn insert_pdf_thumb(&mut self, id: AttachmentId, path: PathBuf) {
+        if !self.pdf_thumbs.contains_key(&id) {
+            self.pdf_thumbs_order.push_back(id.clone());
+        }
+        self.pdf_thumbs.insert(id, path);
+        while self.pdf_thumbs.len() > MAX_PDF_THUMBS {
+            if let Some(oldest) = self.pdf_thumbs_order.pop_front() {
+                self.pdf_thumbs.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn cache_other_index(&mut self, id: AccountId, index: MailIndex) {
+        self.other_indexes_lru.retain(|existing| existing != &id);
+        self.other_indexes_lru.push_back(id.clone());
+        self.other_indexes.insert(id, index);
+        while self.other_indexes.len() > MAX_OTHER_INDEXES {
+            if let Some(evicted) = self.other_indexes_lru.pop_front() {
+                self.other_indexes.remove(&evicted);
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub(crate) fn prune_reminder_memory(&mut self, now_ms: i64) {
+        let cutoff = now_ms - REMINDER_RETENTION_MS;
+        self.notified.retain(|_, ts| *ts > cutoff);
+        if self.notified.len() > MAX_NOTIFIED_REMINDERS {
+            let mut entries: Vec<((EventId, i32), i64)> = self.notified.iter().map(|(k, &v)| (k.clone(), v)).collect();
+            entries.sort_by_key(|(_, ts)| *ts);
+            let drop_count = entries.len() - MAX_NOTIFIED_REMINDERS;
+            for (k, _) in entries.into_iter().take(drop_count) {
+                self.notified.remove(&k);
+            }
+        }
+        let snooze_cutoff = now_ms - 3_600_000;
+        self.snoozed_reminders.retain(|_, until| *until > snooze_cutoff);
+        if self.snoozed_reminders.len() > MAX_SNOOZED_REMINDERS {
+            let mut entries: Vec<(EventId, i64)> = self.snoozed_reminders.iter().map(|(k, &v)| (k.clone(), v)).collect();
+            entries.sort_by_key(|(_, ts)| *ts);
+            let drop_count = entries.len() - MAX_SNOOZED_REMINDERS;
+            for (k, _) in entries.into_iter().take(drop_count) {
+                self.snoozed_reminders.remove(&k);
+            }
         }
     }
 
@@ -1375,35 +1714,33 @@ impl MailWindow {
         self.provider_issues.get(&self.account.id)
     }
 
-    /// What the "fix the credentials" action is called for the active account. Reads its
-    /// server settings, so call it only when the action is shown.
+    /// What the "fix the credentials" action is called for the active account.
     pub(crate) fn sign_in_again_label(&self) -> &'static str {
         sign_in_label_for(self.account.provider, self.oauth_issuer(&self.account.id).is_some())
     }
 
-    /// Who an IMAP or POP3 account signs in through, when not with a password. Reads the
-    /// account's server settings; keep it out of per-row render paths.
+    /// Who an IMAP or POP3 account signs in through, when not with a password.
+    /// Reads from cached server metadata (never queries SQLite in render paths).
     pub(crate) fn oauth_issuer(&self, account: &AccountId) -> Option<OAuthIssuer> {
-        self.store.servers(account).ok().flatten().and_then(|s| s.oauth)
+        self.account_servers.get(account).and_then(|s| s.as_ref()).and_then(|s| s.oauth)
     }
 
-    /// The service mark of `account`: its logo, or Overlook's IMAP, POP3 or own mark. Reads
-    /// the server settings of an IMAP or POP3 account once, then answers from memory.
+    /// The service mark of `account`: its logo, or Overlook's IMAP, POP3 or own mark.
+    /// Derived from cached server metadata without querying SQLite in render paths.
     pub(crate) fn account_mark(&self, account: &Account) -> account_mark::AccountMark {
         if let Some(mark) = self.account_marks.borrow().get(&account.id) {
             return *mark;
         }
         let servers = matches!(account.provider, ProviderKind::Imap | ProviderKind::Pop3)
-            .then(|| self.store.servers(&account.id).ok().flatten())
+            .then(|| self.account_servers.get(&account.id).and_then(|s| s.as_ref()))
             .flatten();
-        let mark = account_mark::AccountMark::of(account, servers.as_ref());
+        let mark = account_mark::AccountMark::of(account, servers);
         self.account_marks.borrow_mut().insert(account.id.clone(), mark);
         mark
     }
 
     /// What kind of account this is, for account lists: "Microsoft" for an IMAP or POP3
-    /// account that signs in with Microsoft, otherwise the provider's name. Its live sign-in
-    /// answers; only a signed-out IMAP or POP3 account costs a settings read.
+    /// account that signs in with Microsoft, otherwise the provider's name.
     pub(crate) fn account_kind_label(&self, account: &Account) -> &'static str {
         match self.providers.get(&account.id) {
             Some(p) if p.microsoft.is_some() => OAuthIssuer::Microsoft.label(),
@@ -1447,7 +1784,7 @@ impl MailWindow {
     }
 
     pub(crate) fn is_syncing_active(&self) -> bool {
-        self.syncing.contains(&self.account.id)
+        self.syncing.contains_key(&self.account.id)
     }
 
     // ---------------------------------------------------------------- accounts
@@ -1460,12 +1797,16 @@ impl MailWindow {
         if self.composer.is_some() {
             self.close_composer(window, cx);
         }
+        self.new_event = None;
+        self.cal_desc_cache.borrow_mut().take();
+        self.invite_events.clear();
         let previous_id = self.account.id.clone();
         let previous_contacts = std::mem::take(&mut self.contacts);
         if !previous_contacts.is_empty() && previous_id != account.id {
             self.other_contacts_by_account.insert(previous_id, previous_contacts);
         }
         self.other_contacts_by_account.remove(&account.id);
+        self.other_contacts_for_generation.remove(&account.id);
         self.account = account;
         self.load_recent_moves();
         // The account a folder window shows is not the one the app opens with next time, and
@@ -1478,8 +1819,11 @@ impl MailWindow {
         self.set_selected(None);
         self.marked.clear();
         self.outbox_selected = None;
+        self.outbox_preview = None;
         self.thread.clear();
         self.expanded.clear();
+        self.local_search_hits = None;
+        self.local_search_coverage.clear();
         if !self.search_query.is_empty() {
             self.search_query.clear();
             let input = self.search_input.clone();
@@ -1498,6 +1842,7 @@ impl MailWindow {
     pub(crate) fn remove_account(&mut self, id: AccountId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(account) = self.accounts.iter().find(|a| a.id == id).cloned() else { return };
         if !self.removing_accounts.insert(id.clone()) { return; }
+        self.bump_provider_generation(&id);
         if let Err(error) = self.store.cancel_caldav_setup(&id) {
             self.removing_accounts.remove(&id);
             crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t stop calendar setup: {error}"));
@@ -1508,7 +1853,9 @@ impl MailWindow {
         let background_id = id.clone();
         crate::ui::toast(window, cx, crate::notify::Level::Info, "Removing account and disconnecting access…");
         cx.spawn_in(window, async move |this, cx| {
-            let result = cx.background_spawn(async move { end_session(&account, &background_id, gmail, microsoft) }).await;
+            let result = spawn_blocking_io(move || end_session(&account, &background_id, gmail, microsoft))
+                .await
+                .unwrap_or_else(|| Err("background task cancelled".into()));
             let _ = this.update_in(cx, |this, window, cx| {
                 this.removing_accounts.remove(&id);
                 match result {
@@ -1528,6 +1875,7 @@ impl MailWindow {
         let expired = expiry.is_some();
         let Some(account) = self.accounts.iter().find(|a| a.id == id).cloned() else { return };
         if account.provider == ProviderKind::Sample || !self.removing_accounts.insert(id.clone()) { return; }
+        self.bump_provider_generation(&id);
         let gmail = self.providers.get(&id).and_then(|p| p.gmail.clone());
         let microsoft = self.providers.get(&id).and_then(|p| p.microsoft.clone());
         let background_id = id.clone();
@@ -1541,13 +1889,17 @@ impl MailWindow {
         };
         tracing::info!(target: "overlook::signin", account = %id.0, reason, "sign-out started");
         cx.spawn_in(window, async move |this, cx| {
-            let result = cx.background_spawn(async move { end_session(&account, &background_id, gmail, microsoft) }).await;
+            let result = spawn_blocking_io(move || end_session(&account, &background_id, gmail, microsoft))
+                .await
+                .unwrap_or_else(|| Err("background task cancelled".into()));
             let _ = this.update_in(cx, |this, window, cx| {
                 this.removing_accounts.remove(&id);
                 match result {
                     Ok(()) => {
                         tracing::info!(target: "overlook::signin", account = %id.0, "sign-out complete: grant revoked where the issuer allows, stored credentials deleted");
+                        this.bump_provider_generation(&id);
                         this.providers.remove(&id);
+                        this.providers_loading.remove(&id);
                         this.syncing.remove(&id);
                         this.next_retry.remove(&id);
                         this.refresh_idle_watchers();
@@ -1567,7 +1919,8 @@ impl MailWindow {
                             };
                             crate::ui::toast(window, cx, crate::notify::Level::Info, text);
                         }
-                        this.reload(cx);
+                        this.refresh_settings_cache();
+                        this.reload_mail(cx);
                     }
                     // An automatic sign-out retries on the next sync pass, quietly.
                     Err(e) if expired => tracing::warn!("idle sign-out incomplete: {e}"),
@@ -1601,6 +1954,8 @@ impl MailWindow {
 
     fn finish_remove_account(&mut self, id: AccountId, window: &mut Window, cx: &mut Context<Self>) {
         self.other_indexes.remove(&id);
+        self.other_indexes_lru.retain(|existing| existing != &id);
+        self.other_contacts_for_generation.remove(&id);
         if self.composer.is_some() {
             self.close_composer(window, cx);
         }
@@ -1609,7 +1964,9 @@ impl MailWindow {
             crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t remove the account: {e}"));
             return;
         }
+        self.bump_provider_generation(&id);
         self.providers.remove(&id);
+        self.providers_loading.remove(&id);
         self.caldav_syncing.remove(&id);
         self.caldav_next_retry.remove(&id);
         self.caldav_requested.remove(&id);
@@ -1619,7 +1976,7 @@ impl MailWindow {
         self.account_counts_stale.remove(&id);
         self.refresh_idle_watchers();
         self.accounts = self.store.accounts().unwrap_or_default();
-        self.account_marks.borrow_mut().clear();
+        self.refresh_account_metadata();
         self.count_kept_offline_mail();
         crate::ui::toast(window, cx, crate::notify::Level::Info, format!("Removed {} from this device.", account.email));
         match self.accounts.first().map(|a| a.id.clone()) {
@@ -1873,31 +2230,53 @@ impl MailWindow {
                 account
             }
         };
-        if let Err(e) = credentials::save_tokens(&account.id, &result.tokens) {
-            crate::ui::toast(window, cx, crate::notify::Level::Error, format!("{e} Overlook cannot keep you signed in without it."));
-            return;
-        }
-        match providers::gmail_providers(&account, result.tokens) {
-            Ok(p) => {
-                self.providers.insert(account.id.clone(), p);
-                self.provider_issues.remove(&account.id);
-            }
-            Err(e) => {
-                crate::ui::toast(window, cx, crate::notify::Level::Error, e);
-                return;
-            }
-        }
-        let _ = self.store.set_sync_state(&account.id, &SyncState::Syncing, None);
-        self.accounts = self.store.accounts().unwrap_or_default();
-        self.account_marks.borrow_mut().clear();
-        if let Some(warning) = sign_in_mismatch(expected.as_deref(), &email, added) {
-            tracing::info!(target: "overlook::signin", account = %account.id.0, "signed in to a different Google account than the one being signed in again");
-            crate::ui::toast(window, cx, crate::notify::Level::Warning, warning);
-        } else {
-            crate::ui::toast(window, cx, crate::notify::Level::Success, format!("Signed in as {}. Downloading recent mail…", account.email));
-        }
-        self.switch_account(account.id.clone(), window, cx);
-        self.sync_account(account.id, window, cx);
+        let tokens = result.tokens;
+        let bg_account = account.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = spawn_blocking_io(move || {
+                credentials::save_tokens(&bg_account.id, &tokens)
+                    .map_err(|e| format!("{e} Overlook cannot keep you signed in without it."))?;
+                providers::gmail_providers(&bg_account, tokens)
+            })
+            .await
+            .unwrap_or_else(|| Err("Sign-in background task stopped unexpectedly.".into()));
+            let _ = this.update_in(cx, |this, window, cx| {
+                let p = match outcome {
+                    Ok(p) => p,
+                    Err(e) => {
+                        crate::ui::toast(window, cx, crate::notify::Level::Error, e);
+                        cx.notify();
+                        return;
+                    }
+                };
+                this.accounts = this.store.accounts().unwrap_or_default();
+                let still_exists = !this.removing_accounts.contains(&account.id)
+                    && this.accounts.iter().any(|a| a.id == account.id);
+                if !still_exists {
+                    this.providers_loading.remove(&account.id);
+                    this.refresh_account_metadata();
+                    this.refresh_settings_cache();
+                    cx.notify();
+                    return;
+                }
+                this.bump_provider_generation(&account.id);
+                this.providers_loading.remove(&account.id);
+                this.providers.insert(account.id.clone(), p);
+                this.provider_issues.remove(&account.id);
+                let _ = this.store.set_sync_state(&account.id, &SyncState::Syncing, None);
+                this.refresh_account_metadata();
+                this.refresh_settings_cache();
+                if let Some(warning) = sign_in_mismatch(expected.as_deref(), &email, added) {
+                    tracing::info!(target: "overlook::signin", account = %account.id.0, "signed in to a different Google account than the one being signed in again");
+                    crate::ui::toast(window, cx, crate::notify::Level::Warning, warning);
+                } else {
+                    crate::ui::toast(window, cx, crate::notify::Level::Success, format!("Signed in as {}. Downloading recent mail…", account.email));
+                }
+                this.switch_account(account.id.clone(), window, cx);
+                this.sync_account(account.id, window, cx);
+            });
+        })
+        .detach();
     }
 
     fn view_title(&self) -> String {
@@ -1922,11 +2301,29 @@ impl MailWindow {
 
     // ------------------------------------------------------------------ loading
 
-    /// Re-reads everything the window shows from the local store. The conversation list
-    /// and counts come from the in-memory index at once; a fresh index is read on a
-    /// background thread and shown when it arrives.
+    /// Re-reads mail, calendar, contacts, and other-account labels from the local store.
+    /// Mail-only actions should call [`Self::reload_mail`] or [`Self::refresh_mail`] instead
+    /// so calendar, contacts, and unrelated account labels are not reloaded unnecessarily.
     pub(crate) fn reload(&mut self, cx: &mut Context<Self>) {
         crate::watchdog::mark("reload");
+        self.reload_mail_inner(true, cx);
+        if !self.is_message_window() {
+            self.reload_calendar();
+        }
+        self.reload_contacts();
+        self.refresh_settings_cache();
+        cx.notify();
+    }
+
+    /// Re-reads mail state (index, list, drafts, status, thread, and badge counts) without
+    /// reloading calendar, contacts, or all-account labels.
+    pub(crate) fn reload_mail(&mut self, cx: &mut Context<Self>) {
+        crate::watchdog::mark("reload_mail");
+        self.reload_mail_inner(false, cx);
+        cx.notify();
+    }
+
+    fn reload_mail_inner(&mut self, reload_all_labels: bool, cx: &mut Context<Self>) {
         let acct = self.account.id.clone();
         if self.mail_index_account.as_ref() != Some(&acct) {
             // Another account (or the first load): show its last index if there is one and
@@ -1940,17 +2337,20 @@ impl MailWindow {
                 counts.insert(MailboxView::Kind(LabelKind::Outbox), self.outbox.len());
                 self.account_counts.insert(old.clone(), counts);
                 self.account_counts_stale.insert(old.clone());
-                self.other_indexes.insert(old, previous);
+                self.cache_other_index(old, previous);
             }
             match self.other_indexes.remove(&acct) {
                 Some(index) => {
+                    self.other_indexes_lru.retain(|id| id != &acct);
                     self.mail_index = index;
                     self.mail_index_account = Some(acct.clone());
+                    self.account_message_count = self.store.message_count(&acct).unwrap_or(0);
                     self.rebuild_mail_index(cx);
                 }
                 None => {
                     self.mail_index = self.store.mail_index(&acct).unwrap_or_default();
                     self.mail_index_account = Some(acct.clone());
+                    self.account_message_count = self.store.message_count(&acct).unwrap_or(0);
                     self.mail_index_generation += 1;
                 }
             }
@@ -1958,19 +2358,48 @@ impl MailWindow {
             self.rebuild_mail_index(cx);
         }
         self.refresh_mail();
-        self.reload_drafts();
+        self.reload_drafts(cx);
         self.status = self.store.account_status(&acct).unwrap_or_default();
         self.queued_downloads = crate::sync::queued_downloads(&self.store, &acct);
         if !self.is_message_window() {
-            self.reload_account_labels();
+            if reload_all_labels {
+                self.reload_account_labels();
+            }
             self.refresh_account_counts(cx);
         }
         self.load_thread(cx);
-        if !self.is_message_window() {
-            self.reload_calendar();
+    }
+
+    /// Populates `self.invite_events` for any iCalendar UIDs referenced by the current
+    /// conversation list or open thread. Never called from `render()`.
+    pub(crate) fn refresh_invite_events(&mut self, clear_existing: bool) {
+        if clear_existing {
+            self.invite_events.clear();
         }
-        self.reload_contacts();
-        cx.notify();
+        let acct = self.account.id.clone();
+        if acct.0.is_empty() {
+            return;
+        }
+        let mut needed: HashSet<String> = HashSet::new();
+        for c in &self.conversations {
+            if let Some(inv) = &c.invitation {
+                needed.insert(inv.uid.clone());
+            }
+        }
+        for m in &self.thread {
+            if let Some(inv) = &m.invitation {
+                needed.insert(inv.uid.clone());
+            }
+        }
+        if self.invite_events.len() > 512 {
+            self.invite_events.retain(|uid, _| needed.contains(uid));
+        }
+        for uid in needed {
+            if !self.invite_events.contains_key(&uid) {
+                let event = self.store.event_by_ical_uid(&acct, &uid).ok().flatten();
+                self.invite_events.insert(uid, event);
+            }
+        }
     }
 
     /// Rebuilds the conversation list, counts and labels from the in-memory index.
@@ -1985,8 +2414,9 @@ impl MailWindow {
         } else {
             self.mail_index.conversations_including(&owner, &self.view, self.filter, focus, self.unread_selection.as_ref())
         };
+        self.rows_unread.set(self.conversations.iter().filter(|c| c.is_unread()).count());
         self.list_data_generation += 1;
-        // Search coverage counts cached bodies, a full scan: only worth it while searching.
+        // Search coverage uses the cached local coverage sentence while searching (no SQLite scan here).
         self.search_coverage = if searching { self.search_coverage_line(&acct) } else { String::new() };
         self.counts = sidebar_counts(&self.mail_index, &owner, self.focused_enabled);
         self.other_unread = if self.focused_enabled {
@@ -1994,7 +2424,7 @@ impl MailWindow {
         } else {
             0
         };
-        self.invite_rows.borrow_mut().clear();
+        self.refresh_invite_events(false);
         if !self.marked.is_empty() {
             let shown: HashSet<&ConversationId> = self.conversations.iter().map(|c| &c.id).collect();
             self.marked.retain(|id| shown.contains(id));
@@ -2064,14 +2494,15 @@ impl MailWindow {
         let store = self.store.clone();
         let acct = self.account.id.clone();
         cx.spawn(async move |this, cx| {
-            let index = cx.background_spawn({
+            let (index, count) = cx.background_spawn({
                 let acct = acct.clone();
-                async move { store.mail_index(&acct) }
+                async move { (store.mail_index(&acct), store.message_count(&acct).unwrap_or(0)) }
             })
             .await;
             let _ = this.update(cx, |this, cx| {
                 let current = this.mail_index_generation == generation && this.account.id == acct && this.local_writes.lock().unwrap().is_empty() && this.local_in_flight.is_empty();
                 if let (true, Ok(index)) = (current, index) {
+                    this.account_message_count = count;
                     this.replace_mail_index(index);
                     this.refresh_mail();
                     cx.notify();
@@ -2081,7 +2512,7 @@ impl MailWindow {
         .detach();
     }
 
-    fn reload_drafts(&mut self) {
+    fn reload_drafts(&mut self, cx: &mut Context<Self>) {
         let acct = self.account.id.clone();
         self.drafts = self.store.drafts(&acct, false).unwrap_or_default();
         self.outbox = self.store.drafts(&acct, true).unwrap_or_default();
@@ -2089,7 +2520,11 @@ impl MailWindow {
         if let Some(sel) = &self.outbox_selected {
             if !self.outbox.iter().any(|d| &d.id == sel) {
                 self.outbox_selected = None;
+                self.outbox_preview = None;
             }
+        }
+        if self.outbox_selected.is_some() {
+            self.prepare_outbox_preview(cx);
         }
     }
 
@@ -2102,7 +2537,49 @@ impl MailWindow {
         self.thread = thread;
         let unwritten = self.unwritten_changes();
         self.apply_to_thread(&unwritten);
-        if history_changed { self.prepare_thread_history(cx); }
+        if history_changed {
+            self.thread_revision = self.thread_revision.wrapping_add(1);
+            self.plain_text_html_cache.borrow_mut().clear();
+            self.prepare_thread_history(cx);
+        }
+        self.refresh_invite_events(false);
+        self.refresh_attachment_presence(cx);
+        self.prepare_inline_images(cx);
+    }
+
+    /// Checks on-disk presence for attachments in the open thread off the UI thread so
+    /// `render_attachment` / `attachment_card` never call `Path::exists()` per frame.
+    fn refresh_attachment_presence(&mut self, cx: &mut Context<Self>) {
+        self.attachment_presence_gen = self.attachment_presence_gen.wrapping_add(1);
+        let gen = self.attachment_presence_gen;
+        let checks: Vec<(AttachmentId, PathBuf)> = self
+            .thread
+            .iter()
+            .flat_map(|m| m.attachments.iter())
+            .filter_map(|a| a.local_path.as_deref().map(|p| (a.id.clone(), PathBuf::from(p))))
+            .collect();
+        self.downloaded_attachments.retain(|id| checks.iter().any(|(cid, _)| cid == id));
+        if checks.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let present: HashSet<AttachmentId> = cx
+                .background_spawn(async move {
+                    checks
+                        .into_iter()
+                        .filter(|(_, p)| p.exists())
+                        .map(|(id, _)| id)
+                        .collect()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.attachment_presence_gen == gen && this.downloaded_attachments != present {
+                    this.downloaded_attachments = present;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// What opening a conversation needs from the server: bodies not downloaded yet (mail
@@ -2134,15 +2611,15 @@ impl MailWindow {
         self.bodies_loading.extend(ids.iter().cloned());
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    let mut messages = provider.fetch_messages(&account, &pids, &labels).await?;
-                    crate::sync::reconcile_incoming(&store, &account.id, &mut messages, &mut Vec::new());
-                    let protected = store.pending_message_ids(&account.id).unwrap_or_default();
-                    // The download queue skips it now that its body is here.
-                    store.merge_remote_messages(&messages, &protected).map_err(|e| overlook_provider::ProviderError::Temporary(e.to_string()))
-                })
-                .await;
+            let result = spawn_blocking_async(async move {
+                let mut messages = provider.fetch_messages(&account, &pids, &labels).await?;
+                crate::sync::reconcile_incoming(&store, &account.id, &mut messages, &mut Vec::new());
+                let protected = store.pending_message_ids(&account.id).unwrap_or_default();
+                // The download queue skips it now that its body is here.
+                store.merge_remote_messages(&messages, &protected).map_err(|e| overlook_provider::ProviderError::Temporary(e.to_string()))
+            })
+            .await
+            .unwrap_or_else(|| Err(overlook_provider::ProviderError::Temporary("download cancelled".into())));
             let _ = this.update_in(cx, |this, window, cx| {
                 for id in &ids {
                     this.bodies_loading.remove(id);
@@ -2162,7 +2639,7 @@ impl MailWindow {
     fn fetch_inline_images(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         const INLINE_LIMIT: u64 = 4 * 1024 * 1024;
         // Inline images the body references, and attached images for their thumbnails.
-        let wanted: Vec<Attachment> = self
+        let candidates: Vec<Attachment> = self
             .thread
             .iter()
             .flat_map(|m| {
@@ -2170,18 +2647,66 @@ impl MailWindow {
                 m.attachments.iter().filter(move |a| (has_cid && a.is_inline_image()) || a.is_image() || a.is_pdf()).cloned()
             })
             .filter(|a| a.size_bytes <= if a.is_pdf() { 2 * INLINE_LIMIT } else { INLINE_LIMIT } && a.provider_id.is_some())
-            .filter(|a| !a.local_path.as_deref().map(PathBuf::from).is_some_and(|p| p.exists()))
+            .filter(|a| !self.downloaded_attachments.contains(&a.id))
             .collect();
-        for att in wanted {
-            self.download_attachment(att, AfterDownload::Inline, window, cx);
+        let mut to_verify = Vec::new();
+        for att in candidates {
+            if att.local_path.is_none() {
+                self.download_attachment(att, AfterDownload::Inline, window, cx);
+            } else {
+                to_verify.push(att);
+            }
+        }
+        if !to_verify.is_empty() {
+            let acct = self.account.id.clone();
+            let thread_rev = self.thread_revision;
+            cx.spawn_in(window, async move |this, cx| {
+                let (present, missing): (Vec<AttachmentId>, Vec<Attachment>) = cx
+                    .background_spawn(async move {
+                        let mut present = Vec::new();
+                        let mut missing = Vec::new();
+                        for att in to_verify {
+                            if att.local_path.as_deref().map(PathBuf::from).is_some_and(|p| p.exists()) {
+                                present.push(att.id);
+                            } else {
+                                missing.push(att);
+                            }
+                        }
+                        (present, missing)
+                    })
+                    .await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    if this.account.id != acct || this.thread_revision != thread_rev {
+                        return;
+                    }
+                    let mut changed = false;
+                    for id in present {
+                        if this.downloaded_attachments.insert(id) {
+                            changed = true;
+                        }
+                    }
+                    for att in missing {
+                        this.download_attachment(att, AfterDownload::Inline, window, cx);
+                    }
+                    if changed {
+                        this.prepare_pdf_thumbnails(window, cx);
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
         }
         self.prepare_pdf_thumbnails(window, cx);
     }
 
     fn search_results(&self) -> Vec<ConversationSummary> {
-        let hits = self.store.search(&self.account.id, &self.search_query).unwrap_or_default();
-        let hit_set: BTreeSet<MessageId> = hits.into_iter().collect();
-        self.mail_index.conversations_matching_including(&hit_set, &self.account.email, self.filter, self.unread_selection.as_ref())
+        let Some((gen, hit_set)) = &self.local_search_hits else {
+            return Vec::new();
+        };
+        if *gen != self.search_generation {
+            return self.conversations.clone();
+        }
+        self.mail_index.conversations_matching_including(hit_set, &self.account.email, self.filter, self.unread_selection.as_ref())
     }
 
     /// The Focused/Other split applies only to the Inbox when the feature is on.
@@ -2194,7 +2719,7 @@ impl MailWindow {
             self.unread_selection = None;
         }
         self.inbox_tab = tab;
-        self.reload(cx);
+        self.refresh_mail();
         if !self.conversations.iter().any(|c| Some(&c.id) == self.selected.as_ref()) {
             self.set_selected(self.conversations.first().map(|c| c.id.clone()));
             self.marked.clear();
@@ -2211,7 +2736,7 @@ impl MailWindow {
         self.save_setting("focused_inbox", &self.focused_enabled);
         self.inbox_tab = FocusTab::Focused;
         self.mark_all_counts_stale();
-        self.reload(cx);
+        self.reload_mail(cx);
         self.share_focused_inbox(cx);
     }
 
@@ -2277,7 +2802,9 @@ impl MailWindow {
         self.quick_look = Some(QuickLook { attachment, pages: Vec::new(), rendering: true, error: None });
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let result = cx.background_spawn(async move { crate::pdf_preview::render_pages(&path) }).await;
+            let result = spawn_blocking_io(move || crate::pdf_preview::render_pages(&path))
+                .await
+                .unwrap_or_else(|| Err(std::io::Error::other("PDF renderer stopped unexpectedly.")));
             let _ = this.update(cx, |this, cx| {
                 if let Some(ql) = this.quick_look.as_mut().filter(|q| q.attachment.id == id) {
                     ql.rendering = false;
@@ -2303,16 +2830,23 @@ impl MailWindow {
             .iter()
             .flat_map(|m| m.attachments.iter())
             .filter(|a| a.is_pdf() && !self.pdf_thumbs.contains_key(&a.id) && !self.pdf_thumbs_pending.contains(&a.id))
-            .filter_map(|a| a.local_path.as_deref().map(PathBuf::from).filter(|p| p.exists()).map(|p| (a.id.clone(), p)))
+            .filter_map(|a| {
+                self.downloaded_attachments
+                    .contains(&a.id)
+                    .then(|| a.local_path.as_deref().map(|p| (a.id.clone(), PathBuf::from(p))))
+                    .flatten()
+            })
             .collect();
         for (id, path) in wanted {
             self.pdf_thumbs_pending.insert(id.clone());
             cx.spawn_in(window, async move |this, cx| {
-                let result = cx.background_spawn(async move { crate::pdf_preview::render_thumbnail(&path) }).await;
+                let result = spawn_blocking_io(move || crate::pdf_preview::render_thumbnail(&path))
+                    .await
+                    .unwrap_or_else(|| Err(std::io::Error::other("PDF renderer stopped unexpectedly.")));
                 let _ = this.update(cx, |this, cx| {
                     this.pdf_thumbs_pending.remove(&id);
                     if let Ok(thumb) = result {
-                        this.pdf_thumbs.insert(id, thumb);
+                        this.insert_pdf_thumb(id, thumb);
                         cx.notify();
                     }
                 });
@@ -2328,7 +2862,10 @@ impl MailWindow {
         cx.spawn_in(window, async move |this, cx| {
             let fallback = overlook_provider::message_to_raw(&message);
             let bytes = match provider {
-                Some(p) => cx.background_spawn(async move { p.fetch_raw(&account, &message).await }).await.unwrap_or(fallback),
+                Some(p) => spawn_blocking_async(async move { p.fetch_raw(&account, &message).await })
+                    .await
+                    .and_then(Result::ok)
+                    .unwrap_or(fallback),
                 None => fallback,
             };
             let _ = this.update_in(cx, |this, window, cx| then(this, bytes, window, cx));
@@ -2349,9 +2886,18 @@ impl MailWindow {
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(target))) = receiver.await else { return };
             let _ = this.update_in(cx, |this, window, cx| {
-                this.with_raw_message(message, window, cx, move |_this, bytes, window, cx| match std::fs::write(&target, &bytes) {
-                    Ok(()) => crate::ui::toast(window, cx, crate::notify::Level::Success, format!("Saved to {}", target.display())),
-                    Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t save the message: {e}")),
+                this.with_raw_message(message, window, cx, move |_this, bytes, window, cx| {
+                    let shown = target.clone();
+                    cx.spawn_in(window, async move |_, cx| {
+                        let written = spawn_blocking_io(move || std::fs::write(&target, &bytes))
+                            .await
+                            .unwrap_or_else(|| Err(std::io::Error::other("write cancelled")));
+                        let _ = cx.update(|window, cx| match written {
+                            Ok(()) => crate::ui::toast(window, cx, crate::notify::Level::Success, format!("Saved to {}", shown.display())),
+                            Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t save the message: {e}")),
+                        });
+                    })
+                    .detach();
                 });
             });
         })
@@ -2362,40 +2908,56 @@ impl MailWindow {
         let dir = crate::updater::cache_dir().join("source");
         let path = dir.join(format!("{}.eml", message.id.as_str().replace([':', '/'], "_")));
         self.with_raw_message(message, window, cx, move |_this, bytes, window, cx| {
-            if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &bytes)) {
-                crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t write the source: {e}"));
-                return;
-            }
-            cx.open_with_system(&path);
+            let open_path = path.clone();
+            cx.spawn_in(window, async move |_, cx| {
+                let written = spawn_blocking_io(move || write_file_atomic(&dir, &path, &bytes))
+                    .await
+                    .unwrap_or_else(|| Err(std::io::Error::other("write cancelled")));
+                let _ = cx.update(|window, cx| match written {
+                    Ok(()) => cx.open_with_system(&open_path),
+                    Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t write the source: {e}")),
+                });
+            })
+            .detach();
         });
     }
 
-    /// Writes a printable page for the message and opens it in the browser, which prints.
+    /// Writes a printable page for the message off the UI thread and opens it in the browser, which prints.
     pub(crate) fn print_message(&mut self, message: Message, window: &mut Window, cx: &mut Context<Self>) {
         use overlook_core::sanitize::{clean_only, escape_html, text_to_html, RemoteContent};
         let allow_remote = self.remote_allowed.contains(&message.id) || self.prefs.remote_images == RemoteImages::Allow;
-        let policy = if allow_remote { RemoteContent::Allowed } else { RemoteContent::Blocked };
-        let body = match (&message.body.html, &message.body.text) {
-            // Printing includes all visible history, not just the unfolded reader body.
-            (Some(h), _) => clean_only(h, policy),
-            (None, Some(t)) => text_to_html(t),
-            (None, None) => String::new(),
-        };
-        let body = self.resolve_inline_images(&message, body);
-        let to = message.to.iter().map(Address::to_header).collect::<Vec<_>>().join(", ");
-        let page = format!(
-            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{subject}</title><style>body{{font:15px/1.5 -apple-system,Segoe UI,Inter,sans-serif;color:#111;max-width:760px;margin:40px auto;padding:0 24px}}.h{{border-bottom:1px solid #ccc;padding-bottom:12px;margin-bottom:20px;font-size:13px;color:#444}}.h b{{color:#111}}h1{{font-size:22px;margin:0 0 12px}}blockquote{{margin:0 0 0 .8ex;border-left:2px solid #ccc;padding-left:1ex;color:#555}}table{{border-collapse:collapse}}td,th{{border:1px solid #ddd;padding:4px 8px}}@media print{{body{{margin:0}}}}</style></head><body><h1>{subject}</h1><div class=\"h\"><div><b>From:</b> {from}</div><div><b>To:</b> {to}</div><div><b>Date:</b> {date}</div></div>{body}<script>window.print()</script></body></html>",
-            subject = escape_html(&message.subject),
-            from = escape_html(&message.from.to_header()),
-            to = escape_html(&to),
-            date = escape_html(&overlook_core::time::format_full(message.date, &self.time_zone)),
-        );
-        let dir = crate::updater::cache_dir().join("print");
-        let path = dir.join(format!("{}.html", message.id.as_str().replace([':', '/'], "_")));
-        match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, page)) {
-            Ok(()) => cx.open_with_system(&path),
-            Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t prepare the page: {e}")),
-        }
+        let time_zone = self.time_zone.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let result = spawn_blocking_io(move || {
+                let policy = if allow_remote { RemoteContent::Allowed } else { RemoteContent::Blocked };
+                let body = match (&message.body.html, &message.body.text) {
+                    // Printing includes all visible history, not just the unfolded reader body.
+                    (Some(h), _) => clean_only(h, policy),
+                    (None, Some(t)) => text_to_html(t),
+                    (None, None) => String::new(),
+                };
+                let body = reader::resolve_inline_images_blocking(&message, body);
+                let to = message.to.iter().map(Address::to_header).collect::<Vec<_>>().join(", ");
+                let page = format!(
+                    "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{subject}</title><style>body{{font:15px/1.5 -apple-system,Segoe UI,Inter,sans-serif;color:#111;max-width:760px;margin:40px auto;padding:0 24px}}.h{{border-bottom:1px solid #ccc;padding-bottom:12px;margin-bottom:20px;font-size:13px;color:#444}}.h b{{color:#111}}h1{{font-size:22px;margin:0 0 12px}}blockquote{{margin:0 0 0 .8ex;border-left:2px solid #ccc;padding-left:1ex;color:#555}}table{{border-collapse:collapse}}td,th{{border:1px solid #ddd;padding:4px 8px}}@media print{{body{{margin:0}}}}</style></head><body><h1>{subject}</h1><div class=\"h\"><div><b>From:</b> {from}</div><div><b>To:</b> {to}</div><div><b>Date:</b> {date}</div></div>{body}<script>window.print()</script></body></html>",
+                    subject = escape_html(&message.subject),
+                    from = escape_html(&message.from.to_header()),
+                    to = escape_html(&to),
+                    date = escape_html(&overlook_core::time::format_full(message.date, &time_zone)),
+                );
+                let dir = crate::updater::cache_dir().join("print");
+                let path = dir.join(format!("{}.html", message.id.as_str().replace([':', '/'], "_")));
+                write_file_atomic(&dir, &path, page.as_bytes())?;
+                Ok::<PathBuf, std::io::Error>(path)
+            })
+            .await
+            .unwrap_or_else(|| Err(std::io::Error::other("print preparation cancelled")));
+            let _ = cx.update(|window, cx| match result {
+                Ok(path) => cx.open_with_system(&path),
+                Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t prepare the page: {e}")),
+            });
+        })
+        .detach();
     }
 
     pub(crate) fn save_attachment(&mut self, attachment: Attachment, window: &mut Window, cx: &mut Context<Self>) {
@@ -2410,19 +2972,22 @@ impl MailWindow {
         let receiver = cx.prompt_for_new_path(&downloads, Some(&attachment.filename));
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(target))) = receiver.await else { return };
-            let _ = this.update_in(cx, |this, window, cx| {
-                match attachment.local_path.as_deref().map(PathBuf::from).filter(|p| p.exists()) {
-                    Some(local) => this.finish_save(&local, &target, window, cx),
-                    None => this.download_attachment(attachment.clone(), AfterDownload::SaveTo(target), window, cx),
-                }
+            let local_check = attachment.local_path.as_deref().map(PathBuf::from);
+            let existing = match local_check {
+                Some(p) => spawn_blocking_io(move || p.exists().then_some(p)).await.flatten(),
+                None => None,
+            };
+            let _ = this.update_in(cx, |this, window, cx| match existing {
+                Some(local) => this.finish_save(&local, &target, window, cx),
+                None => this.download_attachment(attachment.clone(), AfterDownload::SaveTo(target), window, cx),
             });
         })
         .detach();
     }
 
     /// Saves every file of a message into one folder the person picks. Files already on
-    /// this device are copied at once; the rest download into it, each saying so when done.
-    /// A name already in the folder gets a number rather than being replaced.
+    /// this device are copied off the UI thread; the rest download into it, each saying so
+    /// when done. A name already in the folder gets a number rather than being replaced.
     pub(crate) fn save_all_attachments(&mut self, attachments: Vec<Attachment>, window: &mut Window, cx: &mut Context<Self>) {
         if attachments.is_empty() {
             return;
@@ -2431,9 +2996,12 @@ impl MailWindow {
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = receiver.await else { return };
             let Some(dir) = paths.into_iter().next() else { return };
-            let _ = this.update_in(cx, |this, window, cx| {
+            let shown_dir = dir.clone();
+            let result = spawn_blocking_io(move || {
                 let mut taken = HashSet::new();
-                let (mut copied, mut failed) = (0, Vec::new());
+                let mut copied = 0usize;
+                let mut failed = Vec::new();
+                let mut to_download = Vec::new();
                 for attachment in attachments {
                     let target = free_file_name(&dir, &attachment.filename, &mut taken);
                     match attachment.local_path.as_deref().map(PathBuf::from).filter(|p| p.exists()) {
@@ -2441,12 +3009,20 @@ impl MailWindow {
                             Ok(_) => copied += 1,
                             Err(e) => failed.push(format!("{}: {e}", attachment.filename)),
                         },
-                        None => this.download_attachment(attachment, AfterDownload::SaveTo(target), window, cx),
+                        None => to_download.push((attachment, target)),
                     }
+                }
+                (copied, failed, to_download)
+            })
+            .await;
+            let Some((copied, failed, to_download)) = result else { return };
+            let _ = this.update_in(cx, |this, window, cx| {
+                for (attachment, target) in to_download {
+                    this.download_attachment(attachment, AfterDownload::SaveTo(target), window, cx);
                 }
                 if copied > 0 {
                     let files = if copied == 1 { "1 file".to_owned() } else { format!("{copied} files") };
-                    crate::ui::toast(window, cx, crate::notify::Level::Success, format!("Saved {files} to {}", dir.display()));
+                    crate::ui::toast(window, cx, crate::notify::Level::Success, format!("Saved {files} to {}", shown_dir.display()));
                 }
                 if !failed.is_empty() {
                     crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t save {}", failed.join("; ")));
@@ -2457,10 +3033,19 @@ impl MailWindow {
     }
 
     fn finish_save(&mut self, local: &std::path::Path, target: &std::path::Path, window: &mut Window, cx: &mut Context<Self>) {
-        match std::fs::copy(local, target) {
-            Ok(_) => crate::ui::toast(window, cx, crate::notify::Level::Success, format!("Saved to {}", target.display())),
-            Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t save the file: {e}")),
-        }
+        let local = local.to_path_buf();
+        let target = target.to_path_buf();
+        let shown = target.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let result = spawn_blocking_io(move || std::fs::copy(&local, &target))
+                .await
+                .unwrap_or_else(|| Err(std::io::Error::other("copy cancelled")));
+            let _ = cx.update(|window, cx| match result {
+                Ok(_) => crate::ui::toast(window, cx, crate::notify::Level::Success, format!("Saved to {}", shown.display())),
+                Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t save the file: {e}")),
+            });
+        })
+        .detach();
     }
 
     fn download_attachment(&mut self, attachment: Attachment, after: AfterDownload, window: &mut Window, cx: &mut Context<Self>) {
@@ -2473,35 +3058,48 @@ impl MailWindow {
             return;
         };
         let account = self.account.clone();
+        let origin_account = self.account.id.clone();
+        let origin_selected = self.selected.clone();
+        let origin_module = self.module;
+        let origin_message_id = attachment.message_id.clone();
         let (dir, dest) = self.attachment_path(&account.id, &attachment);
         self.downloading.insert(attachment.id.clone());
         cx.notify();
         let att = attachment.clone();
         let store = self.store.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    let bytes = provider.fetch_attachment(&account, &message, &att).await?;
-                    std::fs::create_dir_all(&dir).map_err(|e| overlook_provider::ProviderError::Rejected(e.to_string()))?;
-                    std::fs::write(&dest, &bytes).map_err(|e| overlook_provider::ProviderError::Rejected(e.to_string()))?;
-                    // Recorded here, off the UI thread, before the reader reloads the thread.
-                    let _ = store.set_attachment_local_path(&att.id, Some(&dest.to_string_lossy()));
-                    Ok::<PathBuf, overlook_provider::ProviderError>(dest)
-                })
-                .await;
+            let result = spawn_blocking_async(async move {
+                let bytes = provider.fetch_attachment(&account, &message, &att).await?;
+                write_file_atomic(&dir, &dest, &bytes).map_err(|e| overlook_provider::ProviderError::Rejected(e.to_string()))?;
+                // Recorded here, off the UI thread, before the reader reloads the thread.
+                let _ = store.set_attachment_local_path(&att.id, Some(&dest.to_string_lossy()));
+                Ok::<PathBuf, overlook_provider::ProviderError>(dest)
+            })
+            .await
+            .unwrap_or_else(|| Err(overlook_provider::ProviderError::Temporary("download cancelled".into())));
             let _ = this.update_in(cx, |this, window, cx| {
                 this.downloading.remove(&attachment.id);
                 match result {
                     Ok(path) => {
-                        this.load_thread(cx);
+                        this.downloaded_attachments.insert(attachment.id.clone());
+                        this.inline_images.remove(&attachment.id);
+                        let still_viewing = this.account.id == origin_account
+                            && this.module == origin_module
+                            && this.selected == origin_selected
+                            && this.thread.iter().any(|m| m.id == origin_message_id);
+                        if this.account.id == origin_account && this.thread.iter().any(|m| m.id == origin_message_id) {
+                            this.load_thread(cx);
+                        }
                         match after {
-                            AfterDownload::Open => open_received_attachment(&path, &attachment.filename, window, cx),
+                            AfterDownload::Open if still_viewing => open_received_attachment(&path, &attachment.filename, window, cx),
+                            AfterDownload::Open => {}
                             AfterDownload::SaveTo(target) => this.finish_save(&path, &target, window, cx),
-                            AfterDownload::QuickLook => {
+                            AfterDownload::QuickLook if still_viewing => {
                                 let mut a = attachment.clone();
                                 a.local_path = Some(path.to_string_lossy().into_owned());
                                 this.show_quick_look(a, window, cx);
                             }
+                            AfterDownload::QuickLook => {}
                             AfterDownload::Inline => this.prepare_pdf_thumbnails(window, cx),
                         }
                     }
@@ -2513,10 +3111,17 @@ impl MailWindow {
         .detach();
     }
 
-    /// Where a downloaded attachment lives: one folder per account and message.
+    /// Where a downloaded attachment lives: one folder per account, message, and sanitized attachment id
+    /// so two attachments with the same filename never overwrite each other.
     fn attachment_path(&self, account: &AccountId, attachment: &Attachment) -> (PathBuf, PathBuf) {
         let safe_name: String = attachment.filename.chars().map(|c| if matches!(c, '/' | '\\' | '\0') { '_' } else { c }).collect();
-        let dir = self.attachments_dir.join(account.as_str().replace([':', '/'], "_")).join(attachment.message_id.as_str().replace([':', '/'], "_"));
+        let safe_id: String = attachment.id.as_str().chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') { c } else { '_' }).collect();
+        let safe_id = if safe_id.is_empty() { "att".to_owned() } else { safe_id };
+        let dir = self
+            .attachments_dir
+            .join(account.as_str().replace([':', '/'], "_"))
+            .join(attachment.message_id.as_str().replace([':', '/'], "_"))
+            .join(safe_id);
         let dest = dir.join(if safe_name.trim().is_empty() || safe_name.starts_with('.') { format!("attachment{}", safe_name) } else { safe_name });
         (dir, dest)
     }
@@ -2535,48 +3140,54 @@ impl MailWindow {
         let mut convs = self.mail_index.conversations(&owner, &MailboxView::Kind(LabelKind::Inbox), ListFilter::All, None);
         let unread = self.mail_index.conversations(&owner, &MailboxView::Kind(LabelKind::Archive), ListFilter::Unread, None);
         convs.extend(unread);
-        let mut wanted: Vec<(Attachment, PathBuf, PathBuf)> = Vec::new();
+        let mut candidates: Vec<(Attachment, PathBuf, PathBuf)> = Vec::new();
         for c in convs.iter().take(MESSAGES) {
             for id in self.mail_index.message_ids_in(&c.id) {
                 let Some(m) = self.mail_index.message(&id) else { continue };
                 for a in &m.attachments {
                     let wanted_kind = a.is_inline_image() || a.is_image() || a.is_pdf();
                     let small = a.size_bytes <= if a.is_pdf() { 2 * INLINE_LIMIT } else { INLINE_LIMIT };
-                    let missing = !a.local_path.as_deref().map(PathBuf::from).is_some_and(|p| p.exists());
-                    if wanted_kind && small && missing && a.provider_id.is_some() && !self.downloading.contains(&a.id) {
+                    if wanted_kind && small && a.provider_id.is_some() && !self.downloading.contains(&a.id) {
                         let (dir, dest) = self.attachment_path(&self.account.id, a);
-                        wanted.push((a.clone(), dir, dest));
+                        candidates.push((a.clone(), dir, dest));
                     }
                 }
             }
         }
-        if wanted.is_empty() {
+        if candidates.is_empty() {
             return;
         }
         self.prefetching = true;
         let store = self.store.clone();
         let account = self.account.clone();
         cx.spawn(async move |this, cx| {
-            let fetched = cx
-                .background_spawn(async move {
-                    let mut fetched = 0;
-                    for (att, dir, dest) in wanted {
-                        let Some(message) = store.message(&att.message_id).ok().flatten() else { continue };
-                        let Ok(bytes) = provider.fetch_attachment(&account, &message, &att).await else {
-                            // Offline or rate limited: stop and try again after the next sync.
-                            break;
-                        };
-                        if std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&dest, &bytes).is_ok() {
-                            let _ = store.set_attachment_local_path(&att.id, Some(&dest.to_string_lossy()));
-                            fetched += 1;
-                        }
+            let fetched = spawn_blocking_async(async move {
+                let mut fetched = Vec::new();
+                for (att, dir, dest) in candidates {
+                    if att.local_path.as_deref().map(PathBuf::from).is_some_and(|p| p.exists()) {
+                        continue;
                     }
-                    fetched
-                })
-                .await;
+                    let Some(message) = store.message(&att.message_id).ok().flatten() else { continue };
+                    let Ok(bytes) = provider.fetch_attachment(&account, &message, &att).await else {
+                        // Offline or rate limited: stop and try again after the next sync.
+                        break;
+                    };
+                    if write_file_atomic(&dir, &dest, &bytes).is_ok() {
+                        let _ = store.set_attachment_local_path(&att.id, Some(&dest.to_string_lossy()));
+                        fetched.push(att.id);
+                    }
+                }
+                fetched
+            })
+            .await
+            .unwrap_or_default();
             let _ = this.update(cx, |this, cx| {
                 this.prefetching = false;
-                if fetched > 0 {
+                if !fetched.is_empty() {
+                    for id in fetched {
+                        this.downloaded_attachments.insert(id.clone());
+                        this.inline_images.remove(&id);
+                    }
                     // The open conversation may have gained images; the index sees new paths.
                     this.load_thread(cx);
                     this.rebuild_mail_index(cx);
@@ -2614,6 +3225,8 @@ impl MailWindow {
         }
         if !self.search_query.is_empty() {
             self.search_query.clear();
+            self.local_search_hits = None;
+            self.local_search_coverage.clear();
             let input = self.search_input.clone();
             input.update(cx, |s, cx| s.set_value("", window, cx));
         }
@@ -2622,7 +3235,15 @@ impl MailWindow {
         }
         self.view = view;
         self.outbox_selected = None;
-        self.reload(cx);
+        self.outbox_preview = None;
+        if self.mail_index_account.as_ref() != Some(&self.account.id) {
+            self.reload_mail(cx);
+        } else {
+            if matches!(self.view, MailboxView::Kind(LabelKind::Drafts | LabelKind::Outbox)) {
+                self.reload_drafts(cx);
+            }
+            self.refresh_mail();
+        }
         if self.selected.is_none() || !self.conversations.iter().any(|c| Some(&c.id) == self.selected.as_ref()) {
             self.set_selected(self.conversations.first().map(|c| c.id.clone()));
             self.marked.clear();
@@ -2639,8 +3260,10 @@ impl MailWindow {
             self.unread_selection = None;
         }
         self.filter = filter;
-        self.reload(cx);
+        self.refresh_mail();
+        self.load_thread(cx);
         self.list_focus.focus(window, cx);
+        cx.notify();
     }
 
     fn set_search(&mut self, query: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -2650,20 +3273,59 @@ impl MailWindow {
         self.search_query = query;
         self.search_generation += 1;
         self.online_search = OnlineSearch::Idle;
-        self.reload(cx);
-        if !self.search_query.is_empty() && self.selected_summary().is_none() {
-            self.set_selected(self.conversations.first().map(|c| c.id.clone()));
-            self.marked.clear();
+        if self.search_query.trim().is_empty() {
+            self.local_search_hits = None;
+            self.local_search_coverage.clear();
+            self.refresh_mail();
             self.load_thread(cx);
-            self.fetch_conversation_extras(window, cx);
+            cx.notify();
+            return;
         }
+        self.run_local_search(window, cx);
         self.start_online_search(window, cx);
         cx.notify();
     }
 
-    /// What the search covered, for the line above the results.
+    /// Runs local FTS search and coverage lookup off the UI thread, discarding stale results
+    /// via `search_generation`.
+    fn run_local_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let generation = self.search_generation;
+        let query = self.search_query.clone();
+        let acct = self.account.id.clone();
+        let store = self.store.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let (hits, coverage) = cx
+                .background_spawn({
+                    let acct = acct.clone();
+                    async move {
+                        let hits: BTreeSet<MessageId> = store.search(&acct, &query).unwrap_or_default().into_iter().collect();
+                        let coverage = store.search_coverage(&acct).map(|c| c.sentence()).unwrap_or_default();
+                        (hits, coverage)
+                    }
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.search_generation != generation || this.account.id != acct {
+                    return;
+                }
+                this.local_search_hits = Some((generation, hits));
+                this.local_search_coverage = coverage;
+                this.refresh_mail();
+                if !this.search_query.is_empty() && this.selected_summary().is_none() {
+                    this.set_selected(this.conversations.first().map(|c| c.id.clone()));
+                    this.marked.clear();
+                    this.load_thread(cx);
+                    this.fetch_conversation_extras(window, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// What the search covered, for the line above the results (from cached local coverage).
     fn search_coverage_line(&self, acct: &AccountId) -> String {
-        let local = self.store.search_coverage(acct).map(|c| c.sentence()).unwrap_or_default();
+        let local = &self.local_search_coverage;
         let provider = self.provider_name(acct);
         let online = match &self.online_search {
             OnlineSearch::Idle => String::new(),
@@ -2697,7 +3359,7 @@ impl MailWindow {
         cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(450)).await;
             let still_current = this.update(cx, |this, cx| {
-                if this.search_generation != generation {
+                if this.search_generation != generation || this.account.id != acct {
                     return false;
                 }
                 this.online_search = OnlineSearch::Searching;
@@ -2708,36 +3370,43 @@ impl MailWindow {
             if !matches!(still_current, Ok(true)) {
                 return;
             }
-            let result = cx
-                .background_spawn(async move {
-                    const FETCH_LIMIT: usize = 25;
-                    let ids = provider.search(&account, &query, 60).await?;
-                    let missing: Vec<ProviderId> = ids
-                        .into_iter()
-                        .filter(|pid| store.message_id_for_provider_id(&account.id, pid).ok().flatten().is_none())
-                        .take(FETCH_LIMIT)
-                        .collect();
-                    if missing.is_empty() {
-                        return Ok::<usize, overlook_provider::ProviderError>(0);
-                    }
-                    let mut messages = provider.fetch_messages(&account, &missing, &labels).await?;
-                    // IMAP rows arrive without a conversation; thread them like a sync would.
-                    crate::sync::reconcile_incoming(&store, &account.id, &mut messages, &mut Vec::new());
-                    let protected = store.pending_message_ids(&account.id).unwrap_or_default();
-                    store.merge_remote_messages(&messages, &protected).map_err(|e| overlook_provider::ProviderError::Temporary(e.to_string()))?;
-                    Ok(messages.len())
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                if this.search_generation != generation {
+            let result = spawn_blocking_async(async move {
+                const FETCH_LIMIT: usize = 25;
+                let ids = provider.search(&account, &query, 60).await?;
+                let missing: Vec<ProviderId> = ids
+                    .into_iter()
+                    .filter(|pid| store.message_id_for_provider_id(&account.id, pid).ok().flatten().is_none())
+                    .take(FETCH_LIMIT)
+                    .collect();
+                if missing.is_empty() {
+                    return Ok::<usize, overlook_provider::ProviderError>(0);
+                }
+                let mut messages = provider.fetch_messages(&account, &missing, &labels).await?;
+                // IMAP rows arrive without a conversation; thread them like a sync would.
+                crate::sync::reconcile_incoming(&store, &account.id, &mut messages, &mut Vec::new());
+                let protected = store.pending_message_ids(&account.id).unwrap_or_default();
+                store.merge_remote_messages(&messages, &protected).map_err(|e| overlook_provider::ProviderError::Temporary(e.to_string()))?;
+                Ok(messages.len())
+            })
+            .await
+            .unwrap_or_else(|| Err(overlook_provider::ProviderError::Temporary("search cancelled".into())));
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.search_generation != generation || this.account.id != acct {
                     return;
                 }
+                let added = result.as_ref().copied().unwrap_or(0);
                 this.online_search = match result {
                     Ok(added) => OnlineSearch::Done { added },
                     Err(overlook_provider::ProviderError::Offline) => OnlineSearch::Offline,
                     Err(e) => OnlineSearch::Failed(e.to_string()),
                 };
-                this.reload(cx);
+                if added > 0 {
+                    this.rebuild_mail_index(cx);
+                    this.run_local_search(window, cx);
+                } else {
+                    this.search_coverage = this.search_coverage_line(&acct);
+                    cx.notify();
+                }
             });
         })
         .detach();
@@ -2752,6 +3421,7 @@ impl MailWindow {
             if let Some(index) = self.position_of(&previous) {
                 self.conversations.remove(index);
                 self.marked.remove(&previous);
+                self.rows_unread.set(self.conversations.iter().filter(|c| c.is_unread()).count());
                 self.list_data_generation += 1;
             }
         }
@@ -2812,33 +3482,50 @@ impl MailWindow {
     /// Renders the latest message of the conversations above and below the open one
     /// off-screen, so moving to them (j/k, or archive/delete landing on the next) shows
     /// them at once. Messages whose remote content would load are skipped: nothing is
-    /// fetched for mail the user has not opened.
+    /// fetched for mail the user has not opened. HTML & inline-image preparation runs
+    /// completely off the UI thread.
     fn schedule_prerender(&mut self, cx: &mut Context<Self>) {
         self.prerender = None;
         let Some(size) = crate::browser_body::reader_size() else { return };
+        if self.prefs.remote_images == RemoteImages::Allow {
+            return;
+        }
         let Some(i) = self.selected.as_ref().and_then(|id| self.conversations.iter().position(|c| &c.id == id)) else { return };
         let ids: Vec<MessageId> = [Some(i + 1), i.checked_sub(1)]
             .into_iter()
             .flatten()
             .filter_map(|j| self.conversations.get(j))
             .map(|c| c.latest_message_id.clone())
+            .filter(|id| !self.remote_allowed.contains(id))
             .collect();
+        if ids.is_empty() {
+            return;
+        }
         let store = self.store.clone();
+        let appearance = cx.palette().email_body_appearance(self.prefs.dark_message_body);
+        let fonts = self.prefs.fonts.clone();
         self.prerender = Some(cx.spawn(async move |this, cx| {
             // Let the open message paint and quick j/k runs settle before starting.
             cx.background_executor().timer(Duration::from_millis(250)).await;
-            let messages = cx.background_spawn(async move { ids.into_iter().filter_map(|id| store.message(&id).ok().flatten()).collect::<Vec<_>>() }).await;
-            for m in messages {
-                let job = this
-                    .update(cx, |this, cx| {
+            let prepared: Vec<String> = cx
+                .background_spawn(async move {
+                    let mut docs = Vec::new();
+                    for id in ids {
+                        let Some(m) = store.message(&id).ok().flatten() else { continue };
                         if m.body.html.is_none() {
-                            return None; // Plain text is drawn natively.
+                            continue; // Plain text is drawn natively.
                         }
-                        if this.remote_allowed.contains(&m.id) || this.prefs.remote_images == RemoteImages::Allow {
-                            return None;
-                        }
-                        let appearance = cx.palette().email_body_appearance(this.prefs.dark_message_body);
-                        let (html, _) = this.browser_document(&Self::message_source(&m), Some(&m), appearance);
+                        let source = Self::message_source(&m);
+                        let doc = appearance.prepare_document(&source, &fonts);
+                        let html = reader::resolve_inline_images_blocking(&m, doc.html);
+                        docs.push(html);
+                    }
+                    docs
+                })
+                .await;
+            for html in prepared {
+                let job = this
+                    .update(cx, |_this, cx| {
                         if crate::browser_body::is_rendered(&html, false, appearance.dark_paper(), size) {
                             return None;
                         }
@@ -2879,6 +3566,7 @@ impl MailWindow {
         self.marked.clear();
         self.thread.clear();
         self.outbox_selected = Some(id);
+        self.prepare_outbox_preview(cx);
         cx.notify();
     }
 
@@ -2949,13 +3637,13 @@ impl MailWindow {
         let window_handle = window.window_handle();
         let owner = self.window_owner();
         cx.spawn(async move |this, cx| {
-            let (errors, index) = cx
+            let (errors, index, count) = cx
                 .background_spawn({
                     let store = store.clone();
                     let acct = acct.clone();
                     async move {
                         let errors = apply_local_writes(&store, writes);
-                        (errors, store.mail_index(&acct))
+                        (errors, store.mail_index(&acct), store.message_count(&acct).unwrap_or(0))
                     }
                 })
                 .await;
@@ -2973,6 +3661,7 @@ impl MailWindow {
                         }
                         if this.account.id == acct {
                             if let Ok(index) = index {
+                                this.account_message_count = count;
                                 this.replace_mail_index(index);
                                 this.mail_index_generation += 1;
                                 this.refresh_mail();
@@ -3517,13 +4206,13 @@ impl MailWindow {
                     Ok(_) if this.unwanted_drafts.remove(&draft_id) => {
                         let _ = this.store.delete_draft(&draft_account, &draft_id);
                         this.forget_staged_files(&draft_id);
-                        this.reload_drafts();
+                        this.reload_drafts(cx);
                     }
                     Ok(_) => {
                         if let Some(c) = this.composer.as_mut().filter(|c| c.draft.id == draft_id && c.last_saved.is_none()) {
                             c.last_saved = Some(now());
                         }
-                        this.reload_drafts();
+                        this.reload_drafts(cx);
                     }
                     Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t start the draft: {e}")),
                 }
@@ -3555,8 +4244,9 @@ impl MailWindow {
         match self.store.cancel_send(&self.account.id, &id) {
             Ok(draft) => {
                 self.outbox_selected = None;
+                self.outbox_preview = None;
                 self.view = MailboxView::Kind(LabelKind::Drafts);
-                self.reload(cx);
+                self.reload_mail(cx);
                 self.open_composer(draft, window, cx);
                 if let Some(c) = self.composer.as_mut() {
                     c.last_saved = Some(now());
@@ -3570,7 +4260,7 @@ impl MailWindow {
     pub(crate) fn resend_draft(&mut self, id: DraftId, window: &mut Window, cx: &mut Context<Self>) {
         match self.store.resend(&self.account.id, &id) {
             Ok(draft) => {
-                self.reload(cx);
+                self.reload_mail(cx);
                 self.notify_owner(cx);
                 self.sync_account(draft.account_id, window, cx);
             }
@@ -3583,7 +4273,8 @@ impl MailWindow {
         match self.store.discard_send(&self.account.id, &id) {
             Ok(()) => {
                 self.outbox_selected = None;
-                self.reload(cx);
+                self.outbox_preview = None;
+                self.reload_mail(cx);
                 self.notify_owner(cx);
                 if self.is_message_window() {
                     window.remove_window();
@@ -3696,27 +4387,45 @@ impl MailWindow {
         if self.sync_through_owner(&id, Duration::ZERO, window, cx) {
             return;
         }
+        if self.providers_loading.contains(&id) || self.removing_accounts.contains(&id) {
+            return;
+        }
         let Some(account) = self.accounts.iter().find(|a| a.id == id).cloned() else { return };
         let Some(bundle) = self.providers.get(&id).cloned() else {
             let _ = self.store.set_sync_state(&id, &SyncState::SignInRequired, None);
-            self.reload(cx);
+            self.reload_mail(cx);
+            self.refresh_settings_cache();
             return;
         };
-        if self.syncing.contains(&id) {
+        if self.syncing.contains_key(&id) {
             self.sync_requested.insert(id);
             return;
         }
-        self.syncing.insert(id.clone());
+        let generation = self.provider_generation.get(&id).copied().unwrap_or(0);
+        self.syncing.insert(id.clone(), generation);
         self.sync_requested.remove(&id);
         let verify = self.verify_pending.remove(&id);
         let store = self.store.clone();
         let first_download = store.message_count(&id).unwrap_or(0) == 0;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let outcome: SyncOutcome = cx.background_spawn(run_sync(store, bundle.mail, bundle.calendar, account.clone(), verify)).await;
+            let outcome: Option<SyncOutcome> = spawn_blocking_async(run_sync(store, bundle.mail, bundle.calendar, account.clone(), verify)).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 crate::watchdog::mark("sync finished");
-                this.syncing.remove(&account.id);
+                if this.syncing.get(&account.id) == Some(&generation) {
+                    this.syncing.remove(&account.id);
+                }
+                let still_exists = this.accounts.iter().any(|a| a.id == account.id) && !this.removing_accounts.contains(&account.id);
+                let current_gen = this.provider_generation.get(&account.id).copied().unwrap_or(0);
+                // Discard stale outcomes from before a sign-out, re-sign-in, or account removal.
+                if !still_exists || current_gen != generation {
+                    cx.notify();
+                    return;
+                }
+                let Some(outcome) = outcome else {
+                    cx.notify();
+                    return;
+                };
                 match &outcome.state {
                     Some(SyncState::UpToDate) => {
                         this.retry_attempts.remove(&account.id);
@@ -3748,9 +4457,16 @@ impl MailWindow {
                     }
                 }
                 this.mark_counts_stale([account.id.clone()]);
-                this.reload(cx);
-                if account.id != this.account.id {
+                if account.id == this.account.id {
+                    this.reload(cx);
+                } else {
+                    if !this.is_message_window() {
+                        this.reload_account_labels();
+                        this.refresh_account_counts(cx);
+                    }
                     this.refresh_other_contacts_for(account.id.clone(), cx);
+                    this.refresh_settings_cache();
+                    cx.notify();
                 }
                 this.reload_folder_windows([account.id.clone()], cx);
                 if verify && !outcome.verified {
@@ -3924,26 +4640,58 @@ impl MailWindow {
         }
     }
 
-    /// Rebuilds Gmail providers so a new download size applies, and re-lists the mailboxes.
+    /// Rebuilds Gmail and IMAP providers off the UI thread so a new download size applies,
+    /// and re-lists the mailboxes.
     pub(crate) fn rebuild_providers_for_download_size(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         crate::set_inbox_limit(self.prefs.inbox_messages as usize);
-        let accounts = self.accounts.clone();
-        for a in accounts.iter().filter(|a| matches!(a.provider, ProviderKind::Gmail | ProviderKind::Imap)) {
-            // A Microsoft account keeps its running sign-in: a second session of the same
-            // account would refresh and store on its own.
-            let live = self.providers.get(&a.id).and_then(|p| p.microsoft.clone()).zip(self.store.servers(&a.id).ok().flatten());
-            let rebuilt = match live {
-                Some((session, servers)) => Ok(providers::microsoft_providers(a, servers, session)),
-                None => providers::providers_for(a, &self.sample, &self.store),
-            };
-            if let Ok(bundle) = rebuilt {
-                self.providers.insert(a.id.clone(), bundle);
-            }
-            // Drop the coverage marker so the next sync lists the mailboxes again.
-            let _ = self.store.set_setting(&format!("download_coverage:{}", a.id.0), &0u32);
+        let jobs: Vec<_> = self
+            .accounts
+            .iter()
+            .filter(|a| matches!(a.provider, ProviderKind::Gmail | ProviderKind::Imap))
+            .map(|a| {
+                let live_ms = self.providers.get(&a.id).and_then(|p| p.microsoft.clone());
+                let gen = self.provider_generation.get(&a.id).copied().unwrap_or(0);
+                (a.clone(), live_ms, gen)
+            })
+            .collect();
+        if jobs.is_empty() {
+            return;
         }
-        self.refresh_idle_watchers();
-        self.sync_all(window, cx);
+        let store = self.store.clone();
+        let sample = self.sample.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let rebuilt = spawn_blocking_io(move || {
+                jobs.into_iter()
+                    .map(|(a, live_ms, gen)| {
+                        let live = live_ms.zip(store.servers(&a.id).ok().flatten());
+                        let bundle = match live {
+                            Some((session, servers)) => Ok(providers::microsoft_providers(&a, servers, session)),
+                            None => providers::providers_for(&a, &sample, &store),
+                        };
+                        let _ = store.set_setting(&format!("download_coverage:{}", a.id.0), &0u32);
+                        (a.id, gen, bundle.ok())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default();
+            let _ = this.update_in(cx, |this, window, cx| {
+                for (id, gen, bundle) in rebuilt {
+                    let still_exists = this.accounts.iter().any(|a| a.id == id) && !this.removing_accounts.contains(&id);
+                    let current_gen = this.provider_generation.get(&id).copied().unwrap_or(0);
+                    if still_exists && current_gen == gen {
+                        if let Some(bundle) = bundle {
+                            this.bump_provider_generation(&id);
+                            this.providers.insert(id, bundle);
+                        }
+                    }
+                }
+                this.refresh_idle_watchers();
+                this.sync_all(window, cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Starts an `IDLE` thread for every IMAP account that has a provider and stops the
@@ -4306,7 +5054,7 @@ impl MailWindow {
                 format!("Last synced {} {}, {}", overlook_core::time::MONTHS_SHORT[(date.month as usize).saturating_sub(1) % 12], date.day, format_clock(t))
             }
         });
-        let unread: usize = self.conversations.iter().filter(|c| c.is_unread()).count();
+        let unread = self.rows_unread.get();
         let center = if self.view == MailboxView::Kind(LabelKind::Drafts) {
             format!("{} draft{}", self.drafts.len(), if self.drafts.len() == 1 { "" } else { "s" })
         } else if self.view == MailboxView::Kind(LabelKind::Outbox) {
@@ -4477,9 +5225,22 @@ impl MailWindow {
 
     // ------------------------------------------------------------------ body
 
+    fn schedule_pane_size_save(&mut self, cx: &mut Context<Self>) {
+        self.pane_save_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(250)).await;
+            let _ = this.update(cx, |this, _| {
+                this.save_setting("panes.sidebar", &this.sidebar_width);
+                this.save_setting("panes.list", &this.list_width);
+                this.save_setting("panes.list_height", &this.list_height);
+            });
+        }));
+    }
+
     fn render_body(&self, cx: &mut Context<Self>) -> AnyElement {
         if matches!(self.module, Module::Contacts | Module::Calendar) {
             self.browser_bodies.borrow_mut().clear();
+            self.prepared_docs.borrow_mut().clear();
+            self.preparing_docs.borrow_mut().clear();
         }
         if self.module == Module::Contacts {
             return h_resizable("main-contacts")
@@ -4510,8 +5271,11 @@ impl MailWindow {
                 .child(resizable_panel().bg(gutter).pl(px(5.)).child(reader))
                 .on_resize(cx.listener(|this, state: &Entity<ResizableState>, _window, cx| {
                     if let Some(w) = state.read(cx).sizes().first() {
-                        this.list_width = f32::from(*w);
-                        this.save_setting("panes.list", &this.list_width);
+                        let next = f32::from(*w);
+                        if (this.list_width - next).abs() > 0.5 {
+                            this.list_width = next;
+                            this.schedule_pane_size_save(cx);
+                        }
                     }
                 })),
             ReadingPane::Bottom => v_resizable("content-v")
@@ -4521,8 +5285,11 @@ impl MailWindow {
                 .child(resizable_panel().bg(gutter).pt(px(8.)).child(reader))
                 .on_resize(cx.listener(|this, state: &Entity<ResizableState>, _window, cx| {
                     if let Some(h) = state.read(cx).sizes().first() {
-                        this.list_height = f32::from(*h);
-                        this.save_setting("panes.list_height", &this.list_height);
+                        let next = f32::from(*h);
+                        if (this.list_height - next).abs() > 0.5 {
+                            this.list_height = next;
+                            this.schedule_pane_size_save(cx);
+                        }
                     }
                 })),
         };
@@ -4534,8 +5301,11 @@ impl MailWindow {
             .child(resizable_panel().bg(gutter).pt(px(8.)).child(content))
             .on_resize(cx.listener(|this, state: &Entity<ResizableState>, _window, cx| {
                 if let Some(w) = state.read(cx).sizes().first() {
-                    this.sidebar_width = f32::from(*w);
-                    this.save_setting("panes.sidebar", &this.sidebar_width);
+                    let next = f32::from(*w);
+                    if (this.sidebar_width - next).abs() > 0.5 {
+                        this.sidebar_width = next;
+                        this.schedule_pane_size_save(cx);
+                    }
                 }
             }))
             .into_any_element()
@@ -4822,5 +5592,29 @@ mod save_all_tests {
         assert_eq!(free_file_name(&dir, "../../etc/passwd", &mut taken), dir.join("attachment.._.._etc_passwd"));
         assert_eq!(free_file_name(&dir, "", &mut taken), dir.join("attachment"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod blocking_io_tests {
+    use super::{block_on_thread, spawn_blocking_async};
+    // The parent's GPUI glob also exports a `test` proc macro.
+    use std::prelude::v1::test;
+
+    #[test]
+    fn spawn_blocking_async_allows_nested_tokio_block_on_and_async_wakeups() {
+        let out = block_on_thread(spawn_blocking_async(async {
+            // Confirm an async wakeup across threads completes cleanly.
+            let (tx, rx) = tokio::sync::oneshot::channel::<u32>();
+            std::thread::spawn(move || {
+                let _ = tx.send(21);
+            });
+            let first = rx.await.unwrap();
+            // Confirm calling a separate Tokio Runtime::block_on inside the future does not panic.
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let second = rt.block_on(async { 21u32 });
+            first + second
+        }));
+        assert_eq!(out, Some(42));
     }
 }

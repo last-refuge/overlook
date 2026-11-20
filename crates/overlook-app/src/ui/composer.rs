@@ -24,6 +24,7 @@ struct ComposerReveal {
     until: Instant,
     last_layout: Option<(Pixels, Pixels, Pixels)>,
     stable_since: Instant,
+    settle_task: Option<Task<()>>,
 }
 
 /// Position the whole composer prominently, while keeping its beginning visible
@@ -45,6 +46,14 @@ pub struct Composer {
     pub source: Option<Message>,
     pub preview: bool,
     pub quote_shown: bool,
+    /// Monotonic counter bumped whenever draft body/signature/attachments/kind change.
+    pub content_revision: u64,
+    /// Cached resolved preview HTML `(content_revision, font, html)` prepared off `render()`.
+    pub preview_cache: Option<(u64, Option<overlook_core::prefs::OutgoingFont>, String)>,
+    pub preview_gen: u64,
+    /// Cached `history_preview` HTML `(source_id, draft_kind, html)` prepared off `render()`.
+    pub quote_cache: Option<(MessageId, DraftKind, String)>,
+    pub quote_gen: u64,
     /// The draft's signature as the composer draws it under the editor.
     pub signature_view: Option<SharedString>,
     pub show_cc: bool,
@@ -116,6 +125,8 @@ impl MailWindow {
             c.source = transfer.source; c.preview = transfer.preview; c.quote_shown = transfer.history;
             c.show_cc = transfer.show_cc; c.show_bcc = transfer.show_bcc; c.show_headers = transfer.show_headers;
         }
+        self.prepare_composer_preview(cx);
+        self.prepare_composer_quote(cx);
         self.reveal_current_composer(window, cx);
         if let Some(index) = transfer.focused_header {
             if let Some(c) = &self.composer {
@@ -130,8 +141,81 @@ impl MailWindow {
         if let Some(c) = self.composer.as_mut().filter(|c| c.source.is_some()) {
             c.quote_shown = !c.quote_shown;
             self.cancel_composer_reveal();
+            if self.composer.as_ref().is_some_and(|c| c.quote_shown) {
+                self.prepare_composer_quote(cx);
+            }
             cx.notify();
         }
+    }
+
+    /// Prepares the composer Preview HTML (including markdown + `resolve_draft_images`)
+    /// off the UI thread so `render_composer` never reads disk or parses markdown per frame.
+    pub(super) fn prepare_composer_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(c) = self.composer.as_mut().filter(|c| c.preview) else { return };
+        let font = self.prefs.fonts.outgoing_font();
+        let rev = c.content_revision;
+        if let Some((cached_rev, cached_font, _)) = &c.preview_cache {
+            if *cached_rev == rev && *cached_font == font {
+                return;
+            }
+        }
+        c.preview_gen = c.preview_gen.wrapping_add(1);
+        let gen = c.preview_gen;
+        let mut draft = c.draft.clone();
+        let draft_id = draft.id.clone();
+        cx.spawn(async move |this, cx| {
+            let html = cx
+                .background_spawn({
+                    let font = font.clone();
+                    async move {
+                        draft.body_html = (!draft.body_text.trim().is_empty()).then(|| render_markdown(&draft.body_text));
+                        super::signature::resolve_draft_images(
+                            &overlook_core::compose::outgoing_bodies_with_font(&draft, None, font.as_ref()).html,
+                            &draft.attachments,
+                        )
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(c) = this.composer.as_mut().filter(|c| c.draft.id == draft_id && c.preview_gen == gen) {
+                    c.preview_cache = Some((rev, font, html));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Prepares the composer quoted history HTML off the UI thread so `render_quote_block`
+    /// never calls `history_preview` on every frame.
+    pub(super) fn prepare_composer_quote(&mut self, cx: &mut Context<Self>) {
+        let Some(c) = self.composer.as_mut().filter(|c| c.quote_shown) else { return };
+        let Some(source) = c.source.clone() else { return };
+        let kind = c.draft.kind;
+        if let Some((cached_source, cached_kind, _)) = &c.quote_cache {
+            if *cached_source == source.id && *cached_kind == kind {
+                return;
+            }
+        }
+        c.quote_gen = c.quote_gen.wrapping_add(1);
+        let gen = c.quote_gen;
+        let draft = c.draft.clone();
+        let draft_id = draft.id.clone();
+        let source_id = source.id.clone();
+        cx.spawn(async move |this, cx| {
+            let safe = cx
+                .background_spawn(async move {
+                    overlook_core::compose::history_preview(&draft, &source, overlook_core::sanitize::RemoteContent::Allowed)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(c) = this.composer.as_mut().filter(|c| c.draft.id == draft_id && c.quote_gen == gen) {
+                    c.quote_cache = Some((source_id, kind, safe));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
     /// Opens the composer for `draft`, creating the input entities and autosave wiring.
     pub(super) fn open_composer(&mut self, mut draft: Draft, window: &mut Window, cx: &mut Context<Self>) {
@@ -216,6 +300,11 @@ impl MailWindow {
             source,
             preview: false,
             quote_shown: false,
+            content_revision: 1,
+            preview_cache: None,
+            preview_gen: 0,
+            quote_cache: None,
+            quote_gen: 0,
             signature_view,
             show_cc,
             show_bcc,
@@ -268,7 +357,9 @@ impl MailWindow {
             c.to.update(cx, |input, cx| input.set_value(join(&targets.to), window, cx));
             c.cc.update(cx, |input, cx| input.set_value(join(&targets.cc), window, cx));
             c.show_cc = !targets.cc.is_empty();
+            c.quote_cache = None;
             self.composer_changed(window, cx);
+            self.prepare_composer_quote(cx);
         }
         self.reveal_current_composer(window, cx);
         true
@@ -287,6 +378,7 @@ impl MailWindow {
             until: Instant::now() + Duration::from_secs(8),
             last_layout: None,
             stable_since: Instant::now(),
+            settle_task: None,
         });
         if inline { self.reader_scroll.scroll_to_top_of_item(self.reader_composer_index()); }
     }
@@ -305,6 +397,8 @@ impl MailWindow {
     /// This anchor lives on the viewport, so it prepaints even when the reply is
     /// thousands of pixels offscreen. The reply is a direct, measured scroll child.
     /// Late browser/history layout is followed only during opening and stops on input.
+    /// Repaints are only triggered when the scroll offset or reveal state actually changes,
+    /// avoiding a 60+ fps redraw storm during the settle window.
     pub(super) fn composer_reveal_anchor(&self, cx: &Context<Self>) -> AnyElement {
         let Some(c) = self.composer.as_ref().filter(|c| c.reveal.is_some()) else { return div().into_any_element() };
         let body = c.body.entity_id();
@@ -313,26 +407,53 @@ impl MailWindow {
             let view = view.clone();
             window.on_next_frame(move |_, cx| {
                 view.update(cx, |this, cx| {
-                    let ready = !this.thread_history_pending && this.browser_bodies.borrow().values().all(|(_, _, body)| body.read(cx).layout_is_ready());
+                    let ready = !this.thread_history_pending
+                        && this.preparing_docs.borrow().is_empty()
+                        && this.browser_bodies.borrow().values().all(|(_, _, body)| body.read(cx).layout_is_ready());
                     let viewport = this.reader_scroll.bounds();
                     let bounds = this.reader_scroll.bounds_for_item(this.reader_composer_index());
                     let Some(c) = this.composer.as_mut().filter(|c| c.body.entity_id() == body) else { return };
                     let Some(reveal) = c.reveal.as_mut() else { return };
+                    let mut changed = false;
                     if let Some(bounds) = bounds.filter(|_| viewport.size.height > px(0.)) {
                         let layout = (bounds.top() - viewport.top(), bounds.size.height, viewport.size.height);
                         if reveal.last_layout != Some(layout) {
                             reveal.last_layout = Some(layout);
                             reveal.stable_since = Instant::now();
+                            reveal.settle_task = None;
                         }
                         let offset = this.reader_scroll.offset();
                         let top = bounds.top() - viewport.top() + offset.y;
                         let next = reveal_offset(offset.y, top, bounds.size.height, viewport.size.height, this.reader_scroll.max_offset().y);
-                        if next != offset.y { this.reader_scroll.set_offset(point(offset.x, next)); }
+                        if next != offset.y {
+                            this.reader_scroll.set_offset(point(offset.x, next));
+                            changed = true;
+                        }
                     }
-                    if Instant::now() >= reveal.until || (ready && reveal.last_layout.is_some() && reveal.stable_since.elapsed() >= Duration::from_millis(200)) {
+                    let now_inst = Instant::now();
+                    if now_inst >= reveal.until || (ready && reveal.last_layout.is_some() && reveal.stable_since.elapsed() >= Duration::from_millis(200)) {
                         c.reveal = None;
+                        changed = true;
+                    } else if !changed && reveal.settle_task.is_none() {
+                        // Schedule a single check at the settle/expiry deadline instead of notifying every frame.
+                        let wait = if ready && reveal.last_layout.is_some() {
+                            Duration::from_millis(210).saturating_sub(reveal.stable_since.elapsed()).max(Duration::from_millis(20))
+                        } else {
+                            reveal.until.saturating_duration_since(now_inst).max(Duration::from_millis(50))
+                        };
+                        reveal.settle_task = Some(cx.spawn(async move |this, cx| {
+                            cx.background_executor().timer(wait).await;
+                            let _ = this.update(cx, |this, cx| {
+                                if let Some(r) = this.composer.as_mut().filter(|c| c.body.entity_id() == body).and_then(|c| c.reveal.as_mut()) {
+                                    r.settle_task = None;
+                                    cx.notify();
+                                }
+                            });
+                        }));
                     }
-                    cx.notify();
+                    if changed {
+                        cx.notify();
+                    }
                 }).ok();
             });
         }, |_, _, _, _| {}).absolute().inset_0().into_any_element()
@@ -361,26 +482,38 @@ impl MailWindow {
         }
     }
 
-    /// Reads the inputs back into the draft.
-    pub(super) fn sync_composer_fields(&mut self, cx: &mut Context<Self>) {
+    /// Reads the inputs back into the draft without running Markdown rendering on every keystroke.
+    fn sync_composer_fields_fast(&mut self, cx: &mut Context<Self>) {
         let Some(c) = self.composer.as_mut() else { return };
         c.draft.to = Address::parse_list(&c.to.read(cx).value());
         c.draft.cc = Address::parse_list(&c.cc.read(cx).value());
         c.draft.bcc = Address::parse_list(&c.bcc.read(cx).value());
         c.draft.subject = c.subject.read(cx).value().trim().to_owned();
         c.draft.body_text = c.body.read(cx).value().to_string();
-        c.draft.body_html = (!c.draft.body_text.trim().is_empty()).then(|| render_markdown(&c.draft.body_text));
         c.draft.updated_at = now();
+        c.content_revision = c.content_revision.wrapping_add(1);
+    }
+
+    /// Reads the inputs back into the draft, including rendered Markdown HTML (used on save,
+    /// send, pop-out, and preview).
+    pub(super) fn sync_composer_fields(&mut self, cx: &mut Context<Self>) {
+        self.sync_composer_fields_fast(cx);
+        let Some(c) = self.composer.as_mut() else { return };
+        c.draft.body_html = (!c.draft.body_text.trim().is_empty()).then(|| render_markdown(&c.draft.body_text));
     }
 
     fn composer_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.sync_composer_fields(cx);
+        self.sync_composer_fields_fast(cx);
         let Some(c) = self.composer.as_mut() else { return };
         c.dirty = true;
         c.error = None;
         c.save_generation += 1;
         let generation = c.save_generation;
         let draft_id = c.draft.id.clone();
+        let preview_open = c.preview;
+        if preview_open {
+            self.prepare_composer_preview(cx);
+        }
 
         self.refresh_recipient_suggestions(window, cx);
         cx.notify();
@@ -461,17 +594,22 @@ impl MailWindow {
     /// write) runs off the UI thread, so typing never hitches. "Saved" shows only after it
     /// commits, and only if nothing was typed meanwhile.
     fn autosave_composer(&mut self, generation: u64, window: &mut Window, cx: &mut Context<Self>) {
-        self.sync_composer_fields(cx);
+        self.sync_composer_fields_fast(cx);
         let Some(c) = self.composer.as_ref() else { return };
         if c.draft.is_empty() && c.last_saved.is_none() {
             return;
         }
-        let draft = c.draft.clone();
+        let mut draft = c.draft.clone();
         let draft_id = draft.id.clone();
         self.composer.as_mut().expect("the autosaved composer is open").pending_saves += 1;
         let store = self.store.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let result = cx.background_spawn(async move { store.save_editing_draft(&draft).map(|_| ()) }).await;
+            let result = cx
+                .background_spawn(async move {
+                    draft.body_html = (!draft.body_text.trim().is_empty()).then(|| render_markdown(&draft.body_text));
+                    store.save_editing_draft(&draft).map(|_| ())
+                })
+                .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 let Some(c) = this.composer.as_mut().filter(|c| c.draft.id == draft_id) else { return };
                 c.pending_saves = c.pending_saves.saturating_sub(1);
@@ -483,7 +621,7 @@ impl MailWindow {
                     Ok(()) => {}
                     Err(e) => c.error = Some(format!("Couldn’t save on this device: {e}")),
                 }
-                this.reload_drafts();
+                this.reload_drafts(cx);
                 this.schedule_draft_sync(window, cx);
                 this.notify_owner(cx);
                 cx.notify();
@@ -495,6 +633,7 @@ impl MailWindow {
     /// Writes the draft to the store. Only after this succeeds does the UI say it is saved.
     pub(super) fn save_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         self.sync_composer_fields(cx);
+        self.prepare_composer_preview(cx);
         let Some(c) = self.composer.as_mut() else { return false };
         if c.draft.is_empty() && c.last_saved.is_none() {
             return false;
@@ -503,7 +642,7 @@ impl MailWindow {
             Ok(()) => {
                 c.dirty = false;
                 c.last_saved = Some(now());
-                self.reload_drafts();
+                self.reload_drafts(cx);
                 self.schedule_draft_sync(window, cx);
                 self.notify_owner(cx);
                 cx.notify();
@@ -539,7 +678,7 @@ impl MailWindow {
                     // Nothing was written; do not leave an empty draft behind.
                     let _ = self.store.delete_draft(&c.draft.account_id, &c.draft.id);
                     self.forget_staged_files(&c.draft.id);
-                    self.reload_drafts();
+                    self.reload_drafts(cx);
                 }
             }
             if self.is_message_window() {
@@ -567,7 +706,7 @@ impl MailWindow {
         }
         if let Some(c) = self.composer.take() {
             self.forget_staged_files(&c.draft.id);
-            self.reload_drafts();
+            self.reload_drafts(cx);
             self.schedule_draft_sync(window, cx);
             self.notify_owner(cx);
             if self.composer_owner.is_some() { window.remove_window(); }
@@ -644,7 +783,7 @@ impl MailWindow {
     }
 
     pub(super) fn announce_queued_send(&mut self, draft: &Draft, window: &mut Window, cx: &mut Context<Self>) {
-        self.reload(cx);
+        self.reload_mail(cx);
         let online = self.connected(&draft.account_id);
         let delay = self.prefs.undo_send_secs;
         let text = match (online, delay) {
@@ -770,7 +909,7 @@ impl MailWindow {
                         Ok(Some(mut draft)) if draft.state == DraftState::Editing => {
                             draft.attachments.extend(added);
                             let _ = this.store.save_draft(&draft);
-                            this.reload_drafts();
+                            this.reload_drafts(cx);
                         }
                         _ => {
                             let _ = std::fs::remove_dir_all(this.outgoing_dir.join(draft_id.as_str()));
@@ -989,20 +1128,18 @@ impl MailWindow {
                     .py(px(12.))
                     .text_size(crate::ui::ui_px(15.))
                     .line_height(crate::ui::ui_px(24.))
-                    .child({
-                        let html = super::signature::resolve_draft_images(
-                            &overlook_core::compose::outgoing_bodies_with_font(
-                                &c.draft,
+                    .child(match &c.preview_cache {
+                        Some((rev, _, html)) => self
+                            .browser_message_body(
+                                format!("preview-{}", c.draft.id),
+                                *rev,
+                                || html.clone(),
                                 None,
-                                self.prefs.fonts.outgoing_font().as_ref(),
+                                self.prefs.remote_images == RemoteImages::Allow,
+                                cx,
                             )
-                            .html,
-                            &c.draft.attachments,
-                        );
-                        self.browser_message_body(
-                            format!("preview-{}", c.draft.id), &html, None,
-                            self.prefs.remote_images == RemoteImages::Allow, cx,
-                        ).0
+                            .0,
+                        None => div().min_h(px(120.)).into_any_element(),
                     })
                     .into_any_element()
             } else {
@@ -1108,10 +1245,20 @@ impl MailWindow {
             _ => format!("Quoting {who} · {when}"),
         };
         let shown = c.quote_shown;
-        let html = shown.then(|| {
-            let allow_remote = self.remote_allowed.contains(&source.id) || self.prefs.remote_images == RemoteImages::Allow;
-            let safe = overlook_core::compose::history_preview(&c.draft, source, overlook_core::sanitize::RemoteContent::Allowed);
-            self.browser_message_body(format!("quote-{}", c.draft.id), &safe, Some(source), allow_remote, cx).0
+        let html = shown.then(|| match &c.quote_cache {
+            Some((_, _, safe)) => {
+                let allow_remote = self.remote_allowed.contains(&source.id) || self.prefs.remote_images == RemoteImages::Allow;
+                self.browser_message_body(
+                    format!("quote-{}", c.draft.id),
+                    c.quote_gen,
+                    || safe.clone(),
+                    Some(source),
+                    allow_remote,
+                    cx,
+                )
+                .0
+            }
+            None => div().min_h(px(80.)).into_any_element(),
         });
         Some(
             v_flex()
@@ -1171,10 +1318,17 @@ impl MailWindow {
     }
 
     pub(super) fn toggle_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.sync_composer_fields(cx);
+        let opening = self.composer.as_ref().is_some_and(|c| !c.preview);
+        if opening {
+            self.sync_composer_fields(cx);
+        } else {
+            self.sync_composer_fields_fast(cx);
+        }
         let Some(c) = self.composer.as_mut() else { return };
         c.preview = !c.preview;
-        if !c.preview {
+        if c.preview {
+            self.prepare_composer_preview(cx);
+        } else {
             let body = c.body.clone();
             body.update(cx, |s, cx| s.focus(window, cx));
         }

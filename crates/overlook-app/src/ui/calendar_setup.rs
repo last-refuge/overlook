@@ -448,11 +448,11 @@ impl MailWindow {
         let worker_connection = connection.clone();
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let delay = cx
-                .background_spawn(async move {
-                    caldav_sync::synchronize(&store, &account, &worker_connection, from, to)
-                })
-                .await;
+            let delay = super::spawn_blocking_io(move || {
+                caldav_sync::synchronize(&store, &account, &worker_connection, from, to)
+            })
+            .await
+            .unwrap_or(60);
             let _ = this.update(cx, |this, cx| {
                 if this.caldav_syncing.get(&id) != Some(&connection.id) {
                     return;

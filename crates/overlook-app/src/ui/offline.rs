@@ -174,7 +174,9 @@ impl MailWindow {
             let mut failed: Vec<(MessageId, String)> = Vec::new();
             for chunk in ids.chunks(BATCH) {
                 let chunk = chunk.to_vec();
-                let result = cx.background_spawn(offline_disk::copy_to_offline(store.clone(), provider.clone(), source.clone(), offline.clone(), folder.clone(), chunk.clone())).await;
+                let Some(result) = super::spawn_blocking_async(offline_disk::copy_to_offline(store.clone(), provider.clone(), source.clone(), offline.clone(), folder.clone(), chunk.clone())).await else {
+                    break;
+                };
                 let stopped = result.stopped.is_some();
                 let alive = this.update_in(cx, |this, window, cx| {
                     for id in &chunk {
@@ -191,7 +193,7 @@ impl MailWindow {
                         this.apply_local_for(&source.id, change, window, cx);
                         if this.offline_active() {
                             // Opened meanwhile: show the copies as they land.
-                            this.reload(cx);
+                            this.reload_mail(cx);
                         } else {
                             this.mark_counts_stale([offline.id.clone()]);
                             this.refresh_account_counts(cx);
@@ -280,7 +282,7 @@ impl MailWindow {
                 }
                 // Files moved: the open messages read them from their new places.
                 if this.offline_active() {
-                    this.reload(cx);
+                    this.reload_mail(cx);
                 }
             });
         })
@@ -306,7 +308,7 @@ impl MailWindow {
                 Ok(adopted) if adopted > 0 => {
                     let _ = this.update(cx, |this, cx| {
                         this.reload_account_labels();
-                        this.reload(cx);
+                        this.reload_mail(cx);
                     });
                 }
                 Ok(_) => {}
@@ -385,7 +387,7 @@ impl MailWindow {
                         let offline = this.offline.id.clone();
                         this.reload_account_labels();
                         this.mark_counts_stale([offline]);
-                        this.reload(cx);
+                        this.reload_mail(cx);
                         let place = local::dir_of(&label).map(|d| shown_path(&d)).unwrap_or_default();
                         let what = if renaming.is_some() { "Renamed to" } else { "Created" };
                         crate::ui::toast(window, cx, crate::notify::Level::Success, format!("{what} “{}” in {place}.", Self::offline_folder_name(&label.name)));
@@ -435,7 +437,7 @@ impl MailWindow {
             let _ = this.update_in(cx, |this, window, cx| match result {
                 Ok(()) => {
                     this.reload_account_labels();
-                    this.reload(cx);
+                    this.reload_mail(cx);
                     crate::ui::toast(window, cx, crate::notify::Level::Success, format!("Moved “{}”.", Self::offline_folder_name(&label.name)));
                 }
                 Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t move “{}”: {}", Self::offline_folder_name(&label.name), folder_error(&e))),

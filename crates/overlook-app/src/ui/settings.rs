@@ -96,6 +96,15 @@ pub struct SettingsState {
     pub caldav: Option<super::calendar_setup::CalendarSetup>,
     /// Connecting contacts for an IMAP or POP3 account.
     pub contacts: super::contacts_setup::ContactsSetup,
+    /// Cached per-account status, server info, contact counts, and contacts connection status
+    /// so `render_settings_accounts` / `render_contacts_status` never query SQLite per frame.
+    pub account_status: AccountStatus,
+    pub servers: Option<MailServers>,
+    pub contact_count: usize,
+    pub contacts_source: super::contacts::ContactsSource,
+    pub contacts_status: Option<crate::carddav_sync::ContactsStatus>,
+    pub contacts_is_microsoft: bool,
+    pub microsoft_config_label: String,
     /// Filters every page's settings by name; non-empty shows results instead of a page.
     pub search: Entity<InputState>,
     /// The setting a search result jumped to: scrolled into view and briefly highlighted.
@@ -317,8 +326,58 @@ impl MailWindow {
             crate::theme::apply_fonts(&self.prefs.fonts, cx);
         }
         self.reminders_enabled = self.prefs.event_reminders;
+        self.prepare_outbox_preview(cx);
+        self.prepare_composer_preview(cx);
         self.reload(cx);
         self.share_prefs(cx);
+    }
+
+    /// Refreshes cached SQLite-backed fields in `SettingsState` when settings open,
+    /// sync updates, or account/contacts settings change. Never called from `render()`.
+    pub(crate) fn refresh_settings_cache(&mut self) {
+        let Some(selected) = self.settings.as_ref().map(|s| s.account.clone()) else {
+            return;
+        };
+        let account = self
+            .accounts
+            .iter()
+            .find(|a| a.id == selected)
+            .cloned()
+            .unwrap_or_else(|| self.account.clone());
+        let account_status = self.store.account_status(&account.id).unwrap_or_default();
+        let is_password_account = matches!(account.provider, ProviderKind::Imap | ProviderKind::Pop3);
+        let servers = if is_password_account {
+            self.store.servers(&account.id).ok().flatten()
+        } else {
+            None
+        };
+        let contact_count = self.store.contact_count(&account.id).unwrap_or(0);
+        let contacts_source = self.contacts_source_of(&account);
+        let contacts_status = if is_password_account {
+            crate::carddav_sync::status(&self.store, &account.id)
+        } else {
+            None
+        };
+        let contacts_is_microsoft = is_password_account
+            && self
+                .store
+                .contacts_connection(&account.id)
+                .ok()
+                .flatten()
+                .is_some_and(|c| c.credential == ContactsCredential::Microsoft);
+        let microsoft_config_label = match overlook_provider::microsoft::ClientConfig::built_in() {
+            Some(_) if !crate::microsoft_signin::client_config_path().exists() => "Built into Overlook".to_owned(),
+            _ => crate::microsoft_signin::client_config_path().display().to_string(),
+        };
+        if let Some(state) = self.settings.as_mut() {
+            state.account_status = account_status;
+            state.servers = servers;
+            state.contact_count = contact_count;
+            state.contacts_source = contacts_source;
+            state.contacts_status = contacts_status;
+            state.contacts_is_microsoft = contacts_is_microsoft;
+            state.microsoft_config_label = microsoft_config_label;
+        }
     }
 
     pub(crate) fn account_prefs_for(&self, id: &AccountId) -> AccountPrefs {
@@ -704,10 +763,18 @@ impl MailWindow {
             compose_font,
             caldav,
             contacts: Default::default(),
+            account_status: AccountStatus::default(),
+            servers: None,
+            contact_count: 0,
+            contacts_source: Default::default(),
+            contacts_status: None,
+            contacts_is_microsoft: false,
+            microsoft_config_label: String::new(),
             search,
             scroll_target: None,
             _subscriptions: subs,
         });
+        self.refresh_settings_cache();
         self.load_vacation(acct.id, window, cx);
         cx.notify();
     }
@@ -861,7 +928,7 @@ impl MailWindow {
             SettingsPage::Fonts => self.render_settings_fonts(state, cx).into_any_element(),
             SettingsPage::Mail => self.render_settings_mail(state, cx).into_any_element(),
             SettingsPage::Calendar => self.render_settings_calendar(state, cx).into_any_element(),
-            SettingsPage::About => self.render_settings_about(cx).into_any_element(),
+            SettingsPage::About => self.render_settings_about(state, cx).into_any_element(),
         } };
         RENDER_TARGET.set(None);
         let title: SharedString = if searching { format!("Results for “{query}”").into() } else { page.label().into() };
@@ -987,16 +1054,16 @@ impl MailWindow {
         let selected = state.account.clone();
         let account = self.accounts.iter().find(|a| a.id == selected).cloned().unwrap_or_else(|| self.account.clone());
         let ap = self.account_prefs_for(&account.id);
-        let status = self.store.account_status(&account.id).unwrap_or_default();
+        let status = &state.account_status;
         let issue = self.provider_issues.get(&account.id).cloned();
         let email = account.email.clone();
         let is_gmail = account.provider == ProviderKind::Gmail;
         let is_password_account = matches!(account.provider, ProviderKind::Imap | ProviderKind::Pop3);
-        let servers = if is_password_account { self.store.servers(&account.id).ok().flatten() } else { None };
-        let oauth = servers.as_ref().and_then(|s| s.oauth);
+        let servers = state.servers.as_ref();
+        let oauth = servers.and_then(|s| s.oauth);
         // A server on this computer (Proton Mail Bridge) is trusted by its certificate.
-        let trusted = servers.as_ref().and_then(|s| s.incoming.pinned_certificate.as_deref().or(s.outgoing.pinned_certificate.as_deref())).map(|fp| format!(" Overlook accepts only the certificate you trusted for the server on this computer (SHA-256 {}…).", fp.get(..11).unwrap_or(fp))).unwrap_or_default();
-        let connection_line = match (account.provider, &servers) {
+        let trusted = servers.and_then(|s| s.incoming.pinned_certificate.as_deref().or(s.outgoing.pinned_certificate.as_deref())).map(|fp| format!(" Overlook accepts only the certificate you trusted for the server on this computer (SHA-256 {}…).", fp.get(..11).unwrap_or(fp))).unwrap_or_default();
+        let connection_line = match (account.provider, servers) {
             (ProviderKind::Gmail, _) => "Connected through the Gmail and Google Calendar APIs.".to_owned(),
             (ProviderKind::Sample, _) => "Sample account with fictional mail; nothing leaves this device.".to_owned(),
             (ProviderKind::Local, _) => "Offline folders, kept only on this computer.".to_owned(),
@@ -1011,7 +1078,7 @@ impl MailWindow {
             (_, None) => "Server settings are not set up yet.".to_owned(),
         };
         let sign_in_label = super::sign_in_label_for(account.provider, oauth.is_some());
-        let contacts_source = self.contacts_source_of(&account);
+        let contacts_source = state.contacts_source;
         let contacts_about = match contacts_source {
             super::contacts::ContactsSource::Google => "Your Google Contacts and the people you have written to, for recipient suggestions and sender cards.".to_owned(),
             super::contacts::ContactsSource::Server(Some(name)) => format!("Your {name} contacts, kept in step both ways: changes made here go to {name}, and changes made there arrive within 15 minutes."),
@@ -1110,9 +1177,9 @@ impl MailWindow {
             .children(self.render_vacation(state, &account, cx))
             .child(section("Contacts", Some(contacts_about.as_str())))
             // IMAP and POP3 accounts connect a contacts server; Gmail and the sample have theirs.
-            .children(if is_password_account { self.render_contacts_connection(&account, servers.as_ref(), cx) } else { Vec::new() })
+            .children(if is_password_account { self.render_contacts_connection(state, &account, servers, cx) } else { Vec::new() })
             .when(!is_password_account, |d| d.child({
-                let count = self.store.contact_count(&account.id).unwrap_or(0);
+                let count = state.contact_count;
                 let counted = format!("{count} contact{}", if count == 1 { "" } else { "s" });
                 let acct_id = account.id.clone();
                 let e = email.clone();
@@ -1724,7 +1791,7 @@ impl MailWindow {
             ))
     }
 
-    fn render_settings_about(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_settings_about(&self, state: &SettingsState, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *cx.palette();
         let data_dir = crate::data_dir();
         let data_dir_text = data_dir.display().to_string();
@@ -1733,10 +1800,7 @@ impl MailWindow {
         } else {
             crate::google_signin::client_config_path().display().to_string()
         };
-        let microsoft_config = match overlook_provider::microsoft::ClientConfig::built_in() {
-            Some(_) if !crate::microsoft_signin::client_config_path().exists() => "Built into Overlook".to_owned(),
-            _ => crate::microsoft_signin::client_config_path().display().to_string(),
-        };
+        let microsoft_config = state.microsoft_config_label.clone();
         let update_label = if self.update.install == super::InstallKind::Mac { "Download update" } else { "Update now" };
         v_flex()
             .gap(px(22.))
@@ -1827,7 +1891,9 @@ impl MailWindow {
                 cx.notify();
             });
             let shown = target.clone();
-            let result = cx.background_spawn(async move { crate::backup::write_backup(&store, &data_dir, &target) }).await;
+            let result = super::spawn_blocking_io(move || crate::backup::write_backup(&store, &data_dir, &target))
+                .await
+                .unwrap_or_else(|| Err("Backup stopped unexpectedly.".into()));
             let _ = this.update_in(cx, |this, window, cx| {
                 this.backing_up = false;
                 match result {
