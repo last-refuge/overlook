@@ -298,3 +298,29 @@ fn a_microsoft_connection_signs_in_with_its_own_sign_in() {
     assert_eq!(store.contacts_connection(&account.id).unwrap().unwrap().credential, ContactsCredential::Microsoft);
     assert_eq!(carddav_sync::password(&conn), None, "no password goes anywhere");
 }
+
+#[test]
+fn renewed_contacts_save_does_not_hold_global_generation_lock_across_io() {
+    let account_a = AccountId::from("imap:contacts-lock-a@outlook.com");
+    let account_b = AccountId::from("imap:contacts-lock-b@outlook.com");
+    let gen_a = sign_in_generation(&account_a);
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let a_clone = account_a.clone();
+    let worker = std::thread::spawn(move || {
+        save_renewed_with(&a_clone, gen_a, || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+            Ok(())
+        })
+    });
+    entered_rx.recv().unwrap();
+
+    // Unrelated account B can inspect and end its sign-in while A is blocked in keyring I/O.
+    let before = sign_in_generation(&account_b);
+    end_sign_in(&account_b);
+    assert_eq!(sign_in_generation(&account_b), before + 1);
+
+    let _ = release_tx.send(());
+    assert!(worker.join().unwrap().is_ok());
+}

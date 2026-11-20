@@ -84,27 +84,51 @@ pub fn imap_providers(servers: MailServers, credential: impl Into<Credential>, o
 /// session replaced by a new sign-in, or whose account was signed out or removed, can still
 /// finish a refresh it started, but never stores it or deletes its successor's sign-in.
 /// Microsoft offers no revocation that would stop it otherwise.
+///
+/// Keyring I/O is serialized per account via `AccountSignIn::io` so blocking D-Bus/Keychain
+/// calls never hold the global `GENERATIONS` mutex or stall unrelated accounts.
+#[derive(Default)]
+struct AccountSignIn {
+    generation: Option<u64>,
+    io: Arc<Mutex<()>>,
+}
+
 #[derive(Default)]
 struct SignInGenerations {
-    current: HashMap<AccountId, u64>,
+    accounts: HashMap<AccountId, AccountSignIn>,
     last: u64,
 }
 
 impl SignInGenerations {
     fn begin(&mut self, account: &AccountId) -> u64 {
         self.last += 1;
-        self.current.insert(account.clone(), self.last);
+        let entry = self.accounts.entry(account.clone()).or_default();
+        entry.generation = Some(self.last);
         self.last
     }
 
+    fn clear(&mut self, account: &AccountId) {
+        if let Some(entry) = self.accounts.get_mut(account) {
+            entry.generation = None;
+        }
+    }
+
     fn is_current(&self, account: &AccountId, generation: u64) -> bool {
-        self.current.get(account) == Some(&generation)
+        self.accounts.get(account).and_then(|e| e.generation) == Some(generation)
+    }
+
+    fn io_lock(&mut self, account: &AccountId) -> Arc<Mutex<()>> {
+        self.accounts.entry(account.clone()).or_default().io.clone()
     }
 }
 
 fn generations() -> std::sync::MutexGuard<'static, SignInGenerations> {
     static GENERATIONS: OnceLock<Mutex<SignInGenerations>> = OnceLock::new();
     GENERATIONS.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner())
+}
+
+fn account_io_lock(account: &AccountId) -> Arc<Mutex<()>> {
+    generations().io_lock(account)
 }
 
 type SaveSignIn = dyn Fn(&AccountId, &OAuthTokens, &ClientConfig) -> Result<(), credentials::VaultError> + Send + Sync;
@@ -135,10 +159,11 @@ pub fn adopt_microsoft_sign_in(account: &AccountId, kind: ProviderKind, tokens: 
 }
 
 fn adopt_with(account: &AccountId, kind: ProviderKind, tokens: OAuthTokens, config: ClientConfig, vault: SignInVault) -> Result<Arc<MicrosoftSession>, credentials::VaultError> {
-    let mut generations = generations();
+    let io = account_io_lock(account);
+    let _io = io.lock().unwrap_or_else(|p| p.into_inner());
     (vault.save)(account, &tokens, &config)?;
-    let generation = generations.begin(account);
-    drop(generations);
+    let generation = generations().begin(account);
+    drop(_io);
     Ok(Arc::new(build_session(account, kind, tokens, config, generation, vault)))
 }
 
@@ -152,7 +177,9 @@ pub fn microsoft_session(account: &AccountId, kind: ProviderKind, tokens: OAuthT
 /// Stops every session of the account from writing to the keyring. Sign-out and removal call
 /// it before deleting the stored sign-in.
 pub fn end_microsoft_sign_ins(account: &AccountId) {
-    generations().current.remove(account);
+    let io = account_io_lock(account);
+    let _io = io.lock().unwrap_or_else(|p| p.into_inner());
+    generations().clear(account);
 }
 
 /// Refreshed tokens go to the keyring with the registration that issued them, and a refresh
@@ -164,8 +191,9 @@ fn build_session(account: &AccountId, kind: ProviderKind, tokens: OAuthTokens, c
             microsoft_scopes(kind),
             tokens,
             Box::new(move |fresh| {
-                let generations = generations();
-                if !generations.is_current(&save_id, generation) {
+                let io = account_io_lock(&save_id);
+                let _io = io.lock().unwrap_or_else(|p| p.into_inner());
+                if !generations().is_current(&save_id, generation) {
                     info!(target: "overlook::signin", account = %save_id.0, "a replaced or ended Microsoft session refreshed its token; not stored");
                     return;
                 }
@@ -176,8 +204,9 @@ fn build_session(account: &AccountId, kind: ProviderKind, tokens: OAuthTokens, c
         )
     // Microsoft rejected the refresh token (expired, revoked, password changed).
     .with_on_invalidated(Box::new(move || {
-        let generations = generations();
-        if !generations.is_current(&invalid_id, generation) {
+        let io = account_io_lock(&invalid_id);
+        let _io = io.lock().unwrap_or_else(|p| p.into_inner());
+        if !generations().is_current(&invalid_id, generation) {
             return;
         }
         if let Err(e) = (vault.delete)(&invalid_id) {
@@ -339,5 +368,35 @@ mod tests {
         end_microsoft_sign_ins(&account);
         assert_eq!(signed_out.access_token(None), Ok("after-sign-out-access".into()));
         assert!(!log.lock().unwrap().iter().any(|l| l == "save after-sign-out"));
+    }
+
+    #[test]
+    fn blocking_keyring_io_for_one_account_does_not_block_other_accounts() {
+        let account_a = AccountId::from("imap:io-isolation-a@outlook.com");
+        let account_b = AccountId::from("imap:io-isolation-b@outlook.com");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let blocking_vault = SignInVault {
+            save: Arc::new(move |_, _, _| {
+                let _ = entered_tx.send(());
+                let _ = release_rx.lock().unwrap().recv();
+                Ok(())
+            }),
+            delete: Arc::new(|_| Ok(())),
+        };
+        let a_clone = account_a.clone();
+        let worker = std::thread::spawn(move || {
+            adopt_with(&a_clone, ProviderKind::Imap, tokens("a", "r"), config(), blocking_vault).unwrap();
+        });
+        entered_rx.recv().unwrap();
+
+        // While account_a is blocked inside vault.save, account_b must proceed freely.
+        let (vault_b, log_b) = recording();
+        adopt_with(&account_b, ProviderKind::Imap, tokens("b", "rb"), config(), vault_b).unwrap();
+        assert_eq!(*log_b.lock().unwrap(), ["save rb"]);
+
+        let _ = release_tx.send(());
+        worker.join().unwrap();
     }
 }

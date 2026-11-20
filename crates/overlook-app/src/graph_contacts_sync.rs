@@ -18,26 +18,58 @@ use overlook_provider::microsoft::oauth::{self, AuthError};
 use overlook_store::Store;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tracing::{info, warn};
 
 /// Each account's contacts sign-in, counted up every time one ends or is replaced. A refresh
 /// saves its renewed sign-in only while the count is what it was when the refresh began, so a
 /// refresh that finishes after Disconnect, Sign out or Remove account can't put the deleted
 /// sign-in back in the keyring.
-fn generations() -> MutexGuard<'static, HashMap<AccountId, u64>> {
-    static GENERATIONS: OnceLock<Mutex<HashMap<AccountId, u64>>> = OnceLock::new();
+///
+/// Keyring saves and sign-in transitions are serialized per account via `io`, so blocking
+/// D-Bus/Keychain I/O never holds the global `GENERATIONS` lock across accounts.
+#[derive(Default)]
+struct AccountContactsSignIn {
+    generation: u64,
+    io: Arc<Mutex<()>>,
+}
+
+fn generations() -> MutexGuard<'static, HashMap<AccountId, AccountContactsSignIn>> {
+    static GENERATIONS: OnceLock<Mutex<HashMap<AccountId, AccountContactsSignIn>>> = OnceLock::new();
     GENERATIONS.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner())
+}
+
+fn account_io_lock(account: &AccountId) -> Arc<Mutex<()>> {
+    generations().entry(account.clone()).or_default().io.clone()
 }
 
 /// Ends the account's contacts sign-in before it is deleted or replaced: a refresh under way
 /// keeps its tokens to itself.
 pub fn end_sign_in(account: &AccountId) {
-    *generations().entry(account.clone()).or_default() += 1;
+    let io = account_io_lock(account);
+    let _io = io.lock().unwrap_or_else(|p| p.into_inner());
+    generations().entry(account.clone()).or_default().generation += 1;
 }
 
 fn sign_in_generation(account: &AccountId) -> u64 {
-    generations().get(account).copied().unwrap_or(0)
+    generations().get(account).map(|entry| entry.generation).unwrap_or(0)
+}
+
+fn save_renewed_with(
+    account: &AccountId,
+    expected_generation: u64,
+    save: impl FnOnce() -> Result<(), credentials::VaultError>,
+) -> Result<(), GraphError> {
+    let io = account_io_lock(account);
+    let _io = io.lock().unwrap_or_else(|p| p.into_inner());
+    if sign_in_generation(account) != expected_generation {
+        info!("the contacts sign-in ended while it was being renewed; the renewal isn’t kept");
+        return Err(GraphError::SignInRequired);
+    }
+    if let Err(error) = save() {
+        warn!("couldn’t save the refreshed contacts sign-in: {error}");
+    }
+    Ok(())
 }
 
 /// What the sync needs from Graph; the real client, or a fixture in tests.
@@ -83,16 +115,9 @@ pub fn access_token(account: &AccountId) -> Result<String, GraphError> {
     match oauth::refresh(&config, &refresh_token, &graph::contacts_scopes()) {
         Ok(mut fresh) => {
             fresh.signed_in_at = tokens.signed_in_at;
-            // Held while saving, so ending the sign-in waits for this save, then deletes it.
-            let current = generations();
-            if current.get(account).copied().unwrap_or(0) != generation {
-                info!("the contacts sign-in ended while it was being renewed; the renewal isn’t kept");
-                return Err(GraphError::SignInRequired);
-            }
-            if let Err(error) = credentials::save_microsoft_contacts_tokens(account, &fresh, &config) {
-                warn!("couldn’t save the refreshed contacts sign-in: {error}");
-            }
-            drop(current);
+            save_renewed_with(account, generation, || {
+                credentials::save_microsoft_contacts_tokens(account, &fresh, &config)
+            })?;
             Ok(fresh.access_token)
         }
         Err(AuthError::Network(_)) => Err(GraphError::Network),
