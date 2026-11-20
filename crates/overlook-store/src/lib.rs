@@ -1154,20 +1154,7 @@ impl Store {
     }
 
     pub fn delete_draft(&self, account: &AccountId, id: &DraftId) -> Result<()> {
-        self.with_tx(|tx| {
-            ensure_owned(tx, Owned::Draft, account, [id.0.as_str()])?;
-            tx.execute("DELETE FROM drafts WHERE id=?1", [&id.0])?;
-            // Any unsent / failed / uncertain send for this draft is cancelled with it.
-            tx.execute(
-                "DELETE FROM pending_operations
-                 WHERE account_id=?1 AND state IN ('pending','failed','uncertain')
-                   AND json_valid(kind_json)
-                   AND json_extract(kind_json,'$.op')='send-draft'
-                   AND json_extract(kind_json,'$.draft_id')=?2",
-                params![account.0, id.0],
-            )?;
-            Ok(())
-        })
+        self.with_tx(|tx| delete_draft_tx(tx, account, id))
     }
 
     /// Moves a draft to the Outbox and queues its send in the same transaction.
@@ -2663,6 +2650,22 @@ fn insert_operation_tx(tx: &Connection, account: &AccountId, kind: OperationKind
         params![op.id.0, op.account_id.0, op.seq, serde_json::to_string(&op.kind)?, op.state.as_key(), ts],
     )?;
     Ok(op)
+}
+
+fn delete_draft_tx(tx: &Connection, account: &AccountId, id: &DraftId) -> Result<()> {
+    ensure_owned(tx, Owned::Draft, account, [id.0.as_str()])?;
+    // Retain the draft_sync row so reconciliation can remove a provider copy.
+    tx.execute("DELETE FROM drafts WHERE id=?1", [&id.0])?;
+    // Any unsent / failed / uncertain send for this draft is cancelled with it.
+    tx.execute(
+        "DELETE FROM pending_operations
+         WHERE account_id=?1 AND state IN ('pending','failed','uncertain')
+           AND json_valid(kind_json)
+           AND json_extract(kind_json,'$.op')='send-draft'
+           AND json_extract(kind_json,'$.draft_id')=?2",
+        params![account.0, id.0],
+    )?;
+    Ok(())
 }
 
 fn save_draft_tx(tx: &Connection, d: &Draft) -> Result<()> {

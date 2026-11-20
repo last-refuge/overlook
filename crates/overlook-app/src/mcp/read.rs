@@ -2,7 +2,7 @@
 
 mod calendar;
 mod contacts;
-mod mail;
+pub(super) mod mail;
 mod mail_records;
 
 use std::fmt::Display;

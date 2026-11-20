@@ -1,6 +1,6 @@
 //! Account-scoped MCP mail reads from the owner's Store and provider.
 
-mod attachment;
+pub(in crate::mcp) mod attachment;
 mod search;
 #[cfg(test)]
 mod tests;

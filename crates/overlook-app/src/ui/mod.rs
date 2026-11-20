@@ -4268,7 +4268,11 @@ impl MailWindow {
 
     pub(crate) fn open_draft(&mut self, id: DraftId, window: &mut Window, cx: &mut Context<Self>) {
         if self.activate_detached_draft(&id, cx) { return; }
+        // Protect the stored row before reading it, through the handoff to the
+        // permanent composer guard. Otherwise a concurrent discard can reopen it.
+        let _opening = self.store.edit_draft(&id);
         if let Ok(Some(draft)) = self.store.draft(&id) {
+            if draft.state != DraftState::Editing { return; }
             if let Some(conv) = draft.conversation_id.clone() {
                 // Show the conversation being replied to, if it is in this view.
                 if self.conversations.iter().any(|c| c.id == conv) {
@@ -4285,6 +4289,7 @@ impl MailWindow {
     }
 
     pub(crate) fn cancel_send(&mut self, id: DraftId, window: &mut Window, cx: &mut Context<Self>) {
+        let _opening = self.store.edit_draft(&id);
         match self.store.cancel_send(&self.account.id, &id) {
             Ok(draft) => {
                 self.outbox_selected = None;

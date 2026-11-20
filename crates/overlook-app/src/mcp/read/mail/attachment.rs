@@ -66,7 +66,7 @@ fn too_large() -> Failure {
     )
 }
 
-pub(super) fn bytes(
+pub(in crate::mcp) fn bytes(
     account: &Account,
     attachment: &Attachment,
     profile: &Path,
