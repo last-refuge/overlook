@@ -32,6 +32,24 @@ pub(crate) struct PreparedDoc {
     pub placeholder: Option<SharedString>,
 }
 
+/// Cached prepared HTML produced by background pre-rendering, keyed by message id and
+/// content/appearance/font fingerprint so opening a pre-rendered email hits on frame 0.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PrerenderedDocKey {
+    pub message_id: MessageId,
+    pub html_len: usize,
+    pub inline_count: usize,
+    pub appearance: EmailBodyAppearance,
+    pub fonts: FontPrefs,
+}
+
+pub(crate) struct PrerenderedDoc {
+    pub key: PrerenderedDocKey,
+    pub html: String,
+    pub remote_resources: usize,
+    pub placeholder: Option<SharedString>,
+}
+
 pub(super) struct OutboxPreview {
     pub draft_id: DraftId,
     pub updated_at: i64,
@@ -141,27 +159,63 @@ impl MailWindow {
             inline_rev,
         };
         {
-            let cache = self.browser_bodies.borrow();
-            if let Some((old, count, view)) = cache.get(&key) {
+            let mut cache = self.browser_bodies.borrow_mut();
+            if let Some((old, count, view)) = cache.get_mut(&key) {
                 if *old == doc_key {
                     return (email_paper(view.clone(), appearance, cx).into_any_element(), *count);
                 }
+                // Enabling remote content on an already-prepared document does not change the
+                // sanitized HTML: flip consent directly on the running Chromium on this frame
+                // with zero HTML re-sanitization, zero process restart, and zero blank flash.
+                if !old.allow_remote
+                    && allow_remote
+                    && old.content_rev == doc_key.content_rev
+                    && old.appearance == doc_key.appearance
+                    && old.fonts == doc_key.fonts
+                    && old.inline_rev == doc_key.inline_rev
+                {
+                    old.allow_remote = true;
+                    let view = view.clone();
+                    let count = *count;
+                    drop(cache);
+                    view.update(cx, |body, cx| body.set_allow_remote(true, cx));
+                    return (email_paper(view, appearance, cx).into_any_element(), count);
+                }
             }
         }
-        // Check if background preparation already produced this exact document.
-        let ready = self
+        // Check if background preparation already produced this exact document, or if
+        // `schedule_prerender` already prepared it for an unopened single-message thread.
+        let mut ready = self
             .prepared_docs
             .borrow_mut()
             .remove_entry(&key)
-            .and_then(|(k, doc)| {
-                if doc.key == doc_key {
-                    Some(doc)
-                } else {
-                    // Put back only if still useful? Stale key can be dropped.
-                    let _ = k;
-                    None
+            .and_then(|(_, doc)| (doc.key == doc_key).then_some(doc));
+        if ready.is_none() && reading {
+            if let Some(m) = original.filter(|m| !self.thread_history.contains_key(&m.id)) {
+                let pre_key = PrerenderedDocKey {
+                    message_id: m.id.clone(),
+                    html_len: m.body.html.as_ref().map_or(0, String::len),
+                    inline_count: m
+                        .attachments
+                        .iter()
+                        .filter(|a| a.is_inline_image() && a.local_path.is_some())
+                        .count(),
+                    appearance,
+                    fonts: fonts.clone(),
+                };
+                let mut pre_cache = self.prerendered_docs.borrow_mut();
+                if let Some(pos) = pre_cache.iter().position(|d| d.key == pre_key) {
+                    let hit = pre_cache.remove(pos).unwrap();
+                    ready = Some(PreparedDoc {
+                        key: doc_key.clone(),
+                        html: hit.html.clone(),
+                        remote_resources: hit.remote_resources,
+                        placeholder: hit.placeholder.clone(),
+                    });
+                    pre_cache.push_back(hit);
                 }
-            });
+            }
+        }
         if let Some(doc) = ready {
             let mut cache = self.browser_bodies.borrow_mut();
             if let Some((old, count, view)) = cache.get_mut(&key) {
@@ -223,6 +277,17 @@ impl MailWindow {
             }
             let task_key = key.clone();
             let task_doc_key = doc_key.clone();
+            // Prefer the message's existing plain-text part as the loading placeholder so
+            // multipart emails skip an extra full HTML5 `html_to_text` parse before Chromium loads.
+            let plain_placeholder: Option<SharedString> = reading
+                .then(|| {
+                    original
+                        .and_then(|m| m.body.text.as_deref())
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                        .map(|t| SharedString::from(t.to_owned()))
+                })
+                .flatten();
             cx.spawn(async move |this, cx| {
                 let prepared = cx
                     .background_spawn(async move {
@@ -237,7 +302,11 @@ impl MailWindow {
                         if !inline_pairs.is_empty() {
                             doc.html = apply_inline_image_urls(doc.html, &inline_pairs);
                         }
-                        let placeholder = reading.then(|| SharedString::from(placeholder_text(&source)));
+                        let placeholder = if reading {
+                            plain_placeholder.or_else(|| Some(SharedString::from(placeholder_text(&source))))
+                        } else {
+                            None
+                        };
                         PreparedDoc {
                             key: task_doc_key,
                             html: doc.html,
