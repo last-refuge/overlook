@@ -1,12 +1,15 @@
-//! Account-scoped mail writes through the profile owner's Store.
+//! Account-scoped writes through the profile owner's Store.
 
+mod calendar;
+mod contacts;
 mod delivery;
 mod drafts;
+mod invitations;
 mod organization;
 
 use std::{fmt::Display, path::Path, sync::OnceLock};
 
-use overlook_core::{Account, Draft};
+use overlook_core::{Account, Contact, Draft, Event};
 use overlook_store::{McpWriteKey, McpWriteOutcome, Store, StoreError};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -16,7 +19,7 @@ use super::contract::{ErrorCode, Failure};
 use super::read::{invalid, parse, record_id, ReadTool};
 
 pub fn storage(_error: impl Display) -> Failure {
-    Failure::new(ErrorCode::Internal, "Could not commit the mail change")
+    Failure::new(ErrorCode::Internal, "Could not commit the change")
 }
 
 impl From<StoreError> for Failure {
@@ -31,6 +34,26 @@ pub enum WritePermission {
     Modify,
     Send,
     PermanentDelete,
+    Calendar,
+    Invite,
+    Contacts,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum Domain {
+    Mail,
+    Calendar,
+    Contacts,
+}
+
+impl WritePermission {
+    pub fn domain(self) -> Domain {
+        match self {
+            Self::Calendar | Self::Invite => Domain::Calendar,
+            Self::Contacts => Domain::Contacts,
+            _ => Domain::Mail,
+        }
+    }
 }
 
 pub struct WriteTool {
@@ -73,6 +96,9 @@ pub fn tools() -> impl Iterator<Item = &'static WriteTool> {
                 .into_iter()
                 .chain(drafts::tools())
                 .chain(delivery::tools())
+                .chain(calendar::tools())
+                .chain(invitations::tools())
+                .chain(contacts::tools())
                 .collect()
         })
         .iter()
@@ -92,6 +118,14 @@ impl WriteContext<'_> {
 
     pub fn draft_revision(&self, draft: &Draft) -> String {
         draft_revision(self.key, self.account_id, draft)
+    }
+
+    pub fn event_revision(&self, event: &Event) -> String {
+        event_revision(self.key, self.account_id, event)
+    }
+
+    pub fn contact_revision(&self, contact: &Contact) -> String {
+        contact_revision(self.key, self.account_id, contact)
     }
 
     pub fn execute(
@@ -144,16 +178,19 @@ impl WriteContext<'_> {
                 action: tool.name,
             },
             |tx, receipt_id| {
-                let mut data = if tool.name.starts_with("mail_draft_") {
-                    drafts::execute(self, tx, tool.name, args)?
-                } else if tool.permission == WritePermission::Send {
-                    delivery::execute(self, tx, tool.name, args)?
-                } else {
-                    organization::execute(self, tx, tool.name, args)?
-                };
+                let mut data = match tool.permission {
+                    WritePermission::Calendar => calendar::execute(self, tx, tool.name, args),
+                    WritePermission::Invite => invitations::execute(self, tx, tool.name, args),
+                    WritePermission::Contacts => contacts::execute(self, tx, tool.name, args),
+                    WritePermission::Send => delivery::execute(self, tx, tool.name, args),
+                    WritePermission::Modify if tool.name.starts_with("mail_draft_") => {
+                        drafts::execute(self, tx, tool.name, args)
+                    }
+                    _ => organization::execute(self, tx, tool.name, args),
+                }?;
                 let fields = data
                     .as_object_mut()
-                    .ok_or_else(|| storage("Expected a mail write result object"))?;
+                    .ok_or_else(|| storage("Expected a write result object"))?;
                 fields.insert("account_id".into(), json!(self.account_id));
                 fields.insert(
                     "write_id".into(),
@@ -166,6 +203,18 @@ impl WriteContext<'_> {
 }
 
 pub(super) fn draft_revision(key: &[u8; 32], account_id: &str, draft: &Draft) -> String {
-    let content = serde_json::to_string(draft).expect("draft values are serializable");
-    record_id(key, account_id, "draft_revision", &content)
+    revision(key, account_id, "draft_revision", draft)
+}
+
+pub(super) fn event_revision(key: &[u8; 32], account_id: &str, event: &Event) -> String {
+    revision(key, account_id, "calendar_event_revision", event)
+}
+
+pub(super) fn contact_revision(key: &[u8; 32], account_id: &str, contact: &Contact) -> String {
+    revision(key, account_id, "contact_revision", contact)
+}
+
+fn revision(key: &[u8; 32], account_id: &str, namespace: &str, entity: &impl Serialize) -> String {
+    let content = serde_json::to_string(entity).expect("cached entities are serializable");
+    record_id(key, account_id, namespace, &content)
 }

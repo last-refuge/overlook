@@ -17,6 +17,7 @@ const CALENDARS: &str = "calendar_calendars_list";
 const EVENTS: &str = "calendar_events_list";
 const EVENT: &str = "calendar_event_get";
 const AVAILABILITY: &str = "calendar_availability";
+const CHANGES: &str = "calendar_changes_list";
 const MAX_PAGE: u64 = 50;
 const MAX_QUERY: usize = 200;
 const MAX_ID: usize = 256;
@@ -47,6 +48,10 @@ pub(super) fn tools() -> Vec<ReadTool> {
 
     vec![
         tool(CALENDARS, "List calendars in the account's local cache, including hidden calendars.", calendars, &[]),
+        tool(CHANGES, "List this account's queued CalDAV changes and conflicts.", json!({
+            "limit":{"type":"integer","minimum":1,"maximum":MAX_PAGE},
+            "cursor":{"type":"string"}
+        }), &[]),
         tool(EVENTS, "List cached events and recurrence instances overlapping an explicit time range. Coverage describes where the local cache can account for missing events.", events, &["start", "end"]),
         tool(EVENT, "Read a cached event or recurrence instance by the opaque event ID from calendar_events_list. UTC times and any available all-day dates have exclusive ends.",
             json!({"event_id": {"type": "string", "maxLength": MAX_ID}}), &["event_id"]),
@@ -76,6 +81,7 @@ pub(super) fn execute(
 ) -> Result<Value, Failure> {
     match name {
         CALENDARS => calendars_list(ctx, args),
+        CHANGES => changes_list(ctx, args),
         EVENTS | AVAILABILITY => range_read(ctx, name, args),
         EVENT => event_get(ctx, args),
         _ => Err(Failure::new(
@@ -83,6 +89,23 @@ pub(super) fn execute(
             "Unknown calendar tool",
         )),
     }
+}
+
+fn changes_list(ctx: &ReadContext<'_>, args: &Map<String, Value>) -> Result<Value, Failure> {
+    let changes = ctx.store.caldav_changes(&ctx.account.id).map_err(storage)?;
+    let items = changes
+        .iter()
+        .map(|change| {
+            json!({
+                "operation_id":ctx.id("operation", change.id.as_str()),
+                "calendar_id":ctx.id("calendar", change.calendar_id.as_str()),
+                "revision":change.revision,
+                "status":change.state,
+                "title":clean(&change.title(), 180)
+            })
+        })
+        .collect();
+    ctx.page::<Value>(items, CHANGES, args)
 }
 
 fn calendars_list(ctx: &ReadContext<'_>, args: &Map<String, Value>) -> Result<Value, Failure> {
@@ -101,6 +124,7 @@ fn calendars_list(ctx: &ReadContext<'_>, args: &Map<String, Value>) -> Result<Va
             "name": clean(&c.name, 220),
             "color": c.color.as_deref().filter(|s| s.len() == 7 && s.starts_with('#') && s.as_bytes()[1..].iter().all(u8::is_ascii_hexdigit)),
             "is_primary": c.is_primary,
+            "can_edit": c.can_edit,
             "visible": c.visible,
         })).collect(),
         CALENDARS, args,
@@ -300,6 +324,7 @@ fn event_value(
     });
     let mut value = json!({
         "event_id": ctx.id("event", &event.id.0),
+        "revision": crate::mcp::write::event_revision(ctx.key, ctx.account_id, event),
         "calendar_id": ctx.id("calendar", &event.calendar_id.0),
         "title": clean(&event.summary, 180),
         "location": event.location.as_deref().map(|s| clean(s, 140)),
@@ -405,7 +430,7 @@ pub(super) fn seed_sample(store: &Store, account: &Account) -> anyhow::Result<()
         .into(),
         color: None,
         is_primary: true,
-        can_edit: false,
+        can_edit: !personal,
         visible: true,
         sort_order: 0,
         default_reminders: Vec::new(),

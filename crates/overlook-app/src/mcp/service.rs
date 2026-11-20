@@ -27,7 +27,7 @@ use tokio::runtime::{Builder, Runtime};
 
 use super::contract::{Account, ErrorCode, Failure, Reply, Request, Response};
 use super::read::{self, ReadContext};
-use super::write::{self, WriteContext, WritePermission};
+use super::write::{self, Domain, WriteContext, WritePermission};
 use files::{Endpoint, Profile};
 
 const READ_WORKERS: usize = 3;
@@ -231,7 +231,18 @@ impl Owner {
                 let mut capabilities = self
                     .context(lookup(&account_id)?, &account_id)
                     .capabilities()?;
-                capabilities.details["mail"]["write_permissions"] = json!(grant.permissions);
+                for (key, domain) in [
+                    ("mail", Domain::Mail),
+                    ("calendar", Domain::Calendar),
+                    ("contacts", Domain::Contacts),
+                ] {
+                    let scopes = grant
+                        .permissions
+                        .iter()
+                        .filter(|scope| scope.domain() == domain)
+                        .collect::<Vec<_>>();
+                    capabilities.details[key]["write_permissions"] = json!(scopes);
+                }
                 Ok(Response::Capabilities(capabilities))
             }
             Request::Read {
@@ -278,6 +289,16 @@ impl Owner {
                 if !grant.permissions.contains(&tool.permission) {
                     return Err(denied());
                 }
+                let domain = tool.permission.domain();
+                let read = self.context(account, &account_id);
+                if (domain == Domain::Calendar && !read.calendar_enabled()?)
+                    || (domain == Domain::Contacts && !read.contacts_enabled()?)
+                {
+                    return Err(Failure::new(
+                        ErrorCode::Unsupported,
+                        "This account has no eligible connection for this write",
+                    ));
+                }
                 let ctx = WriteContext {
                     account,
                     account_id: &account_id,
@@ -286,7 +307,7 @@ impl Owner {
                 };
                 match ctx.execute(&self.store, client, tool, &idempotency_key, &args)? {
                     McpWriteOutcome::Applied { data, queued } => {
-                        super::note_write(&account.id, queued);
+                        super::note_write(&account.id, domain, queued);
                         Ok(Response::Read(data))
                     }
                     McpWriteOutcome::Replayed(data) => Ok(Response::Read(data)),

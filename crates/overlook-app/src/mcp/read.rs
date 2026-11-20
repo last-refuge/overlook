@@ -171,7 +171,9 @@ impl ReadContext<'_> {
             | "mail_draft_get"
             | "mail_history_list"
             | "mail_operation_get"
-            | "mail_write_activity_list" => mail_records::execute(self, name, args)?,
+            | "mail_write_activity_list"
+            | "operation_get"
+            | "write_activity_list" => mail_records::execute(self, name, args)?,
             _ => match domain {
                 "mail" => mail::execute(self, name, args)?,
                 "calendar" => calendar::execute(self, name, args)?,
@@ -214,7 +216,7 @@ impl ReadContext<'_> {
         })
     }
 
-    fn calendar_enabled(&self) -> Result<bool, Failure> {
+    pub(super) fn calendar_enabled(&self) -> Result<bool, Failure> {
         let connection = self
             .store
             .calendar_connection(&self.account.id)
@@ -223,7 +225,7 @@ impl ReadContext<'_> {
             || connection.is_some_and(|c| c.enabled && eligible_url(&c.settings.server_url)))
     }
 
-    fn contacts_enabled(&self) -> Result<bool, Failure> {
+    pub(super) fn contacts_enabled(&self) -> Result<bool, Failure> {
         let connection = self
             .store
             .contacts_connection(&self.account.id)

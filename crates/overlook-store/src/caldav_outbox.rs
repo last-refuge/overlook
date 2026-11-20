@@ -163,6 +163,7 @@ impl Store {
             if discard_local || remote.is_none() {tx.execute("DELETE FROM events WHERE id IN (SELECT event_id FROM caldav_event_resources WHERE calendar_id=?1 AND href=?2)",params![token.calendar_id.0,token.href])?;}
             if let Some(remote)=remote {tx.execute("UPDATE caldav_resources SET etag=?3,icalendar=?4 WHERE calendar_id=?1 AND href=?2",params![token.calendar_id.0,token.href,remote.etag,remote.icalendar])?;}
             else {tx.execute("DELETE FROM caldav_resources WHERE calendar_id=?1 AND href=?2",params![token.calendar_id.0,token.href])?;}
+            crate::mcp_write::finish_caldav_operation(tx, &token.id, discard_local)?;
             tx.execute("DELETE FROM caldav_outbox WHERE id=?1",[&token.id.0])?;
             tx.execute("DELETE FROM caldav_coverage WHERE connection_id=?1",[&token.connection_id.0])?;
             // Keep the projection's zone while invalidating range coverage. A failed

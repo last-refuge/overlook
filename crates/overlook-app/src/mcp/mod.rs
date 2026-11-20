@@ -20,29 +20,31 @@ use std::sync::{Arc, Mutex};
 use crate::{
     data_dir, default_data_dir, seed_sample_account, seed_sample_mailbox, single_instance,
 };
+pub(crate) use write::Domain as WriteDomain;
 use write::WritePermission;
 
 static DESKTOP_SERVER: Mutex<Option<service::Server>> = Mutex::new(None);
-static MAIL_CHANGES: Mutex<BTreeMap<AccountId, bool>> = Mutex::new(BTreeMap::new());
+static CHANGES: Mutex<BTreeMap<(AccountId, WriteDomain), bool>> = Mutex::new(BTreeMap::new());
 
-fn note_write(account: &AccountId, queued: bool) {
-    *MAIL_CHANGES
+fn note_write(account: &AccountId, domain: WriteDomain, queued: bool) {
+    *CHANGES
         .lock()
         .unwrap()
-        .entry(account.clone())
+        .entry((account.clone(), domain))
         .or_default() |= queued;
     single_instance::wake();
 }
 
-pub(crate) fn take_mail_changes() -> BTreeMap<AccountId, bool> {
-    std::mem::take(&mut *MAIL_CHANGES.lock().unwrap())
+pub(crate) fn take_changes() -> BTreeMap<(AccountId, WriteDomain), bool> {
+    std::mem::take(&mut *CHANGES.lock().unwrap())
 }
 
 const HELP: &str = r#"Usage: overlook mcp <command>
 
   sample [--offline]                   run a foreground owner with two fictional accounts
   grant --client NAME --account-id ID   issue or replace a grant (repeat --account-id to allow more)
-          [--allow modify|send|permanent-delete]   add a write scope (repeat to combine)
+          [--allow modify|send|permanent-delete|calendar|invite|contacts]
+                                        add a write scope (repeat to combine)
   revoke --client NAME                  revoke a grant
   serve --client NAME                  bridge an MCP client over stdio to the running owner
 
@@ -120,6 +122,9 @@ fn client_flags(
                     "modify" => WritePermission::Modify,
                     "send" => WritePermission::Send,
                     "permanent-delete" => WritePermission::PermanentDelete,
+                    "calendar" => WritePermission::Calendar,
+                    "invite" => WritePermission::Invite,
+                    "contacts" => WritePermission::Contacts,
                     _ => bail!("Unknown write scope. Run overlook mcp --help."),
                 };
                 permissions.insert(permission);
@@ -198,6 +203,19 @@ fn serve_sample(profile: &Path, online: bool) -> Result<()> {
         )?;
         store.set_setting("mcp_sample_initialized", &true)?;
     }
+    // The older read-only fixture already exists in persisted sample profiles.
+    if !store
+        .setting::<bool>("mcp_sample_calendar_permissions")?
+        .unwrap_or(false)
+    {
+        let account = AccountId::from("sample");
+        let mut calendars = store.calendars(&account)?;
+        if let Some(work) = calendars.iter_mut().find(|calendar| calendar.is_primary) {
+            work.can_edit = true;
+            store.replace_calendars(&account, &calendars)?;
+        }
+        store.set_setting("mcp_sample_calendar_permissions", &true)?;
+    }
     let sample = SampleProvider::new().with_latency(std::time::Duration::ZERO);
     let sample = if initialized {
         sample.with_incomplete_send_history()
@@ -220,7 +238,7 @@ fn serve_sample(profile: &Path, online: bool) -> Result<()> {
         }) {
             return Ok(());
         }
-        let changed = take_mail_changes();
+        let changed = take_changes();
         if online && changed.values().any(|queued| *queued) {
             replay_sample(&store, &sample)?;
         }
@@ -237,7 +255,7 @@ fn replay_sample(store: &Arc<Store>, sample: &SampleProvider) -> Result<()> {
             .iter()
             .find(|a| a.id == id && a.provider == ProviderKind::Sample)
         {
-            crate::sync::pollster_block(crate::sync::replay_sample_mail(store, sample, account));
+            crate::sync::pollster_block(crate::sync::replay_sample_changes(store, sample, account));
         }
     }
     Ok(())

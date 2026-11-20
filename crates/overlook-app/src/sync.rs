@@ -1215,17 +1215,19 @@ impl<F: std::future::Future> std::future::Future for AsBackground<F> {
 }
 
 /// Blocks the current thread on a future using a condvar waker (never spin-yielding).
-/// The isolated MCP sample process replays through the normal Outbox and
-/// operation engine, with no real account or provider.
-pub(crate) async fn replay_sample_mail(
+/// The isolated MCP sample process replays through the normal operation
+/// engine using only the fictional provider.
+pub(crate) async fn replay_sample_changes(
     store: &Arc<Store>,
     sample: &overlook_provider::sample::SampleProvider,
     account: &Account,
 ) {
     let Some(_lease) = store.try_mail_sync(&account.id) else { return };
-    let provider: Arc<dyn MailProvider> = Arc::new(sample.clone());
+    let sample = Arc::new(sample.clone());
+    let provider: Arc<dyn MailProvider> = sample.clone();
+    let calendar: Option<Arc<dyn CalendarProvider>> = Some(sample);
     let mut outcome = SyncOutcome::default();
-    let _ = replay_operations(store, &provider, &None, account, &mut outcome).await;
+    let _ = replay_operations(store, &provider, &calendar, account, &mut outcome).await;
 }
 
 pub(crate) fn pollster_block<F: std::future::Future>(f: F) -> F::Output {

@@ -4,8 +4,26 @@ use rusqlite::Connection;
 
 const MIGRATIONS: &[&str] = &[
     V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17, V18, V19, V20,
-    V21, V22, V23, V24,
+    V21, V22, V23, V24, V25,
 ];
+
+const V25: &str = r#"
+ALTER TABLE mcp_operation_status ADD COLUMN source TEXT NOT NULL DEFAULT 'queue';
+
+CREATE TRIGGER mcp_caldav_status_update AFTER UPDATE OF payload_json ON caldav_outbox
+BEGIN
+    UPDATE mcp_operation_status SET state = json_extract(new.payload_json, '$.state'),
+        updated_at = CAST(unixepoch('subsec') * 1000 AS INTEGER)
+    WHERE id = new.id AND source = 'caldav';
+END;
+
+CREATE TRIGGER mcp_caldav_status_delete AFTER DELETE ON caldav_outbox
+BEGIN
+    UPDATE mcp_operation_status SET state = 'cancelled',
+        updated_at = CAST(unixepoch('subsec') * 1000 AS INTEGER)
+    WHERE id = old.id AND source = 'caldav' AND state NOT IN ('applied', 'discarded');
+END;
+"#;
 
 const V24: &str = r#"
 CREATE TABLE mcp_write_receipts (

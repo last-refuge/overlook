@@ -311,14 +311,14 @@ fn serve_launches(cx: &mut App) {
             }
         }
         cx.update(|cx| {
-            let changes = crate::mcp::take_mail_changes();
+            let changes = crate::mcp::take_changes();
             if changes.is_empty() {
                 return;
             }
             let Some((window, view)) = cx.global::<Lifecycle>().main.as_ref()
                 .map(|m| (m.window, m.view.clone())) else { return };
             let _ = window.update(cx, |_, window, cx| view.update(cx, |this, cx| {
-                this.mcp_mail_changed(changes, window, cx);
+                this.mcp_data_changed(changes, window, cx);
             }));
         });
         if wakeups.recv().await.is_none() {

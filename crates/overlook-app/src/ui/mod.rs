@@ -2325,26 +2325,44 @@ impl MailWindow {
         cx.notify();
     }
 
-    pub(crate) fn mcp_mail_changed(
+    pub(crate) fn mcp_data_changed(
         &mut self,
-        changes: std::collections::BTreeMap<AccountId, bool>,
+        changes: std::collections::BTreeMap<(AccountId, crate::mcp::WriteDomain), bool>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        tracing::debug!(accounts = changes.len(), "reloading mail after MCP writes");
-        self.mark_counts_stale(changes.keys().cloned());
-        self.reload_account_labels();
-        if changes.contains_key(&self.account.id) {
-            self.reload_mail(cx);
+        use crate::mcp::WriteDomain;
+        tracing::debug!(changes = changes.len(), "reloading views after MCP writes");
+        let mail = changes.keys().filter_map(|(account, domain)| (*domain == WriteDomain::Mail).then_some(account));
+        let mail: Vec<_> = mail.cloned().collect();
+        if !mail.is_empty() {
+            self.mark_counts_stale(mail.iter().cloned());
+            self.reload_account_labels();
+            if mail.contains(&self.account.id) {
+                self.reload_mail(cx);
+            }
+            self.reload_folder_windows(mail, cx);
         }
-        self.reload_folder_windows(changes.keys().cloned(), cx);
         let undo_delay = self.prefs.undo_send_secs;
-        for (account, queued) in changes {
+        for ((account, domain), queued) in changes {
+            if account == self.account.id {
+                match domain {
+                    WriteDomain::Calendar => self.reload_calendar(),
+                    WriteDomain::Contacts => self.reload_contacts(),
+                    WriteDomain::Mail => {}
+                }
+            }
+            if domain == WriteDomain::Calendar && queued
+                && self.store.calendar_connection(&account).ok().flatten().is_some_and(|connection| connection.enabled)
+            {
+                self.sync_caldav_account(account, true, cx);
+                continue;
+            }
             if !queued || !self.connected(&account) {
                 continue;
             }
             self.sync_account(account.clone(), window, cx);
-            if undo_delay > 0 {
+            if domain == WriteDomain::Mail && undo_delay > 0 {
                 cx.spawn_in(window, async move |this, cx| {
                     cx.background_executor().timer(Duration::from_millis(u64::from(undo_delay) * 1000 + 300)).await;
                     this.update_in(cx, |this, window, cx| this.sync_account(account, window, cx)).ok();

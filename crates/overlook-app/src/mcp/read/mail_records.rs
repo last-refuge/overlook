@@ -13,6 +13,8 @@ const GET: &str = "mail_draft_get";
 const HISTORY: &str = "mail_history_list";
 const ACTIVITY: &str = "mail_write_activity_list";
 const OPERATION: &str = "mail_operation_get";
+const WRITE_ACTIVITY: &str = "write_activity_list";
+const OPERATION_STATUS: &str = "operation_get";
 const HISTORY_WINDOW: usize = overlook_store::HISTORY_MAX_ENTRIES;
 
 pub(super) fn tools() -> Vec<ReadTool> {
@@ -35,11 +37,21 @@ pub(super) fn tools() -> Vec<ReadTool> {
         ReadTool::new(
             ACTIVITY,
             "List committed MCP changes and their client names for this account.",
+            paged.clone(),
+        ),
+        ReadTool::new(
+            WRITE_ACTIVITY,
+            "List committed MCP writes and their client names for this account.",
             paged,
         ),
         ReadTool::new(
             OPERATION,
             "Read the latest durable status of an MCP mail operation.",
+            json!({"type":"object","properties":{"operation_id":{"type":"string"}},"required":["operation_id"]}),
+        ),
+        ReadTool::new(
+            OPERATION_STATUS,
+            "Read the latest durable status of an MCP operation.",
             json!({"type":"object","properties":{"operation_id":{"type":"string"}},"required":["operation_id"]}),
         ),
         ReadTool::new(
@@ -123,7 +135,7 @@ pub(super) fn execute(
                 json!({"scope":"local_history","partial":partial,"maximum_entries":HISTORY_WINDOW});
             Ok(result)
         }
-        ACTIVITY => {
+        ACTIVITY | WRITE_ACTIVITY => {
             let mut rows = ctx
                 .store
                 .mcp_write_activity(account, HISTORY_WINDOW + 1)
@@ -137,7 +149,7 @@ pub(super) fn execute(
             result["coverage"] = json!({"scope":"mcp_writes","partial":partial});
             Ok(result)
         }
-        OPERATION => {
+        OPERATION | OPERATION_STATUS => {
             #[derive(Deserialize)]
             struct Args {
                 operation_id: String,
@@ -155,15 +167,19 @@ pub(super) fn execute(
                         "Operation is unavailable for this account",
                     )
                 })?;
-            let status = match (entry.state.as_str(), entry.action.as_str()) {
-                ("pending", _) => "queued",
-                ("in-flight", _) => "in_flight",
-                ("applied", "send-draft") => "provider_confirmed",
-                ("applied", _) => "synced",
-                (state, _) => state,
+            let status = match (
+                entry.state.as_str(),
+                entry.action.as_str(),
+                entry.source.as_str(),
+            ) {
+                ("pending", _, _) => "queued",
+                ("in-flight", _, _) => "in_flight",
+                ("applied", "send-draft", _) | ("applied", _, "caldav") => "provider_confirmed",
+                ("applied", _, _) => "synced",
+                (state, _, _) => state,
             };
             Ok(json!({"operation_id":ctx.id("operation",entry.id.as_str()),
-                "action":entry.action,"status":status,"updated_at_ms":entry.updated_at}))
+                "action":entry.action,"source":entry.source,"status":status,"updated_at_ms":entry.updated_at}))
         }
         _ => Err(super::invalid("Unknown mail record tool")),
     }

@@ -325,7 +325,14 @@ fn list_tools(modern: bool) -> ListToolsResult {
         tool.annotations = Some(
             ToolAnnotations::new()
                 .read_only(false)
-                .destructive(entry.permission != write::WritePermission::Modify)
+                .destructive(
+                    matches!(
+                        entry.permission,
+                        write::WritePermission::Send
+                            | write::WritePermission::Invite
+                            | write::WritePermission::PermanentDelete
+                    ) || entry.name.ends_with("_delete"),
+                )
                 .idempotent(true)
                 .open_world(true),
         );
@@ -381,13 +388,13 @@ fn tool_request(mut params: JsonObject) -> Result<Result<Request, Failure>, Erro
         },
         _ if write::tools().any(|tool| tool.name == name) => {
             let Some(Value::String(account_id)) = arguments.remove("account_id") else {
-                return invalid("Choose one account_id for a mail write");
+                return invalid("Choose one account_id for a write");
             };
             if account_id.is_empty() || account_id.len() > 128 {
                 return invalid("Invalid account selector");
             }
             let Some(Value::String(idempotency_key)) = arguments.remove("idempotency_key") else {
-                return invalid("Provide an idempotency_key for a mail write");
+                return invalid("Provide an idempotency_key for a write");
             };
             Ok(Ok(Request::Write {
                 name,
