@@ -217,6 +217,7 @@ impl MailWindow {
                 target
                     .update(cx, |this, cx| {
                         if this.focused_enabled != enabled {
+                            this.unread_selection = None;
                             this.focused_enabled = enabled;
                             this.inbox_tab = FocusTab::Focused;
                             this.mark_all_counts_stale();

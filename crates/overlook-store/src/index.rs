@@ -86,11 +86,16 @@ impl MailIndex {
     /// Conversation summaries for a mailbox view, newest first. `focus` splits the Inbox
     /// into Focused and Other; `None` shows everything.
     pub fn conversations(&self, owner_email: &str, view: &MailboxView, filter: ListFilter, focus: Option<FocusTab>) -> Vec<ConversationSummary> {
+        self.conversations_including(owner_email, view, filter, focus, None)
+    }
+
+    /// Keeps one open conversation in the Unread list if it still belongs to this view.
+    pub fn conversations_including(&self, owner_email: &str, view: &MailboxView, filter: ListFilter, focus: Option<FocusTab>, open: Option<&ConversationId>) -> Vec<ConversationSummary> {
         let mut out = Vec::new();
         for visible in self.visible_conversations(view, focus) {
             let keep = match filter {
                 ListFilter::All => true,
-                ListFilter::Unread => visible.iter().any(|m| !m.is_read),
+                ListFilter::Unread => visible.iter().any(|m| !m.is_read || Some(&m.conversation_id) == open),
                 ListFilter::Attachments => visible.iter().any(|m| Message::has_attachments(m)),
             };
             if !keep {
@@ -205,6 +210,11 @@ impl MailIndex {
     /// Summaries of the conversations containing any of `hits` (search results), newest
     /// first. Trashed messages stay out unless they matched.
     pub fn conversations_matching(&self, hits: &BTreeSet<MessageId>, owner_email: &str, filter: ListFilter) -> Vec<ConversationSummary> {
+        self.conversations_matching_including(hits, owner_email, filter, None)
+    }
+
+    /// Keeps one open conversation in Unread search results for as long as it matches.
+    pub fn conversations_matching_including(&self, hits: &BTreeSet<MessageId>, owner_email: &str, filter: ListFilter, open: Option<&ConversationId>) -> Vec<ConversationSummary> {
         let mut convs: BTreeSet<&ConversationId> = BTreeSet::new();
         for id in hits {
             if let Some(c) = self.conv_of.get(id) {
@@ -216,7 +226,7 @@ impl MailIndex {
             .filter_map(|c| ConversationSummary::from_messages(self.by_conv.get(c)?, owner_email, &self.pending))
             .filter(|c| match filter {
                 ListFilter::All => true,
-                ListFilter::Unread => c.is_unread(),
+                ListFilter::Unread => c.is_unread() || Some(&c.id) == open,
                 ListFilter::Attachments => c.has_attachments,
             })
             .collect();
