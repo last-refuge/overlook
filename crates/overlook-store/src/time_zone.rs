@@ -185,6 +185,133 @@ impl Store {
     }
 }
 
+/// One account's local calendar projection, read from a single SQLite snapshot.
+pub struct CalendarReadCache {
+    pub calendar_ids: Vec<CalendarId>,
+    pub events: Vec<Event>,
+    pub projection: Option<ZoneDefinition>,
+    pub caldav_windows: Vec<(Timestamp, Timestamp)>,
+    pub caldav_windows_apply_to_all_selected: bool,
+}
+
+impl Store {
+    /// Read overlaps on all cached collections, including calendars hidden in the UI.
+    /// An optional collection must belong to the account to produce any results.
+    pub fn calendar_read_cache(
+        &self,
+        account: &AccountId,
+        calendar: Option<&CalendarId>,
+        from: Timestamp,
+        to: Timestamp,
+        timezone: &str,
+    ) -> Result<CalendarReadCache> {
+        self.with_read_tx(|tx| {
+            let calendar = calendar.map(|id| id.0.as_str());
+            let mut stmt = tx.prepare(
+                "SELECT c.id, conn.enabled, EXISTS(SELECT 1 FROM caldav_outbox o WHERE o.calendar_id=c.id)
+                 FROM calendars c
+                 LEFT JOIN caldav_collections col ON col.calendar_id=c.id
+                 LEFT JOIN calendar_connections conn ON conn.id=col.connection_id AND conn.account_id=c.account_id
+                 WHERE c.account_id=?1 AND (?2 IS NULL OR c.id=?2)
+                 ORDER BY c.id",
+            )?;
+            let mut calendar_ids = Vec::new();
+            let mut caldav_windows_apply_to_all_selected = true;
+            for row in stmt.query_map(params![account.0, calendar], |r| {
+                Ok((CalendarId(r.get(0)?), r.get::<_, Option<bool>>(1)?, r.get::<_, bool>(2)?))
+            })? {
+                let (id, enabled, pending) = row?;
+                calendar_ids.push(id);
+                caldav_windows_apply_to_all_selected &= enabled == Some(true) && !pending;
+            }
+            let mut events = load_events(
+                tx,
+                "JOIN calendars c ON c.id=e.calendar_id AND c.account_id=e.account_id
+                 WHERE e.account_id=?1 AND (?2 IS NULL OR c.id=?2)
+                   AND e.start<?4 AND e.end>=e.start AND (e.end>?3 OR e.start>=?3)
+                   AND e.status!='cancelled'
+                 ORDER BY e.start,e.end,e.id",
+                params![account.0, calendar, from, to],
+            )?;
+            let pending = pending_calendar_events(tx, account)?;
+            for event in &mut events {
+                event.pending |= pending.contains(&event.id);
+            }
+            let mut windows = tx.prepare(
+                "SELECT v.range_start,v.range_end
+                 FROM caldav_coverage v JOIN calendar_connections conn ON conn.id=v.connection_id
+                 WHERE conn.account_id=?1 AND v.timezone=?2 AND v.synced_at>0
+                   AND v.range_start<?4 AND v.range_end>?3 AND v.range_start<v.range_end
+                 ORDER BY v.range_start
+                 LIMIT 32",
+            )?;
+            let caldav_windows = windows
+                .query_map(params![account.0, timezone, from, to], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(CalendarReadCache {
+                caldav_windows_apply_to_all_selected: caldav_windows_apply_to_all_selected && !calendar_ids.is_empty(),
+                calendar_ids,
+                events,
+                projection: read_projection(tx)?,
+                caldav_windows,
+            })
+        })
+    }
+
+    /// Resolve an opaque ID within an account without materializing unrelated event content.
+    /// The predicate must be pure and must not call the Store while its reader is held.
+    pub fn find_cached_calendar_event(
+        &self,
+        account: &AccountId,
+        timezone: &str,
+        matches: impl Fn(&str) -> bool,
+    ) -> Result<(Option<Event>, Option<ZoneDefinition>, bool)> {
+        self.with_read_tx(|tx| {
+            let mut stmt = tx.prepare(
+                "SELECT e.id FROM events e JOIN calendars c ON c.id=e.calendar_id AND c.account_id=e.account_id
+                 WHERE e.account_id=?1 AND e.status!='cancelled'",
+            )?;
+            let mut rows = stmt.query([&account.0])?;
+            while let Some(row) = rows.next()? {
+                let id: String = row.get(0)?;
+                if !matches(&id) {
+                    continue;
+                }
+                let event = load_events(tx, "WHERE e.id=?1 AND e.account_id=?2", params![id, account.0])?.pop();
+                if let Some(mut event) = event {
+                    event.pending |= pending_calendar_events(tx, account)?.contains(&event.id);
+                    let known_caldav_projection = tx.query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM caldav_coverage v
+                            JOIN caldav_collections col ON col.connection_id=v.connection_id
+                            WHERE col.calendar_id=?1 AND v.timezone=?2 AND v.synced_at>0
+                              AND v.range_start<?4 AND v.range_end>?3 AND v.range_start<v.range_end
+                        )",
+                        params![event.calendar_id.0, timezone, event.start, event.end.max(event.start.saturating_add(1))],
+                        |r| r.get(0),
+                    )?;
+                    return Ok((Some(event), read_projection(tx)?, known_caldav_projection));
+                }
+            }
+            Ok((None, None, false))
+        })
+    }
+}
+
+fn read_projection(tx: &Connection) -> Result<Option<ZoneDefinition>> {
+    let value: Option<String> = tx
+        .query_row("SELECT value FROM settings WHERE key=?1", [PROJECTION], |r| r.get(0))
+        .optional()?;
+    Ok(value.as_deref().map(serde_json::from_str).transpose()?)
+}
+
+fn pending_calendar_events(tx: &Connection, account: &AccountId) -> Result<HashSet<EventId>> {
+    Ok(pending_operations_tx(tx, account)?
+        .iter()
+        .filter_map(|op| op.kind.event_id().cloned())
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
