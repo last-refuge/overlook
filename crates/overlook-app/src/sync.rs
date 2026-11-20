@@ -28,6 +28,8 @@ pub struct SyncOutcome {
     pub uncertain: Vec<String>,
     pub failed: Vec<String>,
     pub stopped_offline: bool,
+    /// A configured CardDAV or Graph connection was checked during this pass.
+    pub checked_connected_contacts: bool,
     /// A verifying sync ran (start-up or the Sync button).
     pub verified: bool,
     /// The check compared the store with the provider's full list. Only providers that can
@@ -135,12 +137,8 @@ pub fn contacts_synced_key(account: &AccountId) -> String {
 /// retried next time; they never affect the mail sync state.
 async fn sync_contacts(store: &Store, provider: &dyn MailProvider, account: &Account, outcome: &mut SyncOutcome) {
     const DAY: i64 = 24 * 3_600_000;
-    if let Ok(Some(connection)) = store.contacts_connection(&account.id) {
-        // Edits the server refused for good are shown like any other change that couldn't sync.
-        let refused = match connection.credential {
-            ContactsCredential::Microsoft => crate::graph_contacts_sync::run(store, account, &connection),
-            _ => crate::carddav_sync::run(store, account, &connection),
-        };
+    if let Some(refused) = sync_connected_contacts(store, account) {
+        outcome.checked_connected_contacts = true;
         outcome.failed.extend(refused);
         return;
     }
@@ -163,6 +161,15 @@ async fn sync_contacts(store: &Store, provider: &dyn MailProvider, account: &Acc
         }
         Err(e) => warn!("contacts sync failed for {}: {e}", account.email),
     }
+}
+
+/// CardDAV and Graph connections can be used even if mail isn't connected.
+pub(crate) fn sync_connected_contacts(store: &Store, account: &Account) -> Option<Vec<String>> {
+    let connection = store.contacts_connection(&account.id).ok().flatten()?;
+    Some(match connection.credential {
+        ContactsCredential::Microsoft => crate::graph_contacts_sync::run(store, account, &connection),
+        _ => crate::carddav_sync::run(store, account, &connection),
+    })
 }
 
 /// Downloads calendars and events. Errors are recorded in the calendar status only; they

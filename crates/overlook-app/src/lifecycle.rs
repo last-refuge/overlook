@@ -76,6 +76,8 @@ pub fn start(store: Arc<Store>, sample: SampleProvider, hidden: bool, cx: &mut A
     });
     cx.on_window_closed(window_closed).detach();
     cx.on_app_quit(|cx| {
+        crate::single_instance::desktop_stopping();
+        crate::mcp::stop_desktop();
         if cx.has_global::<Lifecycle>() {
             cx.global_mut::<Lifecycle>().tray.shutdown();
         }
@@ -290,9 +292,8 @@ pub fn quit(cx: &mut App) {
 
 fn quit_now(cx: &mut App) {
     tracing::info!("quitting");
-    // A launch from now on starts a new Overlook rather than handing itself to this one.
+    crate::single_instance::desktop_stopping();
     crate::mcp::stop_desktop();
-    crate::single_instance::release();
     cx.quit();
 }
 

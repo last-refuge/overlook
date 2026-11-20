@@ -10,14 +10,13 @@ mod wire;
 use std::collections::BTreeSet;
 use std::io;
 use std::net::Shutdown;
-use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc, Mutex,
 };
-use std::thread;
+use std::thread::{self, JoinHandle};
 
 use overlook_core::Account as LocalAccount;
 use overlook_provider::sample::SampleProvider;
@@ -29,6 +28,7 @@ use super::contract::{Account, ErrorCode, Failure, Reply, Request, Response};
 use super::read::{self, ReadContext};
 use super::write::{self, Domain, WriteContext, WritePermission};
 use files::{Endpoint, Profile};
+pub(crate) use wire::connect_until;
 
 const READ_WORKERS: usize = 3;
 const WAITING_CALLS: usize = 8;
@@ -37,15 +37,29 @@ const WAITING_CALLS: usize = 8;
 pub struct Server {
     stopped: Arc<AtomicBool>,
     wake: UnixStream,
+    workers: Vec<JoinHandle<()>>,
     _endpoint: Endpoint,
+}
+
+impl Server {
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+        let _ = self.wake.shutdown(Shutdown::Both);
+    }
+
+    /// Quiesce on foreground-owner shutdown, before releasing the profile launch lock.
+    pub fn drain(mut self) {
+        self.stop();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
-        self.stopped.store(true, Ordering::Release);
-        // A discovery read may be waiting on a Store lock. Let the worker
-        // finish that read without delaying desktop shutdown.
-        let _ = self.wake.shutdown(Shutdown::Both);
+        // Desktop quit keeps ownership until process exit and need not block GPUI.
+        self.stop();
     }
 }
 
@@ -66,11 +80,17 @@ pub fn start(profile: &Path, store: Arc<Store>, sample: SampleProvider) -> anyho
             .build()?,
         stopped: stopped.clone(),
     });
+    let mut server = Server {
+        stopped: stopped.clone(),
+        wake,
+        workers: Vec::new(),
+        _endpoint: endpoint,
+    };
     let (queue, pending) = mpsc::sync_channel(WAITING_CALLS);
     let pending = Arc::new(Mutex::new(pending));
     for index in 0..READ_WORKERS {
         let (owner, pending) = (owner.clone(), pending.clone());
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name(format!("overlook-mcp-read-{index}"))
             .spawn(move || loop {
                 let next = pending.lock().unwrap().recv();
@@ -82,16 +102,13 @@ pub fn start(profile: &Path, store: Arc<Store>, sample: SampleProvider) -> anyho
                     owner.call(client, token, request)
                 });
             })?;
+        server.workers.push(worker);
     }
-    let stop_signal = stopped.clone();
-    thread::Builder::new()
+    let acceptor = thread::Builder::new()
         .name("overlook-mcp".into())
-        .spawn(move || serve(listener, shutdown, queue, stop_signal))?;
-    Ok(Server {
-        stopped,
-        wake,
-        _endpoint: endpoint,
-    })
+        .spawn(move || serve(listener, shutdown, queue, stopped))?;
+    server.workers.push(acceptor);
+    Ok(server)
 }
 
 pub fn call(profile: &Path, client: &str, token: &str, request: Request) -> Reply {
@@ -144,7 +161,9 @@ fn serve(
     queue: mpsc::SyncSender<UnixStream>,
     stopped: Arc<AtomicBool>,
 ) {
-    while wait_for_request(&listener, &shutdown) && !stopped.load(Ordering::Acquire) {
+    while crate::single_instance::listener_ready(&listener, &shutdown)
+        && !stopped.load(Ordering::Acquire)
+    {
         match listener.accept() {
             Ok((stream, _)) => {
                 if stream.set_nonblocking(true).is_ok() {
@@ -162,23 +181,6 @@ fn serve(
                 continue
             }
             Err(_) => break,
-        }
-    }
-}
-
-fn wait_for_request(listener: &UnixListener, shutdown: &UnixStream) -> bool {
-    let mut ready = [listener.as_raw_fd(), shutdown.as_raw_fd()].map(|fd| libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    });
-    loop {
-        // SAFETY: ready is an initialized array of two valid pollfd entries.
-        if unsafe { libc::poll(ready.as_mut_ptr(), ready.len() as libc::nfds_t, -1) } >= 0 {
-            return ready[1].revents == 0 && ready[0].revents & libc::POLLIN != 0;
-        }
-        if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-            return false;
         }
     }
 }

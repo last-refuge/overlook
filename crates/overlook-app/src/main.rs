@@ -97,8 +97,8 @@ fn seed_sample_mailbox(store: &Store, account: &Account) -> anyhow::Result<()> {
 }
 
 /// Opens the profile database. With no accounts yet, the window offers the sample mailbox.
-fn open_store() -> anyhow::Result<(Arc<Store>, Vec<Account>)> {
-    let dir = data_dir();
+fn open_store(dir: &std::path::Path) -> anyhow::Result<(Arc<Store>, Vec<Account>)> {
+    mcp::check_real_profile(dir)?;
     let store = Store::open(&dir.join("overlook.sqlite"))?;
     let previous_zone = overlook_core::tz::current_zone();
     let mut prefs = store.setting::<Prefs>("prefs").ok().flatten().unwrap_or_default();
@@ -266,6 +266,16 @@ mod security_tests {
     }
 }
 
+fn sample_provider() -> SampleProvider {
+    let provider = SampleProvider::new().with_incomplete_send_history();
+    // The sample account's connection is simulated. Start it connected when asked, so a
+    // restart-while-offline test can be followed by a reconnect at launch.
+    if std::env::var("OVERLOOK_SAMPLE_ONLINE").is_ok_and(|v| v == "1") {
+        provider.set_online(true);
+    }
+    provider
+}
+
 fn main() {
     STARTED.get_or_init(std::time::Instant::now);
     // Plain command-line conveniences; anything else starts the app.
@@ -278,12 +288,6 @@ fn main() {
         return;
     }
     let mailto = args.iter().find(|a| a.to_ascii_lowercase().starts_with("mailto:")).cloned();
-    if let Some(link) = &mailto {
-        // A running Overlook takes the link; this launch is done.
-        if single_instance::send(link) {
-            return;
-        }
-    }
     if args.iter().any(|a| a == "--reload-theme") {
         // Omarchy's theme-set hook: running instances re-read the theme; nothing starts.
         single_instance::broadcast(single_instance::RELOAD_THEME);
@@ -304,41 +308,26 @@ fn main() {
         }
         return;
     }
-    // Start at login: an Overlook already running is left as it is.
     let background = args.iter().any(|a| a == "--background");
-    if background && single_instance::running() {
-        return;
-    }
-    // Any other launch brings the running Overlook forward rather than starting a second
-    // copy against the same database. It passes its desktop along, so a window hidden in the
-    // background opens there, focused with this launch's activation token.
-    if !background && single_instance::send(&single_instance::LaunchEnv::current().show_line()) {
-        return;
-    }
-    // Resolve aliases to the same launch channel, including on the first launch.
-    restrict_to_owner(&data_dir());
-    match single_instance::listen() {
-        Ok(true) => {}
-        Ok(false) => {
-            // A concurrent launch claimed the profile after the first handoff attempt.
-            if !background {
-                let line = mailto.clone().unwrap_or_else(|| single_instance::LaunchEnv::current().show_line());
-                single_instance::send(&line);
-            }
-            return;
-        }
+    let launch = mailto.clone().unwrap_or_else(|| single_instance::LaunchEnv::current().show_line());
+    let profile = data_dir();
+    restrict_to_owner(&profile);
+    let mut owner = match single_instance::launch_desktop(&profile, (!background || mailto.is_some()).then_some(launch.as_str())) {
+        Ok(Some(owner)) => owner,
+        Ok(None) => return,
         Err(error) => {
             eprintln!("Overlook could not claim its profile: {error}");
             std::process::exit(1);
         }
-    }
+    };
     init_logging();
     install_panic_hook();
 
-    let (store, _accounts) = match open_store() {
+    let (store, _accounts) = match open_store(owner.profile()) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("Overlook could not open its local database: {e}");
+            drop(owner);
             std::process::exit(1);
         }
     };
@@ -347,13 +336,8 @@ fn main() {
     if let Some(link) = mailto {
         single_instance::push(link);
     }
-    let provider = SampleProvider::new().with_incomplete_send_history();
-    // The sample account's connection is simulated. Start it connected when asked, so a
-    // restart-while-offline test can be followed by a reconnect at launch.
-    if std::env::var("OVERLOOK_SAMPLE_ONLINE").is_ok_and(|v| v == "1") {
-        provider.set_online(true);
-    }
-    mcp::start_desktop(&data_dir(), store.clone(), provider.clone());
+    let provider = sample_provider();
+    mcp::start_desktop(owner.profile(), store.clone(), provider.clone());
 
     let prefs = store.setting::<overlook_core::Prefs>("prefs").ok().flatten();
     lifecycle::set_keep_running(prefs.as_ref().is_some_and(|p| p.keep_running));
@@ -389,4 +373,8 @@ fn main() {
         tracing::debug!("startup: theme and keys ready after {} ms", since_start_ms());
         lifecycle::start(store.clone(), provider.clone(), start_hidden, cx);
     });
+    mcp::stop_desktop();
+    owner.close_listener();
+    // Desktop tasks can outlive their windows. Keep the launch lock until process exit.
+    std::process::exit(0);
 }

@@ -1,6 +1,7 @@
-//! Owns the MCP endpoint in the desktop process or the synthetic sample process.
+//! MCP commands and endpoint lifecycle for desktop, headless, and sample profiles.
 
 mod contract;
+mod headless;
 mod read;
 mod service;
 mod transport;
@@ -13,13 +14,14 @@ use overlook_store::Store;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, DirBuilder};
 use std::io::{self, Write};
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::{
     data_dir, default_data_dir, seed_sample_account, seed_sample_mailbox, single_instance,
 };
+pub(crate) use service::connect_until;
 pub(crate) use write::Domain as WriteDomain;
 use write::WritePermission;
 
@@ -41,6 +43,7 @@ pub(crate) fn take_changes() -> BTreeMap<(AccountId, WriteDomain), bool> {
 
 const HELP: &str = r#"Usage: overlook mcp <command>
 
+  headless                             run a foreground owner for the desktop profile
   sample [--offline]                   run a foreground owner with two fictional accounts
   grant --client NAME --account-id ID   issue or replace a grant (repeat --account-id to allow more)
           [--allow modify|send|permanent-delete|calendar|invite|contacts]
@@ -50,6 +53,9 @@ const HELP: &str = r#"Usage: overlook mcp <command>
 
   OVERLOOK_DATA_DIR    selects the profile. Sample mode requires a separate directory.
   OVERLOOK_MCP_TOKEN   credential supplied by the MCP client to the serve command.
+
+Stop the headless owner with overlook --quit, SIGINT, or SIGTERM.
+A foreground desktop launch waits for the headless owner to finish and takes ownership.
 
 Use sample or sample-secondary for the fictional accounts. For eligible IMAP and POP3
 accounts, use imap:<address> or pop3:<address> as stored by Overlook."#;
@@ -75,6 +81,7 @@ pub fn run(args: &[String]) -> Result<()> {
             println!("{HELP}");
             Ok(())
         }
+        "headless" if flags.is_empty() => headless::run(&data_dir()),
         "sample" if flags.is_empty() => run_sample(true),
         "sample" if flags == ["--offline"] => run_sample(false),
         "serve" => {
@@ -141,13 +148,14 @@ fn client_flags(
 
 fn run_sample(online: bool) -> Result<()> {
     let profile = sample_profile()?;
+    let _owner = single_instance::listen(&profile, single_instance::Role::Sample)
+        .context("could not claim the sample profile")?
+        .context("Overlook is already running for this profile")?;
     ensure!(
-        single_instance::listen().context("could not claim the sample profile")?,
-        "Overlook is already running for this profile"
+        !entry_exists(&profile.join("overlook.sqlite"))?,
+        "sample mode requires a separate directory without an Overlook database"
     );
-    let result = serve_sample(&profile, online);
-    single_instance::release();
-    result
+    serve_sample(&profile, online)
 }
 
 fn sample_profile() -> Result<PathBuf> {
@@ -165,11 +173,33 @@ fn sample_profile() -> Result<PathBuf> {
         default_data_dir().canonicalize().ok().as_ref() != Some(&profile),
         "sample mode requires a directory outside the default profile"
     );
-    match fs::symlink_metadata(profile.join("overlook.sqlite")) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(profile),
-        Ok(_) => bail!("sample mode requires a separate directory without an Overlook database"),
-        Err(error) => Err(error).context("could not inspect the sample directory"),
+    Ok(profile)
+}
+
+fn entry_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Ok(_) => Ok(true),
+        Err(error) => Err(error).context("could not inspect the profile directory"),
     }
+}
+
+pub(crate) fn check_real_profile(profile: &Path) -> Result<()> {
+    ensure!(
+        !entry_exists(&profile.join(".mcp/sample.sqlite"))?,
+        "this directory is reserved for the MCP sample profile"
+    );
+    // The profile directory can be an alias. The database itself must belong
+    // to this profile so a different directory's lock cannot protect the same file.
+    match fs::symlink_metadata(profile.join("overlook.sqlite")) {
+        Ok(meta) => ensure!(
+            meta.is_file() && meta.nlink() == 1,
+            "the Overlook database must be a regular file within the profile"
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("could not inspect the Overlook database"),
+    }
+    Ok(())
 }
 
 fn serve_sample(profile: &Path, online: bool) -> Result<()> {
@@ -223,9 +253,20 @@ fn serve_sample(profile: &Path, online: bool) -> Result<()> {
         sample
     };
     sample.set_online(online);
-    let _server = service::start(profile, store.clone(), sample.clone())?;
+    let server = service::start(profile, store.clone(), sample.clone())?;
+    let result = sample_loop(&store, &sample, online, initialized);
+    server.drain();
+    result
+}
+
+fn sample_loop(
+    store: &Arc<Store>,
+    sample: &SampleProvider,
+    online: bool,
+    initialized: bool,
+) -> Result<()> {
     if online && initialized {
-        replay_sample(&store, &sample)?;
+        replay_sample(store, sample)?;
     }
     eprintln!("Overlook MCP sample profile is ready.");
     let mut wakeups = single_instance::wakeups();
@@ -240,7 +281,7 @@ fn serve_sample(profile: &Path, online: bool) -> Result<()> {
         }
         let changed = take_changes();
         if online && changed.values().any(|queued| *queued) {
-            replay_sample(&store, &sample)?;
+            replay_sample(store, sample)?;
         }
         if wakeups.blocking_recv().is_none() {
             return Ok(());

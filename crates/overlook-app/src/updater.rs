@@ -408,9 +408,9 @@ pub fn restart_in_background() -> ! {
 }
 
 fn restart_with(args: &[&str]) -> ! {
-    // The new copy must not find this one and hand its launch back to it.
+    // The new copy waits for this process and its background jobs to exit.
+    crate::single_instance::desktop_stopping();
     crate::mcp::stop_desktop();
-    crate::single_instance::release();
     let _ = Command::new(installed_exe()).args(args).spawn();
     std::process::exit(0)
 }

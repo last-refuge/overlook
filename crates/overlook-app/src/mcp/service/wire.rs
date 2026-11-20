@@ -78,9 +78,8 @@ pub(super) fn serve(
             }
             dispatch(&invocation.client, &invocation.token, invocation.request)
         });
-    if stopped.load(Ordering::Acquire) {
-        return;
-    }
+    // A request that was dispatched before shutdown may have committed a
+    // write. Return its reply while the foreground owner drains this worker.
     let response = ReplyFrame {
         version: VERSION,
         reply,
@@ -197,6 +196,10 @@ fn wait_ready(stream: &UnixStream, events: libc::c_short, deadline: Instant) -> 
 }
 
 pub(super) fn connect(path: &Path) -> io::Result<UnixStream> {
+    connect_until(path, Instant::now() + CLIENT_TIMEOUT)
+}
+
+pub(crate) fn connect_until(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
     // UnixStream::connect can block when the owner's listen queue fills.
     // SAFETY: zero is a valid initial representation for sockaddr_un.
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
@@ -230,7 +233,7 @@ pub(super) fn connect(path: &Path) -> io::Result<UnixStream> {
         if err.raw_os_error() != Some(libc::EINPROGRESS) {
             return Err(err);
         }
-        wait_ready(&stream, libc::POLLOUT, Instant::now() + CLIENT_TIMEOUT)?;
+        wait_ready(&stream, libc::POLLOUT, deadline)?;
         if let Some(err) = stream.take_error()? {
             return Err(err);
         }
