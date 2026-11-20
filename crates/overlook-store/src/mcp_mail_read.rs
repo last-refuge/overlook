@@ -12,6 +12,12 @@ pub struct McpMailCache {
     pub result_limit_reached: bool,
 }
 
+pub enum McpMailSelection<'a> {
+    Coverage,
+    Headers,
+    Search(&'a str),
+}
+
 impl Store {
     /// Resolve opaque IDs against lightweight local keys, without reading bodies or addresses.
     pub fn mcp_mail_keys(&self, account: &AccountId) -> Result<Vec<(MessageId, ConversationId)>> {
@@ -68,7 +74,7 @@ impl Store {
         folder: Option<&LabelId>,
         after: Option<Timestamp>,
         before: Option<Timestamp>,
-        query: Option<&str>,
+        selection: McpMailSelection<'_>,
     ) -> Result<McpMailCache> {
         const MAX_HITS: usize = 500;
         const SCOPE: &str = "m.account_id=?1 AND (?2 IS NULL OR EXISTS
@@ -84,20 +90,26 @@ impl Store {
                 scope_args,
                 |r| Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as usize, r.get(2)?, r.get(3)?)),
             )?;
-            let mut messages = if let Some(query) = query {
-                let fts = fts_query(query);
-                let count = MAX_HITS as i64 + 1;
-                load_messages_with(
+            let count = MAX_HITS as i64 + 1;
+            let mut messages = match selection {
+                McpMailSelection::Search(query) => load_messages_with(
                     tx,
                     &format!("WHERE m.id IN (
                         SELECT m.id FROM messages_fts JOIN messages m ON m.rowid=messages_fts.rowid
                         WHERE {SCOPE} AND messages_fts MATCH ?5
                         ORDER BY m.date DESC, m.id LIMIT ?6)"),
-                    params![account.0, folder, after, before, fts, count],
+                    params![account.0, folder, after, before, fts_query(query), count],
                     false,
-                )?
-            } else {
-                Vec::new()
+                )?,
+                McpMailSelection::Headers => load_messages_with(
+                    tx,
+                    &format!("WHERE m.id IN (
+                        SELECT m.id FROM messages m WHERE {SCOPE}
+                        ORDER BY m.date DESC, m.id LIMIT ?5)"),
+                    params![account.0, folder, after, before, count],
+                    false,
+                )?,
+                McpMailSelection::Coverage => Vec::new(),
             };
             messages.sort_unstable_by(|a, b| b.date.cmp(&a.date).then(a.id.cmp(&b.id)));
             let result_limit_reached = messages.len() > MAX_HITS;

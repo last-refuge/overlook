@@ -12,6 +12,7 @@
 //! the primary copy. For POP3 accounts the local store *is* the primary copy: nothing may
 //! evict their messages. Any eviction routine must check [`Store::is_local_primary`] first.
 
+mod mcp_mail_read;
 mod index;
 mod calendar_connections;
 mod contact_cards;
@@ -25,6 +26,7 @@ pub use history::{reversal_for, HistoryEntry, Reversal, HISTORY_MAX_ENTRIES};
 pub use draft_sync::{DraftEditGuard, DraftSyncEntry, DraftUpload, same_draft_content};
 
 pub use index::{apply_to_message, MailIndex};
+pub use mcp_mail_read::McpMailSelection;
 
 use overlook_core::focus::{FocusRule, FocusTab};
 use overlook_core::sanitize::html_to_text;
@@ -1178,9 +1180,15 @@ impl Store {
 
     /// Drafts of an account. `outbox` selects Outbox states instead of editing drafts.
     pub fn drafts(&self, account: &AccountId, outbox: bool) -> Result<Vec<Draft>> {
+        let mut drafts = self.drafts_for_account(account)?;
+        drafts.retain(|d| d.state.is_outbox() == outbox);
+        Ok(drafts)
+    }
+
+    /// Drafts and Outbox items from one account snapshot, newest first.
+    pub fn drafts_for_account(&self, account: &AccountId) -> Result<Vec<Draft>> {
         self.with_read_tx(|tx| {
             let mut all = load_drafts(tx, "WHERE d.account_id=?1", params![account.0])?;
-            all.retain(|d| d.state.is_outbox() == outbox);
             all.sort_by_key(|d| std::cmp::Reverse(d.updated_at));
             Ok(all)
         })

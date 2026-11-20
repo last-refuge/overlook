@@ -147,6 +147,240 @@ fn sample_mode_leaves_existing_desktop_database_alone() {
     assert_eq!(fs::read(database).unwrap(), contents);
 }
 
+#[test]
+fn batch_reads_authorize_each_account_and_keep_results_separate() {
+    let root = fixture();
+    let profile = root.path().join("profile");
+    let mut owner = start_owner(&profile);
+    let full = grant(&profile, "full", &[PRIMARY, SECONDARY]);
+    let limited = grant(&profile, "limited", &[PRIMARY]);
+    let mut client = Mcp::start(&profile, "full", &full, MODERN);
+    let accounts = client.accounts();
+    let primary = account_id(&accounts, "Jason Alexander", "jason@example.com");
+    let secondary = account_id(&accounts, "Sample Secondary", "secondary@example.com");
+    let batch = json!({"account_ids":[primary, secondary],"query":"Alex"});
+    let result = client.tool("contacts_search", batch.clone());
+    let results = success(&result)["results"].as_array().unwrap();
+    assert_eq!(results[0]["account_id"], primary);
+    assert_eq!(results[1]["account_id"], secondary);
+    let alex = &results[1]["items"][0];
+    assert_eq!(alex["display_name"], "Alex Rivera");
+    assert_eq!(alex["email"], "alex@studio.example");
+    let record = json!({"account_id":primary,"contact_id":alex["contact_id"]});
+    assert_failure(&client.tool("contacts_get", record), "access_denied");
+
+    let address_book = &alex["address_book_id"];
+    let scoped = client.tool(
+        "contacts_search",
+        json!({
+            "account_ids":[primary, secondary], "query":"Alex", "address_book_id":address_book
+        }),
+    );
+    let scoped = success(&scoped);
+    assert_eq!(scoped["partial"], true);
+    assert_eq!(scoped["results"][0]["error"]["code"], "access_denied");
+    assert_eq!(
+        scoped["results"][1]["items"][0]["contact_id"],
+        alex["contact_id"]
+    );
+
+    let mut legacy = Mcp::start(&profile, "limited", &limited, LEGACY);
+    assert_failure(&legacy.tool("contacts_search", batch), "access_denied");
+    let one = legacy.tool(
+        "contacts_search",
+        json!({"account_ids":[primary],"query":"Daniel"}),
+    );
+    assert_eq!(success(&one)["results"][0]["account_id"], primary);
+    client.finish();
+    legacy.finish();
+    quit_owner(&profile, &mut owner);
+}
+
+#[test]
+fn cross_account_reads_join_mail_calendar_and_contacts_and_report_coverage() {
+    use overlook_core::{time::now, tz};
+
+    let root = fixture();
+    let profile = root.path().join("profile");
+    let mut owner = start_owner(&profile);
+    let token = grant(&profile, "reader", &[PRIMARY, SECONDARY]);
+    let mut client = Mcp::start(&profile, "reader", &token, MODERN);
+    let accounts = client.accounts();
+    let primary = account_id(&accounts, "Jason Alexander", "jason@example.com");
+    let secondary = account_id(&accounts, "Sample Secondary", "secondary@example.com");
+
+    let search = client.read(
+        "mail_search",
+        json!({"account_id":primary,"query":"Trail walk"}),
+    );
+    assert_eq!(search["cache"]["freshness"], "stale");
+    assert_eq!(search["source"], "cache");
+    let invitation = search["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["subject"] == "Invitation: Trail walk")
+        .unwrap();
+    let message = client.read(
+        "mail_message_get",
+        json!({"account_id":primary,"message_id":invitation["message_id"]}),
+    );
+    assert_eq!(message["from"]["email"], "sophie@example.com");
+    assert!(message["body_text"]
+        .as_str()
+        .unwrap()
+        .contains("ridge trailhead"));
+    assert_eq!(message["content_is_untrusted"], true);
+
+    let now = now();
+    let start = tz::to_rfc3339(now - 8 * 86_400_000);
+    let end = tz::to_rfc3339(now + 15 * 86_400_000);
+    let calendar = client.read(
+        "calendar_events_list",
+        json!({
+            "account_id":secondary,"start":start,"end":end,"query":"Trail walk"
+        }),
+    );
+    assert_eq!(calendar["coverage"]["status"], "partial");
+    assert!(!calendar["coverage"]["gaps"].as_array().unwrap().is_empty());
+    let event = &calendar["items"][0];
+    assert_eq!(event["title"], "Trail walk");
+    let details = client.read(
+        "calendar_event_get",
+        json!({"account_id":secondary,"event_id":event["event_id"]}),
+    );
+    assert_eq!(details["title"], event["title"]);
+    assert_eq!(details["location"], "Ridge trailhead");
+    assert!(details["start"].as_str().unwrap().ends_with('Z'));
+    assert_eq!(message["invitation"]["summary"], details["title"]);
+    assert_eq!(
+        tz::to_rfc3339(message["invitation"]["start_ms"].as_i64().unwrap()),
+        details["start"]
+    );
+
+    let contact = client.read(
+        "contacts_search",
+        json!({
+            "account_id":secondary,"query":message["from"]["email"]
+        }),
+    );
+    assert_eq!(contact["items"][0]["display_name"], "Sophie Williams");
+    assert_eq!(calendar["account_id"], secondary);
+    assert_eq!(message["account_id"], primary);
+
+    let availability = client.read(
+        "calendar_availability",
+        json!({
+            "account_id":secondary, "start":start, "end":end
+        }),
+    );
+    let statuses: Vec<_> = availability["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["status"].as_str())
+        .collect();
+    assert!(statuses.contains(&"unknown"));
+    assert!(statuses.contains(&"busy"));
+
+    let provider = client.read(
+        "mail_search",
+        json!({
+            "account_id":primary,"query":"Trail walk","source":"provider"
+        }),
+    );
+    assert_eq!(provider["source"], "provider");
+    assert_eq!(provider["coverage"]["provider"]["scope"], "sample_mailbox");
+    assert!(provider["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|hit| hit["message_id"] == message["message_id"]));
+    client.finish();
+    quit_owner(&profile, &mut owner);
+}
+
+#[test]
+fn mail_read_pagination_and_refresh_keep_message_flags_and_outbox() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    let root = fixture();
+    let profile = root.path().join("profile");
+    let mut owner = start_owner(&profile);
+    let token = grant(&profile, "reader", &[PRIMARY, SECONDARY]);
+    let mut client = Mcp::start(&profile, "reader", &token, LEGACY);
+    let accounts = client.accounts();
+    let primary = account_id(&accounts, "Jason Alexander", "jason@example.com");
+    let secondary = account_id(&accounts, "Sample Secondary", "secondary@example.com");
+
+    let first = client.read("mail_folders_list", json!({"account_id":primary,"limit":1}));
+    let list = client.read(
+        "mail_messages_list",
+        json!({
+            "account_id":primary,"folder_id":first["items"][0]["folder_id"],"limit":1
+        }),
+    );
+    assert_eq!(list["items"].as_array().unwrap().len(), 1);
+    assert!(list["next_cursor"].is_string());
+    let cursor = &first["next_cursor"];
+    let next = client.read(
+        "mail_folders_list",
+        json!({"account_id":primary,"limit":1,"cursor":cursor}),
+    );
+    assert_ne!(
+        first["items"][0]["folder_id"],
+        next["items"][0]["folder_id"]
+    );
+    assert_failure(
+        &client.tool(
+            "mail_folders_list",
+            json!({
+                "account_id":secondary,"limit":1,"cursor":cursor
+            }),
+        ),
+        "invalid_request",
+    );
+
+    let search = client.read(
+        "mail_search",
+        json!({"account_id":primary,"query":"creative final review"}),
+    );
+    let row = search["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["subject"] == "Launch creative — final review")
+        .unwrap();
+    let selector = json!({"account_id":primary, "message_id":row["message_id"]});
+    let before = client.read("mail_message_get", selector.clone());
+    let attachment = before["attachments"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["filename"] == "sample-notes.txt")
+        .unwrap();
+    let bytes = client.read("mail_attachment_get", json!({
+        "account_id":primary, "message_id":row["message_id"], "attachment_id":attachment["attachment_id"]
+    }));
+    assert_eq!(bytes["encoding"], "base64");
+    let decoded = STANDARD.decode(bytes["content"].as_str().unwrap()).unwrap();
+    assert!(decoded.starts_with(b"Overlook sample mailbox attachment."));
+    let after = client.read("mail_message_get", selector);
+    assert_eq!(before["is_read"], row["is_read"]);
+    assert_eq!(after["is_read"], before["is_read"]);
+    assert_eq!(after["is_starred"], before["is_starred"]);
+
+    let outbox = client.read("mail_outbox_list", json!({"account_id":primary}));
+    assert_eq!(outbox["items"][0]["state"], "queued");
+    let refresh = client.read("mail_refresh", json!({"account_id":primary}));
+    assert_eq!(refresh["status"], "updated_cache");
+    assert_eq!(refresh["cache"]["freshness"], "recent");
+    let unchanged = client.read("mail_outbox_list", json!({"account_id":primary}));
+    assert_eq!(unchanged["items"], outbox["items"]);
+    client.finish();
+    quit_owner(&profile, &mut owner);
+}
+
 fn assert_tool_catalog(client: &mut Mcp) {
     let catalog = client.request("tools/list", json!({}));
     let tools = catalog["tools"].as_array().expect("tools/list tools array");
@@ -347,6 +581,10 @@ impl Mcp {
 
     fn tool(&mut self, name: &str, arguments: Value) -> Value {
         self.request("tools/call", json!({"name": name, "arguments": arguments}))
+    }
+
+    fn read(&mut self, name: &str, arguments: Value) -> Value {
+        success(&self.tool(name, arguments)).clone()
     }
 
     fn accounts(&mut self) -> Vec<Value> {

@@ -17,6 +17,7 @@ const CONVERSATION: &str = "mail_conversation";
 const MESSAGE: &str = "mail_message";
 const ATTACHMENT: &str = "mail_attachment";
 const FOLDERS_LIST: &str = "mail_folders_list";
+const MESSAGES_LIST: &str = "mail_messages_list";
 const SEARCH: &str = "mail_search";
 const CONVERSATION_GET: &str = "mail_conversation_get";
 const MESSAGE_GET: &str = "mail_message_get";
@@ -25,7 +26,8 @@ const ATTACHMENT_GET: &str = "mail_attachment_get";
 pub(super) fn tools() -> Vec<ReadTool> {
     vec![
         ReadTool::new(FOLDERS_LIST, "List cached mail folders for the selected account.", schema(json!({}), &[], true)),
-        ReadTool::new(SEARCH, "Search cached mail or explicitly request a bounded provider search. Check coverage before interpreting zero hits.", search::schema()),
+        ReadTool::new(MESSAGES_LIST, "List cached message headers for the selected folder or account.", search::schema(false)),
+        ReadTool::new(SEARCH, "Search cached mail or explicitly request a bounded provider search. Check coverage before interpreting zero hits.", search::schema(true)),
         ReadTool::new(CONVERSATION_GET, "List cached message headers in a conversation, oldest first.", schema(json!({
             "conversation_id": {"type": "string", "description": "Opaque ID from a search result."}
         }), &["conversation_id"], true)),
@@ -54,7 +56,7 @@ pub(super) fn execute(
 ) -> Result<Value, Failure> {
     match name {
         FOLDERS_LIST => folders(ctx, args),
-        SEARCH => search::execute(ctx, args),
+        MESSAGES_LIST | SEARCH => search::execute(ctx, name, args),
         CONVERSATION_GET => conversation(ctx, args),
         MESSAGE_GET => message(ctx, args),
         ATTACHMENT_GET => attachment::execute(ctx, args),
@@ -158,6 +160,18 @@ fn message(ctx: &ReadContext<'_>, args: &Map<String, Value>) -> Result<Value, Fa
     });
     result["body_truncated"] = json!(text.as_ref().is_some_and(|s| s.len() > 4_096));
     result["body_text"] = json!(text.as_deref().map(|s| display(s, 4_096)));
+    if let Some(invitation) = &message.invitation {
+        result["invitation"] = json!({
+            "invitation_id":ctx.id("mail_invitation", &invitation.uid),
+            "method":display(&invitation.method, 16),
+            "summary":invitation.summary.as_deref().map(|s| display(s, 192)),
+            "start_ms":invitation.start,
+            "start_date":invitation.start_date.as_deref()
+                .and_then(overlook_core::tz::parse_date).map(|date| date.to_string()),
+            "all_day":invitation.all_day,
+            "organizer_email":invitation.organizer_email.as_deref().map(|s| display(s, 128))
+        });
+    }
     result["attachments"] = ctx.page(
         message
             .attachments

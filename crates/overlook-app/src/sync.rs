@@ -826,6 +826,19 @@ async fn download(store: &Store, provider: &dyn MailProvider, account: &Account,
     }
 }
 
+/// Downloads into the cache under the caller's account sync lease. This path
+/// skips the operation and draft queues and is used for read-only IMAP refreshes.
+pub(crate) async fn refresh_mail_cache(
+    store: &Store,
+    provider: &dyn MailProvider,
+    account: &Account,
+) -> Result<usize, ProviderError> {
+    provider.probe().await?;
+    let mut outcome = SyncOutcome::default();
+    let mut deferred = Vec::new();
+    AsBackground(download(store, provider, account, &mut outcome, &mut deferred, false)).await
+}
+
 /// Sends pending local changes (sends, label changes, calendar and contact edits) to the
 /// provider in order, and returns the state to report.
 async fn replay_operations(

@@ -6,7 +6,7 @@ Connect an MCP-capable harness to one Overlook profile. The harness can discover
 
 The first release targets harnesses that launch a local subprocess on macOS or Linux. The proposed entry point is `overlook mcp serve --client <name>`. In **Settings → Integrations → MCP**, the user creates a client grant, chooses its accounts and permissions, and gets the command and arguments to paste into the harness. The bridge uses the same Overlook profile the user selected. A harness can work across every account the user grants it, even when a different account is selected in the app.
 
-## Try milestone 1 with fictional accounts
+## Try the read tools with fictional accounts
 
 Build with `cargo build --locked -p overlook`. Start an isolated profile in one terminal.
 
@@ -18,13 +18,29 @@ target/debug/overlook mcp sample
 
 In a second terminal, set `OVERLOOK_DATA_DIR` to the printed path. Run `target/debug/overlook mcp grant --client my-harness --account-id sample`. Repeat `--account-id` on the same command to grant `sample-secondary` as well. The command returns the client credential once. Running it again for the same client replaces its grant and credential.
 
-Configure the harness to launch the absolute path to `target/debug/overlook` with arguments `mcp serve --client my-harness`. Supply the same `OVERLOOK_DATA_DIR` and the issued `OVERLOOK_MCP_TOKEN` through the harness's environment and secret storage. The harness can list its granted accounts with `accounts_list`, then pass a returned opaque `account_id` to `account_capabilities`. Its three capability flags describe the fictional account's supported domains. The two tools expose sample metadata only.
+Configure the harness to launch the absolute path to `target/debug/overlook` with arguments `mcp serve --client my-harness`. Supply the same `OVERLOOK_DATA_DIR` and the issued `OVERLOOK_MCP_TOKEN` through the harness's environment and secret storage. Use `accounts_list` to find the granted accounts and `account_capabilities` to check what each supports. Use the returned opaque account IDs in tools.
 
 Run `target/debug/overlook mcp revoke --client my-harness` to deny subsequent calls, including on open connections. Run `target/debug/overlook --quit` with the same profile path to stop the sample owner. Calls without an owner return `profile_unavailable`. Calls with a missing, mismatched, or revoked grant return `access_denied` when an owner is running.
 
-The sample owner keeps its records in memory and starts without provider sync. The desktop owner uses its existing store. Grants are local to the selected profile and apply to the two synthetic accounts. Use one credential per harness. A harness running under your OS login has that login's local filesystem permissions.
+The sample owner keeps its records in memory and starts without a background sync worker. Try finding the Trail walk invitation in the primary mailbox, then looking up its date and the sender's contact in the secondary account. For a desktop profile, eligible IMAP and POP3 accounts use `imap:<address>` and `pop3:<address>` as their CLI grant IDs. Gmail accounts and connections to recognized Google endpoints stay outside the MCP catalog while Google data flows are reviewed. Use one credential per harness. A harness running under your OS login has that login's local filesystem permissions.
 
-Run `cargo test --locked -p overlook --test mcp_milestone` to exercise both stdio protocol versions against one sample owner. The official TypeScript SDK clients `@modelcontextprotocol/client` 2.4.0 and `@modelcontextprotocol/sdk` 1.32.2 also passed discovery, both tool calls, and live revocation on macOS.
+Run `cargo test --locked -p overlook --test mcp_milestone` to exercise both stdio protocol versions and the cross-account workflow against one sample owner. On macOS, the official TypeScript SDK clients `@modelcontextprotocol/client` 2.4.0 and `@modelcontextprotocol/sdk` 1.32.2 passed tool discovery, the Trail walk workflow, and live revocation.
+
+### Read tools
+
+| Area | Tools and coverage |
+| --- | --- |
+| Account | `accounts_list`, `account_capabilities`, and `account_status` show the granted accounts, supported reads, cache status, and pending counts. |
+| Mail | `mail_folders_list`, `mail_messages_list`, `mail_search`, `mail_conversation_get`, and `mail_message_get` read cached folders, headers, plain text, and meeting invitations without changing flags. Listing and search accept an opaque folder ID and optional UTC millisecond bounds. Explicit `source: "provider"` searches the Sample or IMAP provider and reports matches whose headers are absent from the cache. IMAP search bounds its folder and UID scope. |
+| Attachments | `mail_message_get` includes paginated attachment metadata. `mail_attachment_get` returns eligible cached content up to 24 KiB as base64. |
+| Drafts and history | `mail_drafts_list`, `mail_outbox_list`, `mail_draft_get`, and `mail_history_list` inspect local records, including up to 500 recent history entries. |
+| Calendar | `calendar_calendars_list`, `calendar_events_list`, `calendar_event_get`, and `calendar_availability` read cached calendars and events. Range reads take RFC 3339 timestamps with offsets and an exclusive end. Availability reports busy, free within verified cache coverage, and unknown intervals. |
+| Contacts | `contacts_address_books_list`, `contacts_search`, and `contacts_get` read cached contact records and identify their sources, including inferred contacts. |
+| Refresh | `mail_refresh` downloads changes for one Sample or IMAP account using the existing account sync lease. It does not replay drafts, the Outbox, or other pending operations. |
+
+`mail_search`, `calendar_events_list`, and `contacts_search` accept an explicit `account_ids` array of up to four granted accounts. Batch results report a separate result or error for each account. Continue individual pages with `account_id` and the corresponding cursor. Cursors are tied to the tool, account and filters, and pages reflect the current cache.
+
+`cache.freshness` reports `recent`, `stale`, or `unknown` independently of coverage. The cutoff for a recent successful fetch is 24 hours. Check `coverage` for unmatched remote results, missing bodies, or uncovered calendar time before interpreting an empty result. User and provider content is marked as untrusted in the tool payloads.
 
 ## Architecture
 

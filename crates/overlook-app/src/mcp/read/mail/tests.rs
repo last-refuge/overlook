@@ -42,7 +42,7 @@ fn cache_search_scopes_hits_dates_and_body_coverage() {
             Some(folder),
             Some(first.date),
             Some(first.date + 1),
-            Some("launch creative"),
+            overlook_store::McpMailSelection::Search("launch creative"),
         )
         .unwrap();
     assert_eq!(result.messages.len(), 1);
@@ -57,7 +57,7 @@ fn cache_search_scopes_hits_dates_and_body_coverage() {
             Some(folder),
             Some(first.date),
             Some(first.date + 1),
-            Some("nonexistentkeyword"),
+            overlook_store::McpMailSelection::Search("nonexistentkeyword"),
         )
         .unwrap();
     assert!(gaps.messages.is_empty());

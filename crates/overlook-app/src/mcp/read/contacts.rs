@@ -386,7 +386,7 @@ fn coverage(provider: ProviderKind, connection: Option<ContactsCredential>) -> V
         ],
         _ => &["No remote contacts connection is configured."],
     };
-    json!({"scope": "local_cache", "limitations": limitations})
+    json!({"scope": "local_cache", "partial": provider != ProviderKind::Sample && connection.is_some(), "limitations": limitations})
 }
 
 fn contact_matches(contact: &Contact, terms: &[&str]) -> bool {

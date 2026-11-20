@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 const STATE: &str = ".mcp";
 const TOKEN_BYTES: usize = 32;
 const KEY_BYTES: usize = 32;
-const MAX_GRANT_BYTES: usize = 4096;
+const MAX_GRANT_BYTES: usize = 64 * 1024;
 
 pub(super) struct Profile {
     path: PathBuf,

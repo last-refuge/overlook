@@ -11,10 +11,10 @@ use serde::{Deserialize, Serialize};
 
 use super::super::contract::{ErrorCode, Failure, Reply, Request, VERSION};
 
-const MAX_REQUEST: usize = 4096;
-const MAX_REPLY: usize = 65_536;
-const SERVER_TIMEOUT: Duration = Duration::from_secs(1);
-const CLIENT_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_REQUEST: usize = 16 * 1024;
+const MAX_REPLY: usize = 256 * 1024;
+const FRAME_TIMEOUT: Duration = Duration::from_secs(2);
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Serialize)]
 struct RequestFrame<'a> {
@@ -68,7 +68,7 @@ pub(super) fn serve(
     stopped: &AtomicBool,
     dispatch: impl FnOnce(&str, &str, Request) -> Reply,
 ) {
-    let deadline = Instant::now() + SERVER_TIMEOUT;
+    let deadline = Instant::now() + FRAME_TIMEOUT;
     let reply = read_frame(stream, MAX_REQUEST, deadline)
         .map_err(|_| invalid())
         .and_then(parse)
@@ -89,7 +89,10 @@ pub(super) fn serve(
         return;
     };
     if bytes.len() > MAX_REPLY {
-        let failure = Failure::new(ErrorCode::Internal, "Account discovery reply too large");
+        let failure = Failure::new(
+            ErrorCode::Internal,
+            "The tool reply exceeded the profile service size limit",
+        );
         let Ok(fallback) = serde_json::to_vec(&ReplyFrame {
             version: VERSION,
             reply: Err(failure),
@@ -98,7 +101,7 @@ pub(super) fn serve(
         };
         bytes = fallback;
     }
-    let _ = write_frame(stream, &bytes, deadline);
+    let _ = write_frame(stream, &bytes, Instant::now() + FRAME_TIMEOUT);
 }
 
 fn parse(bytes: Vec<u8>) -> Result<Invocation, Failure> {

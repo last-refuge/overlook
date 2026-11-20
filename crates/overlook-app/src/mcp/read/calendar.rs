@@ -238,6 +238,7 @@ fn range_read(
     let mut page = ctx.page(items, name, args)?;
     page["coverage"] = json!({
         "status": status,
+        "partial": status != "complete",
         "source": source,
         "calendar_id": request.calendar_id,
         "calendar_count": cache.calendar_ids.len(),

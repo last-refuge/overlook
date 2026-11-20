@@ -4,6 +4,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use overlook_core::{Label, LabelKind, ProviderId, ProviderKind};
+use overlook_store::McpMailSelection;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
@@ -22,18 +23,18 @@ impl Drop for ProviderSlot {
     }
 }
 
-pub(super) fn schema() -> Value {
-    super::schema(
-        json!({
-            "query": {"type": "string", "minLength": 1, "maxLength": 256},
-            "folder_id": {"type": "string", "description": "Opaque ID from mail_folders_list."},
-            "after": {"type": "integer", "description": "Inclusive message date, Unix milliseconds UTC."},
-            "before": {"type": "integer", "description": "Exclusive message date, Unix milliseconds UTC."},
-            "source": {"type": "string", "enum": ["cache", "provider"], "default": "cache"}
-        }),
-        &["query"],
-        true,
-    )
+pub(super) fn schema(search: bool) -> Value {
+    let mut properties = json!({
+        "folder_id": {"type": "string", "description": "Opaque ID from mail_folders_list."},
+        "after": {"type": "integer", "description": "Inclusive message date, Unix milliseconds UTC."},
+        "before": {"type": "integer", "description": "Exclusive message date, Unix milliseconds UTC."}
+    });
+    if search {
+        properties["query"] = json!({"type":"string","minLength":1,"maxLength":256});
+        properties["source"] =
+            json!({"type":"string","enum":["cache","provider"],"default":"cache"});
+    }
+    super::schema(properties, if search { &["query"] } else { &[] }, true)
 }
 
 #[derive(Default, Deserialize, PartialEq, Eq)]
@@ -47,7 +48,7 @@ enum Source {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Input {
-    query: String,
+    query: Option<String>,
     folder_id: Option<String>,
     after: Option<i64>,
     before: Option<i64>,
@@ -60,11 +61,14 @@ struct Input {
 }
 
 impl Input {
-    fn validate(&self) -> Result<(), Failure> {
-        if self.query.trim().is_empty()
-            || self.query.len() > 256
-            || self.query.chars().any(char::is_control)
-            || !self.query.chars().any(char::is_alphanumeric)
+    fn validate(&self, search: bool) -> Result<(), Failure> {
+        if search
+            && !self.query.as_deref().is_some_and(|query| {
+                !query.trim().is_empty()
+                    && query.len() <= 256
+                    && !query.chars().any(char::is_control)
+                    && query.chars().any(char::is_alphanumeric)
+            })
         {
             return Err(Failure::new(
                 ErrorCode::InvalidRequest,
@@ -85,9 +89,13 @@ impl Input {
     }
 }
 
-pub(super) fn execute(ctx: &ReadContext<'_>, args: &Map<String, Value>) -> Result<Value, Failure> {
+pub(super) fn execute(
+    ctx: &ReadContext<'_>,
+    name: &str,
+    args: &Map<String, Value>,
+) -> Result<Value, Failure> {
     let input: Input = parse(args)?;
-    input.validate()?;
+    input.validate(name == SEARCH)?;
     let mut labels = ctx.store.labels(&ctx.account.id).map_err(storage)?;
     labels.sort_unstable_by_key(|label| {
         (
@@ -113,6 +121,11 @@ pub(super) fn execute(ctx: &ReadContext<'_>, args: &Map<String, Value>) -> Resul
         ));
     }
 
+    let selection = match (input.source == Source::Provider, input.query.as_deref()) {
+        (true, _) => McpMailSelection::Coverage,
+        (false, Some(query)) => McpMailSelection::Search(query),
+        (false, None) => McpMailSelection::Headers,
+    };
     let cache = ctx
         .store
         .mcp_mail_cache_search(
@@ -120,7 +133,7 @@ pub(super) fn execute(ctx: &ReadContext<'_>, args: &Map<String, Value>) -> Resul
             folder.map(|label| &label.id),
             input.after,
             input.before,
-            (input.source == Source::Cache).then_some(input.query.as_str()),
+            selection,
         )
         .map_err(storage)?;
     let mut coverage = json!({
@@ -137,16 +150,22 @@ pub(super) fn execute(ctx: &ReadContext<'_>, args: &Map<String, Value>) -> Resul
     });
     let (messages, source) = if input.source == Source::Provider {
         let (matches, evidence) = provider_search(ctx, &input, &labels, folder)?;
+        coverage["partial"] = evidence["partial"].clone();
         coverage["provider"] = evidence;
         (matches, "provider")
     } else {
         coverage["result_limit_reached"] = json!(cache.result_limit_reached);
+        coverage["partial"] = json!(
+            ctx.account.provider != ProviderKind::Sample
+                || cache.result_limit_reached
+                || cache.coverage.messages_indexed > cache.coverage.bodies_cached
+        );
         coverage["provider_mail_searched"] = json!(false);
         (cache.messages, "cache")
     };
     let mut data = ctx.page(
         messages.iter().map(|m| summary(ctx, m)).collect(),
-        SEARCH,
+        name,
         args,
     )?;
     data["source"] = json!(source);
@@ -228,7 +247,7 @@ fn provider_search(
     }
     let slot = ProviderSlot;
     let account = ctx.account.clone();
-    let query = input.query.trim().to_owned();
+    let query = input.query.as_deref().unwrap_or_default().trim().to_owned();
     let deadline = Instant::now() + PROVIDER_WAIT;
     let runtime = ctx.runtime.handle().clone();
     let (sender, receiver) = mpsc::sync_channel(1);

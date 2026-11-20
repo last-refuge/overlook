@@ -59,11 +59,13 @@ fn sample_call(request: Request) -> Reply {
                 mail: true,
                 calendar: false,
                 contacts: false,
+                details: Value::Null,
             }))
         }
         Request::AccountCapabilities { .. } => {
             Err(Failure::new(ErrorCode::AccessDenied, "Account unavailable"))
         }
+        Request::Read { .. } => panic!("unexpected read tool"),
     }
 }
 
@@ -115,7 +117,7 @@ fn modern_tools_work_in_a_fresh_process_after_a_separate_discovery_probe() {
     assert_eq!(list["cacheScope"], "private");
     assert!(list.get("nextCursor").is_none());
     let tools = list["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 2);
+    assert!(tools.iter().any(|tool| tool["name"] == "mail_search"));
     assert_eq!(tools[0]["name"], "accounts_list");
     assert_eq!(tools[0]["inputSchema"]["additionalProperties"], false);
     assert_eq!(tools[1]["name"], "account_capabilities");
@@ -180,7 +182,11 @@ fn legacy_handshake_consumes_notification_and_uses_legacy_result_shapes() {
     assert_eq!(responses[1]["result"]["serverInfo"]["name"], "overlook");
     assert_eq!(responses[2]["error"]["code"], -32600);
     assert_eq!(responses[3]["id"], 2);
-    assert_eq!(responses[3]["result"]["tools"].as_array().unwrap().len(), 2);
+    assert!(responses[3]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "contacts_search"));
     for response in [&responses[3], &responses[4], &responses[5]] {
         assert!(response["result"].get("resultType").is_none());
         assert!(response["result"].get("ttlMs").is_none());

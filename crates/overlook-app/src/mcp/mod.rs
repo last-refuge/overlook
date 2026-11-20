@@ -1,11 +1,13 @@
 //! Owns the MCP endpoint in the desktop process or the synthetic sample process.
 
 mod contract;
+mod read;
 mod service;
 mod transport;
 
 use anyhow::{bail, ensure, Context, Result};
-use overlook_core::{time::now, Account, AccountId, ProviderKind};
+use overlook_core::{time::now, Account, AccountId, ProviderKind, SyncState};
+use overlook_provider::sample::SampleProvider;
 use overlook_store::Store;
 use std::fs::{self, DirBuilder};
 use std::io::{self, Write};
@@ -29,10 +31,11 @@ const HELP: &str = r#"Usage: overlook mcp <command>
   OVERLOOK_DATA_DIR    selects the profile. Sample mode requires a separate directory.
   OVERLOOK_MCP_TOKEN   credential supplied by the MCP client to the serve command.
 
-For milestone 1, use sample or sample-secondary as the grant account ID."#;
+Use sample or sample-secondary for the fictional accounts. For eligible IMAP and POP3
+accounts, use imap:<address> or pop3:<address> as stored by Overlook."#;
 
-pub fn start_desktop(profile: &Path, store: Arc<Store>) {
-    match service::start(profile, store) {
+pub fn start_desktop(profile: &Path, store: Arc<Store>, sample: SampleProvider) {
+    match service::start(profile, store, sample) {
         Ok(server) => *DESKTOP_SERVER.lock().unwrap() = Some(server),
         Err(error) => tracing::warn!("the local MCP endpoint could not start: {error:#}"),
     }
@@ -130,18 +133,25 @@ fn sample_profile() -> Result<PathBuf> {
 
 fn serve_sample(profile: &Path) -> Result<()> {
     let store = Arc::new(Store::open_in_memory()?);
-    seed_sample_account(&store)?;
-    seed_sample_mailbox(
-        &store,
-        &Account {
-            id: AccountId::from("sample-secondary"),
-            provider: ProviderKind::Sample,
-            display_name: "Sample Secondary".into(),
-            email: "secondary@example.com".into(),
-            created_at: now(),
-        },
+    let primary = seed_sample_account(&store)?;
+    let secondary = Account {
+        id: AccountId::from("sample-secondary"),
+        provider: ProviderKind::Sample,
+        display_name: "Sample Secondary".into(),
+        email: "secondary@example.com".into(),
+        created_at: now(),
+    };
+    seed_sample_mailbox(&store, &secondary)?;
+    read::seed_sample(&store, &primary)?;
+    read::seed_sample(&store, &secondary)?;
+    store.set_sync_state(
+        &primary.id,
+        &SyncState::Offline,
+        Some(now() - 2 * 86_400_000),
     )?;
-    let _server = service::start(profile, store)?;
+    let sample = SampleProvider::new().with_latency(std::time::Duration::ZERO);
+    sample.set_online(true);
+    let _server = service::start(profile, store, sample)?;
     eprintln!("Overlook MCP sample profile is ready.");
     let mut wakeups = single_instance::wakeups();
     loop {

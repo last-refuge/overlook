@@ -343,7 +343,6 @@ fn main() {
         }
     };
     tracing::debug!("startup: store open after {} ms", since_start_ms());
-    mcp::start_desktop(&data_dir(), store.clone());
     theme::install_omarchy_hook();
     if let Some(link) = mailto {
         single_instance::push(link);
@@ -354,6 +353,7 @@ fn main() {
     if std::env::var("OVERLOOK_SAMPLE_ONLINE").is_ok_and(|v| v == "1") {
         provider.set_online(true);
     }
+    mcp::start_desktop(&data_dir(), store.clone(), provider.clone());
 
     let prefs = store.setting::<overlook_core::Prefs>("prefs").ok().flatten();
     lifecycle::set_keep_running(prefs.as_ref().is_some_and(|p| p.keep_running));

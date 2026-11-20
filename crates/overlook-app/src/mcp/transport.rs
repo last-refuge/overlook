@@ -5,12 +5,13 @@ use std::io::{self, BufRead, Read, Write};
 use rmcp::model::{
     CacheScope, CallToolResult, DiscoverResult, ErrorCode as RpcCode, Implementation,
     InitializeRequestParams, InitializeResult, JsonObject, ListToolsResult, MetaObject,
-    ProtocolVersion, RequestMetaObject, ServerCapabilities, Tool,
+    ProtocolVersion, RequestMetaObject, ServerCapabilities, Tool, ToolAnnotations,
 };
 use rmcp::ErrorData;
 use serde_json::{json, Value};
 
 use super::contract::{ErrorCode, Failure, Reply, Request};
+use super::read;
 
 const MODERN: ProtocolVersion = ProtocolVersion::V_2026_07_28;
 const LEGACY: ProtocolVersion = ProtocolVersion::V_2025_11_25;
@@ -281,7 +282,7 @@ fn server_meta() -> MetaObject {
 }
 
 fn list_tools(modern: bool) -> ListToolsResult {
-    let mut tools = ListToolsResult::with_all_items(vec![
+    let mut catalog = vec![
         Tool::new(
             ACCOUNTS_LIST,
             "List Overlook accounts visible to this connection.",
@@ -303,7 +304,23 @@ fn list_tools(modern: bool) -> ListToolsResult {
                 ("additionalProperties".into(), json!(false)),
             ]),
         ),
-    ]);
+    ];
+    catalog.extend(
+        read::tools().map(|tool| Tool::new(tool.name, tool.description, tool.schema.clone())),
+    );
+    for tool in &mut catalog {
+        tool.annotations = Some(if tool.name == "mail_refresh" {
+            ToolAnnotations::new()
+                .read_only(false)
+                .destructive(false)
+                .open_world(true)
+        } else {
+            ToolAnnotations::new()
+                .read_only(true)
+                .open_world(tool.name == "mail_search")
+        });
+    }
+    let mut tools = ListToolsResult::with_all_items(catalog);
     if modern {
         tools.ttl_ms = Some(0);
         tools.cache_scope = Some(CacheScope::Private);
@@ -351,6 +368,40 @@ fn tool_request(mut params: JsonObject) -> Result<Result<Request, Failure>, Erro
             }
             _ => invalid("account_capabilities requires one non-empty string argument, account_id"),
         },
+        _ if read::tools().any(|tool| tool.name == name) => {
+            let batch = arguments.contains_key("account_ids");
+            let ids = match (
+                arguments.remove("account_id"),
+                arguments.remove("account_ids"),
+            ) {
+                (Some(Value::String(id)), None) => vec![id],
+                (None, Some(Value::Array(ids))) if read::batch_tool(&name) => {
+                    let Some(ids) = ids
+                        .into_iter()
+                        .map(|id| id.as_str().map(str::to_owned))
+                        .collect()
+                    else {
+                        return invalid("account_ids must contain only opaque account IDs");
+                    };
+                    ids
+                }
+                _ => return invalid("Choose an explicit account_id or supported account_ids list"),
+            };
+            if ids.is_empty()
+                || ids.len() > read::MAX_ACCOUNTS
+                || ids
+                    .iter()
+                    .any(|id: &String| id.is_empty() || id.len() > 128)
+            {
+                return invalid("Invalid account selector");
+            }
+            Ok(Ok(Request::Read {
+                name,
+                account_ids: ids,
+                batch,
+                args: arguments,
+            }))
+        }
         _ => Err(ErrorData::invalid_params("Unknown tool", None)),
     }
 }

@@ -2,13 +2,21 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum Request {
     AccountsList,
-    AccountCapabilities { account_id: String },
+    AccountCapabilities {
+        account_id: String,
+    },
+    Read {
+        name: String,
+        account_ids: Vec<String>,
+        batch: bool,
+        args: serde_json::Map<String, serde_json::Value>,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -16,6 +24,7 @@ pub enum Request {
 pub enum Response {
     Accounts { accounts: Vec<Account> },
     Capabilities(Capabilities),
+    Read(serde_json::Value),
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -32,6 +41,8 @@ pub struct Capabilities {
     pub mail: bool,
     pub calendar: bool,
     pub contacts: bool,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub details: serde_json::Value,
 }
 
 pub type Reply = Result<Response, Failure>;
@@ -49,6 +60,9 @@ pub enum ErrorCode {
     ProfileUnavailable,
     UnsupportedVersion,
     InvalidRequest,
+    Unsupported,
+    NotCached,
+    ProviderUnavailable,
     Internal,
 }
 
