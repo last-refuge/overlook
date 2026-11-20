@@ -1159,38 +1159,86 @@ impl Store {
 
     /// Moves a draft to the Outbox and queues its send in the same transaction.
     pub fn queue_send(&self, draft: &Draft) -> Result<PendingOperation> {
-        draft.validate_for_send().map_err(|e| StoreError::Invalid(e.to_string()))?;
-        let ts = now();
-        let mut queued = draft.clone();
-        queued.state = DraftState::Queued;
-        queued.updated_at = ts;
-        self.with_tx(|tx| {
-            save_draft_tx(tx, &queued)?;
-            insert_operation_tx(tx, &draft.account_id, OperationKind::SendDraft { draft_id: draft.id.clone() }, ts)
-        })
+        self.with_tx(|tx| queue_send_tx(tx, draft).map(|(_, operation)| operation))
     }
 
-    /// Returns a queued (not yet in-flight) draft to editing and removes its send operation.
+    /// Returns a cancellable Outbox item to editing and removes its send operation.
     pub fn cancel_send(&self, account: &AccountId, id: &DraftId) -> Result<Draft> {
         self.with_tx(|tx| {
             ensure_owned(tx, Owned::Draft, account, [id.0.as_str()])?;
-            let mut found = load_drafts(tx, "WHERE d.id=?1", params![id.0])?;
-            let mut draft = found.pop().ok_or_else(|| StoreError::NotFound(id.0.clone()))?;
-            if !matches!(draft.state, DraftState::Queued | DraftState::Failed(_)) {
-                return Err(StoreError::Invalid("This message is already being sent.".into()));
+            let draft = load_drafts(tx, "WHERE d.id=?1", params![id.0])?
+                .pop()
+                .ok_or_else(|| StoreError::NotFound(id.0.clone()))?;
+            cancel_send_tx(tx, draft, true).map(|(draft, _)| draft)
+        })
+    }
+
+    /// Claims a send under the account's mail sync lease. The replay plan can be stale:
+    /// cancellation, resend, or another claim may have changed it since it was read.
+    /// The returned flag means an earlier submission may have reached the provider.
+    pub fn claim_send(&self, op: &PendingOperation, undo_ms: i64) -> Result<Option<(Draft, bool)>> {
+        let OperationKind::SendDraft { draft_id } = &op.kind else {
+            return Err(StoreError::Invalid("Expected a send operation.".into()));
+        };
+        self.with_tx(|tx| {
+            let current = tx.query_row(
+                "SELECT id, account_id, seq, kind_json, state, attempts, last_error, created_at, updated_at
+                 FROM pending_operations WHERE id=?1 AND account_id=?2",
+                params![op.id.0, op.account_id.0],
+                row_to_operation,
+            ).optional()?;
+            if current.as_ref() != Some(op) || op.state == OperationState::Applied {
+                return Ok(None);
             }
-            draft.state = DraftState::Editing;
-            draft.updated_at = now();
-            save_draft_tx(tx, &draft)?;
+
+            let Some(mut draft) = load_drafts(tx, "WHERE d.id=?1 AND d.account_id=?2", params![draft_id.0, op.account_id.0])?.pop() else {
+                // An orphaned intent has no message to submit. It has no delivery receipt.
+                tx.execute("DELETE FROM pending_operations WHERE id=?1", [&op.id.0])?;
+                return Ok(None);
+            };
+            let reconcile = match (&draft.state, op.state) {
+                (DraftState::Sending | DraftState::Uncertain, _)
+                | (DraftState::Queued | DraftState::Failed(_), OperationState::InFlight | OperationState::Uncertain) => true,
+                (DraftState::Queued, OperationState::Pending) => false,
+                _ => return Ok(None),
+            };
+            let ts = now();
+            if !reconcile && ts - op.created_at < undo_ms {
+                return Ok(None);
+            }
             tx.execute(
-                "DELETE FROM pending_operations
-                 WHERE account_id=?1 AND state IN ('pending','failed')
-                   AND json_valid(kind_json)
-                   AND json_extract(kind_json,'$.op')='send-draft'
-                   AND json_extract(kind_json,'$.draft_id')=?2",
-                params![account.0, id.0],
+                "UPDATE pending_operations SET state='in-flight', attempts=attempts+1, last_error=NULL, updated_at=?2 WHERE id=?1",
+                params![op.id.0, ts],
             )?;
-            Ok(draft)
+            draft.state = DraftState::Sending;
+            draft.updated_at = ts;
+            set_draft_state_tx(tx, draft_id, &draft.state, ts)?;
+            Ok(Some((draft, reconcile)))
+        })
+    }
+
+    /// Records the outcome of a claimed attempt atomically with the Outbox state.
+    pub fn finish_send_attempt(&self, op: &PendingOperation, draft_state: &DraftState, error: &str) -> Result<()> {
+        let OperationKind::SendDraft { draft_id } = &op.kind else {
+            return Err(StoreError::Invalid("Expected a send operation.".into()));
+        };
+        let state = match draft_state {
+            DraftState::Queued => OperationState::Pending,
+            DraftState::Uncertain => OperationState::Uncertain,
+            DraftState::Failed(_) => OperationState::Failed,
+            _ => return Err(StoreError::Invalid("Invalid send outcome.".into())),
+        };
+        self.with_tx(|tx| {
+            let ts = now();
+            let updated = tx.execute(
+                "UPDATE pending_operations SET state=?3, last_error=?4, updated_at=?5
+                 WHERE id=?1 AND account_id=?2 AND state='in-flight' AND attempts=?6",
+                params![op.id.0, op.account_id.0, state.as_key(), error, ts, i64::from(op.attempts) + 1],
+            )?;
+            if updated != 1 {
+                return Err(StoreError::Invalid("The send claim is no longer current.".into()));
+            }
+            set_draft_state_tx(tx, draft_id, draft_state, ts)
         })
     }
 
@@ -1246,13 +1294,7 @@ impl Store {
     }
 
     pub fn set_draft_state(&self, id: &DraftId, state: &DraftState) -> Result<()> {
-        self.with_conn(|c| {
-            c.execute(
-                "UPDATE drafts SET state_json=?2, updated_at=?3 WHERE id=?1",
-                params![id.0, serde_json::to_string(state)?, now()],
-            )?;
-            Ok(())
-        })
+        self.with_conn(|c| set_draft_state_tx(c, id, state, now()))
     }
 
     /// Records provider acceptance: stores the sent message, removes the draft, and marks
@@ -2668,6 +2710,64 @@ fn delete_draft_tx(tx: &Connection, account: &AccountId, id: &DraftId) -> Result
     Ok(())
 }
 
+fn active_send_operations_tx(tx: &Connection, account: &AccountId, draft_id: &DraftId) -> Result<Vec<(OperationId, String)>> {
+    let mut stmt = tx.prepare_cached(
+        "SELECT id, state FROM pending_operations
+         WHERE account_id=?1 AND state!='applied' AND json_valid(kind_json)
+           AND json_extract(kind_json,'$.op')='send-draft'
+           AND json_extract(kind_json,'$.draft_id')=?2 ORDER BY seq",
+    )?;
+    let rows = stmt.query_map(params![account.0, draft_id.0], |r| Ok((OperationId(r.get(0)?), r.get(1)?)))?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn queue_send_tx(tx: &Connection, draft: &Draft) -> Result<(Draft, PendingOperation)> {
+    draft.validate_for_send().map_err(|e| StoreError::Invalid(e.to_string()))?;
+    ensure_owned(tx, Owned::Draft, &draft.account_id, [draft.id.as_str()])?;
+    let current = load_drafts(tx, "WHERE d.id=?1", params![draft.id.0])?.pop();
+    if draft.state != DraftState::Editing
+        || current.is_some_and(|saved| saved.state != DraftState::Editing)
+        || !active_send_operations_tx(tx, &draft.account_id, &draft.id)?.is_empty()
+    {
+        return Err(StoreError::Invalid("Only an editing draft can be queued for sending.".into()));
+    }
+
+    let ts = now();
+    let mut queued = draft.clone();
+    queued.state = DraftState::Queued;
+    queued.updated_at = ts;
+    save_draft_tx(tx, &queued)?;
+    let operation = insert_operation_tx(tx, &draft.account_id, OperationKind::SendDraft { draft_id: draft.id.clone() }, ts)?;
+    Ok((queued, operation))
+}
+
+fn cancel_send_tx(tx: &Connection, mut draft: Draft, allow_failed: bool) -> Result<(Draft, Option<OperationId>)> {
+    let cancellable_state = draft.state == DraftState::Queued || (allow_failed && matches!(draft.state, DraftState::Failed(_)));
+    let operations = active_send_operations_tx(tx, &draft.account_id, &draft.id)?;
+    if !cancellable_state
+        || (!allow_failed && operations.is_empty())
+        || operations.iter().any(|(_, state)| state != "pending" && !(allow_failed && state == "failed"))
+    {
+        return Err(StoreError::Invalid("This message is no longer queued for cancellation.".into()));
+    }
+
+    draft.state = DraftState::Editing;
+    draft.updated_at = now();
+    set_draft_state_tx(tx, &draft.id, &draft.state, draft.updated_at)?;
+    for (id, _) in &operations {
+        tx.execute("DELETE FROM pending_operations WHERE id=?1", [&id.0])?;
+    }
+    Ok((draft, operations.into_iter().next().map(|(id, _)| id)))
+}
+
+fn set_draft_state_tx(tx: &Connection, id: &DraftId, state: &DraftState, at: Timestamp) -> Result<()> {
+    tx.execute(
+        "UPDATE drafts SET state_json=?2, updated_at=?3 WHERE id=?1",
+        params![id.0, serde_json::to_string(state)?, at],
+    )?;
+    Ok(())
+}
+
 fn save_draft_tx(tx: &Connection, d: &Draft) -> Result<()> {
     // A draft is saved under its own account; an id already used by another account's
     // draft is refused rather than overwritten.
@@ -3473,6 +3573,35 @@ mod tests {
         bad.to.clear();
         assert!(store.queue_send(&bad).is_err());
         assert_eq!(store.pending_count(&acct).unwrap(), 0);
+    }
+
+    #[test]
+    fn send_claim_and_cancellation_use_the_current_queue_entry() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let account = AccountId::from("acct-1");
+        let mut draft = Draft::new(account.clone(), DraftKind::New, 10);
+        draft.to = vec![Address::named("Maya Chen", "maya@northstar.example")];
+
+        let cancelled = store.queue_send(&draft).unwrap();
+        assert!(store.queue_send(&draft).is_err());
+        assert_eq!(store.pending_operations(&account).unwrap(), vec![cancelled.clone()]);
+        assert!(store.claim_send(&cancelled, 60_000).unwrap().is_none());
+
+        let restored = store.cancel_send(&account, &draft.id).unwrap();
+        let queued = store.queue_send(&restored).unwrap();
+        assert!(store.claim_send(&cancelled, 0).unwrap().is_none());
+        assert_eq!(store.draft(&draft.id).unwrap().unwrap().state, DraftState::Queued);
+
+        let (claimed, reconcile) = store.claim_send(&queued, 0).unwrap().unwrap();
+        assert!(!reconcile);
+        assert_eq!(claimed.state, DraftState::Sending);
+        assert_eq!(store.pending_operations(&account).unwrap()[0].state, OperationState::InFlight);
+        assert!(store.claim_send(&queued, 0).unwrap().is_none());
+        assert!(store.cancel_send(&account, &draft.id).is_err());
+        store.finish_send_attempt(&queued, &DraftState::Uncertain, "unknown").unwrap();
+        assert_eq!(store.draft(&draft.id).unwrap().unwrap().state, DraftState::Uncertain);
+        assert_eq!(store.pending_operations(&account).unwrap()[0].state, OperationState::Uncertain);
     }
 
     #[test]

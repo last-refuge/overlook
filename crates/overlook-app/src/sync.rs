@@ -875,21 +875,23 @@ async fn replay_operations(
     // sync, not to the mail provider.
     let contacts_elsewhere = store.contacts_connection(&acct).ok().flatten().is_some();
     for (op, covered) in plan.send {
-        if matches!(op.kind, OperationKind::SendDraft { .. }) && overlook_core::time::now() - op.created_at < undo_ms {
-            continue;
-        }
         if contacts_elsewhere && op.kind.is_contact() {
             continue;
         }
-        set_states(&covered, OperationState::InFlight, None);
+        if !matches!(op.kind, OperationKind::SendDraft { .. }) {
+            set_states(&covered, OperationState::InFlight, None);
+        }
         match &op.kind {
-            OperationKind::SendDraft { draft_id } => {
-                let Some(draft) = store.draft(draft_id).ok().flatten() else {
-                    let _ = store.set_operation_state(&op.id, OperationState::Applied, None);
-                    continue;
+            OperationKind::SendDraft { .. } => {
+                let (draft, needs_reconcile) = match store.claim_send(&op, undo_ms) {
+                    Ok(Some(claim)) => claim,
+                    Ok(None) => continue,
+                    Err(e) => return SyncState::SyncFailed(e.to_string()),
                 };
                 let subject = draft.display_subject();
-                let _ = store.set_draft_state(&draft.id, &DraftState::Sending);
+                let finish = |draft_state, error: &str| {
+                    store.finish_send_attempt(&op, &draft_state, error).map_err(|e| SyncState::SyncFailed(e.to_string()))
+                };
                 let outgoing_font = store
                     .setting::<overlook_core::Prefs>("prefs")
                     .ok()
@@ -901,7 +903,6 @@ async fn replay_operations(
                     labels: labels.clone(),
                     outgoing_font,
                 };
-                let needs_reconcile = op.state == OperationState::Uncertain || draft.state == DraftState::Uncertain;
                 let send_result = if needs_reconcile {
                     match provider.reconcile_send(&account, &draft).await {
                         Ok(SendOutcome::Delivered(provider_id)) => {
@@ -912,15 +913,29 @@ async fn replay_operations(
                                 rfc_message_id: Some(rfc),
                             })
                         }
-                        Ok(SendOutcome::NotDelivered) => provider.send(&account, &draft, context).await,
-                        Ok(SendOutcome::Unknown) => {
-                            // The provider cannot tell; the Outbox offers "Send again" and
-                            // "Discard". Later operations are not held up.
-                            let _ = store.set_operation_state(&op.id, OperationState::Uncertain, Some(UNCERTAIN_SEND_WORDING));
-                            let _ = store.set_draft_state(&draft.id, &DraftState::Uncertain);
+                        // Gmail reports a search miss as NotDelivered. Its index can lag an
+                        // accepted send, so only definitive evidence makes a retry safe.
+                        Ok(SendOutcome::NotDelivered) if provider.kind() != ProviderKind::Gmail => {
+                            provider.send(&account, &draft, context).await
+                        }
+                        Ok(SendOutcome::Unknown | SendOutcome::NotDelivered) => {
+                            if let Err(state) = finish(DraftState::Uncertain, UNCERTAIN_SEND_WORDING) {
+                                return state;
+                            }
                             continue;
                         }
-                        Err(e) => Err(e),
+                        Err(err) => {
+                            // A failed lookup says nothing about the original submission.
+                            if let Err(state) = finish(DraftState::Uncertain, UNCERTAIN_SEND_WORDING) {
+                                return state;
+                            }
+                            if matches!(err, ProviderError::Rejected(_)) {
+                                continue;
+                            }
+                            outcome.stopped_offline = matches!(err, ProviderError::Offline);
+                            outcome.rate_limited = matches!(err, ProviderError::RateLimited(_));
+                            return state_for(&err);
+                        }
                     }
                 } else {
                     provider.send(&account, &draft, context).await
@@ -929,30 +944,32 @@ async fn replay_operations(
                     Ok(receipt) => {
                         if let Err(e) = store.complete_send(&draft.id, &op.id, &receipt.message) {
                             warn!("complete_send failed: {e}");
-                            let _ = store.set_operation_state(&op.id, OperationState::Failed, Some(&e.to_string()));
-                            let _ = store.set_draft_state(&draft.id, &DraftState::Failed(e.to_string()));
-                            outcome.failed.push(subject);
-                        } else {
-                            info!("sent {subject}");
-                            outcome.sent.push(subject);
-                            outcome.applied += 1;
+                            let _ = finish(DraftState::Uncertain, "Provider accepted the message, but local delivery confirmation could not be saved.");
+                            outcome.uncertain.push(subject);
+                            return SyncState::SyncFailed(e.to_string());
                         }
+                        info!("sent {subject}");
+                        outcome.sent.push(subject);
+                        outcome.applied += 1;
                     }
                     Err(ProviderError::Uncertain) => {
-                        let _ = store.set_operation_state(&op.id, OperationState::Uncertain, Some("connection dropped during sending"));
-                        let _ = store.set_draft_state(&draft.id, &DraftState::Uncertain);
+                        if let Err(state) = finish(DraftState::Uncertain, "connection dropped during sending") {
+                            return state;
+                        }
                         outcome.uncertain.push(subject);
                         final_state = SyncState::Offline;
                         break;
                     }
                     Err(ProviderError::Rejected(reason)) => {
-                        let _ = store.set_operation_state(&op.id, OperationState::Failed, Some(&reason));
-                        let _ = store.set_draft_state(&draft.id, &DraftState::Failed(reason));
+                        if let Err(state) = finish(DraftState::Failed(reason.clone()), &reason) {
+                            return state;
+                        }
                         outcome.failed.push(subject);
                     }
                     Err(err) => {
-                        let _ = store.set_operation_state(&op.id, OperationState::Pending, Some(&err.to_string()));
-                        let _ = store.set_draft_state(&draft.id, &DraftState::Queued);
+                        if let Err(state) = finish(DraftState::Queued, &err.to_string()) {
+                            return state;
+                        }
                         final_state = state_for(&err);
                         outcome.stopped_offline = matches!(err, ProviderError::Offline);
                         outcome.rate_limited = matches!(err, ProviderError::RateLimited(_));
@@ -2003,6 +2020,56 @@ mod tests {
         assert_eq!((third.provider_id.clone(), label_of(&third)), (Some(MessageRef::provider_id("Archive", validity, 1)), "Archive".to_owned()));
         assert_eq!(store.pending_count(&env.account.id).unwrap(), 0);
         assert_eq!(store.message_count(&env.account.id).unwrap(), 3);
+    }
+
+    #[test]
+    fn imap_restarted_send_reconciles_an_existing_sent_copy() {
+        let env = imap_env("send-restart-delivered");
+        let live = imap_provider(&env);
+        let store = open_store(&env);
+        block_on(run_sync(store.clone(), live.clone(), None, env.account.clone(), false));
+        let draft = queued_draft(&store, &env.account);
+        let op = store.pending_operations(&env.account.id).unwrap().remove(0);
+        let (claimed, reconcile) = store.claim_send(&op, 0).unwrap().unwrap();
+        assert!(!reconcile);
+        let labels = store.labels(&env.account.id).unwrap();
+        let context = SendContext {
+            sent_label: labels.iter().find(|l| l.kind == LabelKind::Sent).map(|l| l.id.clone()),
+            labels,
+            ..Default::default()
+        };
+        // Simulate the owner exiting after SMTP accepts the message and before complete_send.
+        block_on(live.send(&env.account, &claimed, context)).unwrap();
+        drop(store);
+
+        let store = open_store(&env);
+        let outcome = block_on(run_sync(store.clone(), imap_provider(&env), None, env.account.clone(), false));
+        assert_eq!(outcome.sent, vec![draft.subject.clone()]);
+        assert_eq!(env.smtp.seen.lock().unwrap().len(), 1);
+        assert_eq!(env.imap.lock().folder("Sent").messages.len(), 1);
+        assert!(store.draft(&draft.id).unwrap().is_none());
+        assert_eq!(store.pending_count(&env.account.id).unwrap(), 0);
+    }
+
+    #[test]
+    fn imap_restarted_send_without_confirmation_stays_uncertain() {
+        let env = imap_env("send-restart-unknown");
+        let live = imap_provider(&env);
+        let store = open_store(&env);
+        block_on(run_sync(store.clone(), live, None, env.account.clone(), false));
+        let draft = queued_draft(&store, &env.account);
+        let op = store.pending_operations(&env.account.id).unwrap().remove(0);
+        // An older owner could exit between writing the operation and draft states.
+        store.set_operation_state(&op.id, OperationState::InFlight, None).unwrap();
+        drop(store);
+
+        let store = open_store(&env);
+        let outcome = block_on(run_sync(store.clone(), imap_provider(&env), None, env.account.clone(), false));
+        assert_eq!(outcome.state, Some(SyncState::UpToDate));
+        assert!(outcome.sent.is_empty());
+        assert!(env.smtp.seen.lock().unwrap().is_empty());
+        assert_eq!(store.draft(&draft.id).unwrap().unwrap().state, DraftState::Uncertain);
+        assert_eq!(store.pending_operations(&env.account.id).unwrap()[0].state, OperationState::Uncertain);
     }
 
     #[test]
