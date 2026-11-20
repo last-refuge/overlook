@@ -62,9 +62,9 @@ impl AccountMark {
         self.render_badge(size, size / 2., 0.62, p)
     }
 
-    /// The sidebar has room for a rounded square with more space for the artwork.
+    /// The sidebar uses a rounded square with a clear inset around the artwork.
     pub(super) fn render_sidebar(self, size: f32, p: &Palette) -> AnyElement {
-        self.render_badge(size, size / 4., 0.9, p)
+        self.render_badge(size, size / 4., 0.75, p)
     }
 
     fn render_badge(self, size: f32, corner_radius: f32, logo_fill: f32, p: &Palette) -> AnyElement {
