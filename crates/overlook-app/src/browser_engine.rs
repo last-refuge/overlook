@@ -341,9 +341,7 @@ impl BrowserHandle {
                             None => break,
                         };
                         for command in commands {
-                            layout_dirty |= matches!(&command, Input::Resize(..) | Input::Key(..) | Input::SelectAll)
-                                || matches!(&command, Input::Mouse(kind, _, _, _, buttons, _) if kind != "mouseMoved" || *buttons != 0);
-                            actor.input(command, &emit)?;
+                            layout_dirty |= actor.input(command, &emit)?;
                         }
                         if layout_dirty {
                             actor.refresh_layout(&emit)?;
@@ -1026,11 +1024,13 @@ impl Actor {
             style.textContent='html{{overflow:auto!important;scrollbar-width:none!important}} html::-webkit-scrollbar{{display:none!important;width:0!important;height:0!important}} body{{overflow:visible!important;overflow-wrap:anywhere}} *,*::before,*::after{{animation:none!important;transition:none!important;caret-color:transparent!important}}';
             document.head.append(style);
             globalThis.overlookApplyDarkPaper = undefined;
+            globalThis.overlookPaperHoverTarget = null;
             if (paper !== null) {{
                 const originals = new Map();
                 globalThis.overlookApplyDarkPaper = () => {{
-                    // Re-read the sender's styles when the pane crosses a media-query
-                    // breakpoint. Read all computed colors before writing any overrides.
+                    // Restore the sender's cascade before measuring current styles, so
+                    // responsive, hover, focus, and disclosure rules can change the fill.
+                    // Read all computed colors before writing any overrides.
                     for (const [node, inline] of originals) {{
                         if (inline === null) node.removeAttribute('style');
                         else node.setAttribute('style', inline);
@@ -1051,7 +1051,6 @@ impl Actor {
                     }}
                     for (const node of originals.keys()) node.style.setProperty('background-color', paper, 'important');
                 }};
-                globalThis.overlookApplyDarkPaper();
             }}
             return true;
         }})({args})"#))?;
@@ -1146,7 +1145,8 @@ impl Actor {
         }
         Ok(())
     }
-    fn scrollability(&mut self, x: f64, y: f64, emit: &impl Fn(BrowserEvent)) -> Result<()> {
+    /// Reports scrollability and whether the dark document changed its hover target.
+    fn update_pointer_state(&mut self, x: f64, y: f64, emit: &impl Fn(BrowserEvent)) -> Result<bool> {
         let args = json!([x, y]);
         let state = self.cdp.eval(format!(r#"(([x,y])=>{{
             const s=[false,false,false,false];
@@ -1154,7 +1154,12 @@ impl Actor {
                 if(root||/auto|scroll/.test(c.overflowY)){{s[0] ||= e.scrollTop>1;s[1] ||= e.scrollTop+e.clientHeight<e.scrollHeight-1;}}
                 if(root||/auto|scroll/.test(c.overflowX)){{s[2] ||= e.scrollLeft>1;s[3] ||= e.scrollLeft+e.clientWidth<e.scrollWidth-1;}}
             }};
-            let e=document.elementFromPoint(x,y);for(let i=0;e&&i<256;i++,e=e.parentElement)add(e);
+            let e=document.elementFromPoint(x,y);
+            if (globalThis.overlookApplyDarkPaper) {{
+                s.push(e !== globalThis.overlookPaperHoverTarget);
+                globalThis.overlookPaperHoverTarget = e;
+            }}
+            for(let i=0;e&&i<256;i++,e=e.parentElement)add(e);
             add(document.scrollingElement);return s;
         }})({args})"#))?;
         emit(BrowserEvent::Scrollability {
@@ -1163,7 +1168,7 @@ impl Actor {
             left: state[2].as_bool().unwrap_or(false),
             right: state[3].as_bool().unwrap_or(false),
         });
-        Ok(())
+        Ok(state[4].as_bool().unwrap_or(false))
     }
 
     fn anchor(&mut self, x: f64, y: f64) -> Result<Option<String>> {
@@ -1171,7 +1176,10 @@ impl Actor {
         let v = self.cdp.eval(format!("(([x,y])=>document.elementFromPoint(x,y)?.closest('a,area')?.getAttribute('data-overlook-link')||'')({args})"))?;
         Ok(v.as_str().filter(|s| safe_link(s)).map(str::to_owned))
     }
-    fn input(&mut self, input: Input, emit: &impl Fn(BrowserEvent)) -> Result<()> {
+    /// Whether the input changed the page enough to regenerate its tiles.
+    fn input(&mut self, input: Input, emit: &impl Fn(BrowserEvent)) -> Result<bool> {
+        let repaint = matches!(&input, Input::Resize(..) | Input::Key(..) | Input::SelectAll)
+            || matches!(&input, Input::Mouse(kind, _, _, _, buttons, _) if kind != "mouseMoved" || *buttons != 0);
         match input {
             Input::VisibleRange(top, bottom) => {
                 let range = (top.min(100_000), bottom.max(top).min(100_000));
@@ -1187,8 +1195,6 @@ impl Actor {
                 }
             }
             Input::Resize(w, _h, s) => {
-                let previous_width = self.width;
-                let previous_scale = self.scale;
                 self.width = w.clamp(1, 2048);
                 self.cap = 900;
                 self.scale = if s.is_finite() {
@@ -1198,9 +1204,6 @@ impl Actor {
                 };
                 self.height = 900;
                 self.metrics()?;
-                if self.dark && (self.width != previous_width || self.scale != previous_scale) {
-                    self.cdp.eval("globalThis.overlookApplyDarkPaper()".into())?;
-                }
             }
             Input::Mouse(kind, x, y, button, buttons, count) => {
                 if !x.is_finite()
@@ -1214,7 +1217,7 @@ impl Actor {
                         "none" | "left" | "middle" | "right" | "back" | "forward"
                     )
                 {
-                    return Ok(());
+                    return Ok(false);
                 }
                 // Blink needs the held button as well as its buttons mask for
                 // drag selection. A hover-style `button:none` with buttons:1
@@ -1229,7 +1232,8 @@ impl Actor {
                         _ => "none",
                     }
                 } else { button.as_str() };
-                let viewport_y = self.interaction_y(y)?;
+                // A pointer leaving the native surface has no document coordinate.
+                let viewport_y = if x < 0. && y < 0. { y } else { self.interaction_y(y)? };
                 self.pointer = (x, viewport_y);
                 if kind == "mousePressed" && button == "left" {
                     self.pressed = self.anchor(x, viewport_y)?.map(|url| (url, x, y, Instant::now()));
@@ -1246,19 +1250,19 @@ impl Actor {
                     }
                 }
                 self.cdp.call("Input.dispatchMouseEvent", json!({"type":kind,"x":x,"y":viewport_y,"button":button,"buttons":buttons & 31,"clickCount":count.min(3)}))?;
-                self.scrollability(x, viewport_y, emit)?;
+                return Ok(self.update_pointer_state(x, viewport_y, emit)? || repaint);
             }
             // The native pane exclusively owns scrolling; never dispatch root wheels.
             Input::Scroll(..) => {}
             Input::Key(kind, key, code, modifiers, text) => {
                 if !matches!(kind.as_str(), "keyDown" | "keyUp" | "rawKeyDown" | "char") {
-                    return Ok(());
+                    return Ok(false);
                 }
                 if key == "Enter" && matches!(kind.as_str(), "keyDown" | "rawKeyDown") {
                     let v = self.cdp.eval("document.activeElement?.closest('a,area')?.getAttribute('data-overlook-link')||''".into())?;
                     if let Some(url) = v.as_str().filter(|s| safe_link(s)) {
                         emit(BrowserEvent::Link(url.into()));
-                        return Ok(());
+                        return Ok(false);
                     }
                 }
                 // Clipboard shortcuts are host-only; never touch system clipboard.
@@ -1266,13 +1270,13 @@ impl Actor {
                     if kind != "keyUp" {
                         self.selection(emit)?;
                     }
-                    return Ok(());
+                    return Ok(false);
                 }
                 if modifiers & (2 | 4) != 0 && key.eq_ignore_ascii_case("a") {
                     if kind != "keyUp" {
                         self.select_all()?;
                     }
-                    return Ok(());
+                    return Ok(repaint);
                 }
                 let virtual_key = match key.as_str() {
                     "Tab" => 9, "Enter" => 13, "Escape" => 27,
@@ -1306,12 +1310,12 @@ impl Actor {
             Input::SelectAll => self.select_all()?,
             Input::ContextMenu { x, y, request_id } => {
                 if !x.is_finite() || !y.is_finite() {
-                    return Ok(());
+                    return Ok(false);
                 }
                 self.context_menu(x, y, request_id, emit)?;
             }
         }
-        Ok(())
+        Ok(repaint)
     }
     fn context_menu(
         &mut self,
@@ -1371,6 +1375,9 @@ impl Actor {
     }
 
     fn refresh_layout(&mut self, emit: &impl Fn(BrowserEvent)) -> Result<()> {
+        if self.dark {
+            self.cdp.eval("globalThis.overlookApplyDarkPaper()".into())?;
+        }
         self.document_height = self.measure_height()?;
         self.revision = self.revision.wrapping_add(1);
         self.tiles.clear();
@@ -2640,6 +2647,7 @@ mod tests {
                     &fonts,
                 );
                 actor.load(&document.html, appearance.dark_paper()).unwrap();
+                actor.refresh_layout(&|_| {}).unwrap();
                 let (png, _, _) = actor.frame().unwrap();
                 let pixels = image::load_from_memory(&png).unwrap().into_rgb8();
                 let paper = appearance.paper.to_be_bytes();
@@ -2654,8 +2662,10 @@ mod tests {
                         pixels.get_pixel(x, y).0.iter().all(|&channel| channel > 192)
                     })), "the authored black text should be readable on the dark card");
                     actor.input(Input::Resize(640, 900, 1.0), &|_| {}).unwrap();
+                    actor.refresh_layout(&|_| {}).unwrap();
                     assert_eq!(actor.cdp.eval("getComputedStyle(document.querySelector('#card')).backgroundColor".into()).unwrap(), "rgb(40, 69, 99)");
                     actor.input(Input::Resize(800, 900, 1.0), &|_| {}).unwrap();
+                    actor.refresh_layout(&|_| {}).unwrap();
                     let (png, _, _) = actor.frame().unwrap();
                     assert_eq!(image::load_from_memory(&png).unwrap().into_rgb8().get_pixel(400, 50).0, paper);
                 } else {
@@ -2669,6 +2679,52 @@ mod tests {
 
     #[test]
     #[ignore = "runs real sandboxed Chromium"]
+    fn chromium_email_paper_keeps_sender_hover_and_disclosure_colors() {
+        let appearance = crate::theme::Palette::dark().email_body_appearance(true);
+        let document = appearance.prepare_document(
+            r##"
+                <style>
+                    .button, summary { background: white; width: 160px; height: 40px; }
+                    .button:hover { background: #e86714 !important; }
+                    details[open] summary { background: #284563 !important; }
+                </style>
+                <a class="button" style="display:block" href="https://example.org/">Synthetic link</a>
+                <details><summary>Earlier message</summary><p>Synthetic history</p></details>
+            "##,
+            &overlook_core::FontPrefs::default(),
+        );
+        let mut actor = Actor::start(Arc::new(AtomicBool::new(false)), false).unwrap();
+        actor.load(&document.html, appearance.dark_paper()).unwrap();
+        actor.refresh_layout(&|_| {}).unwrap();
+        let color = |actor: &mut Actor, selector: &str| {
+            actor.cdp.eval(format!("getComputedStyle(document.querySelector({selector:?})).backgroundColor")).unwrap()
+        };
+        let paper = color(&mut actor, "body");
+        assert_eq!(color(&mut actor, ".button"), paper);
+        assert_eq!(color(&mut actor, "summary"), paper);
+
+        for (x, y, expected) in [(15., 10., "rgb(232, 103, 20)".into()), (-1., -1., paper.clone())] {
+            let moved = Input::Mouse("mouseMoved".into(), x, y, "none".into(), 0, 0);
+            assert!(actor.input(moved, &|_| {}).unwrap(), "hover changes require repainting");
+            actor.refresh_layout(&|_| {}).unwrap();
+            assert_eq!(color(&mut actor, ".button"), expected);
+        }
+
+        for (kind, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {
+            let click = Input::Mouse(kind.into(), 15., 50., "left".into(), buttons, 1);
+            assert!(actor.input(click, &|_| {}).unwrap());
+        }
+        actor.refresh_layout(&|_| {}).unwrap();
+        assert_eq!(color(&mut actor, "summary"), "rgb(40, 69, 99)");
+
+        let enter = Input::Key("keyDown".into(), "Enter".into(), "Enter".into(), 0, None);
+        assert!(actor.input(enter, &|_| {}).unwrap());
+        actor.refresh_layout(&|_| {}).unwrap();
+        assert_eq!(color(&mut actor, "summary"), paper);
+    }
+
+    #[test]
+    #[ignore = "runs real sandboxed Chromium"]
     fn chromium_nested_scroll_edges() {
         let mut actor = Actor::start(Arc::new(AtomicBool::new(false)), false).unwrap();
         let doc = overlook_core::browser::prepare_document("<div style='height:60px;overflow:auto'><div style='height:200px'>Synthetic nested panel</div></div>");
@@ -2677,7 +2733,7 @@ mod tests {
         actor.frame().unwrap();
         let events = Mutex::new(Vec::new());
         actor
-            .scrollability(10., 10., &|e| events.lock().unwrap().push(e))
+            .update_pointer_state(10., 10., &|e| events.lock().unwrap().push(e))
             .unwrap();
         assert!(matches!(
             events.lock().unwrap().last(),
@@ -2690,7 +2746,7 @@ mod tests {
         actor.cdp.eval("document.querySelector('body div').scrollTop=1000".into()).unwrap();
         thread::sleep(Duration::from_millis(150));
         actor
-            .scrollability(10., 10., &|e| events.lock().unwrap().push(e))
+            .update_pointer_state(10., 10., &|e| events.lock().unwrap().push(e))
             .unwrap();
         assert!(matches!(
             events.lock().unwrap().last(),

@@ -1128,10 +1128,19 @@ impl Render for BrowserBody {
                 if this.error.is_some() { return; }
                 // Active drags (including outside the viewport) are tracked at the window level.
                 if this.buttons != 0 || event.pressed_button.is_some() { return; }
+                // A later opening should not reuse tiles with sender hover styles.
+                if this.prepared.dark_paper.is_some() { this.cache_initial_layout = false; }
                 let (x, y) = this.position(event.position);
                 this.browser
                     .mouse("mouseMoved", x, y, "none", 0, 0);
             }))
+            .when(self.prepared.dark_paper.is_some(), |surface| {
+                surface.on_hover(cx.listener(|this, hovered: &bool, _, _| {
+                    if !hovered && this.buttons == 0 && this.error.is_none() {
+                        this.browser.mouse("mouseMoved", -1., -1., "none", 0, 0);
+                    }
+                }))
+            })
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.error.is_some() || !this.focus.contains_focused(window, cx)
                     || !browser_handles_key(&event.keystroke)
