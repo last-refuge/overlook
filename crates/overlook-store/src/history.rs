@@ -96,7 +96,13 @@ pub(crate) fn rename_labels_tx(tx: &Connection, account: &AccountId, id_changes:
         rows.collect::<rusqlite::Result<_>>()?
     };
     for (id, json) in rows {
-        let Ok(mut reversal) = serde_json::from_str::<Reversal>(&json) else { continue };
+        let mut reversal = match serde_json::from_str::<Reversal>(&json) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(history_id = id, error = %e, "ignoring corrupt reversal_json during folder rename");
+                continue;
+            }
+        };
         let mut changed = false;
         for (old, new) in id_changes {
             changed |= reversal.rename_label(old, new);
@@ -112,19 +118,51 @@ pub(crate) fn rename_labels_tx(tx: &Connection, account: &AccountId, id_changes:
 /// Only messages the changes actually affect are reversed, so a mixed selection (some
 /// already starred, some already in the Inbox) goes back exactly as it was.
 pub fn reversal_for(changes: &[LocalChange], index: &MailIndex) -> Vec<LocalChange> {
+    if changes.is_empty() {
+        return Vec::new();
+    }
     let inbox = index.label_of_kind(LabelKind::Inbox);
     let trash = index.label_of_kind(LabelKind::Trash);
-    let mut scratch = index.clone();
-    let mut out: Vec<Vec<LocalChange>> = Vec::new();
+    if changes.len() == 1 {
+        return inverse_of(&changes[0], &|id| index.message(id), inbox.as_ref(), trash.as_ref());
+    }
+    // Clone only the affected messages into a small local overlay instead of cloning the entire MailIndex.
+    let mut overlay: HashMap<MessageId, Option<Message>> = HashMap::new();
+    let mut out: Vec<Vec<LocalChange>> = Vec::with_capacity(changes.len());
     for change in changes {
-        out.push(inverse_of(change, &scratch, inbox.as_ref(), trash.as_ref()));
-        scratch.apply(change);
+        let rev = {
+            let lookup = |id: &MessageId| -> Option<&Message> {
+                match overlay.get(id) {
+                    Some(slot) => slot.as_ref(),
+                    None => index.message(id),
+                }
+            };
+            inverse_of(change, &lookup, inbox.as_ref(), trash.as_ref())
+        };
+        out.push(rev);
+        if let LocalChange::DeleteForever { message_ids, .. } = change {
+            for id in message_ids {
+                overlay.insert(id.clone(), None);
+            }
+        } else {
+            for id in change.message_ids() {
+                let slot = overlay.entry(id.clone()).or_insert_with(|| index.message(id).cloned());
+                if let Some(m) = slot.as_mut() {
+                    apply_to_message(m, change, inbox.as_ref(), trash.as_ref());
+                }
+            }
+        }
     }
     out.into_iter().rev().flatten().collect()
 }
 
-fn inverse_of(change: &LocalChange, index: &MailIndex, inbox: Option<&LabelId>, trash: Option<&LabelId>) -> Vec<LocalChange> {
-    let known = |ids: &[MessageId]| -> Vec<&Message> { ids.iter().filter_map(|id| index.message(id)).collect() };
+fn inverse_of<'a>(
+    change: &LocalChange,
+    lookup: &dyn Fn(&MessageId) -> Option<&'a Message>,
+    inbox: Option<&LabelId>,
+    trash: Option<&LabelId>,
+) -> Vec<LocalChange> {
+    let known = |ids: &[MessageId]| -> Vec<&'a Message> { ids.iter().filter_map(lookup).collect() };
     let ids_where = |ids: &[MessageId], keep: &dyn Fn(&Message) -> bool| -> Vec<MessageId> { known(ids).into_iter().filter(|m| keep(m)).map(|m| m.id.clone()).collect() };
     let has = |m: &Message, l: Option<&LabelId>| l.is_some_and(|l| m.has_label(l));
     let mut out = Vec::new();
@@ -184,8 +222,46 @@ fn row_to_entry(r: &Row<'_>) -> rusqlite::Result<(HistoryEntry, String)> {
 
 fn with_reversal((mut entry, json): (HistoryEntry, String)) -> HistoryEntry {
     // A row written by a newer version may hold a reversal this one doesn't know.
-    entry.reversal = serde_json::from_str(&json).unwrap_or(Reversal::None);
+    entry.reversal = serde_json::from_str(&json).unwrap_or_else(|e| {
+        tracing::warn!(history_id = entry.id, error = %e, "unrecognized or corrupt reversal_json; treating as non-undoable");
+        Reversal::None
+    });
     entry
+}
+
+fn last_undoable_tx(conn: &Connection, account: &AccountId) -> Result<Option<HistoryEntry>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {ENTRY_COLUMNS} FROM change_history WHERE account_id=?1 AND undone_at IS NULL ORDER BY at DESC, id DESC LIMIT ?2"
+    ))?;
+    let mut rows = stmt.query_map(params![account.0, HISTORY_MAX_ENTRIES as i64], row_to_entry)?;
+    for row in &mut rows {
+        let entry = with_reversal(row?);
+        if entry.can_undo() {
+            return Ok(Some(entry));
+        }
+    }
+    Ok(None)
+}
+
+fn undoable_since_tx(conn: &Connection, account: &AccountId, id: i64) -> Result<Vec<HistoryEntry>> {
+    let target: Option<Timestamp> = conn
+        .query_row("SELECT at FROM change_history WHERE id=?1 AND account_id=?2", params![id, account.0], |r| r.get(0))
+        .optional()?;
+    let Some(target_at) = target else { return Ok(Vec::new()) };
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {ENTRY_COLUMNS} FROM change_history
+         WHERE account_id=?1 AND undone_at IS NULL AND (at > ?2 OR (at = ?2 AND id >= ?3))
+         ORDER BY at DESC, id DESC LIMIT ?4"
+    ))?;
+    let rows = stmt.query_map(params![account.0, target_at, id, HISTORY_MAX_ENTRIES as i64], row_to_entry)?;
+    let mut out = Vec::new();
+    for row in rows {
+        let entry = with_reversal(row?);
+        if entry.can_undo() {
+            out.push(entry);
+        }
+    }
+    Ok(out)
 }
 
 impl Store {
@@ -204,30 +280,28 @@ impl Store {
 
     /// The account's recorded actions, newest first.
     pub fn history(&self, account: &AccountId, limit: usize) -> Result<Vec<HistoryEntry>> {
-        self.with_conn(|conn| {
-            let mut stmt = conn.prepare(&format!("SELECT {ENTRY_COLUMNS} FROM change_history WHERE account_id=?1 ORDER BY at DESC, id DESC LIMIT ?2"))?;
+        self.with_read(|conn| {
+            let mut stmt = conn.prepare_cached(&format!("SELECT {ENTRY_COLUMNS} FROM change_history WHERE account_id=?1 ORDER BY at DESC, id DESC LIMIT ?2"))?;
             let rows = stmt.query_map(params![account.0, limit as i64], row_to_entry)?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().map(with_reversal).collect())
         })
     }
 
     pub fn history_entry(&self, id: i64) -> Result<Option<HistoryEntry>> {
-        self.with_conn(|conn| {
+        self.with_read(|conn| {
             Ok(conn.query_row(&format!("SELECT {ENTRY_COLUMNS} FROM change_history WHERE id=?1"), [id], row_to_entry).optional()?.map(with_reversal))
         })
     }
 
     /// The newest entry of the account that can still be undone.
     pub fn last_undoable(&self, account: &AccountId) -> Result<Option<HistoryEntry>> {
-        Ok(self.history(account, HISTORY_MAX_ENTRIES)?.into_iter().find(HistoryEntry::can_undo))
+        self.with_read(|conn| last_undoable_tx(conn, account))
     }
 
     /// Entries of the account from `id` onwards that can still be undone, newest first: what
     /// "Restore to here" takes back.
     pub fn undoable_since(&self, account: &AccountId, id: i64) -> Result<Vec<HistoryEntry>> {
-        let all = self.history(account, HISTORY_MAX_ENTRIES)?;
-        let Some(pos) = all.iter().position(|e| e.id == id) else { return Ok(Vec::new()) };
-        Ok(all.into_iter().take(pos + 1).filter(HistoryEntry::can_undo).collect())
+        self.with_read_tx(|tx| undoable_since_tx(tx, account, id))
     }
 
     /// Marks an entry undone. Returns `false` if it already was, so an undo runs once.
@@ -239,28 +313,48 @@ impl Store {
     /// already undone or can't be undone. Claiming first means an undo runs once even when
     /// the button and Ctrl+Z race.
     pub fn begin_undo(&self, id: i64) -> Result<Option<HistoryEntry>> {
-        let Some(entry) = self.history_entry(id)? else { return Ok(None) };
-        Ok((entry.can_undo() && self.mark_undone(id)?).then_some(entry))
+        let ts = now();
+        self.with_tx(|tx| {
+            let Some(entry) = tx
+                .query_row(&format!("SELECT {ENTRY_COLUMNS} FROM change_history WHERE id=?1"), [id], row_to_entry)
+                .optional()?
+                .map(with_reversal)
+            else {
+                return Ok(None);
+            };
+            if !entry.can_undo() {
+                return Ok(None);
+            }
+            let changed = tx.execute("UPDATE change_history SET undone_at=?2 WHERE id=?1 AND undone_at IS NULL", params![id, ts])?;
+            Ok((changed == 1).then_some(entry))
+        })
     }
 
     /// Claims the newest entry of the account that can still be undone (Ctrl+Z).
     pub fn begin_undo_last(&self, account: &AccountId) -> Result<Option<HistoryEntry>> {
-        let _claim = self.history_claim.lock().expect("history mutex poisoned");
-        let Some(entry) = self.last_undoable(account)? else { return Ok(None) };
-        Ok(self.mark_undone(entry.id)?.then_some(entry))
+        let ts = now();
+        self.with_tx(|tx| {
+            let Some(entry) = last_undoable_tx(tx, account)? else { return Ok(None) };
+            let changed = tx.execute("UPDATE change_history SET undone_at=?2 WHERE id=?1 AND undone_at IS NULL", params![entry.id, ts])?;
+            Ok((changed == 1).then_some(entry))
+        })
     }
 
     /// Claims every entry from `id` onwards that can still be undone, newest first
     /// ("Restore to here").
     pub fn begin_undo_since(&self, account: &AccountId, id: i64) -> Result<Vec<HistoryEntry>> {
-        let _claim = self.history_claim.lock().expect("history mutex poisoned");
-        let mut out = Vec::new();
-        for entry in self.undoable_since(account, id)? {
-            if self.mark_undone(entry.id)? {
-                out.push(entry);
+        let ts = now();
+        self.with_tx(|tx| {
+            let entries = undoable_since_tx(tx, account, id)?;
+            let mut out = Vec::with_capacity(entries.len());
+            let mut update = tx.prepare_cached("UPDATE change_history SET undone_at=?2 WHERE id=?1 AND undone_at IS NULL")?;
+            for entry in entries {
+                if update.execute(params![entry.id, ts])? == 1 {
+                    out.push(entry);
+                }
             }
-        }
-        Ok(out)
+            Ok(out)
+        })
     }
 
     /// Keeps the entry in the timeline but stops offering to undo it (an undo that came too
@@ -275,8 +369,8 @@ impl Store {
 
     /// The account's messages that carry `label`, for putting a deleted label back.
     pub fn message_ids_with_label(&self, account: &AccountId, label: &LabelId) -> Result<Vec<MessageId>> {
-        self.with_conn(|conn| {
-            let mut stmt = conn.prepare("SELECT ml.message_id FROM message_labels ml JOIN messages m ON m.id=ml.message_id WHERE m.account_id=?1 AND ml.label_id=?2 ORDER BY ml.message_id")?;
+        self.with_read(|conn| {
+            let mut stmt = conn.prepare_cached("SELECT ml.message_id FROM message_labels ml JOIN messages m ON m.id=ml.message_id WHERE m.account_id=?1 AND ml.label_id=?2 ORDER BY ml.message_id")?;
             let rows = stmt.query_map(params![account.0, label.0], |r| Ok(MessageId(r.get(0)?)))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         })
@@ -491,5 +585,45 @@ mod tests {
         let left = store.history(&a, 10).unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].reversal, Reversal::RestoreFolder { label_id: LabelId::from("x"), parent: None });
+    }
+
+    #[test]
+    fn reversal_for_handles_empty_single_and_multi_step_with_delete_forever() {
+        let idx = index();
+        assert!(reversal_for(&[], &idx).is_empty());
+        // Multi-step: star + trash + set_read on same message round-trips via local overlay.
+        assert_round_trip(vec![
+            LocalChange::SetStarred { message_ids: ids(&["in", "archived"]), starred: true },
+            LocalChange::Trash { message_ids: ids(&["in", "archived"]) },
+            LocalChange::SetRead { message_ids: ids(&["in", "archived"]), read: true },
+        ]);
+        // DeleteForever hides the message from subsequent changes in the same batch.
+        let rev = reversal_for(
+            &[
+                LocalChange::DeleteForever { message_ids: ids(&["in"]), folder: None },
+                LocalChange::SetRead { message_ids: ids(&["in", "archived"]), read: false },
+            ],
+            &idx,
+        );
+        assert_eq!(rev, vec![LocalChange::SetRead { message_ids: ids(&["archived"]), read: true }]);
+    }
+
+    #[test]
+    fn undoable_since_respects_tie_breaking_and_skips_undone_atomically() {
+        let store = store();
+        let a = AccountId::from("a");
+        let rev = |id: &str| Reversal::Changes { changes: vec![LocalChange::Untrash { message_ids: ids(&[id]) }] };
+        let t = now();
+        let e1 = store.record_history(&a, t, "1", "", &rev("m1")).unwrap();
+        let e2 = store.record_history(&a, t, "2", "", &rev("m2")).unwrap();
+        let e3 = store.record_history(&a, t, "3", "", &rev("m3")).unwrap();
+        let e4 = store.record_history(&a, t + 1, "4", "", &rev("m4")).unwrap();
+        assert!(store.begin_undo(e3).unwrap().is_some());
+        // Since e2 with same timestamp t: includes e4 (t+1) and e2 (t, id=e2), skips undone e3 and older-id e1.
+        let claimed = store.begin_undo_since(&a, e2).unwrap();
+        assert_eq!(claimed.iter().map(|e| e.id).collect::<Vec<_>>(), vec![e4, e2]);
+        // Only e1 remains undoable.
+        assert_eq!(store.last_undoable(&a).unwrap().unwrap().id, e1);
+        assert!(store.begin_undo_since(&a, e2).unwrap().is_empty());
     }
 }

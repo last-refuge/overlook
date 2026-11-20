@@ -50,7 +50,7 @@ impl Store {
 
     /// Returns a CAS token and the exact original resource; this does not queue a write.
     pub fn caldav_change_for_event(&self, event: &Event, creating: bool) -> Result<CalDavChange> {
-        self.with_read(|tx| {
+        self.with_read_tx(|tx| {
             let connection=super::calendar_connections::read_connection(tx,&event.account_id)?.ok_or_else(||invalid("Connect a calendar service first."))?;
             let (owner,url,editable):(String,String,bool)=tx.query_row("SELECT c.account_id,c.provider_id,c.can_edit FROM calendars c JOIN caldav_collections d ON d.calendar_id=c.id WHERE c.id=?1 AND d.connection_id=?2",params![event.calendar_id.0,connection.id.0],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
             if owner!=event.account_id.0 || !connection.enabled || !editable {return Err(invalid("This calendar is read-only. Sync to check its permissions."));}
@@ -128,7 +128,7 @@ impl Store {
         })
     }
     pub fn caldav_change_current(&self, token: &CalDavChange) -> Result<bool> {
-        self.with_read(|tx| {
+        self.with_read_tx(|tx| {
             Ok(connection_current(tx, token)?
                 && read(tx, &token.calendar_id, &token.href)?.as_ref() == Some(token))
         })

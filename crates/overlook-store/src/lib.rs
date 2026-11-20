@@ -30,9 +30,10 @@ use overlook_core::focus::{FocusRule, FocusTab};
 use overlook_core::sanitize::html_to_text;
 use overlook_core::time::{now, Timestamp};
 use overlook_core::*;
-use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, Transaction};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 #[derive(Debug, thiserror::Error)]
@@ -182,42 +183,70 @@ impl LocalChange {
 }
 
 pub struct Store {
+    path: Option<PathBuf>,
     conn: Mutex<Connection>,
-    /// A second connection for the reads the window does on every action (the mail index,
-    /// the open conversation). With WAL it reads the last committed state while a sync
-    /// holds `conn` for a write, so the UI never waits for a download. `None` in memory.
-    reader: Option<Mutex<Connection>>,
+    /// A small pool of read-only connections for the reads the window does on every action
+    /// (the mail index, the open conversation). With WAL they read the last committed state
+    /// concurrently while a sync holds `conn` for a write, so the UI never waits for a
+    /// download. `None` in memory.
+    readers: Option<Vec<Mutex<Connection>>>,
+    next_reader: AtomicUsize,
     editing_drafts: Mutex<HashMap<DraftId, usize>>,
-    /// Serializes finding and claiming history entries, so two quick undos take two entries.
-    history_claim: Mutex<()>,
     /// A sync may outlive its window while another controller opens from the same store.
     mail_syncs: Mutex<HashMap<AccountId, Weak<()>>>,
 }
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                StoreError::Invalid(format!("could not create database directory {}: {e}", parent.display()))
+            })?;
         }
-        let mut store = Self::init(Connection::open(path)?)?;
-        let reader = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
-        reader.busy_timeout(std::time::Duration::from_secs(5))?;
-        store.reader = Some(Mutex::new(reader));
+        let writer = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let mut store = Self::init(writer, Some(path.to_path_buf()))?;
+        let mut readers = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let reader = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+            reader.busy_timeout(std::time::Duration::from_secs(5))?;
+            reader.pragma_update(None, "foreign_keys", "ON")?;
+            reader.pragma_update(None, "cache_size", -16384)?;
+            reader.pragma_update(None, "temp_store", "MEMORY")?;
+            reader.pragma_update(None, "query_only", "ON")?;
+            readers.push(Mutex::new(reader));
+        }
+        store.readers = Some(readers);
         Ok(store)
     }
 
     pub fn open_in_memory() -> Result<Self> {
-        Self::init(Connection::open_in_memory()?)
+        Self::init(Connection::open_in_memory()?, None)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
-        schema::ensure_supported(&conn)?;
+    fn init(mut conn: Connection, path: Option<PathBuf>) -> Result<Self> {
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let user_version = schema::ensure_supported(&conn)?;
+        if user_version == 0 {
+            conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+        }
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        schema::migrate(&conn)?;
-        Ok(Self { conn: Mutex::new(conn), reader: None, editing_drafts: Mutex::new(HashMap::new()), history_claim: Mutex::new(()), mail_syncs: Mutex::new(HashMap::new()) })
+        conn.pragma_update(None, "cache_size", -16384)?;
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
+        conn.pragma_update(None, "journal_size_limit", 67_108_864i64)?;
+        schema::migrate(&mut conn)?;
+        Ok(Self {
+            path,
+            conn: Mutex::new(conn),
+            readers: None,
+            next_reader: AtomicUsize::new(0),
+            editing_drafts: Mutex::new(HashMap::new()),
+            mail_syncs: Mutex::new(HashMap::new()),
+        })
     }
 
     /// Claims the account's mail sync until the returned lease is dropped. A new window
@@ -245,12 +274,40 @@ impl Store {
         f(&conn)
     }
 
-    /// Runs a read-only query on the reader connection when there is one.
-    fn with_read<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        match &self.reader {
-            Some(reader) => f(&reader.lock().expect("store reader mutex poisoned")),
-            None => self.with_conn(f),
+    /// Runs a read-only closure with mutable access to a reader connection (or the writer in memory).
+    fn with_read_mut<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
+        match &self.readers {
+            Some(readers) => {
+                for r in readers {
+                    if let Ok(mut guard) = r.try_lock() {
+                        return f(&mut guard);
+                    }
+                }
+                let idx = self.next_reader.fetch_add(1, Ordering::Relaxed) % readers.len();
+                let mut guard = readers[idx].lock().expect("store reader mutex poisoned");
+                f(&mut guard)
+            }
+            None => {
+                let mut conn = self.conn.lock().expect("store mutex poisoned");
+                f(&mut conn)
+            }
         }
+    }
+
+    /// Runs a read-only query on a reader connection when there is one.
+    fn with_read<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        self.with_read_mut(|c| f(c))
+    }
+
+    /// Runs multi-statement reads inside a single deferred read transaction so every query
+    /// sees a consistent WAL snapshot.
+    fn with_read_tx<T>(&self, f: impl FnOnce(&Transaction) -> Result<T>) -> Result<T> {
+        self.with_read_mut(|conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+            let out = f(&tx)?;
+            tx.commit()?;
+            Ok(out)
+        })
     }
 
     // ----------------------------------------------------------------- accounts
@@ -336,8 +393,9 @@ impl Store {
     /// Records where messages are kept (offline folders: each message's file).
     pub fn set_provider_ids(&self, ids: &[(MessageId, Option<ProviderId>)]) -> Result<()> {
         self.with_tx(|tx| {
+            let mut stmt = tx.prepare_cached("UPDATE messages SET provider_id=?2 WHERE id=?1")?;
             for (id, pid) in ids {
-                tx.execute("UPDATE messages SET provider_id=?2 WHERE id=?1", params![id.0, pid.as_ref().map(|p| &p.0)])?;
+                stmt.execute(params![id.0, pid.as_ref().map(|p| &p.0)])?;
             }
             Ok(())
         })
@@ -353,6 +411,9 @@ impl Store {
     /// Removes an account and everything that belongs to it (cascade).
     pub fn delete_account(&self, account: &AccountId) -> Result<()> {
         self.with_tx(|tx| {
+            // Delete messages explicitly first so AFTER DELETE triggers clean up messages_fts
+            // (SQLite ON DELETE CASCADE does not fire triggers on child tables).
+            tx.execute("DELETE FROM messages WHERE account_id=?1", [&account.0])?;
             tx.execute("DELETE FROM accounts WHERE id=?1", [&account.0])?;
             Ok(())
         })
@@ -416,10 +477,24 @@ impl Store {
             // Undo history names folders by id as well.
             history::rename_labels_tx(tx, account, &id_changes)?;
             for (old, new) in id_prefixes {
-                tx.execute(
-                    "UPDATE messages SET provider_id = ?3 || substr(provider_id, length(?2) + 1) WHERE account_id=?1 AND substr(provider_id, 1, length(?2)) = ?2",
-                    params![account.0, old, new],
-                )?;
+                if old.is_empty() {
+                    tx.prepare_cached(
+                        "UPDATE messages SET provider_id = ?2 || provider_id WHERE account_id=?1 AND provider_id IS NOT NULL",
+                    )?
+                    .execute(params![account.0, new])?;
+                } else if let Some(upper) = prefix_upper_bound(old) {
+                    tx.prepare_cached(
+                        "UPDATE messages SET provider_id = ?3 || substr(provider_id, length(?2) + 1)
+                         WHERE account_id=?1 AND provider_id >= ?2 AND provider_id < ?4",
+                    )?
+                    .execute(params![account.0, old, new, upper])?;
+                } else {
+                    tx.prepare_cached(
+                        "UPDATE messages SET provider_id = ?3 || substr(provider_id, length(?2) + 1)
+                         WHERE account_id=?1 AND provider_id >= ?2",
+                    )?
+                    .execute(params![account.0, old, new])?;
+                }
             }
             // Queued operations name the folder too: a permanent deletion by its messages'
             // provider ids, a label change by the label id. Both must follow the rename or
@@ -430,7 +505,13 @@ impl Store {
                 rows.collect::<std::result::Result<_, _>>()?
             };
             for (id, json) in ops {
-                let Ok(mut kind) = serde_json::from_str::<OperationKind>(&json) else { continue };
+                let mut kind = match serde_json::from_str::<OperationKind>(&json) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        tracing::warn!(op_id = %id, error = %e, "ignoring corrupt kind_json during folder rename");
+                        continue;
+                    }
+                };
                 let mut changed = false;
                 match &mut kind {
                     OperationKind::DeleteForever { provider_ids, .. } => {
@@ -482,11 +563,7 @@ impl Store {
     }
 
     pub fn labels(&self, account: &AccountId) -> Result<Vec<Label>> {
-        self.with_read(|c| {
-            let mut stmt = c.prepare("SELECT id, account_id, kind, name, provider_id, color, sort_order FROM labels WHERE account_id=?1 ORDER BY sort_order, name")?;
-            let rows = stmt.query_map([&account.0], row_to_label)?;
-            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
-        })
+        self.with_read(|c| labels_tx(c, account))
     }
 
     pub fn label_by_kind(&self, account: &AccountId, kind: LabelKind) -> Result<Option<Label>> {
@@ -529,9 +606,11 @@ impl Store {
         }
         self.with_tx(|tx| {
             for incoming in messages {
-                let mut existing = load_messages(tx, "WHERE m.id=?1", params![incoming.id.0])?.pop();
+                let load_bodies = incoming.body.is_cached();
+                let mut existing = load_messages_with(tx, "WHERE m.id=?1", params![incoming.id.0], load_bodies)?.pop();
                 let mut merged = incoming.clone();
-                if let Some(local) = existing.take() {
+                let mut skip_body_write = false;
+                if let Some(local) = existing.as_ref() {
                     if merged.conversation_id.0.is_empty() {
                         // A header-only refresh from a provider without thread ids keeps the
                         // conversation the message was threaded into.
@@ -540,16 +619,39 @@ impl Store {
                     if !merged.body.is_cached() {
                         // A header-only row (IMAP flag refresh, new mail before its body
                         // arrives) must not blank what the body download already filled in.
-                        merged.body = local.body;
                         if merged.snippet.is_empty() {
-                            merged.snippet = local.snippet;
+                            merged.snippet = local.snippet.clone();
                         }
                         if merged.invitation.is_none() {
-                            merged.invitation = local.invitation;
+                            merged.invitation = local.invitation.clone();
                         }
+                        if merged.from == local.from
+                            && merged.to == local.to
+                            && merged.cc == local.cc
+                            && merged.snippet == local.snippet
+                        {
+                            // Body, people, and snippet are unchanged: skip reading/rewriting
+                            // message_bodies and skip html_to_text / FTS re-tokenization.
+                            skip_body_write = true;
+                        } else {
+                            let body: Option<(Option<String>, Option<String>)> = tx
+                                .prepare_cached("SELECT body_text, body_html FROM message_bodies WHERE message_id=?1")?
+                                .query_row([&incoming.id.0], |r| Ok((r.get(0)?, r.get(1)?)))
+                                .optional()?;
+                            if let Some((text, html)) = body {
+                                merged.body = Body { text, html };
+                            }
+                        }
+                    } else if merged.body == local.body
+                        && merged.from == local.from
+                        && merged.to == local.to
+                        && merged.cc == local.cc
+                        && merged.snippet == local.snippet
+                    {
+                        skip_body_write = true;
                     }
                     if merged.attachments.is_empty() {
-                        merged.attachments = local.attachments;
+                        merged.attachments = local.attachments.clone();
                     } else {
                         // Keep downloaded attachment files.
                         for a in &mut merged.attachments {
@@ -564,10 +666,11 @@ impl Store {
                     if protected.contains(&incoming.id) || local_primary.contains(&incoming.account_id) {
                         merged.is_read = local.is_read;
                         merged.is_starred = local.is_starred;
-                        merged.label_ids = local.label_ids;
+                        merged.label_ids = local.label_ids.clone();
                     }
                 }
-                upsert_message_tx(tx, &merged)?;
+                upsert_message_diff_tx(tx, &merged, existing.as_ref(), skip_body_write)?;
+                existing.take();
             }
             Ok(())
         })
@@ -576,9 +679,10 @@ impl Store {
     /// Removes messages deleted at the provider.
     pub fn delete_messages(&self, ids: &[MessageId]) -> Result<usize> {
         self.with_tx(|tx| {
+            let mut stmt = tx.prepare_cached("DELETE FROM messages WHERE id=?1")?;
             let mut n = 0;
             for id in ids {
-                n += tx.execute("DELETE FROM messages WHERE id=?1", [&id.0])?;
+                n += stmt.execute([&id.0])?;
             }
             Ok(n)
         })
@@ -589,15 +693,15 @@ impl Store {
     }
 
     pub fn message(&self, id: &MessageId) -> Result<Option<Message>> {
-        self.with_read(|c| {
-            let mut found = load_messages(c, "WHERE m.id=?1", params![id.0])?;
+        self.with_read_tx(|tx| {
+            let mut found = load_messages(tx, "WHERE m.id=?1", params![id.0])?;
             Ok(found.pop())
         })
     }
 
     pub fn messages_in_conversation(&self, account: &AccountId, conversation: &ConversationId) -> Result<Vec<Message>> {
-        self.with_read(|c| {
-            let mut msgs = load_messages(c, "WHERE m.account_id=?1 AND m.conversation_id=?2", params![account.0, conversation.0])?;
+        self.with_read_tx(|tx| {
+            let mut msgs = load_messages(tx, "WHERE m.account_id=?1 AND m.conversation_id=?2", params![account.0, conversation.0])?;
             msgs.sort_by_key(|m| m.date);
             Ok(msgs)
         })
@@ -605,23 +709,28 @@ impl Store {
 
     /// All messages of an account (prototype scale). Used to compute conversation lists.
     pub fn messages_for_account(&self, account: &AccountId) -> Result<Vec<Message>> {
-        self.with_read(|c| load_messages(c, "WHERE m.account_id=?1", params![account.0]))
+        self.with_read_tx(|tx| load_messages(tx, "WHERE m.account_id=?1", params![account.0]))
     }
 
     /// Every message of an account without bodies: enough for lists, counts and address
     /// lookups, at a fraction of the cost of [`Store::messages_for_account`].
     pub fn message_headers_for_account(&self, account: &AccountId) -> Result<Vec<Message>> {
-        self.with_read(|c| load_messages_with(c, "WHERE m.account_id=?1", params![account.0], false))
+        self.with_read_tx(|tx| load_messages_with(tx, "WHERE m.account_id=?1", params![account.0], false))
     }
 
     /// Every message of an account without its body, with labels, pending changes and
     /// Focused Inbox rules: enough to build any conversation list or count in memory.
     pub fn mail_index(&self, account: &AccountId) -> Result<MailIndex> {
-        let labels = self.labels(account)?;
-        let messages = self.message_headers_for_account(account)?;
-        let pending = self.pending_message_ids(account)?;
-        let rules = self.focus_rule_map(account)?;
-        Ok(MailIndex::new(labels, messages, pending, rules))
+        self.with_read_tx(|tx| {
+            let labels = labels_tx(tx, account)?;
+            let messages = load_messages_with(tx, "WHERE m.account_id=?1", params![account.0], false)?;
+            let pending = pending_message_ids_tx(tx, account)?;
+            let rules = focus_rules_tx(tx, account)?
+                .into_iter()
+                .map(|r| (r.email.to_ascii_lowercase(), r.focused))
+                .collect();
+            Ok(MailIndex::new(labels, messages, pending, rules))
+        })
     }
 
     /// Conversation summaries for a mailbox view, newest first. `focus` splits the Inbox
@@ -645,15 +754,7 @@ impl Store {
     // ------------------------------------------------------------ focused inbox
 
     pub fn focus_rules(&self, account: &AccountId) -> Result<Vec<FocusRule>> {
-        self.with_read(|c| {
-            let mut stmt = c.prepare("SELECT email, focused FROM focus_rules WHERE account_id=?1 ORDER BY email")?;
-            let rows = stmt.query_map([&account.0], |r| Ok(FocusRule { email: r.get(0)?, focused: r.get(1)? }))?;
-            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
-        })
-    }
-
-    fn focus_rule_map(&self, account: &AccountId) -> Result<HashMap<String, bool>> {
-        Ok(self.focus_rules(account)?.into_iter().map(|r| (r.email.to_ascii_lowercase(), r.focused)).collect())
+        self.with_read(|c| focus_rules_tx(c, account))
     }
 
     /// Sets (or with `None` clears) the standing rule for a sender.
@@ -679,8 +780,9 @@ impl Store {
     pub fn set_focus_override(&self, account: &AccountId, ids: &[MessageId], focused: Option<bool>) -> Result<()> {
         self.with_tx(|tx| {
             ensure_owned(tx, Owned::Message, account, ids.iter().map(|i| i.0.as_str()))?;
+            let mut stmt = tx.prepare_cached("UPDATE messages SET focus_override=?2 WHERE id=?1")?;
             for id in ids {
-                tx.execute("UPDATE messages SET focus_override=?2 WHERE id=?1", params![id.0, focused])?;
+                stmt.execute(params![id.0, focused])?;
             }
             Ok(())
         })
@@ -688,15 +790,20 @@ impl Store {
 
     /// Lowercase addresses the account owner has sent mail to.
     pub fn sent_recipients(&self, account: &AccountId) -> Result<HashSet<String>> {
-        let mut out = HashSet::new();
-        for m in self.message_headers_for_account(account)? {
-            if m.is_outgoing {
-                for a in m.to.iter().chain(m.cc.iter()) {
+        self.with_read(|c| {
+            let mut stmt = c.prepare_cached("SELECT to_json, cc_json FROM messages WHERE account_id=?1 AND is_outgoing=1")?;
+            let rows = stmt.query_map([&account.0], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            let mut out = HashSet::new();
+            for row in rows {
+                let (to_json, cc_json) = row?;
+                let to: Vec<Address> = serde_json::from_str(&to_json)?;
+                let cc: Vec<Address> = serde_json::from_str(&cc_json)?;
+                for a in to.iter().chain(cc.iter()) {
                     out.insert(a.email.to_ascii_lowercase());
                 }
             }
-        }
-        Ok(out)
+            Ok(out)
+        })
     }
 
     // ---------------------------------------------------------------- calendars
@@ -731,8 +838,14 @@ impl Store {
         self.with_read(|c| {
             let mut stmt = c.prepare("SELECT id, account_id, provider_id, name, color, is_primary, can_edit, visible, sort_order, default_reminders_json FROM calendars WHERE account_id=?1 ORDER BY is_primary DESC, sort_order, name")?;
             let rows = stmt.query_map([&account.0], |r| {
+                let id: String = r.get(0)?;
+                let reminders_json: String = r.get(9)?;
+                let default_reminders = serde_json::from_str(&reminders_json).unwrap_or_else(|e| {
+                    tracing::warn!(calendar_id = %id, error = %e, "corrupt calendars.default_reminders_json");
+                    Vec::new()
+                });
                 Ok(Calendar {
-                    id: CalendarId(r.get(0)?),
+                    id: CalendarId(id),
                     account_id: AccountId(r.get(1)?),
                     provider_id: r.get::<_, Option<String>>(2)?.map(ProviderId),
                     name: r.get(3)?,
@@ -741,7 +854,7 @@ impl Store {
                     can_edit: r.get(6)?,
                     visible: r.get(7)?,
                     sort_order: r.get(8)?,
-                    default_reminders: serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default(),
+                    default_reminders,
                 })
             })?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -767,9 +880,10 @@ impl Store {
 
     pub fn delete_events(&self, ids: &[EventId]) -> Result<usize> {
         self.with_tx(|tx| {
+            let mut stmt = tx.prepare_cached("DELETE FROM events WHERE id=?1")?;
             let mut n = 0;
             for id in ids {
-                n += tx.execute("DELETE FROM events WHERE id=?1", [&id.0])?;
+                n += stmt.execute([&id.0])?;
             }
             Ok(n)
         })
@@ -806,14 +920,13 @@ impl Store {
     /// Events of visible calendars overlapping `[from, to)`, cancelled ones excluded, with
     /// `pending` set for events referenced by queued operations.
     pub fn events_between(&self, account: &AccountId, from: Timestamp, to: Timestamp) -> Result<Vec<Event>> {
-        let pending: HashSet<EventId> = self
-            .pending_operations(account)?
-            .iter()
-            .filter_map(|op| op.kind.event_id().cloned())
-            .collect();
-        self.with_read(|c| {
+        self.with_read_tx(|tx| {
+            let pending: HashSet<EventId> = pending_operations_tx(tx, account)?
+                .iter()
+                .filter_map(|op| op.kind.event_id().cloned())
+                .collect();
             let mut events = load_events(
-                c,
+                tx,
                 "JOIN calendars cal ON cal.id = e.calendar_id WHERE e.account_id=?1 AND cal.visible=1 AND e.start < ?3 AND e.end > ?2 AND e.status != 'cancelled'",
                 params![account.0, from, to],
             )?;
@@ -888,13 +1001,14 @@ impl Store {
     /// same amount, with the duration of the edited one. One operation carries the scope.
     pub fn apply_series_change(&self, account: &AccountId, event: &Event, scope: RecurrenceScope) -> Result<PendingOperation> {
         let ts = now();
-        let before = self.event(&event.id)?;
-        let delta = before.as_ref().map(|b| event.start - b.start).unwrap_or(0);
+        ensure_same_account(&event.account_id, account, "event")?;
         let duration = event.end - event.start;
         self.with_tx(|tx| {
             ensure_owned(tx, Owned::Calendar, account, [event.calendar_id.0.as_str()])?;
             ensure_owned(tx, Owned::Event, account, [event.id.0.as_str()])?;
             caldav::reject_caldav_write(tx, &event.calendar_id)?;
+            let before = load_events(tx, "WHERE e.id=?1", params![event.id.0])?.pop();
+            let delta = before.as_ref().map(|b| event.start - b.start).unwrap_or(0);
             let members = before.as_ref().map(|b| Self::series_members_tx(tx, account, b, scope)).transpose()?.unwrap_or_default();
             for member in members {
                 if member.id == event.id {
@@ -927,7 +1041,9 @@ impl Store {
         self.with_read(|c| {
             let mut stmt = c.prepare(
                 "SELECT DISTINCT m.provider_id FROM messages m
-                 WHERE m.account_id=?1 AND m.provider_id IS NOT NULL AND m.body_html LIKE '%cid:%'
+                 JOIN message_bodies b ON b.message_id = m.id
+                 WHERE m.account_id=?1 AND m.provider_id IS NOT NULL
+                   AND b.body_html IS NOT NULL AND b.body_html LIKE '%cid:%'
                    AND NOT EXISTS (SELECT 1 FROM attachments a WHERE a.message_id = m.id AND a.content_id IS NOT NULL)",
             )?;
             let rows = stmt.query_map([&account.0], |r| Ok(ProviderId(r.get(0)?)))?;
@@ -986,24 +1102,11 @@ impl Store {
     }
 
     pub fn pending_operations(&self, account: &AccountId) -> Result<Vec<PendingOperation>> {
-        self.with_read(|c| {
-            let mut stmt = c.prepare(
-                "SELECT id, account_id, seq, kind_json, state, attempts, last_error, created_at, updated_at FROM pending_operations
-                 WHERE account_id=?1 AND state != 'applied' ORDER BY seq",
-            )?;
-            let rows = stmt.query_map([&account.0], row_to_operation)?;
-            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
-        })
+        self.with_read(|c| pending_operations_tx(c, account))
     }
 
     pub fn pending_count(&self, account: &AccountId) -> Result<usize> {
-        self.with_read(|c| {
-            Ok(c.query_row(
-                "SELECT COUNT(*) FROM pending_operations WHERE account_id=?1 AND state != 'applied'",
-                [&account.0],
-                |r| r.get::<_, i64>(0),
-            )? as usize)
-        })
+        self.with_read(|c| pending_count_tx(c, account))
     }
 
     /// Message ids referenced by operations that have not been applied yet.
@@ -1015,12 +1118,7 @@ impl Store {
     }
 
     pub fn pending_message_ids(&self, account: &AccountId) -> Result<BTreeSet<MessageId>> {
-        let ops = self.pending_operations(account)?;
-        let mut ids = BTreeSet::new();
-        for op in ops {
-            ids.extend(op.kind.message_ids().iter().cloned());
-        }
-        Ok(ids)
+        self.with_read(|c| pending_message_ids_tx(c, account))
     }
 
     pub fn set_operation_state(&self, id: &OperationId, state: OperationState, error: Option<&str>) -> Result<()> {
@@ -1060,16 +1158,16 @@ impl Store {
     }
 
     pub fn draft(&self, id: &DraftId) -> Result<Option<Draft>> {
-        self.with_read(|c| {
-            let mut found = load_drafts(c, "WHERE d.id=?1", params![id.0])?;
+        self.with_read_tx(|tx| {
+            let mut found = load_drafts(tx, "WHERE d.id=?1", params![id.0])?;
             Ok(found.pop())
         })
     }
 
     /// Drafts of an account. `outbox` selects Outbox states instead of editing drafts.
     pub fn drafts(&self, account: &AccountId, outbox: bool) -> Result<Vec<Draft>> {
-        self.with_read(|c| {
-            let mut all = load_drafts(c, "WHERE d.account_id=?1", params![account.0])?;
+        self.with_read_tx(|tx| {
+            let mut all = load_drafts(tx, "WHERE d.account_id=?1", params![account.0])?;
             all.retain(|d| d.state.is_outbox() == outbox);
             all.sort_by_key(|d| std::cmp::Reverse(d.updated_at));
             Ok(all)
@@ -1080,10 +1178,14 @@ impl Store {
         self.with_tx(|tx| {
             ensure_owned(tx, Owned::Draft, account, [id.0.as_str()])?;
             tx.execute("DELETE FROM drafts WHERE id=?1", [&id.0])?;
-            // Any queued send for this draft is cancelled with it.
+            // Any unsent / failed / uncertain send for this draft is cancelled with it.
             tx.execute(
-                "DELETE FROM pending_operations WHERE state='pending' AND kind_json LIKE ?1",
-                [format!("%\"draft_id\":\"{}\"%", id.0)],
+                "DELETE FROM pending_operations
+                 WHERE account_id=?1 AND state IN ('pending','failed','uncertain')
+                   AND json_valid(kind_json)
+                   AND json_extract(kind_json,'$.op')='send-draft'
+                   AND json_extract(kind_json,'$.draft_id')=?2",
+                params![account.0, id.0],
             )?;
             Ok(())
         })
@@ -1115,8 +1217,12 @@ impl Store {
             draft.updated_at = now();
             save_draft_tx(tx, &draft)?;
             tx.execute(
-                "DELETE FROM pending_operations WHERE state IN ('pending','failed') AND kind_json LIKE ?1",
-                [format!("%\"draft_id\":\"{}\"%", id.0)],
+                "DELETE FROM pending_operations
+                 WHERE account_id=?1 AND state IN ('pending','failed')
+                   AND json_valid(kind_json)
+                   AND json_extract(kind_json,'$.op')='send-draft'
+                   AND json_extract(kind_json,'$.draft_id')=?2",
+                params![account.0, id.0],
             )?;
             Ok(draft)
         })
@@ -1136,8 +1242,12 @@ impl Store {
             draft.updated_at = now();
             save_draft_tx(tx, &draft)?;
             let n = tx.execute(
-                "UPDATE pending_operations SET state='pending', last_error=NULL, updated_at=?2 WHERE state IN ('uncertain','failed') AND kind_json LIKE ?1",
-                params![format!("%\"draft_id\":\"{}\"%", id.0), now()],
+                "UPDATE pending_operations SET state='pending', last_error=NULL, updated_at=?3
+                 WHERE account_id=?1 AND state IN ('uncertain','failed')
+                   AND json_valid(kind_json)
+                   AND json_extract(kind_json,'$.op')='send-draft'
+                   AND json_extract(kind_json,'$.draft_id')=?2",
+                params![account.0, id.0, now()],
             )?;
             if n == 0 {
                 insert_operation_tx(tx, &draft.account_id, OperationKind::SendDraft { draft_id: draft.id.clone() }, now())?;
@@ -1158,8 +1268,12 @@ impl Store {
             }
             tx.execute("DELETE FROM drafts WHERE id=?1", [&id.0])?;
             tx.execute(
-                "DELETE FROM pending_operations WHERE state IN ('pending','uncertain','failed') AND kind_json LIKE ?1",
-                [format!("%\"draft_id\":\"{}\"%", id.0)],
+                "DELETE FROM pending_operations
+                 WHERE account_id=?1 AND state IN ('pending','uncertain','failed')
+                   AND json_valid(kind_json)
+                   AND json_extract(kind_json,'$.op')='send-draft'
+                   AND json_extract(kind_json,'$.draft_id')=?2",
+                params![account.0, id.0],
             )?;
             Ok(())
         })
@@ -1192,21 +1306,36 @@ impl Store {
     // --------------------------------------------------------------- sync state
 
     pub fn account_status(&self, account: &AccountId) -> Result<AccountStatus> {
-        let (state, last) = self.with_read(|c| {
-            Ok(c.query_row(
-                "SELECT state_json, last_successful_sync FROM sync_state WHERE account_id=?1",
+        self.with_read_tx(|tx| {
+            let (state, last) = tx
+                .query_row(
+                    "SELECT state_json, last_successful_sync FROM sync_state WHERE account_id=?1",
+                    [&account.0],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)),
+                )
+                .optional()?
+                .map(|(s, l)| {
+                    let state = serde_json::from_str::<SyncState>(&s).unwrap_or_else(|e| {
+                        tracing::warn!(account = %account.0, error = %e, "corrupt sync_state.state_json");
+                        SyncState::Offline
+                    });
+                    (state, l)
+                })
+                .unwrap_or((SyncState::Offline, None));
+            let pending_operations = pending_count_tx(tx, account)?;
+            let outbox_items: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM drafts
+                 WHERE account_id=?1 AND json_valid(state_json)
+                   AND json_extract(state_json, '$.state') IN ('queued','sending','uncertain','failed')",
                 [&account.0],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)),
-            )
-            .optional()?)
-        })?
-        .map(|(s, l)| (serde_json::from_str::<SyncState>(&s).unwrap_or(SyncState::Offline), l))
-        .unwrap_or((SyncState::Offline, None));
-        Ok(AccountStatus {
-            state,
-            last_successful_sync: last,
-            pending_operations: self.pending_count(account)?,
-            outbox_items: self.drafts(account, true)?.len(),
+                |r| r.get(0),
+            )?;
+            Ok(AccountStatus {
+                state,
+                last_successful_sync: last,
+                pending_operations,
+                outbox_items: outbox_items as usize,
+            })
         })
     }
 
@@ -1282,7 +1411,7 @@ impl Store {
     /// All messages of the account with this Message-ID, newest first. Several can exist
     /// legitimately (a Sent copy and a received copy; a message mid-move seen in two folders).
     pub fn messages_by_rfc_id(&self, account: &AccountId, rfc_id: &str) -> Result<Vec<Message>> {
-        self.with_read(|c| load_messages(c, "WHERE m.account_id=?1 AND m.rfc_message_id=?2", params![account.0, rfc_id]))
+        self.with_read_tx(|tx| load_messages(tx, "WHERE m.account_id=?1 AND m.rfc_message_id=?2", params![account.0, rfc_id]))
     }
 
     /// The newest message of the account with this Message-ID.
@@ -1300,13 +1429,54 @@ impl Store {
         })
     }
 
+    /// Whether the message identified by `pid` has a cached text or HTML body, without
+    /// reading any body blobs.
+    pub fn has_cached_body(&self, account: &AccountId, pid: &ProviderId) -> Result<bool> {
+        self.with_read(|c| {
+            let mut stmt = c.prepare_cached(
+                "SELECT EXISTS(
+                     SELECT 1 FROM messages m
+                     JOIN message_bodies b ON b.message_id = m.id
+                     WHERE m.account_id=?1 AND m.provider_id=?2
+                       AND (b.body_text IS NOT NULL OR b.body_html IS NOT NULL)
+                 )",
+            )?;
+            Ok(stmt.query_row(params![account.0, pid.0], |r| r.get(0))?)
+        })
+    }
+
+    /// Provider ids from `pids` whose messages already have a cached text or HTML body,
+    /// without reading any body blobs.
+    pub fn cached_body_provider_ids(&self, account: &AccountId, pids: &[ProviderId]) -> Result<HashSet<ProviderId>> {
+        if pids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        self.with_read_tx(|tx| {
+            let mut out = HashSet::new();
+            let mut stmt = tx.prepare_cached(
+                "SELECT 1 FROM messages m
+                 JOIN message_bodies b ON b.message_id = m.id
+                 WHERE m.account_id=?1 AND m.provider_id=?2
+                   AND (b.body_text IS NOT NULL OR b.body_html IS NOT NULL)
+                 LIMIT 1",
+            )?;
+            for pid in pids {
+                if stmt.query_row(params![account.0, pid.0], |_| Ok(())).optional()?.is_some() {
+                    out.insert(pid.clone());
+                }
+            }
+            Ok(out)
+        })
+    }
+
     /// Sets read and starred as the provider has them (a sync check's repair). Only this
     /// account's messages are touched.
     pub fn set_remote_flags(&self, account: &AccountId, flags: &[(MessageId, bool, bool)]) -> Result<usize> {
         self.with_tx(|tx| {
+            let mut stmt = tx.prepare_cached("UPDATE messages SET is_read=?3, is_starred=?4 WHERE id=?1 AND account_id=?2")?;
             let mut n = 0;
             for (id, read, starred) in flags {
-                n += tx.execute("UPDATE messages SET is_read=?3, is_starred=?4 WHERE id=?1 AND account_id=?2", params![id.0, account.0, read, starred])?;
+                n += stmt.execute(params![id.0, account.0, read, starred])?;
             }
             Ok(n)
         })
@@ -1326,25 +1496,35 @@ impl Store {
     /// lookup `overlook_core::threading::assign_conversations` needs, and the second clause
     /// is what lets a parent downloaded after its reply join the reply's conversation.
     pub fn conversation_for_rfc_id(&self, account: &AccountId, rfc_id: &str) -> Result<Option<ConversationId>> {
-        self.with_read(|c| {
-            let direct: Option<String> = c
-                .query_row(
-                    "SELECT conversation_id FROM messages WHERE account_id=?1 AND (rfc_message_id=?2 OR in_reply_to=?2) ORDER BY date DESC LIMIT 1",
-                    params![account.0, rfc_id],
-                    |r| r.get(0),
-                )
+        self.with_read_tx(|tx| {
+            let by_rfc: Option<(String, i64)> = tx
+                .prepare_cached("SELECT conversation_id, date FROM messages WHERE account_id=?1 AND rfc_message_id=?2 ORDER BY +date DESC LIMIT 1")?
+                .query_row(params![account.0, rfc_id], |r| Ok((r.get(0)?, r.get(1)?)))
                 .optional()?;
+            let by_reply: Option<(String, i64)> = tx
+                .prepare_cached(
+                    "SELECT conversation_id, date FROM messages
+                     WHERE account_id=?1 AND in_reply_to=?2 AND in_reply_to IS NOT NULL
+                     ORDER BY date DESC LIMIT 1",
+                )?
+                .query_row(params![account.0, rfc_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            let direct = match (by_rfc, by_reply) {
+                (Some((c1, d1)), Some((c2, d2))) => Some(if d1 >= d2 { c1 } else { c2 }),
+                (Some((c, _)), None) | (None, Some((c, _))) => Some(c),
+                (None, None) => None,
+            };
             if let Some(conv) = direct {
                 return Ok(Some(ConversationId(conv)));
             }
-            let quoted = serde_json::to_string(rfc_id)?;
-            let pattern = format!("%{}%", quoted.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
-            let via_references: Option<String> = c
-                .query_row(
-                    "SELECT conversation_id FROM messages WHERE account_id=?1 AND references_json LIKE ?2 ESCAPE '\\' ORDER BY date DESC LIMIT 1",
-                    params![account.0, pattern],
-                    |r| r.get(0),
-                )
+            let via_references: Option<String> = tx
+                .prepare_cached(
+                    "SELECT m.conversation_id FROM message_references r
+                     JOIN messages m ON m.id = r.message_id
+                     WHERE r.account_id=?1 AND r.rfc_id=?2
+                     ORDER BY m.date DESC LIMIT 1",
+                )?
+                .query_row(params![account.0, rfc_id], |r| r.get(0))
                 .optional()?;
             Ok(via_references.map(ConversationId))
         })
@@ -1406,11 +1586,20 @@ impl Store {
     pub fn replace_imap_folders(&self, account: &AccountId, folders: &[ImapFolder]) -> Result<()> {
         self.with_tx(|tx| {
             tx.execute("DELETE FROM imap_folders WHERE account_id=?1", [&account.0])?;
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO imap_folders(account_id, path, uidvalidity, highest_uid, highest_modseq, delimiter, special_use, subscribed) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            )?;
             for f in folders {
-                tx.execute(
-                    "INSERT INTO imap_folders(account_id, path, uidvalidity, highest_uid, highest_modseq, delimiter, special_use, subscribed) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                    params![account.0, f.path, f.uidvalidity.map(i64::from), i64::from(f.highest_uid), f.highest_modseq.map(|v| v as i64), f.delimiter, f.special_use, f.subscribed as i64],
-                )?;
+                stmt.execute(params![
+                    account.0,
+                    f.path,
+                    f.uidvalidity.map(i64::from),
+                    i64::from(f.highest_uid),
+                    f.highest_modseq.map(|v| v as i64),
+                    f.delimiter,
+                    f.special_use,
+                    f.subscribed as i64
+                ])?;
             }
             Ok(())
         })
@@ -1425,12 +1614,30 @@ impl Store {
         })
     }
 
-    /// Replaces the account's POP3 ledger rows.
+    /// Replaces the account's POP3 ledger rows incrementally, touching only added, updated,
+    /// or removed entries.
     pub fn replace_pop3_seen(&self, account: &AccountId, rows: &[Pop3Seen]) -> Result<()> {
         self.with_tx(|tx| {
-            tx.execute("DELETE FROM pop3_seen WHERE account_id=?1", [&account.0])?;
+            let existing: HashMap<String, (i64, bool)> = {
+                let mut stmt = tx.prepare_cached("SELECT uidl, seen_at, deleted_on_server FROM pop3_seen WHERE account_id=?1")?;
+                let mapped = stmt.query_map([&account.0], |r| Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)? != 0))))?;
+                mapped.collect::<std::result::Result<_, _>>()?
+            };
+            let incoming: HashSet<&str> = rows.iter().map(|r| r.uidl.as_str()).collect();
+            let mut delete = tx.prepare_cached("DELETE FROM pop3_seen WHERE account_id=?1 AND uidl=?2")?;
+            for uidl in existing.keys() {
+                if !incoming.contains(uidl.as_str()) {
+                    delete.execute(params![account.0, uidl])?;
+                }
+            }
+            let mut upsert = tx.prepare_cached(
+                "INSERT INTO pop3_seen(account_id, uidl, seen_at, deleted_on_server) VALUES(?1,?2,?3,?4)
+                 ON CONFLICT(account_id, uidl) DO UPDATE SET seen_at=excluded.seen_at, deleted_on_server=excluded.deleted_on_server",
+            )?;
             for r in rows {
-                tx.execute("INSERT INTO pop3_seen(account_id, uidl, seen_at, deleted_on_server) VALUES(?1,?2,?3,?4)", params![account.0, r.uidl, r.seen_at, r.deleted_on_server as i64])?;
+                if existing.get(&r.uidl) != Some(&(r.seen_at, r.deleted_on_server)) {
+                    upsert.execute(params![account.0, r.uidl, r.seen_at, r.deleted_on_server as i64])?;
+                }
             }
             Ok(())
         })
@@ -1438,14 +1645,37 @@ impl Store {
 
     /// Writes a consistent copy of the whole database to `path` (`VACUUM INTO`), for the
     /// "Back up mail" action. The copy is a plain SQLite file that `Store::open` reads.
+    /// Writes to a sibling temporary path and renames atomically so an existing backup is
+    /// never destroyed if `VACUUM INTO` fails; uses a dedicated read-only connection when
+    /// file-backed so writers are not stalled.
     pub fn backup_to(&self, path: &Path) -> Result<()> {
-        if path.exists() {
-            std::fs::remove_file(path).map_err(|e| StoreError::Sqlite(rusqlite::Error::InvalidPath(std::path::PathBuf::from(format!("{}: {e}", path.display())))))?;
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("backup.sqlite");
+        let tmp_name = format!(".{file_name}.{}.tmp", OperationId::generate());
+        let tmp_path = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.join(tmp_name),
+            _ => PathBuf::from(tmp_name),
+        };
+        let vacuum_result: Result<()> = match &self.path {
+            Some(db_path) => {
+                let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+                conn.busy_timeout(std::time::Duration::from_secs(5))?;
+                conn.execute("VACUUM INTO ?1", [tmp_path.to_string_lossy().as_ref()])?;
+                Ok(())
+            }
+            None => self.with_conn(|c| {
+                c.execute("VACUUM INTO ?1", [tmp_path.to_string_lossy().as_ref()])?;
+                Ok(())
+            }),
+        };
+        if let Err(err) = vacuum_result {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(err);
         }
-        self.with_conn(|c| {
-            c.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])?;
-            Ok(())
-        })
+        if let Err(e) = std::fs::rename(&tmp_path, path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(StoreError::Invalid(format!("could not move backup into {}: {e}", path.display())));
+        }
+        Ok(())
     }
 
     // ----------------------------------------------------------------- settings
@@ -1454,7 +1684,13 @@ impl Store {
         self.with_read(|c| {
             let raw: Option<String> = c.query_row("SELECT value FROM settings WHERE key=?1", [key], |r| r.get(0)).optional()?;
             Ok(match raw {
-                Some(s) => serde_json::from_str(&s).ok(),
+                Some(s) => match serde_json::from_str(&s) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        tracing::warn!(key, error = %e, "ignoring corrupt JSON in settings");
+                        None
+                    }
+                },
                 None => None,
             })
         })
@@ -1496,10 +1732,11 @@ impl Store {
     }
 
     pub fn search_coverage(&self, account: &AccountId) -> Result<SearchCoverage> {
-        self.with_read(|c| {
-            let total: i64 = c.query_row("SELECT COUNT(*) FROM messages WHERE account_id=?1", [&account.0], |r| r.get(0))?;
-            let cached: i64 = c.query_row(
-                "SELECT COUNT(*) FROM messages WHERE account_id=?1 AND (body_text IS NOT NULL OR body_html IS NOT NULL)",
+        self.with_read_tx(|tx| {
+            let total: i64 = tx.query_row("SELECT COUNT(*) FROM messages WHERE account_id=?1", [&account.0], |r| r.get(0))?;
+            let cached: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM messages m JOIN message_bodies b ON b.message_id = m.id
+                 WHERE m.account_id=?1 AND (b.body_text IS NOT NULL OR b.body_html IS NOT NULL)",
                 [&account.0],
                 |r| r.get(0),
             )?;
@@ -1512,8 +1749,13 @@ impl Store {
     pub fn replace_contacts(&self, account: &AccountId, contacts: &[Contact]) -> Result<()> {
         self.with_tx(|tx| {
             tx.execute("DELETE FROM people WHERE account_id=?1 AND pending=0", [&account.0])?;
+            let pending_ids: HashSet<String> = {
+                let mut stmt = tx.prepare_cached("SELECT id FROM people WHERE account_id=?1 AND pending=1")?;
+                let rows = stmt.query_map([&account.0], |r| r.get(0))?;
+                rows.collect::<std::result::Result<_, _>>()?
+            };
             for c in contacts {
-                if tx.query_row("SELECT COUNT(*) FROM people WHERE account_id=?1 AND id=?2", params![account.0, c.id], |r| r.get::<_, i64>(0))? > 0 {
+                if pending_ids.contains(&c.id) {
                     continue; // a pending local edit wins until it is pushed
                 }
                 upsert_contact_tx(tx, c)?;
@@ -1539,15 +1781,50 @@ impl Store {
     /// The contact with this address, address-book entries first.
     pub fn contact(&self, account: &AccountId, email: &str) -> Result<Option<Contact>> {
         let needle = email.trim().to_ascii_lowercase();
-        let mut hits: Vec<Contact> = self.contacts_where(account, "", &[])?.into_iter().filter(|c| c.has_email(&needle)).collect();
-        hits.sort_by(|a, b| b.in_address_book.cmp(&a.in_address_book));
-        Ok(hits.into_iter().next())
+        if needle.is_empty() {
+            return Ok(None);
+        }
+        self.with_read_tx(|tx| {
+            let mut primary = contacts_where_conn(tx, account, "AND email=?2 ORDER BY in_address_book DESC LIMIT 1", &[needle.as_str()])?;
+            if let Some(hit) = primary.first() {
+                if hit.in_address_book {
+                    return Ok(primary.pop());
+                }
+            }
+            let escaped = format!("%\"{}\"%", escape_like(&needle));
+            let secondary = contacts_where_conn(tx, account, "AND lower(emails_json) LIKE ?2 ESCAPE '\\'", &[escaped.as_str()])?;
+            let mut hits: Vec<Contact> = primary
+                .into_iter()
+                .chain(secondary.into_iter().filter(|c| c.has_email(&needle)))
+                .collect();
+            hits.sort_by(|a, b| b.in_address_book.cmp(&a.in_address_book));
+            Ok(hits.into_iter().next())
+        })
     }
 
     /// Contacts whose name or address starts with `prefix` (any word of the name), address
     /// book entries first.
     pub fn contacts_matching(&self, account: &AccountId, prefix: &str, limit: usize) -> Result<Vec<Contact>> {
-        Ok(contacts_matching(&self.contacts_where(account, "", &[])?, prefix, limit))
+        let needle = prefix.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        let candidates = if needle.is_ascii() {
+            let escaped = escape_like(&needle);
+            let prefix_pat = format!("{escaped}%");
+            let contains_pat = format!("%{escaped}%");
+            self.with_read(|c| {
+                contacts_where_conn(
+                    c,
+                    account,
+                    "AND (email LIKE ?2 ESCAPE '\\' OR emails_json LIKE ?3 ESCAPE '\\' OR name LIKE ?3 ESCAPE '\\' OR given_name LIKE ?3 ESCAPE '\\' OR family_name LIKE ?3 ESCAPE '\\')",
+                    &[prefix_pat.as_str(), contains_pat.as_str()],
+                )
+            })?
+        } else {
+            self.contacts_where(account, "", &[])?
+        };
+        Ok(contacts_matching(&candidates, prefix, limit))
     }
 
     /// Saves a contact changed on this device and queues the push.
@@ -1556,10 +1833,17 @@ impl Store {
         let ts = now();
         let mut c = contact.clone();
         c.pending = true;
-        c.updated = ts;
         let kind = if c.id.starts_with("local:") { OperationKind::CreateContact { contact_id: c.id.clone() } } else { OperationKind::UpdateContact { contact_id: c.id.clone() } };
         self.with_tx(|tx| {
+            let prev_updated: Option<Timestamp> = tx
+                .query_row("SELECT updated FROM people WHERE account_id=?1 AND id=?2", params![account.0, c.id], |r| r.get(0))
+                .optional()?;
+            // Strictly monotonic per-contact timestamp so same-ms edits or backward clock
+            // skew can never collide with an in-flight sync's `sent` marker.
+            c.updated = prev_updated.map_or(ts, |prev| ts.max(prev + 1));
             upsert_contact_tx(tx, &c)?;
+            tx.prepare_cached("UPDATE people SET edit_revision = edit_revision + 1 WHERE account_id=?1 AND id=?2")?
+                .execute(params![account.0, c.id])?;
             insert_operation_tx(tx, account, kind, ts)
         })
     }
@@ -1587,45 +1871,44 @@ impl Store {
     }
 
     fn contacts_where(&self, account: &AccountId, clause: &str, args: &[&str]) -> Result<Vec<Contact>> {
-        self.with_read(|c| {
-            let sql = format!(
-                "SELECT id, account_id, email, emails_json, name, given_name, family_name, phone, organization, title, notes, photo_url, in_address_book, etag, updated, pending
-                 FROM people WHERE account_id=?1 {clause}"
-            );
-            let mut stmt = c.prepare(&sql)?;
-            let map = |r: &rusqlite::Row| {
-                Ok(Contact {
-                    id: r.get(0)?,
-                    account_id: AccountId(r.get(1)?),
-                    email: r.get(2)?,
-                    emails: serde_json::from_str(&r.get::<_, String>(3)?).unwrap_or_default(),
-                    name: r.get(4)?,
-                    given_name: r.get(5)?,
-                    family_name: r.get(6)?,
-                    phone: r.get(7)?,
-                    organization: r.get(8)?,
-                    title: r.get(9)?,
-                    notes: r.get(10)?,
-                    photo_url: r.get(11)?,
-                    in_address_book: r.get::<_, i64>(12)? != 0,
-                    etag: r.get(13)?,
-                    updated: r.get(14)?,
-                    pending: r.get::<_, i64>(15)? != 0,
-                })
-            };
-            let rows: Vec<Contact> = match args {
-                [] => stmt.query_map([&account.0], map)?.collect::<std::result::Result<Vec<_>, _>>()?,
-                [a] => stmt.query_map(params![account.0, a], map)?.collect::<std::result::Result<Vec<_>, _>>()?,
-                _ => Vec::new(),
-            };
-            Ok(rows)
-        })
+        self.with_read(|c| contacts_where_conn(c, account, clause, args))
     }
 
     /// Addresses the user has corresponded with, most frequent first, for recipient
     /// autocomplete.
     pub fn known_recipients(&self, account: &AccountId, prefix: &str, limit: usize) -> Result<Vec<Address>> {
-        Ok(known_recipients(&self.message_headers_for_account(account)?, prefix, limit))
+        self.with_read(|c| {
+            let mut stmt = c.prepare_cached("SELECT from_json, to_json, cc_json FROM messages WHERE account_id=?1")?;
+            let rows = stmt.query_map([&account.0], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            })?;
+            let needle = prefix.trim().to_ascii_lowercase();
+            let mut counts: BTreeMap<String, (Address, usize)> = BTreeMap::new();
+            for row in rows {
+                let (from_json, to_json, cc_json) = row?;
+                let from: Address = serde_json::from_str(&from_json)?;
+                let to: Vec<Address> = serde_json::from_str(&to_json)?;
+                let cc: Vec<Address> = serde_json::from_str(&cc_json)?;
+                for a in std::iter::once(&from).chain(to.iter()).chain(cc.iter()) {
+                    let key = a.email.to_ascii_lowercase();
+                    let entry = counts.entry(key).or_insert_with(|| (a.clone(), 0));
+                    entry.1 += 1;
+                    if entry.0.name.is_none() && a.name.is_some() {
+                        entry.0 = a.clone();
+                    }
+                }
+            }
+            let mut list: Vec<(Address, usize)> = counts
+                .into_values()
+                .filter(|(a, _)| {
+                    needle.is_empty()
+                        || a.email.to_ascii_lowercase().contains(&needle)
+                        || a.name.as_deref().is_some_and(|n| n.to_ascii_lowercase().contains(&needle))
+                })
+                .collect();
+            list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.email.cmp(&b.0.email)));
+            Ok(list.into_iter().take(limit).map(|(a, _)| a).collect())
+        })
     }
 }
 
@@ -1679,10 +1962,110 @@ pub fn known_recipients<'a>(msgs: impl IntoIterator<Item = &'a Message>, prefix:
 
 // ---------------------------------------------------------------------- helpers
 
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(c) = chars.pop() {
+        if c == char::MAX {
+            continue;
+        }
+        let next = if c == '\u{D7FF}' {
+            '\u{E000}'
+        } else {
+            char::from_u32(c as u32 + 1)?
+        };
+        chars.push(next);
+        return Some(chars.into_iter().collect());
+    }
+    None
+}
+
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
+fn labels_tx(c: &Connection, account: &AccountId) -> Result<Vec<Label>> {
+    let mut stmt = c.prepare_cached("SELECT id, account_id, kind, name, provider_id, color, sort_order FROM labels WHERE account_id=?1 ORDER BY sort_order, name")?;
+    let rows = stmt.query_map([&account.0], row_to_label)?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn focus_rules_tx(c: &Connection, account: &AccountId) -> Result<Vec<FocusRule>> {
+    let mut stmt = c.prepare_cached("SELECT email, focused FROM focus_rules WHERE account_id=?1 ORDER BY email")?;
+    let rows = stmt.query_map([&account.0], |r| Ok(FocusRule { email: r.get(0)?, focused: r.get(1)? }))?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn pending_operations_tx(c: &Connection, account: &AccountId) -> Result<Vec<PendingOperation>> {
+    let mut stmt = c.prepare_cached(
+        "SELECT id, account_id, seq, kind_json, state, attempts, last_error, created_at, updated_at FROM pending_operations
+         WHERE account_id=?1 AND state != 'applied' ORDER BY seq",
+    )?;
+    let rows = stmt.query_map([&account.0], row_to_operation)?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn pending_count_tx(c: &Connection, account: &AccountId) -> Result<usize> {
+    Ok(c.query_row(
+        "SELECT COUNT(*) FROM pending_operations WHERE account_id=?1 AND state != 'applied'",
+        [&account.0],
+        |r| r.get::<_, i64>(0),
+    )? as usize)
+}
+
+fn pending_message_ids_tx(c: &Connection, account: &AccountId) -> Result<BTreeSet<MessageId>> {
+    let ops = pending_operations_tx(c, account)?;
+    let mut ids = BTreeSet::new();
+    for op in ops {
+        ids.extend(op.kind.message_ids().iter().cloned());
+    }
+    Ok(ids)
+}
+
+fn contacts_where_conn(c: &Connection, account: &AccountId, clause: &str, args: &[&str]) -> Result<Vec<Contact>> {
+    let sql = format!(
+        "SELECT id, account_id, email, emails_json, name, given_name, family_name, phone, organization, title, notes, photo_url, in_address_book, etag, updated, pending
+         FROM people WHERE account_id=?1 {clause}"
+    );
+    let mut stmt = c.prepare(&sql)?;
+    let map = |r: &rusqlite::Row| {
+        let id: String = r.get(0)?;
+        let emails_json: String = r.get(3)?;
+        let emails = serde_json::from_str(&emails_json).unwrap_or_else(|e| {
+            tracing::warn!(contact_id = %id, error = %e, "corrupt people.emails_json");
+            Vec::new()
+        });
+        Ok(Contact {
+            id,
+            account_id: AccountId(r.get(1)?),
+            email: r.get(2)?,
+            emails,
+            name: r.get(4)?,
+            given_name: r.get(5)?,
+            family_name: r.get(6)?,
+            phone: r.get(7)?,
+            organization: r.get(8)?,
+            title: r.get(9)?,
+            notes: r.get(10)?,
+            photo_url: r.get(11)?,
+            in_address_book: r.get::<_, i64>(12)? != 0,
+            etag: r.get(13)?,
+            updated: r.get(14)?,
+            pending: r.get::<_, i64>(15)? != 0,
+        })
+    };
+    let rows: Vec<Contact> = match args {
+        [] => stmt.query_map([&account.0], map)?.collect::<std::result::Result<Vec<_>, _>>()?,
+        [a] => stmt.query_map(params![account.0, a], map)?.collect::<std::result::Result<Vec<_>, _>>()?,
+        [a, b] => stmt.query_map(params![account.0, a, b], map)?.collect::<std::result::Result<Vec<_>, _>>()?,
+        _ => Vec::new(),
+    };
+    Ok(rows)
+}
+
 fn fts_query(input: &str) -> String {
     input
         .split_whitespace()
-        .map(|w| w.replace('"', ""))
+        .map(|w| w.replace(['"', '\0'], ""))
         .filter(|w| !w.is_empty())
         .map(|w| format!("\"{w}\"*"))
         .collect::<Vec<_>>()
@@ -1702,15 +2085,30 @@ fn row_to_label(r: &Row<'_>) -> rusqlite::Result<Label> {
 }
 
 fn row_to_operation(r: &Row<'_>) -> rusqlite::Result<PendingOperation> {
+    let op_id: String = r.get(0)?;
     let kind_json: String = r.get(3)?;
-    let kind: OperationKind = serde_json::from_str(&kind_json)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e)))?;
+    let kind: OperationKind = serde_json::from_str(&kind_json).map_err(|e| {
+        tracing::warn!(op_id = %op_id, error = %e, "corrupt pending_operations.kind_json");
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let state_key: String = r.get(4)?;
+    let state = OperationState::from_key(&state_key).ok_or_else(|| {
+        tracing::warn!(op_id = %op_id, state = %state_key, "unknown pending_operations.state");
+        rusqlite::Error::FromSqlConversionFailure(
+            4,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown operation state: {state_key}"),
+            )),
+        )
+    })?;
     Ok(PendingOperation {
-        id: OperationId(r.get(0)?),
+        id: OperationId(op_id),
         account_id: AccountId(r.get(1)?),
         seq: r.get(2)?,
         kind,
-        state: OperationState::from_key(&r.get::<_, String>(4)?).unwrap_or(OperationState::Pending),
+        state,
         attempts: r.get::<_, i64>(5)? as u32,
         last_error: r.get(6)?,
         created_at: r.get(7)?,
@@ -1719,92 +2117,135 @@ fn row_to_operation(r: &Row<'_>) -> rusqlite::Result<PendingOperation> {
 }
 
 fn upsert_message_tx(tx: &Connection, m: &Message) -> Result<()> {
-    tx.execute(
+    upsert_message_diff_tx(tx, m, None, false)
+}
+
+fn upsert_message_diff_tx(tx: &Connection, m: &Message, prev: Option<&Message>, skip_body_write: bool) -> Result<()> {
+    tx.prepare_cached(
         "INSERT INTO messages(id, account_id, conversation_id, provider_id, from_json, to_json, cc_json, bcc_json, reply_to_json,
-            subject, snippet, body_text, body_html, search_text, date, is_read, is_starred, is_outgoing, rfc_message_id, in_reply_to,
+            subject, snippet, date, is_read, is_starred, is_outgoing, rfc_message_id, in_reply_to,
             category, is_important, focus_override, invitation_json, references_json)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)
          ON CONFLICT(id) DO UPDATE SET conversation_id=excluded.conversation_id, provider_id=excluded.provider_id,
             from_json=excluded.from_json, to_json=excluded.to_json, cc_json=excluded.cc_json, bcc_json=excluded.bcc_json,
             reply_to_json=excluded.reply_to_json, subject=excluded.subject, snippet=excluded.snippet,
-            body_text=excluded.body_text, body_html=excluded.body_html, search_text=excluded.search_text, date=excluded.date,
-            is_read=excluded.is_read, is_starred=excluded.is_starred, is_outgoing=excluded.is_outgoing,
+            date=excluded.date, is_read=excluded.is_read, is_starred=excluded.is_starred, is_outgoing=excluded.is_outgoing,
             rfc_message_id=excluded.rfc_message_id, in_reply_to=excluded.in_reply_to,
-            category=excluded.category, is_important=excluded.is_important, focus_override=excluded.focus_override, invitation_json=excluded.invitation_json,
-            references_json=excluded.references_json",
-        params![
-            m.id.0,
-            m.account_id.0,
-            m.conversation_id.0,
-            m.provider_id.as_ref().map(|p| &p.0),
-            serde_json::to_string(&m.from)?,
-            serde_json::to_string(&m.to)?,
-            serde_json::to_string(&m.cc)?,
-            serde_json::to_string(&m.bcc)?,
-            m.reply_to.as_ref().map(serde_json::to_string).transpose()?,
-            m.subject,
-            m.snippet,
-            m.body.text,
-            m.body.html,
-            search_text(m),
-            m.date,
-            m.is_read,
-            m.is_starred,
-            m.is_outgoing,
-            m.rfc_message_id,
-            m.in_reply_to,
-            m.category,
-            m.is_important,
-            m.focus_override,
-            m.invitation.as_ref().map(serde_json::to_string).transpose()?,
-            if m.references.is_empty() { None } else { Some(serde_json::to_string(&m.references)?) },
-        ],
-    )?;
-    tx.execute("DELETE FROM message_labels WHERE message_id=?1", [&m.id.0])?;
-    for label in &m.label_ids {
-        tx.execute("INSERT INTO message_labels(message_id, label_id) VALUES(?1,?2)", params![m.id.0, label.0])?;
+            category=excluded.category, is_important=excluded.is_important, focus_override=excluded.focus_override,
+            invitation_json=excluded.invitation_json, references_json=excluded.references_json",
+    )?
+    .execute(params![
+        m.id.0,
+        m.account_id.0,
+        m.conversation_id.0,
+        m.provider_id.as_ref().map(|p| &p.0),
+        serde_json::to_string(&m.from)?,
+        serde_json::to_string(&m.to)?,
+        serde_json::to_string(&m.cc)?,
+        serde_json::to_string(&m.bcc)?,
+        m.reply_to.as_ref().map(serde_json::to_string).transpose()?,
+        m.subject,
+        m.snippet,
+        m.date,
+        m.is_read,
+        m.is_starred,
+        m.is_outgoing,
+        m.rfc_message_id,
+        m.in_reply_to,
+        m.category,
+        m.is_important,
+        m.focus_override,
+        m.invitation.as_ref().map(serde_json::to_string).transpose()?,
+        if m.references.is_empty() { None } else { Some(serde_json::to_string(&m.references)?) },
+    ])?;
+
+    if !skip_body_write {
+        tx.prepare_cached(
+            "INSERT INTO message_bodies(message_id, body_text, body_html, search_text) VALUES(?1,?2,?3,?4)
+             ON CONFLICT(message_id) DO UPDATE SET body_text=excluded.body_text, body_html=excluded.body_html, search_text=excluded.search_text",
+        )?
+        .execute(params![m.id.0, m.body.text, m.body.html, search_text(m)])?;
     }
-    tx.execute("DELETE FROM attachments WHERE message_id=?1", [&m.id.0])?;
-    for a in &m.attachments {
-        tx.execute(
-            "INSERT INTO attachments(id, message_id, filename, mime_type, size_bytes, local_path, provider_id, content_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![a.id.0, m.id.0, a.filename, a.mime_type, a.size_bytes as i64, a.local_path, a.provider_id.as_ref().map(|p| &p.0), a.content_id],
-        )?;
+
+    if prev.is_none_or(|p| p.references != m.references) {
+        tx.prepare_cached("DELETE FROM message_references WHERE message_id=?1")?
+            .execute([&m.id.0])?;
+        if !m.references.is_empty() {
+            let mut ref_stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO message_references(account_id, rfc_id, message_id) VALUES(?1,?2,?3)",
+            )?;
+            for rfc_id in &m.references {
+                ref_stmt.execute(params![m.account_id.0, rfc_id, m.id.0])?;
+            }
+        }
+    }
+
+    if prev.is_none_or(|p| p.label_ids != m.label_ids) {
+        tx.prepare_cached("DELETE FROM message_labels WHERE message_id=?1")?
+            .execute([&m.id.0])?;
+        if !m.label_ids.is_empty() {
+            let mut label_stmt = tx.prepare_cached("INSERT INTO message_labels(message_id, label_id) VALUES(?1,?2)")?;
+            for label in &m.label_ids {
+                label_stmt.execute(params![m.id.0, label.0])?;
+            }
+        }
+    }
+
+    if prev.is_none_or(|p| p.attachments != m.attachments) {
+        tx.prepare_cached("DELETE FROM attachments WHERE message_id=?1")?
+            .execute([&m.id.0])?;
+        if !m.attachments.is_empty() {
+            let mut att_stmt = tx.prepare_cached(
+                "INSERT INTO attachments(id, message_id, filename, mime_type, size_bytes, local_path, provider_id, content_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            )?;
+            for a in &m.attachments {
+                att_stmt.execute(params![
+                    a.id.0,
+                    m.id.0,
+                    a.filename,
+                    a.mime_type,
+                    a.size_bytes as i64,
+                    a.local_path,
+                    a.provider_id.as_ref().map(|p| &p.0),
+                    a.content_id
+                ])?;
+            }
+        }
     }
     Ok(())
 }
 
 fn upsert_contact_tx(tx: &Connection, c: &Contact) -> Result<()> {
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO people(id, account_id, email, emails_json, name, given_name, family_name, phone, organization, title, notes, photo_url, in_address_book, etag, updated, pending)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
          ON CONFLICT(account_id, id) DO UPDATE SET email=excluded.email, emails_json=excluded.emails_json, name=excluded.name, given_name=excluded.given_name,
             family_name=excluded.family_name, phone=excluded.phone, organization=excluded.organization, title=excluded.title, notes=excluded.notes,
             photo_url=excluded.photo_url, in_address_book=excluded.in_address_book, etag=excluded.etag, updated=excluded.updated, pending=excluded.pending",
-        params![
-            c.id,
-            c.account_id.0,
-            c.email.to_ascii_lowercase(),
-            serde_json::to_string(&c.emails)?,
-            c.name,
-            c.given_name,
-            c.family_name,
-            c.phone,
-            c.organization,
-            c.title,
-            c.notes,
-            c.photo_url,
-            c.in_address_book as i64,
-            c.etag,
-            c.updated,
-            c.pending as i64,
-        ],
-    )?;
+    )?
+    .execute(params![
+        c.id,
+        c.account_id.0,
+        c.email.to_ascii_lowercase(),
+        serde_json::to_string(&c.emails)?,
+        c.name,
+        c.given_name,
+        c.family_name,
+        c.phone,
+        c.organization,
+        c.title,
+        c.notes,
+        c.photo_url,
+        c.in_address_book as i64,
+        c.etag,
+        c.updated,
+        c.pending as i64,
+    ])?;
     Ok(())
 }
 
 fn upsert_event_tx(tx: &Connection, e: &Event) -> Result<()> {
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO events(id, account_id, calendar_id, provider_id, ical_uid, summary, description, location, start, end, all_day, status,
             organizer_json, attendees_json, html_link, conference_url, recurring_event_id, updated, event_type, color, reminders_json, original_start, wants_conference)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)
@@ -1814,32 +2255,32 @@ fn upsert_event_tx(tx: &Connection, e: &Event) -> Result<()> {
             html_link=excluded.html_link, conference_url=excluded.conference_url, recurring_event_id=excluded.recurring_event_id, updated=excluded.updated,
             event_type=excluded.event_type, color=excluded.color, reminders_json=excluded.reminders_json,
             original_start=excluded.original_start, wants_conference=excluded.wants_conference",
-        params![
-            e.id.0,
-            e.account_id.0,
-            e.calendar_id.0,
-            e.provider_id.as_ref().map(|p| &p.0),
-            e.ical_uid,
-            e.summary,
-            e.description,
-            e.location,
-            e.start,
-            e.end,
-            e.all_day,
-            serde_json::to_string(&e.status)?.trim_matches('"').to_owned(),
-            e.organizer.as_ref().map(serde_json::to_string).transpose()?,
-            serde_json::to_string(&e.attendees)?,
-            e.html_link,
-            e.conference_url,
-            e.recurring_event_id,
-            e.updated,
-            e.event_type,
-            e.color,
-            e.reminders.as_ref().map(serde_json::to_string).transpose()?,
-            e.original_start,
-            e.wants_conference,
-        ],
-    )?;
+    )?
+    .execute(params![
+        e.id.0,
+        e.account_id.0,
+        e.calendar_id.0,
+        e.provider_id.as_ref().map(|p| &p.0),
+        e.ical_uid,
+        e.summary,
+        e.description,
+        e.location,
+        e.start,
+        e.end,
+        e.all_day,
+        serde_json::to_string(&e.status)?.trim_matches('"').to_owned(),
+        e.organizer.as_ref().map(serde_json::to_string).transpose()?,
+        serde_json::to_string(&e.attendees)?,
+        e.html_link,
+        e.conference_url,
+        e.recurring_event_id,
+        e.updated,
+        e.event_type,
+        e.color,
+        e.reminders.as_ref().map(serde_json::to_string).transpose()?,
+        e.original_start,
+        e.wants_conference,
+    ])?;
     Ok(())
 }
 
@@ -1929,15 +2370,19 @@ fn load_messages(c: &Connection, where_clause: &str, args: &[&dyn rusqlite::ToSq
     load_messages_with(c, where_clause, args, true)
 }
 
-/// Loads messages with labels and attachments; `bodies: false` leaves the bodies empty,
-/// which is all a list or count needs and far less to read.
+/// Loads messages with labels and attachments; `bodies: false` leaves the bodies empty
+/// and touches only `messages` (zero `message_bodies` / overflow-page reads).
 fn load_messages_with(c: &Connection, where_clause: &str, args: &[&dyn rusqlite::ToSql], bodies: bool) -> Result<Vec<Message>> {
-    let body_columns = if bodies { "m.body_text, m.body_html" } else { "NULL, NULL" };
+    let (body_columns, body_join) = if bodies {
+        ("b.body_text, b.body_html", "LEFT JOIN message_bodies b ON b.message_id = m.id")
+    } else {
+        ("NULL, NULL", "")
+    };
     let sql = format!(
         "SELECT m.id, m.account_id, m.conversation_id, m.provider_id, m.from_json, m.to_json, m.cc_json, m.bcc_json, m.reply_to_json,
                 m.subject, m.snippet, {body_columns}, m.date, m.is_read, m.is_starred, m.is_outgoing, m.rfc_message_id, m.in_reply_to,
                 m.category, m.is_important, m.focus_override, m.invitation_json, m.references_json
-         FROM messages m {where_clause} ORDER BY m.date DESC"
+         FROM messages m {body_join} {where_clause} ORDER BY m.date DESC"
     );
     let mut stmt = c.prepare(&sql)?;
     let mut messages: Vec<Message> = stmt
@@ -2044,6 +2489,24 @@ struct RawMessage {
 
 impl RawMessage {
     fn into_message(self) -> Result<Message> {
+        let references = self
+            .references_json
+            .as_deref()
+            .and_then(|j| match serde_json::from_str(j) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(message_id = %self.id, error = %e, "corrupt messages.references_json");
+                    None
+                }
+            })
+            .unwrap_or_default();
+        let invitation = self.invitation_json.as_deref().and_then(|j| match serde_json::from_str(j) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(message_id = %self.id, error = %e, "corrupt messages.invitation_json");
+                None
+            }
+        });
         Ok(Message {
             id: MessageId(self.id),
             account_id: AccountId(self.account_id),
@@ -2065,11 +2528,11 @@ impl RawMessage {
             attachments: Vec::new(),
             rfc_message_id: self.rfc_message_id,
             in_reply_to: self.in_reply_to,
-            references: self.references_json.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default(),
+            references,
             category: self.category,
             is_important: self.is_important,
             focus_override: self.focus_override,
-            invitation: self.invitation_json.as_deref().and_then(|j| serde_json::from_str(j).ok()),
+            invitation,
         })
     }
 }
@@ -2091,26 +2554,30 @@ fn apply_change_tx(tx: &Connection, account: &AccountId, change: &LocalChange) -
         .ok_or_else(|| StoreError::Invalid(format!("account has no {} label", kind.as_key())))
     };
     let add_label = |ids: &[MessageId], label: &LabelId| -> Result<()> {
+        let mut stmt = tx.prepare_cached("INSERT OR IGNORE INTO message_labels(message_id, label_id) VALUES(?1,?2)")?;
         for id in ids {
-            tx.execute("INSERT OR IGNORE INTO message_labels(message_id, label_id) VALUES(?1,?2)", params![id.0, label.0])?;
+            stmt.execute(params![id.0, label.0])?;
         }
         Ok(())
     };
     let remove_label = |ids: &[MessageId], label: &LabelId| -> Result<()> {
+        let mut stmt = tx.prepare_cached("DELETE FROM message_labels WHERE message_id=?1 AND label_id=?2")?;
         for id in ids {
-            tx.execute("DELETE FROM message_labels WHERE message_id=?1 AND label_id=?2", params![id.0, label.0])?;
+            stmt.execute(params![id.0, label.0])?;
         }
         Ok(())
     };
     match change {
         LocalChange::SetRead { message_ids, read } => {
+            let mut stmt = tx.prepare_cached("UPDATE messages SET is_read=?2 WHERE id=?1")?;
             for id in message_ids {
-                tx.execute("UPDATE messages SET is_read=?2 WHERE id=?1", params![id.0, read])?;
+                stmt.execute(params![id.0, read])?;
             }
         }
         LocalChange::SetStarred { message_ids, starred } => {
+            let mut stmt = tx.prepare_cached("UPDATE messages SET is_starred=?2 WHERE id=?1")?;
             for id in message_ids {
-                tx.execute("UPDATE messages SET is_starred=?2 WHERE id=?1", params![id.0, starred])?;
+                stmt.execute(params![id.0, starred])?;
             }
         }
         LocalChange::AddLabel { message_ids, label_id } => add_label(message_ids, label_id)?,
@@ -2129,8 +2596,9 @@ fn apply_change_tx(tx: &Connection, account: &AccountId, change: &LocalChange) -
             add_label(message_ids, &inbox)?;
         }
         LocalChange::DeleteForever { message_ids, .. } => {
+            let mut stmt = tx.prepare_cached("DELETE FROM messages WHERE id=?1")?;
             for id in message_ids {
-                tx.execute("DELETE FROM messages WHERE id=?1", [&id.0])?;
+                stmt.execute([&id.0])?;
             }
         }
     }
@@ -2222,10 +2690,14 @@ fn save_draft_tx(tx: &Connection, d: &Draft) -> Result<()> {
     Ok(())
 }
 
-fn load_drafts(c: &Connection, where_clause: &str, args: impl rusqlite::Params) -> Result<Vec<Draft>> {
+fn load_drafts(c: &Connection, where_clause: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<Draft>> {
     let sql = format!(
         "SELECT d.id, d.account_id, d.kind, d.conversation_id, d.in_reply_to, d.to_json, d.cc_json, d.bcc_json, d.subject, d.body_text,
-                d.body_html, d.state_json, d.created_at, d.updated_at, d.provider_id, d.include_quote, i.source_json FROM drafts d LEFT JOIN draft_imports i ON i.draft_id=d.id {where_clause}"
+                d.body_html, d.state_json, d.created_at, d.updated_at, d.provider_id, d.include_quote, i.source_json, s.signature_id, s.html
+         FROM drafts d
+         LEFT JOIN draft_imports i ON i.draft_id=d.id
+         LEFT JOIN draft_signatures s ON s.draft_id=d.id
+         {where_clause}"
     );
     let mut stmt = c.prepare(&sql)?;
     let rows = stmt.query_map(args, |r| {
@@ -2247,11 +2719,12 @@ fn load_drafts(c: &Connection, where_clause: &str, args: impl rusqlite::Params) 
             r.get::<_, Option<String>>(14)?,
             r.get::<_, i64>(15)? != 0,
             r.get::<_, Option<String>>(16)?,
+            (r.get::<_, Option<String>>(17)?, r.get::<_, Option<String>>(18)?),
         ))
     })?;
     let mut drafts = Vec::new();
     for row in rows {
-        let (id, account_id, kind, conv, reply, to, cc, bcc, subject, body_text, body_html, state, created, updated, provider, include_quote, imported) = row?;
+        let (id, account_id, kind, conv, reply, to, cc, bcc, subject, body_text, body_html, state, created, updated, provider, include_quote, imported, (signature_id, signature_html)) = row?;
         drafts.push(Draft {
             id: DraftId(id),
             account_id: AccountId(account_id),
@@ -2266,8 +2739,8 @@ fn load_drafts(c: &Connection, where_clause: &str, args: impl rusqlite::Params) 
             body_html,
             imported: imported.as_deref().map(serde_json::from_str).transpose()?,
             include_quote,
-            signature_id: None,
-            signature_html: None,
+            signature_id,
+            signature_html,
             attachments: Vec::new(),
             state: serde_json::from_str(&state)?,
             created_at: created,
@@ -2275,18 +2748,17 @@ fn load_drafts(c: &Connection, where_clause: &str, args: impl rusqlite::Params) 
             provider_id: provider.map(ProviderId),
         });
     }
-    let mut stmt = c.prepare("SELECT draft_id, signature_id, html FROM draft_signatures")?;
-    for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, String>(2)?)))? {
-        let (draft_id, signature_id, html) = row?;
-        if let Some(d) = drafts.iter_mut().find(|d| d.id.0 == draft_id) {
-            d.signature_id = signature_id;
-            d.signature_html = Some(html);
-        }
+    if drafts.is_empty() {
+        return Ok(drafts);
     }
-    let mut stmt = c.prepare("SELECT id, draft_id, filename, mime_type, size_bytes, local_path, content_id FROM draft_attachments ORDER BY rowid")?;
-    for row in stmt.query_map([], |r| {
+    let by_id: HashMap<String, usize> = drafts.iter().enumerate().map(|(i, d)| (d.id.0.clone(), i)).collect();
+    let att_sql = format!(
+        "SELECT da.id, da.draft_id, da.filename, da.mime_type, da.size_bytes, da.local_path, da.content_id
+         FROM draft_attachments da JOIN drafts d ON d.id = da.draft_id {where_clause} ORDER BY da.rowid"
+    );
+    let mut stmt = c.prepare(&att_sql)?;
+    for row in stmt.query_map(args, |r| {
         Ok((
-            r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
             DraftAttachment {
                 id: AttachmentId(r.get(0)?),
@@ -2298,9 +2770,9 @@ fn load_drafts(c: &Connection, where_clause: &str, args: impl rusqlite::Params) 
             },
         ))
     })? {
-        let (_, draft_id, att) = row?;
-        if let Some(d) = drafts.iter_mut().find(|d| d.id.0 == draft_id) {
-            d.attachments.push(att);
+        let (draft_id, att) = row?;
+        if let Some(&i) = by_id.get(&draft_id) {
+            drafts[i].attachments.push(att);
         }
     }
     Ok(drafts)
@@ -3406,5 +3878,283 @@ mod tests {
         let stored = store.message(&MessageId::from("t1")).unwrap().unwrap();
         assert_eq!(stored.conversation_id.as_str(), "conv-threaded");
         assert!(stored.is_read && stored.body.is_cached());
+    }
+
+    #[test]
+    fn fts_triggers_track_subject_body_deletes_and_strip_nul() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+
+        // Initial search matches subject and body.
+        assert_eq!(store.search(&acct, "launch").unwrap(), vec![MessageId::from("m1")]);
+        assert_eq!(store.search(&acct, "materials").unwrap(), vec![MessageId::from("m1")]);
+        // NUL and quotes in search query are stripped cleanly instead of failing.
+        assert_eq!(store.search(&acct, "\"launch\0\" mater\0ials").unwrap(), vec![MessageId::from("m1")]);
+        assert!(store.search(&acct, "\0 \"\"").unwrap().is_empty());
+
+        // Flag-only update keeps FTS working cleanly.
+        let mut flag_only = store.message(&MessageId::from("m1")).unwrap().unwrap();
+        flag_only.is_read = true;
+        store.merge_remote_messages(&[flag_only], &BTreeSet::new()).unwrap();
+        assert_eq!(store.search(&acct, "materials").unwrap(), vec![MessageId::from("m1")]);
+
+        // Subject-only update replaces indexed subject while retaining body search_text.
+        assert_eq!(store.search(&acct, "creative").unwrap(), vec![MessageId::from("m1")]);
+        let mut re_subj = store.message(&MessageId::from("m1")).unwrap().unwrap();
+        re_subj.subject = "Zebra kickoff".into();
+        store.upsert_messages(&[re_subj]).unwrap();
+        assert!(store.search(&acct, "creative").unwrap().is_empty());
+        assert_eq!(store.search(&acct, "zebra").unwrap(), vec![MessageId::from("m1")]);
+        assert_eq!(store.search(&acct, "materials").unwrap(), vec![MessageId::from("m1")]);
+
+        // Body-only update replaces indexed body while retaining subject.
+        let mut re_body = store.message(&MessageId::from("m1")).unwrap().unwrap();
+        re_body.body.text = Some("Telescope calibration complete.".into());
+        store.upsert_messages(&[re_body]).unwrap();
+        assert!(store.search(&acct, "materials").unwrap().is_empty());
+        assert_eq!(store.search(&acct, "telescope").unwrap(), vec![MessageId::from("m1")]);
+        assert_eq!(store.search(&acct, "zebra").unwrap(), vec![MessageId::from("m1")]);
+
+        // Deleting a message removes it from FTS5.
+        assert_eq!(store.delete_messages(&[MessageId::from("m1")]).unwrap(), 1);
+        assert!(store.search(&acct, "telescope").unwrap().is_empty());
+        assert!(store.search(&acct, "zebra").unwrap().is_empty());
+
+        // Deleting an account cleans up FTS5 entries too.
+        assert_eq!(store.search(&acct, "trail").unwrap(), vec![MessageId::from("m2")]);
+        store.delete_account(&acct).unwrap();
+        let fts_left: i64 = store.with_read(|c| Ok(c.query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(fts_left, 0);
+    }
+
+    #[test]
+    fn has_cached_body_and_cached_body_provider_ids_check_without_loading_blobs() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+        let mut text_only = message("b1", "T", "hello", &["label-inbox"]);
+        text_only.provider_id = Some(ProviderId("p-text".into()));
+        let mut html_only = message("b2", "H", "", &["label-inbox"]);
+        html_only.provider_id = Some(ProviderId("p-html".into()));
+        html_only.body = Body { text: None, html: Some("<p>hi</p>".into()) };
+        let mut header_only = message("b3", "E", "", &["label-inbox"]);
+        header_only.provider_id = Some(ProviderId("p-empty".into()));
+        header_only.body = Body::default();
+        store.upsert_messages(&[text_only, html_only, header_only]).unwrap();
+
+        let p_text = ProviderId("p-text".into());
+        let p_html = ProviderId("p-html".into());
+        let p_empty = ProviderId("p-empty".into());
+        let p_missing = ProviderId("p-missing".into());
+
+        assert!(store.has_cached_body(&acct, &p_text).unwrap());
+        assert!(store.has_cached_body(&acct, &p_html).unwrap());
+        assert!(!store.has_cached_body(&acct, &p_empty).unwrap());
+        assert!(!store.has_cached_body(&acct, &p_missing).unwrap());
+        assert!(!store.has_cached_body(&AccountId::from("other"), &p_text).unwrap());
+
+        assert!(store.cached_body_provider_ids(&acct, &[]).unwrap().is_empty());
+        let cached = store.cached_body_provider_ids(&acct, &[p_text.clone(), p_html.clone(), p_empty, p_missing]).unwrap();
+        assert_eq!(cached, HashSet::from([p_text, p_html]));
+    }
+
+    #[test]
+    fn conversation_for_rfc_id_uses_message_references_index_and_updates_on_upsert() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+        let mut m = message("ref1", "Sub", "body", &["label-inbox"]);
+        m.conversation_id = ConversationId::from("conv-a");
+        m.in_reply_to = Some("<parent@x>".into());
+        m.references = vec!["<anc1@x>".into(), "<anc2@x>".into()];
+        store.upsert_messages(&[m.clone()]).unwrap();
+
+        assert_eq!(store.conversation_for_rfc_id(&acct, "<parent@x>").unwrap(), Some(ConversationId::from("conv-a")));
+        assert_eq!(store.conversation_for_rfc_id(&acct, "<anc1@x>").unwrap(), Some(ConversationId::from("conv-a")));
+        assert_eq!(store.conversation_for_rfc_id(&acct, "<anc2@x>").unwrap(), Some(ConversationId::from("conv-a")));
+
+        // Updating references replaces old entries in message_references.
+        m.references = vec!["<anc2@x>".into(), "<anc3@x>".into()];
+        store.upsert_messages(&[m]).unwrap();
+        assert_eq!(store.conversation_for_rfc_id(&acct, "<anc1@x>").unwrap(), None);
+        assert_eq!(store.conversation_for_rfc_id(&acct, "<anc3@x>").unwrap(), Some(ConversationId::from("conv-a")));
+
+        // Verify query plans use indexes rather than full table scans.
+        let plan_ref: String = store.with_read(|c| {
+            let mut stmt = c.prepare("EXPLAIN QUERY PLAN SELECT m.conversation_id FROM message_references r JOIN messages m ON m.id = r.message_id WHERE r.account_id=?1 AND r.rfc_id=?2 ORDER BY m.date DESC LIMIT 1")?;
+            let rows: Vec<String> = stmt.query_map(params!["acct-1", "<anc3@x>"], |r| r.get(3))?.collect::<std::result::Result<_, _>>()?;
+            Ok(rows.join(" | "))
+        }).unwrap();
+        assert!(plan_ref.contains("SEARCH r USING PRIMARY KEY"), "unexpected plan: {plan_ref}");
+
+        let plan_reply: String = store.with_read(|c| {
+            let mut stmt = c.prepare("EXPLAIN QUERY PLAN SELECT conversation_id, date FROM messages WHERE account_id=?1 AND in_reply_to=?2 AND in_reply_to IS NOT NULL ORDER BY date DESC LIMIT 1")?;
+            let rows: Vec<String> = stmt.query_map(params!["acct-1", "<parent@x>"], |r| r.get(3))?.collect::<std::result::Result<_, _>>()?;
+            Ok(rows.join(" | "))
+        }).unwrap();
+        assert!(plan_reply.contains("messages_in_reply_to"), "unexpected plan: {plan_reply}");
+
+        let plan_rfc: String = store.with_read(|c| {
+            let mut stmt = c.prepare("EXPLAIN QUERY PLAN SELECT conversation_id, date FROM messages WHERE account_id=?1 AND rfc_message_id=?2 ORDER BY +date DESC LIMIT 1")?;
+            let rows: Vec<String> = stmt.query_map(params!["acct-1", "<parent@x>"], |r| r.get(3))?.collect::<std::result::Result<_, _>>()?;
+            Ok(rows.join(" | "))
+        }).unwrap();
+        assert!(plan_rfc.contains("messages_rfc_id"), "unexpected plan: {plan_rfc}");
+
+        // Deleting message cascades message_references.
+        store.delete_messages(&[MessageId::from("ref1")]).unwrap();
+        assert_eq!(store.conversation_for_rfc_id(&acct, "<anc3@x>").unwrap(), None);
+    }
+
+    #[test]
+    fn file_backed_backup_is_atomic_and_preserves_existing_backup_on_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("main.sqlite");
+        let backup_path = dir.path().join("backup.sqlite");
+        let store = Store::open(&db_path).unwrap();
+        seeded(&store);
+
+        // First backup from a file-backed store (uses dedicated read-only connection).
+        store.backup_to(&backup_path).unwrap();
+        let reopened = Store::open(&backup_path).unwrap();
+        assert_eq!(reopened.message_count(&AccountId::from("acct-1")).unwrap(), 2);
+        drop(reopened);
+
+        // Overwrite backup atomically after a new write.
+        store.upsert_messages(&[message("m3", "Third", "Body 3", &["label-inbox"])]).unwrap();
+        store.backup_to(&backup_path).unwrap();
+        let reopened = Store::open(&backup_path).unwrap();
+        assert_eq!(reopened.message_count(&AccountId::from("acct-1")).unwrap(), 3);
+        drop(reopened);
+
+        // Failed backup to a nonexistent directory must fail cleanly without leaving temp files.
+        let bad_target = dir.path().join("no-such-dir").join("backup.sqlite");
+        assert!(store.backup_to(&bad_target).is_err());
+
+        // Failed rename over a directory must clean up temp file and leave directory untouched.
+        let dir_target = dir.path().join("existing-dir");
+        std::fs::create_dir(&dir_target).unwrap();
+        assert!(store.backup_to(&dir_target).is_err());
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp backup files must be cleaned up on error");
+    }
+
+    #[test]
+    fn draft_ops_use_exact_json_match_and_clean_failed_and_uncertain_on_delete() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+        let mut d_wild = Draft::new(acct.clone(), DraftKind::New, 1);
+        d_wild.id = DraftId::from("d_%_1");
+        d_wild.to = vec![Address::named("Maya", "maya@northstar.example")];
+        let mut d_other = Draft::new(acct.clone(), DraftKind::New, 2);
+        d_other.id = DraftId::from("d_x_1");
+        d_other.to = vec![Address::named("Maya", "maya@northstar.example")];
+
+        let op_wild = store.queue_send(&d_wild).unwrap();
+        let _op_other = store.queue_send(&d_other).unwrap();
+        assert_eq!(store.pending_count(&acct).unwrap(), 2);
+
+        // Mark d_wild failed and delete it: must remove d_wild's failed op WITHOUT matching d_other via `%`/`_`.
+        store.set_operation_state(&op_wild.id, OperationState::Failed, Some("err")).unwrap();
+        store.delete_draft(&acct, &d_wild.id).unwrap();
+        let remaining = store.pending_operations(&acct).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].kind, OperationKind::SendDraft { draft_id: d_other.id.clone() });
+
+        // Uncertain send op is also cleaned up on delete_draft.
+        store.set_operation_state(&remaining[0].id, OperationState::Uncertain, Some("lost")).unwrap();
+        store.delete_draft(&acct, &d_other.id).unwrap();
+        assert_eq!(store.pending_count(&acct).unwrap(), 0);
+    }
+
+    #[test]
+    fn row_to_operation_rejects_unknown_state_and_open_propagates_dir_error() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+        store.with_tx(|tx| {
+            tx.execute(
+                "INSERT INTO pending_operations(id, account_id, seq, kind_json, state, created_at, updated_at)
+                 VALUES('op-weird', ?1, 1, '{\"op\":\"archive\",\"message_ids\":[\"m1\"]}', 'mystery-state', 1, 1)",
+                [&acct.0],
+            )?;
+            Ok(())
+        }).unwrap();
+        assert!(store.pending_operations(&acct).is_err(), "unknown OperationState must not silently default to Pending");
+
+        // Store::open propagates create_dir_all errors when parent path is a regular file.
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"file").unwrap();
+        assert!(Store::open(&blocker.join("db.sqlite")).is_err());
+    }
+
+    #[test]
+    fn contacts_queries_sent_recipients_and_draft_guard_poison_recovery() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+
+        let mut c1 = Contact {
+            id: "c1".into(),
+            account_id: acct.clone(),
+            email: "alice@example.com".into(),
+            emails: vec!["alice@example.com".into(), "ali.alt@example.com".into()],
+            name: Some("Alice Wonder".into()),
+            in_address_book: true,
+            updated: 1,
+            ..Default::default()
+        };
+        let c2 = Contact {
+            id: "c2".into(),
+            account_id: acct.clone(),
+            email: "ali.alt@example.com".into(),
+            emails: vec!["ali.alt@example.com".into()],
+            name: Some("Auto".into()),
+            in_address_book: false,
+            updated: 1,
+            ..Default::default()
+        };
+        store.replace_contacts(&acct, &[c1.clone(), c2]).unwrap();
+        // Secondary email lookup still prefers address-book entry c1 over non-address-book c2.
+        assert_eq!(store.contact(&acct, "ALI.ALT@example.com").unwrap().unwrap().id, "c1");
+        assert_eq!(store.contacts_matching(&acct, "won", 5).unwrap().iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), vec!["c1"]);
+        assert!(store.contacts_matching(&acct, "   ", 5).unwrap().is_empty());
+
+        // Pending contact survives replace_contacts.
+        c1.name = Some("Alice Edited".into());
+        store.save_contact_locally(&acct, &c1).unwrap();
+        let mut c1_remote = c1.clone();
+        c1_remote.name = Some("Alice Old".into());
+        c1_remote.pending = false;
+        store.replace_contacts(&acct, &[c1_remote]).unwrap();
+        assert_eq!(store.contact_by_id(&acct, "c1").unwrap().unwrap().name.as_deref(), Some("Alice Edited"));
+
+        // sent_recipients only counts outgoing messages.
+        let mut sent = message("out1", "Hi", "body", &["label-sent"]);
+        sent.is_outgoing = true;
+        sent.to = vec![Address::named("Bob", "Bob@Example.COM")];
+        sent.cc = vec![Address::named("Carol", "carol@example.com")];
+        store.upsert_messages(&[sent]).unwrap();
+        assert_eq!(store.sent_recipients(&acct).unwrap(), HashSet::from(["bob@example.com".into(), "carol@example.com".into()]));
+
+        // DraftEditGuard::drop recovers cleanly even if editing_drafts mutex was poisoned.
+        let draft_id = DraftId::from("poison-draft");
+        let guard = store.edit_draft(&draft_id);
+        assert!(store.draft_is_open(&draft_id));
+        let store_clone = store.clone();
+        let _ = std::thread::spawn(move || {
+            let _lock = store_clone.editing_drafts.lock().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        drop(guard);
+        assert!(!store.draft_is_open(&draft_id));
     }
 }
