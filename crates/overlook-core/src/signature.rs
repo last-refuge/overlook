@@ -147,12 +147,21 @@ fn too_big() -> String {
 /// and returns its `Content-ID`. An image that is already there is reused.
 pub fn add_image(images: &mut Vec<SignatureImage>, filename: &str, bytes: &[u8]) -> Result<String, String> {
     let (mime, ext) = image_type(bytes).ok_or_else(|| NOT_AN_IMAGE.to_owned())?;
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return Err(too_big());
+    }
+    let stored: usize = images.iter().map(|i| i.data.len() / 4 * 3).sum();
+    let over_capacity =
+        images.len() >= MAX_IMAGES || stored.saturating_add(bytes.len()) > MAX_TOTAL_IMAGE_BYTES;
+    let expected_b64_len = bytes.len().div_ceil(3) * 4;
+    if over_capacity && !images.iter().any(|i| i.data.len() == expected_b64_len) {
+        return Err(too_big());
+    }
     let data = base64::engine::general_purpose::STANDARD.encode(bytes);
     if let Some(existing) = images.iter().find(|i| i.data == data) {
         return Ok(existing.content_id.clone());
     }
-    let stored: usize = images.iter().map(|i| i.data.len() / 4 * 3).sum();
-    if bytes.len() > MAX_IMAGE_BYTES || images.len() >= MAX_IMAGES || stored + bytes.len() > MAX_TOTAL_IMAGE_BYTES {
+    if over_capacity {
         return Err(too_big());
     }
     let stem = crate::attachment_policy::sanitize_filename(filename);
@@ -186,10 +195,27 @@ pub fn extract_data_images(html: &str, images: &mut Vec<SignatureImage>) -> Extr
         let end = start + html[start..].find(['"', '\'', '<', '>', ')']).unwrap_or(html.len() - start);
         from = end;
         let url = &html[start..end];
-        let decoded = url.split_once(',').filter(|(header, _)| header.to_ascii_lowercase().ends_with(";base64")).and_then(|(_, payload)| {
-            let payload: String = payload.chars().filter(|c| !c.is_whitespace()).collect();
-            LENIENT.decode(payload).ok()
-        });
+        const MAX_BASE64_IMAGE_LEN: usize = MAX_IMAGE_BYTES.div_ceil(3) * 4;
+        let decoded = url
+            .split_once(',')
+            .filter(|(header, _)| {
+                header
+                    .get(header.len().saturating_sub(7)..)
+                    .is_some_and(|s| s.eq_ignore_ascii_case(";base64"))
+            })
+            .and_then(|(_, payload)| {
+                let mut clean = String::new();
+                for c in payload.chars() {
+                    if c.is_whitespace() {
+                        continue;
+                    }
+                    if !c.is_ascii() || clean.len() >= MAX_BASE64_IMAGE_LEN {
+                        return None;
+                    }
+                    clean.push(c);
+                }
+                LENIENT.decode(&clean).ok()
+            });
         let before = images.len();
         match decoded.and_then(|bytes| add_image(images, "image", &bytes).ok()) {
             Some(content_id) => {
@@ -371,6 +397,10 @@ mod tests {
             bytes.push(i as u8);
             add_image(&mut images, "x.png", &bytes).unwrap();
         }
+        // Reusing an already-stored image still succeeds even at MAX_IMAGES capacity.
+        let mut duplicate = PNG.to_vec();
+        duplicate.push(0);
+        assert_eq!(add_image(&mut images, "dup.png", &duplicate).unwrap(), images[0].content_id);
         let mut one_more = PNG.to_vec();
         one_more.push(200);
         assert_eq!(add_image(&mut images, "x.png", &one_more), Err(too_big()));
@@ -384,6 +414,13 @@ mod tests {
         let mut over = PNG.to_vec();
         over.resize(4096, 9);
         assert_eq!(add_image(&mut images, "x.png", &over), Err(too_big()), "the total is capped too");
+
+        // Oversized data: URL is rejected before base64 decoding.
+        let huge_b64 = "A".repeat(MAX_IMAGE_BYTES.div_ceil(3) * 4 + 4);
+        let html = format!("<img src=\"data:image/png;base64,{huge_b64}\">");
+        let mut extracted_images = Vec::new();
+        let out = extract_data_images(&html, &mut extracted_images);
+        assert_eq!((out.added, out.rejected, extracted_images.len()), (0, 1, 0));
     }
 
     #[test]

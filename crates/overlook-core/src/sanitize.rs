@@ -5,8 +5,9 @@
 //! native HTML text view, which executes nothing, but the policy is enforced here so that
 //! no renderer ever sees the raw markup.
 
-use markup5ever_rcdom::{Handle, NodeData};
+use markup5ever_rcdom::{Handle, NodeData, RcDom};
 use std::collections::HashSet;
+use std::sync::LazyLock;
 #[path = "presentation.rs"]
 pub(crate) mod presentation;
 
@@ -31,9 +32,21 @@ pub struct Sanitized {
     pub text: String,
 }
 
+static BUILDER_BLOCKED: LazyLock<ammonia::Builder<'static>> =
+    LazyLock::new(|| build_cleaner(RemoteContent::Blocked));
+static BUILDER_ALLOWED: LazyLock<ammonia::Builder<'static>> =
+    LazyLock::new(|| build_cleaner(RemoteContent::Allowed));
+
 /// Sanitizes `html` for display. Never fails: malformed input yields best-effort output.
 /// The ammonia policy shared by the reader and by outgoing quotes.
-fn builder(policy: RemoteContent) -> ammonia::Builder<'static> {
+fn builder(policy: RemoteContent) -> &'static ammonia::Builder<'static> {
+    match policy {
+        RemoteContent::Blocked => &BUILDER_BLOCKED,
+        RemoteContent::Allowed => &BUILDER_ALLOWED,
+    }
+}
+
+fn build_cleaner(policy: RemoteContent) -> ammonia::Builder<'static> {
     let mut builder = ammonia::Builder::default();
     let tags: HashSet<&str> = [
         "a",
@@ -180,34 +193,42 @@ pub fn clean_only(html: &str, policy: RemoteContent) -> String {
 }
 
 pub fn sanitize_html(html: &str, policy: RemoteContent) -> Sanitized {
-    let prepared = crate::prepass::prepare(html);
+    let Some(prepared) = crate::prepass::prepare_dom(html) else {
+        return Sanitized::default();
+    };
     let blocked_remote = if policy == RemoteContent::Blocked {
-        count_remote(&prepared.html) + prepared.quoted.as_deref().map(count_remote).unwrap_or(0)
+        count_remote_in_dom(&prepared.doc.document)
+            + prepared
+                .quoted
+                .as_ref()
+                .map(|q| count_remote_in_dom(&q.document))
+                .unwrap_or(0)
     } else {
         0
     };
-    let html = prepared.html.as_str();
 
     let builder = builder(policy);
-    let root_preserved = presentation::serialize_body(&presentation::document(html));
-    let mut clean = flatten_tables(&builder.clean(&root_preserved).to_string());
-    let mut quoted = prepared.quoted.as_deref().map(|q| {
-        let q = presentation::serialize_body(&presentation::document(q));
-        flatten_tables(&builder.clean(&q).to_string())
+    let root_preserved = presentation::serialize_body(&prepared.doc);
+    let cleaned = builder.clean(&root_preserved).to_string();
+    let (mut clean, clean_dom) = flatten_tables_with_dom(&cleaned);
+    let mut quoted_and_text = prepared.quoted.as_ref().map(|q| {
+        let q_root = presentation::serialize_body(q);
+        let q_cleaned = builder.clean(&q_root).to_string();
+        let (q_html, q_dom) = flatten_tables_with_dom(&q_cleaned);
+        let q_text = render_html_to_text(&q_dom.document);
+        (q_html, q_text)
     });
-    let mut text = html_to_text(&clean);
-    if let Some(q) = &quoted {
-        let quoted_text = html_to_text(q);
+    let mut text = render_html_to_text(&clean_dom.document);
+    let mut quoted = None;
+    if let Some((q, quoted_text)) = quoted_and_text.take() {
         if text.trim().is_empty() {
             // Nothing but history: show it inline rather than behind a toggle.
-            clean.push_str(q);
-            quoted = None;
+            clean.push_str(&q);
             text = quoted_text;
         } else if !quoted_text.trim().is_empty() {
             text.push_str("\n\n");
             text.push_str(&quoted_text);
-        } else {
-            quoted = None;
+            quoted = Some(q);
         }
     }
     Sanitized {
@@ -218,19 +239,37 @@ pub fn sanitize_html(html: &str, policy: RemoteContent) -> Sanitized {
     }
 }
 
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
 /// Rewrites tables into block flow: each row becomes a block, cells are separated by a
 /// wide gap and cells retain their sender attributes on block wrappers. Email relies on
 /// nested layout tables that the native HTML view cannot lay
 /// out yet; without this step adjacent cells run together. Column alignment of real
 /// data tables is lost, which is a known foundation gap.
 pub fn flatten_tables(html: &str) -> String {
-    fn render(n: &Handle, out: &mut String, flatten: bool) {
+    flatten_tables_with_dom(html).0
+}
+
+fn flatten_tables_with_dom(html: &str) -> (String, RcDom) {
+    fn render(n: &Handle, out: &mut String, flatten: bool, depth: usize, changed: &mut bool) {
+        if depth > crate::browser::MAX_DOM_DEPTH {
+            return;
+        }
         match &n.data {
             NodeData::Text { contents } => out.push_str(&escape_html(&contents.borrow())),
             NodeData::Element { name, attrs, .. } => {
                 let local = &*name.local;
                 let flatten = if local == "table" {
-                    !is_data_table(n)
+                    let should_flatten = !is_data_table(n);
+                    if should_flatten {
+                        *changed = true;
+                    }
+                    should_flatten
                 } else {
                     flatten
                 };
@@ -271,7 +310,7 @@ pub fn flatten_tables(html: &str) -> String {
                         }
                         cells += 1;
                     }
-                    render(c, out, flatten);
+                    render(c, out, flatten, depth + 1, changed);
                 }
                 if !matches!(local, "br" | "hr" | "img") {
                     out.push_str("</");
@@ -281,46 +320,102 @@ pub fn flatten_tables(html: &str) -> String {
             }
             NodeData::Document => {
                 for c in n.children.borrow().iter() {
-                    render(c, out, flatten);
+                    render(c, out, flatten, depth + 1, changed);
                 }
             }
             _ => {}
         }
     }
     let dom = presentation::document(html);
-    let mut out = String::new();
+    if !contains_ignore_ascii_case(html, "<table") {
+        let serialized = presentation::serialize_body(&dom);
+        return (serialized, dom);
+    }
+    let mut out = String::with_capacity(html.len());
+    let mut changed = false;
     presentation::walk(&dom.document, &mut |n| {
         if matches!(&n.data, NodeData::Element { name, .. } if &*name.local == "body") {
             for c in n.children.borrow().iter() {
-                render(c, &mut out, false);
+                render(c, &mut out, false, 0, &mut changed);
             }
         }
     });
+    if !changed {
+        let serialized = presentation::serialize_body(&dom);
+        return (serialized, dom);
+    }
     // Transformations can change HTML's adoption-agency/foster-parenting behavior
     // (notably anchors around table layouts). Normalize the resulting tree now.
-    presentation::serialize_body(&presentation::document(&out))
+    let normalized = presentation::document(&out);
+    let serialized = presentation::serialize_body(&normalized);
+    (serialized, normalized)
+}
+
+/// Counts characters in the trimmed text of `node` without allocating a `String`.
+fn trimmed_char_count(node: &Handle) -> usize {
+    let mut stack = vec![(node.clone(), 0usize)];
+    let mut seen_non_ws = false;
+    let mut total_chars = 0usize;
+    let mut trailing_ws = 0usize;
+    while let Some((n, depth)) = stack.pop() {
+        if depth > crate::browser::MAX_DOM_DEPTH {
+            continue;
+        }
+        match &n.data {
+            NodeData::Text { contents } => {
+                for c in contents.borrow().chars() {
+                    if c.is_whitespace() {
+                        if seen_non_ws {
+                            trailing_ws += 1;
+                        }
+                    } else {
+                        seen_non_ws = true;
+                        total_chars += trailing_ws + 1;
+                        trailing_ws = 0;
+                    }
+                }
+            }
+            _ => {
+                let children = n.children.borrow();
+                for child in children.iter().rev() {
+                    stack.push((child.clone(), depth + 1));
+                }
+            }
+        }
+    }
+    total_chars
 }
 
 /// Classify actual cells, not tag-like strings or the tail of an entire row.
 fn is_data_table(table: &Handle) -> bool {
     let mut rows = Vec::new();
-    let mut nested_or_image = false;
-    presentation::walk(table, &mut |n| {
+    let mut stack = Vec::new();
+    for child in table.children.borrow().iter().rev() {
+        stack.push((child.clone(), 1usize));
+    }
+    while let Some((n, depth)) = stack.pop() {
+        if depth > crate::browser::MAX_DOM_DEPTH {
+            continue;
+        }
         if let NodeData::Element { name, .. } = &n.data {
-            if &*name.local == "img" || (&*name.local == "table" && !std::rc::Rc::ptr_eq(n, table))
-            {
-                nested_or_image = true;
+            let local = &*name.local;
+            if local == "img" || local == "table" {
+                return false;
             }
-            if &*name.local == "tr" {
+            if local == "tr" {
                 rows.push(n.clone());
             }
         }
-    });
-    if nested_or_image || rows.len() < 2 {
+        let children = n.children.borrow();
+        for child in children.iter().rev() {
+            stack.push((child.clone(), depth + 1));
+        }
+    }
+    if rows.len() < 2 {
         return false;
     }
-    let mut counts = Vec::new();
-    let (mut cells, mut total, mut longest, mut header) = (0, 0, 0, false);
+    let mut first_count: Option<usize> = None;
+    let (mut cells, mut total, mut longest, mut header) = (0usize, 0usize, 0usize, false);
     for row in rows {
         let mut count = 0usize;
         for cell in row.children.borrow().iter() {
@@ -337,23 +432,24 @@ fn is_data_table(table: &Handle) -> bool {
                     .unwrap_or(1)
                     .clamp(1, 1000);
                 count = count.saturating_add(span);
-                let mut text = String::new();
-                presentation::walk(cell, &mut |n| {
-                    if let NodeData::Text { contents } = &n.data {
-                        text.push_str(&contents.borrow());
-                    }
-                });
-                let len = text.trim().chars().count();
+                let len = trimmed_char_count(cell);
                 longest = longest.max(len);
                 total += len;
                 cells += 1;
             }
         }
-        counts.push(count);
+        match first_count {
+            None => {
+                if !(2..=8).contains(&count) {
+                    return false;
+                }
+                first_count = Some(count);
+            }
+            Some(first) if count != first => return false,
+            _ => {}
+        }
     }
-    let first = counts[0];
-    let consistent = (2..=8).contains(&first) && counts.iter().all(|&n| n == first);
-    consistent && (header || (cells > 0 && longest <= 160 && total / cells <= 60))
+    header || (cells > 0 && longest <= 160 && total / cells <= 60)
 }
 
 /// Adapt only actual color attributes/declarations; sender text and URLs are untouched.
@@ -457,17 +553,16 @@ fn adapt_rgb(r: u8, g: u8, b: u8, dark: bool) -> (u8, u8, u8) {
     )
 }
 
-fn count_remote(html: &str) -> usize {
-    let dom = presentation::document(html);
+fn count_remote_in_dom(root: &Handle) -> usize {
     let mut count = 0;
-    presentation::walk(&dom.document, &mut |n| {
+    presentation::walk(root, &mut |n| {
         if let NodeData::Element { name, attrs, .. } = &n.data {
             if &*name.local == "img"
                 && attrs.borrow().iter().any(|a| {
                     &*a.name.local == "src" && {
-                        let src = a.value.trim().to_ascii_lowercase();
-                        src.starts_with("http://")
-                            || src.starts_with("https://")
+                        let src = a.value.trim();
+                        src.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+                            || src.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("https://"))
                             || src.starts_with("//")
                     }
                 })
@@ -481,6 +576,11 @@ fn count_remote(html: &str) -> usize {
 
 /// Parsed HTML-to-text conversion. Active and invisible subtrees are never indexed.
 pub fn html_to_text(html: &str) -> String {
+    let dom = presentation::visible_document(html);
+    render_html_to_text(&dom.document)
+}
+
+fn render_html_to_text(root: &Handle) -> String {
     fn boundary(out: &mut String) {
         if !out.is_empty() && !out.ends_with("\n\n") {
             if out.ends_with('\n') {
@@ -490,7 +590,10 @@ pub fn html_to_text(html: &str) -> String {
             }
         }
     }
-    fn render(n: &Handle, out: &mut String, pre: bool) {
+    fn render(n: &Handle, out: &mut String, pre: bool, depth: usize) {
+        if depth > crate::browser::MAX_DOM_DEPTH {
+            return;
+        }
         match &n.data {
             NodeData::Text { contents } => {
                 for c in contents.borrow().chars() {
@@ -547,7 +650,7 @@ pub fn html_to_text(html: &str) -> String {
                             })
                     });
                 for c in n.children.borrow().iter() {
-                    render(c, out, pre);
+                    render(c, out, pre, depth + 1);
                 }
                 if block {
                     boundary(out);
@@ -558,15 +661,14 @@ pub fn html_to_text(html: &str) -> String {
             }
             NodeData::Document => {
                 for c in n.children.borrow().iter() {
-                    render(c, out, pre);
+                    render(c, out, pre, depth + 1);
                 }
             }
             _ => {}
         }
     }
-    let dom = presentation::visible_document(html);
     let mut out = String::new();
-    render(&dom.document, &mut out, false);
+    render(root, &mut out, false, 0);
     out.trim().to_owned()
 }
 
@@ -613,6 +715,8 @@ pub fn text_to_html(text: &str) -> String {
     out
 }
 
+const MAX_QUOTE_DEPTH: usize = 32;
+
 /// Counts the leading `>` markers of a quoted line and returns the text after them.
 fn strip_quote_markers(line: &str) -> (usize, &str) {
     let mut depth = 0;
@@ -621,7 +725,7 @@ fn strip_quote_markers(line: &str) -> (usize, &str) {
         depth += 1;
         rest = after.strip_prefix(' ').unwrap_or(after);
     }
-    (depth, if depth == 0 { line } else { rest })
+    (depth.min(MAX_QUOTE_DEPTH), if depth == 0 { line } else { rest })
 }
 
 /// Escapes text for HTML, turning bare URLs into links.
@@ -1139,5 +1243,22 @@ mod tests {
             html,
             "<div style=\"white-space:pre-wrap\">Hello &lt;you&gt;<br>second line<br><blockquote>quoted one<br>quoted two<br><blockquote>nested</blockquote></blockquote><br>After <a href=\"https://ex.com/a\">https://ex.com/a</a>.</div>"
         );
+    }
+
+    #[test]
+    fn quote_depth_and_deep_html_are_bounded() {
+        let deep_quotes = format!("{} hello", ">".repeat(500));
+        let html = text_to_html(&deep_quotes);
+        assert_eq!(html.matches("<blockquote>").count(), MAX_QUOTE_DEPTH);
+        assert_eq!(html.matches("</blockquote>").count(), MAX_QUOTE_DEPTH);
+        let sanitized = sanitize_html(&html, RemoteContent::Blocked);
+        assert!(sanitized.text.contains("hello"));
+
+        let deep_html = format!("{}payload{}", "<div>".repeat(1000), "</div>".repeat(1000));
+        assert!(sanitize_html(&deep_html, RemoteContent::Blocked).html.is_empty());
+        assert!(clean_only(&deep_html, RemoteContent::Blocked).is_empty());
+        assert!(html_to_text(&deep_html).is_empty());
+        assert!(flatten_tables(&deep_html).is_empty());
+        assert!(adapt_colors(&deep_html, true).is_empty());
     }
 }

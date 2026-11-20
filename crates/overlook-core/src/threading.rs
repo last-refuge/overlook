@@ -11,15 +11,11 @@ use std::collections::HashMap;
 
 /// Normalises a Message-ID for comparison: trimmed and wrapped in angle brackets.
 pub fn normalize_message_id(raw: &str) -> String {
-    let t = raw.trim();
-    if t.is_empty() {
+    let inner = raw.trim().trim_matches(|c| c == '<' || c == '>').trim();
+    if inner.is_empty() {
         return String::new();
     }
-    if t.starts_with('<') && t.ends_with('>') {
-        t.to_owned()
-    } else {
-        format!("<{}>", t.trim_matches(|c| c == '<' || c == '>'))
-    }
+    format!("<{inner}>")
 }
 
 /// The ids a message points at, most specific first: `In-Reply-To`, then `References`
@@ -60,7 +56,10 @@ pub fn assign_conversations(incoming: &mut [Message], lookup: impl Fn(&str) -> O
     let mut known: HashMap<String, ConversationId> = HashMap::new();
     for m in incoming.iter().filter(|m| !m.conversation_id.0.is_empty()) {
         if let Some(id) = &m.rfc_message_id {
-            known.entry(normalize_message_id(id)).or_insert_with(|| m.conversation_id.clone());
+            let norm = normalize_message_id(id);
+            if !norm.is_empty() {
+                known.entry(norm).or_insert_with(|| m.conversation_id.clone());
+            }
         }
     }
 
@@ -204,5 +203,18 @@ mod tests {
         assert_eq!(normalize_message_id("<x@y>"), "<x@y>");
         assert_eq!(normalize_message_id("x@y"), "<x@y>");
         assert_eq!(parent_candidates(&msg("p", None, Some("<c@x>"), &["<a@x>", "<b@x>", "<c@x>"], 0)), vec!["<c@x>", "<b@x>", "<a@x>"]);
+    }
+
+    #[test]
+    fn empty_or_bracket_only_message_ids_never_collapse_unrelated_threads() {
+        for empty in ["", "  ", "<>", "<", ">", "<  >", "<<<>>>"] {
+            assert_eq!(normalize_message_id(empty), "", "{empty:?}");
+        }
+        let mut batch = vec![
+            msg("m1", Some("<>"), Some("<"), &["<>"], 1),
+            msg("m2", Some("<"), Some("<>"), &[">"], 2),
+        ];
+        assign_conversations(&mut batch, no_lookup);
+        assert_ne!(batch[0].conversation_id, batch[1].conversation_id);
     }
 }

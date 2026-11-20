@@ -28,8 +28,9 @@ pub fn local_date(ts: Timestamp) -> Date {
 
 /// Midnight at the start of the local day containing `ts`.
 pub fn day_start(ts: Timestamp) -> Timestamp {
-    let z = zoned(ts);
-    z.date().to_zoned(current_zone()).map(|d| to_millis(&d)).unwrap_or(ts)
+    let zone = current_zone();
+    let date = in_zone(ts, &zone).date();
+    date.to_zoned(zone).map(|d| to_millis(&d)).unwrap_or(ts)
 }
 
 /// Midnight at the start of a local date.
@@ -39,27 +40,35 @@ pub fn date_start(date: Date) -> Timestamp {
 
 /// Start of the week (Monday by default) containing `ts`.
 pub fn week_start(ts: Timestamp, monday: bool) -> Timestamp {
-    let date = local_date(ts);
+    let zone = current_zone();
+    let date = in_zone(ts, &zone).date();
     let weekday = date.weekday().to_monday_zero_offset() as i64; // Monday = 0
     let back = if monday { weekday } else { (weekday + 1) % 7 };
-    date_start(date.checked_sub((back as i32).days()).unwrap_or(date))
+    date.checked_sub((back as i32).days())
+        .unwrap_or(date)
+        .to_zoned(zone)
+        .map(|d| to_millis(&d))
+        .unwrap_or(0)
 }
 
 /// Midnight on the first day of the month containing `ts`.
 pub fn month_start(ts: Timestamp) -> Timestamp {
-    let d = local_date(ts);
-    date_start(d.first_of_month())
+    let zone = current_zone();
+    let d = in_zone(ts, &zone).date();
+    d.first_of_month().to_zoned(zone).map(|d| to_millis(&d)).unwrap_or(0)
 }
 
 /// The same day `n` months later (clamped to the month length), at local midnight.
 pub fn add_months(ts: Timestamp, n: i32) -> Timestamp {
-    let d = local_date(ts);
-    date_start(d.checked_add(n.months()).unwrap_or(d))
+    let zone = current_zone();
+    let d = in_zone(ts, &zone).date();
+    d.checked_add(n.months()).unwrap_or(d).to_zoned(zone).map(|d| to_millis(&d)).unwrap_or(0)
 }
 
 pub fn add_days(ts: Timestamp, days: i32) -> Timestamp {
-    let date = local_date(ts);
-    date_start(date.checked_add(days.days()).unwrap_or(date))
+    let zone = current_zone();
+    let date = in_zone(ts, &zone).date();
+    date.checked_add(days.days()).unwrap_or(date).to_zoned(zone).map(|d| to_millis(&d)).unwrap_or(0)
 }
 
 /// Combines a local date and time into a timestamp.
@@ -76,11 +85,21 @@ pub fn local_datetime_in(date: Date, time: Time, zone: &TimeZone) -> Option<Time
 /// The time `minutes` past midnight by the clock on `day`'s local date; 24:00 is the next
 /// midnight.
 pub fn at_minutes(day: Timestamp, minutes: i32) -> Timestamp {
+    let zone = current_zone();
+    let date = in_zone(day, &zone).date();
+    if minutes <= 0 {
+        return date.to_zoned(zone).map(|d| to_millis(&d)).unwrap_or(day);
+    }
     if minutes >= 24 * 60 {
-        return add_days(day, 1);
+        return date
+            .checked_add(1.days())
+            .unwrap_or(date)
+            .to_zoned(zone)
+            .map(|d| to_millis(&d))
+            .unwrap_or(0);
     }
     let time = Time::new((minutes / 60) as i8, (minutes % 60) as i8, 0, 0).unwrap_or_default();
-    local_datetime(local_date(day), time)
+    local_datetime_in(date, time, &zone).unwrap_or(0)
 }
 
 /// All-day dates are civil dates, not elapsed UTC hours. Keep their dates intact
@@ -141,8 +160,10 @@ pub fn format_month_year(ts: Timestamp) -> String {
 
 /// `Oct 12 – 18, 2026` or `Sep 29 – Oct 5, 2026` for a week starting at `start`.
 pub fn format_week_range(start: Timestamp) -> String {
-    let a = zoned(start);
-    let b = zoned(add_days(start, 6));
+    let zone = current_zone();
+    let a = in_zone(start, &zone);
+    let end_date = a.date().checked_add(6.days()).unwrap_or(a.date());
+    let b = end_date.to_zoned(zone).unwrap_or_else(|_| a.clone());
     if a.month() == b.month() {
         format!("{} {} – {}, {}", a.strftime("%b"), a.day(), b.day(), a.year())
     } else if a.year() == b.year() {
@@ -174,9 +195,17 @@ pub fn parse_clock(input: &str) -> Option<Time> {
         None => (digits.parse::<i8>().ok()?, 0),
     };
     let hour = match suffix {
-        Some(true) if h < 12 => h + 12,
-        Some(false) if h == 12 => 0,
-        _ => h,
+        Some(is_pm) => {
+            if !(1..=12).contains(&h) {
+                return None;
+            }
+            match (is_pm, h) {
+                (false, 12) => 0,
+                (true, 1..=11) => h + 12,
+                _ => h,
+            }
+        }
+        None => h,
     };
     Time::new(hour, m, 0, 0).ok()
 }
@@ -213,7 +242,10 @@ mod tests {
         assert_eq!(minutes_into_day(at_minutes(day, 570)), 570);
         assert_eq!(local_date(at_minutes(day, 570)), local_date(day));
         assert_eq!(at_minutes(day, 0), day);
+        assert_eq!(at_minutes(day, -60), day);
+        assert_eq!(at_minutes(day, i32::MIN), day);
         assert_eq!(at_minutes(day, 24 * 60), add_days(day, 1));
+        assert_eq!(at_minutes(day, i32::MAX), add_days(day, 1));
     }
 
     #[test]
@@ -242,8 +274,14 @@ mod tests {
         assert_eq!(parse_clock("9:30 am"), Some(Time::constant(9, 30, 0, 0)));
         assert_eq!(parse_clock("2pm"), Some(Time::constant(14, 0, 0, 0)));
         assert_eq!(parse_clock("12:15 AM"), Some(Time::constant(0, 15, 0, 0)));
+        assert_eq!(parse_clock("12:00 PM"), Some(Time::constant(12, 0, 0, 0)));
         assert_eq!(parse_clock("14:45"), Some(Time::constant(14, 45, 0, 0)));
         assert_eq!(parse_clock("noon"), None);
+        assert_eq!(parse_clock("0 am"), None);
+        assert_eq!(parse_clock("0 pm"), None);
+        assert_eq!(parse_clock("13 am"), None);
+        assert_eq!(parse_clock("13 pm"), None);
+        assert_eq!(parse_clock("-1 pm"), None);
     }
 
     #[test]

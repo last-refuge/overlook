@@ -70,7 +70,7 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
 
 /// Days-from-civil, inverse of [`civil_from_days`].
 pub fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
-    let y = if month <= 2 { year - 1 } else { year } as i64;
+    let y = if month <= 2 { i64::from(year) - 1 } else { i64::from(year) };
     let era = y.div_euclid(400);
     let yoe = y.rem_euclid(400);
     let m = month as i64;
@@ -239,5 +239,11 @@ mod tests {
         let phoenix = TimeZone::get("America/Phoenix").unwrap();
         assert_eq!(civil_in_zone(summer, &phoenix).1.hour, 9);
         assert_eq!(civil_in_zone(winter, &phoenix).1.hour, 9);
+    }
+
+    #[test]
+    fn days_from_civil_does_not_overflow_at_i32_min() {
+        let _ = days_from_civil(i32::MIN, 1, 1);
+        let _ = days_from_civil(i32::MIN, 2, 28);
     }
 }

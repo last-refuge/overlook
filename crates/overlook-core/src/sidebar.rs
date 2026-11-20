@@ -172,10 +172,17 @@ pub fn unpin(favorites: &mut Vec<Favorite>, favorite: &Favorite) -> bool {
 /// `accounts` in the saved order. Accounts the saved order doesn't know (added since) follow
 /// in their given order; saved ids for accounts that no longer exist are dropped.
 pub fn ordered_accounts(accounts: &[AccountId], saved: &[AccountId]) -> Vec<AccountId> {
-    let mut out: Vec<AccountId> = saved.iter().filter(|id| accounts.contains(id)).cloned().collect();
-    out.dedup();
+    let known: std::collections::HashSet<&AccountId> = accounts.iter().collect();
+    let mut seen: std::collections::HashSet<&AccountId> =
+        std::collections::HashSet::with_capacity(accounts.len());
+    let mut out = Vec::with_capacity(accounts.len());
+    for id in saved {
+        if known.contains(id) && seen.insert(id) {
+            out.push(id.clone());
+        }
+    }
     for id in accounts {
-        if !out.contains(id) {
+        if seen.insert(id) {
             out.push(id.clone());
         }
     }
@@ -320,6 +327,14 @@ mod tests {
     #[test]
     fn removed_accounts_drop_out_of_the_order() {
         assert_eq!(ordered_accounts(&ids(&["a", "b"]), &ids(&["gone", "b", "a"])), ids(&["b", "a"]));
+    }
+
+    #[test]
+    fn non_adjacent_duplicate_accounts_are_deduplicated() {
+        assert_eq!(
+            ordered_accounts(&ids(&["a", "b", "c"]), &ids(&["b", "a", "b", "c", "a"])),
+            ids(&["b", "a", "c"])
+        );
     }
 
     #[test]

@@ -120,7 +120,7 @@ pub struct Event {
 
 impl Event {
     pub fn duration_minutes(&self) -> i64 {
-        ((self.end - self.start) / 60_000).max(0)
+        (self.end.saturating_sub(self.start) / 60_000).max(0)
     }
 
     pub fn my_attendance(&self) -> Option<&Attendee> {
@@ -200,6 +200,40 @@ mod tests {
         let id = new_provider_event_id();
         assert_eq!(id.len(), 26);
         assert!(id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='v')));
+    }
+
+    #[test]
+    fn duration_minutes_saturates_without_overflow() {
+        let mut ev = Event {
+            id: EventId::from("e"),
+            account_id: AccountId::from("a"),
+            calendar_id: CalendarId::from("c"),
+            provider_id: None,
+            ical_uid: None,
+            summary: String::new(),
+            description: None,
+            location: None,
+            start: i64::MIN,
+            end: i64::MAX,
+            all_day: false,
+            status: EventStatus::Confirmed,
+            organizer: None,
+            attendees: vec![],
+            html_link: None,
+            conference_url: None,
+            recurring_event_id: None,
+            updated: 0,
+            event_type: None,
+            color: None,
+            reminders: None,
+            original_start: None,
+            wants_conference: false,
+            pending: false,
+        };
+        assert_eq!(ev.duration_minutes(), i64::MAX / 60_000);
+        ev.start = i64::MAX;
+        ev.end = i64::MIN;
+        assert_eq!(ev.duration_minutes(), 0);
     }
 }
 

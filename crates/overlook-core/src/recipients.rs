@@ -106,7 +106,7 @@ pub fn ghost_completion(typed: &str, address: &Address) -> Option<String> {
     }
     if let Some(name) = address.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
         // A name that has to be quoted would not read as what it becomes, so it is not offered.
-        if address.to_header() == format!("{name} <{}>", address.email) {
+        if !Address::name_needs_quoting(name) {
             if let Some(rest) = strip_prefix_ignore_case(name, typed) {
                 return Some(format!("{rest} <{}>", address.email));
             }
@@ -190,9 +190,21 @@ mod tests {
 
     #[test]
     fn a_name_that_needs_quoting_is_not_spelled_out_but_its_address_still_completes() {
-        let jane = Address::named("Doe, Jane", "jane@example.com");
-        assert_eq!(ghost_completion("Doe", &jane), None);
-        assert_eq!(ghost_completion("jan", &jane).as_deref(), Some("e@example.com"));
+        for (typed, special_name) in [
+            ("Doe", "Doe, Jane"),
+            ("Jane", "Jane; Ops"),
+            ("Jane", "Jane \"J\" Doe"),
+            ("Jane", "Jane \\ Ops"),
+            ("Jane", "Jane <Ops>"),
+            ("Jane", "Jane (Ops)"),
+            ("Jane", "Jane: Ops"),
+            ("Jane", "Jane @ Home"),
+            ("Jane", "Jane [Ops]"),
+        ] {
+            let addr = Address::named(special_name, "contact@example.com");
+            assert_eq!(ghost_completion(typed, &addr), None, "{special_name}");
+            assert_eq!(ghost_completion("con", &addr).as_deref(), Some("tact@example.com"));
+        }
     }
 
     #[test]

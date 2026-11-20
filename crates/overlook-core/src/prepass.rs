@@ -8,8 +8,7 @@
 //! `sanitize_html` cleans it afterwards.
 
 use html5ever::serialize::{serialize, SerializeOpts, TraversalScope};
-use html5ever::tendril::TendrilSink;
-use html5ever::{namespace_url, ns, parse_document, Attribute, LocalName, ParseOpts, QualName};
+use html5ever::{namespace_url, ns, Attribute, LocalName, QualName};
 use markup5ever_rcdom::{Handle, Node, NodeData, RcDom, SerializableHandle};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -20,24 +19,43 @@ pub struct Prepared {
     pub quoted: Option<String>,
 }
 
+pub(crate) struct PreparedDom {
+    pub doc: RcDom,
+    pub quoted: Option<RcDom>,
+}
+
 /// Elements removed with their content.
 const REMOVE: &[&str] = &[
     "head", "title", "style", "script", "meta", "link", "noscript", "template", "iframe", "object",
     "embed", "svg", "math", "base",
 ];
 
-pub fn prepare(html: &str) -> Prepared {
-    let dom = parse_document(RcDom::default(), ParseOpts::default()).one(html);
+pub(crate) fn prepare_dom(html: &str) -> Option<PreparedDom> {
+    let dom = crate::browser::parse_bounded_document(html)?;
     let doc = dom.document.clone();
-    let cleaned = clean_children(&doc, &Flags::default());
+    let cleaned = clean_children(&doc, &Flags::default(), 0);
     set_children(&doc, cleaned);
-    let quoted = split_quote(&doc).map(|nodes| {
-        let holder = element("div", vec![]);
-        set_children(&holder, nodes);
-        serialize_children(&holder)
+    let quoted = split_quote(&doc, 0).map(|nodes| {
+        let qdom = RcDom::default();
+        set_children(&qdom.document, nodes);
+        qdom
     });
+    Some(PreparedDom { doc: dom, quoted })
+}
+
+pub fn prepare(html: &str) -> Prepared {
+    let Some(prepared) = prepare_dom(html) else {
+        return Prepared {
+            html: String::new(),
+            quoted: None,
+        };
+    };
+    let quoted = prepared
+        .quoted
+        .as_ref()
+        .map(|q| serialize_children(&q.document));
     Prepared {
-        html: serialize_children(&doc),
+        html: serialize_children(&prepared.doc.document),
         quoted,
     }
 }
@@ -48,7 +66,10 @@ struct Flags {
     no_links: bool,
 }
 
-fn clean_children(node: &Handle, flags: &Flags) -> Vec<Handle> {
+fn clean_children(node: &Handle, flags: &Flags, depth: usize) -> Vec<Handle> {
+    if depth > crate::browser::MAX_DOM_DEPTH {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     for child in node.children.borrow().iter() {
         match &child.data {
@@ -73,19 +94,23 @@ fn clean_children(node: &Handle, flags: &Flags) -> Vec<Handle> {
                 if local == "sup" || local == "sub" {
                     // Resolve descendant visibility before converting glyphs; reading
                     // raw subtree text can resurrect a hidden footnote or tracker.
-                    let visible = clean_children(child, flags);
-                    set_children(child, visible);
-                    let text = subtree_text(child, 64);
+                    let visible = clean_children(child, flags, depth + 1);
+                    // Detach before `child` is dropped so rcdom's Drop does not clear reused nodes.
+                    child.children.borrow_mut().clear();
+                    let mut text = String::new();
+                    for v in &visible {
+                        collect_subtree_text(v, &mut text, 64, depth + 1);
+                    }
                     match script_text(&text, local == "sup") {
                         Some(converted) => out.push(text_node(&converted)),
-                        None => out.extend(clean_children(child, flags)),
+                        None => out.extend(visible),
                     }
                     continue;
                 }
                 let mut inner = *flags;
                 inner.in_pre |= local == "pre";
                 inner.no_links |= matches!(local.as_str(), "a" | "pre" | "code");
-                let children = clean_children(child, &inner);
+                let children = clean_children(child, &inner, depth + 1);
                 let (new_name, bold) = match local.as_str() {
                     "center" => ("div", false),
                     "dt" => ("div", true),
@@ -390,55 +415,84 @@ fn linkified_nodes(text: &str, original: &Handle) -> Vec<Handle> {
 
 /// Position and length of the first bare URL in `s`.
 pub fn find_url(s: &str) -> Option<(usize, usize)> {
-    let mut best: Option<usize> = None;
-    for needle in ["https://", "http://", "www."] {
-        if let Some(i) = s.find(needle) {
-            // A word boundary before it; "www." must not be part of a longer token.
-            let boundary = i == 0
-                || !s[..i]
-                    .chars()
-                    .next_back()
-                    .is_some_and(|c| c.is_alphanumeric() || c == '/' || c == '.' || c == '@');
-            if boundary && best.is_none_or(|b| i < b) {
-                best = Some(i);
+    let mut search_from = 0;
+    while search_from < s.len() {
+        let mut best: Option<(usize, usize)> = None;
+        for needle in ["https://", "http://", "www."] {
+            let mut offset = search_from;
+            while let Some(rel) = s[offset..].find(needle) {
+                let i = offset + rel;
+                if best.is_some_and(|(b, _)| i >= b) {
+                    break;
+                }
+                // A word boundary before it; "www." must not be part of a longer token.
+                let boundary = i == 0
+                    || !s[..i]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '/' || c == '.' || c == '@');
+                if boundary {
+                    best = Some((i, needle.len()));
+                    break;
+                }
+                offset = i + needle.len();
             }
         }
-    }
-    let start = best?;
-    let tail = &s[start..];
-    let mut end = tail
-        .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'' | '\u{a0}'))
-        .unwrap_or(tail.len());
-    // Trailing punctuation belongs to the sentence, not the link.
-    while end > 0 {
-        let c = tail[..end].chars().next_back().unwrap();
-        let unbalanced_paren =
-            c == ')' && tail[..end].matches('(').count() < tail[..end].matches(')').count();
-        if matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"' | ']') || unbalanced_paren {
-            end -= c.len_utf8();
-        } else {
-            break;
+        let (start, needle_len) = best?;
+        let tail = &s[start..];
+        let mut end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'' | '\u{a0}'))
+            .unwrap_or(tail.len());
+        let mut open_parens = 0usize;
+        let mut close_parens = 0usize;
+        for b in tail[..end].bytes() {
+            if b == b'(' {
+                open_parens += 1;
+            } else if b == b')' {
+                close_parens += 1;
+            }
         }
+        // Trailing punctuation belongs to the sentence, not the link.
+        while end > 0 {
+            let c = tail[..end].chars().next_back().unwrap();
+            let unbalanced_paren = c == ')' && open_parens < close_parens;
+            if matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"' | ']') || unbalanced_paren
+            {
+                if c == ')' {
+                    close_parens -= 1;
+                }
+                end -= c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let url = &tail[..end];
+        let min = if url.starts_with("www.") { 5 } else { 9 };
+        if end >= min && url.contains('.') {
+            return Some((start, end));
+        }
+        search_from = start + end.max(needle_len);
     }
-    let url = &tail[..end];
-    let min = if url.starts_with("www.") { 5 } else { 9 };
-    (end >= min && url.contains('.')).then_some((start, end))
+    None
 }
 
 // ------------------------------------------------------------------ quoted history
 
 /// Detaches the quoted history (and whatever follows it) from the message body.
-fn split_quote(node: &Handle) -> Option<Vec<Handle>> {
+fn split_quote(node: &Handle, depth: usize) -> Option<Vec<Handle>> {
+    if depth > crate::browser::MAX_DOM_DEPTH {
+        return None;
+    }
     let children: Vec<Handle> = node.children.borrow().clone();
     for (i, child) in children.iter().enumerate() {
-        if is_quote_start(child) {
+        if is_quote_start(child, depth + 1) {
             let (keep, quoted) = children.split_at(i);
             let quoted = quoted.to_vec();
             set_children(node, keep.to_vec());
             return Some(quoted);
         }
         if matches!(child.data, NodeData::Element { .. }) {
-            if let Some(mut found) = split_quote(child) {
+            if let Some(mut found) = split_quote(child, depth + 1) {
                 // Everything after the quote in document order goes with it, at every
                 // level: siblings that follow the ancestor holding the quote start too.
                 // Keep the ancestor's sender attributes on its split-off portion too.
@@ -490,7 +544,7 @@ fn starts_embedded_message(node: &Handle, local: &str, attrs: &[Attribute]) -> b
     }
 }
 
-fn is_quote_start(node: &Handle) -> bool {
+fn is_quote_start(node: &Handle, depth: usize) -> bool {
     let NodeData::Element { name, attrs, .. } = &node.data else {
         return false;
     };
@@ -506,7 +560,7 @@ fn is_quote_start(node: &Handle) -> bool {
                 .any(|c| c == "gmail_quote" || c == "gmail_quote_container")
             {
                 // A forward is content, not history.
-                return !first_text_matching(node, "gmail_attr")
+                return !first_text_matching(node, "gmail_attr", depth)
                     .is_some_and(|t| t.contains("Forwarded message"));
             }
             // Outlook's "From: / Sent: / To:" header block is deliberately not a quote
@@ -521,7 +575,10 @@ fn is_quote_start(node: &Handle) -> bool {
     }
 }
 
-fn first_text_matching(node: &Handle, class: &str) -> Option<String> {
+fn first_text_matching(node: &Handle, class: &str, depth: usize) -> Option<String> {
+    if depth > crate::browser::MAX_DOM_DEPTH {
+        return None;
+    }
     for child in node.children.borrow().iter() {
         if let NodeData::Element { attrs, .. } = &child.data {
             if attr(&attrs.borrow(), "class")
@@ -530,29 +587,30 @@ fn first_text_matching(node: &Handle, class: &str) -> Option<String> {
                 return Some(subtree_text(child, 400));
             }
         }
-        if let Some(found) = first_text_matching(child, class) {
+        if let Some(found) = first_text_matching(child, class, depth + 1) {
             return Some(found);
         }
     }
     None
 }
 
-fn subtree_text(node: &Handle, limit: usize) -> String {
-    fn walk(node: &Handle, out: &mut String, limit: usize) {
-        if out.len() >= limit {
-            return;
-        }
-        match &node.data {
-            NodeData::Text { contents } => out.push_str(&contents.borrow()),
-            _ => {
-                for child in node.children.borrow().iter() {
-                    walk(child, out, limit);
-                }
+fn collect_subtree_text(node: &Handle, out: &mut String, limit: usize, depth: usize) {
+    if out.len() >= limit || depth > crate::browser::MAX_DOM_DEPTH {
+        return;
+    }
+    match &node.data {
+        NodeData::Text { contents } => out.push_str(&contents.borrow()),
+        _ => {
+            for child in node.children.borrow().iter() {
+                collect_subtree_text(child, out, limit, depth + 1);
             }
         }
     }
+}
+
+fn subtree_text(node: &Handle, limit: usize) -> String {
     let mut out = String::new();
-    walk(node, &mut out, limit);
+    collect_subtree_text(node, &mut out, limit, 0);
     out
 }
 
@@ -722,5 +780,41 @@ mod tests {
         assert_eq!(find_url("(see www.x.org)"), Some((5, 9)));
         assert_eq!(find_url("mail@www.example.com"), None);
         assert_eq!(find_url("https://x"), None);
+        // Invalid prefix matches must not hide a valid URL later in the string.
+        assert_eq!(
+            find_url("mail@www.example.com and www.good.org"),
+            Some((25, 12))
+        );
+        assert_eq!(
+            find_url("foohttps://bad.test then https://good.example/a"),
+            Some((25, 22))
+        );
+        assert_eq!(
+            find_url("https://x then https://good.example/b"),
+            Some((15, 22))
+        );
+        // Balanced vs unbalanced trailing parentheses in O(n).
+        assert_eq!(
+            find_url("(see https://en.wikipedia.org/wiki/Rust_(lang)))"),
+            Some((5, 41))
+        );
+        let many_parens = format!("https://example.org/a{}", ")".repeat(2000));
+        assert_eq!(find_url(&many_parens), Some((0, 21)));
+    }
+
+    #[test]
+    fn sup_fallback_does_not_double_clean_or_drop_children() {
+        let p = prepare("<p>A<sup><span>note</span></sup> B<sup><dt>term</dt></sup></p>");
+        assert!(p.html.contains("<span>note</span>"), "{}", p.html);
+        assert_eq!(p.html.matches("<b>").count(), 1, "{}", p.html);
+        assert!(p.html.contains("<div><b>term</b></div>"), "{}", p.html);
+    }
+
+    #[test]
+    fn deeply_nested_html_is_bounded_without_stack_overflow() {
+        let deep = format!("{}hi{}", "<div>".repeat(1000), "</div>".repeat(1000));
+        let p = prepare(&deep);
+        assert!(p.html.is_empty());
+        assert!(p.quoted.is_none());
     }
 }

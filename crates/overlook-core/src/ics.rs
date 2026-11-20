@@ -52,22 +52,59 @@ fn lines(text: &str) -> Vec<(String, String)> {
 }
 
 fn unescape(v: &str) -> String {
-    v.replace("\\n", "\n").replace("\\,", ",").replace("\\;", ";").replace("\\\\", "\\")
+    let mut out = String::with_capacity(v.len());
+    let mut chars = v.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n' | 'N') => out.push('\n'),
+                Some(',') => out.push(','),
+                Some(';') => out.push(';'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn parse_dt(key: &str, value: &str) -> Option<(Timestamp, Option<String>)> {
     use jiff::civil::{Date, DateTime};
     use jiff::tz::TimeZone;
-    let params: Vec<&str> = key.split(';').skip(1).collect();
-    let tzid = params.iter().find_map(|p| p.strip_prefix("TZID="));
-    let is_date = params.iter().any(|p| *p == "VALUE=DATE") || value.len() == 8;
+    if !value.is_ascii() {
+        return None;
+    }
+    let mut tzid = None;
+    let mut has_value_date = false;
+    for p in key.split(';').skip(1) {
+        if let Some((k, v)) = p.split_once('=') {
+            if k.eq_ignore_ascii_case("TZID") {
+                let cleaned = v.trim_matches('"');
+                if !cleaned.is_empty() {
+                    tzid = Some(cleaned);
+                }
+            } else if k.eq_ignore_ascii_case("VALUE") && v.eq_ignore_ascii_case("DATE") {
+                has_value_date = true;
+            }
+        }
+    }
+    let is_date = has_value_date || value.len() == 8;
     if is_date {
+        if value.len() < 8 {
+            return None;
+        }
         let date: Date = format!("{}-{}-{}", &value[0..4], &value[4..6], &value[6..8]).parse().ok()?;
         return Some((crate::tz::date_start(date), Some(date.to_string())));
     }
     let utc = value.ends_with('Z');
-    let v = value.trim_end_matches('Z');
-    if v.len() < 15 {
+    let v = value.strip_suffix('Z').unwrap_or(value);
+    if v.len() < 15 || v.as_bytes()[8] != b'T' {
         return None;
     }
     let dt: DateTime = format!("{}-{}-{}T{}:{}:{}", &v[0..4], &v[4..6], &v[6..8], &v[9..11], &v[11..13], &v[13..15]).parse().ok()?;
@@ -89,24 +126,41 @@ pub fn parse_invitation(text: &str) -> Option<Invitation> {
     let mut start_date = None;
     let mut all_day = false;
     let mut organizer = None;
-    let mut in_event = false;
+    let mut event_depth = 0usize;
     for (key, value) in lines(text) {
         let name = key.split(';').next().unwrap_or("").to_ascii_uppercase();
         match name.as_str() {
-            "METHOD" => method = value.trim().to_ascii_uppercase(),
-            "BEGIN" if value.trim().eq_ignore_ascii_case("VEVENT") => in_event = true,
-            "END" if value.trim().eq_ignore_ascii_case("VEVENT") => break,
-            "UID" if in_event => uid = Some(value.trim().to_owned()),
-            "SUMMARY" if in_event => summary = Some(unescape(value.trim())),
-            "DTSTART" if in_event => {
+            "METHOD" if event_depth == 0 => method = value.trim().to_ascii_uppercase(),
+            "BEGIN" => {
+                if event_depth == 0 {
+                    if value.trim().eq_ignore_ascii_case("VEVENT") {
+                        event_depth = 1;
+                    }
+                } else {
+                    event_depth += 1;
+                }
+            }
+            "END" => {
+                if event_depth == 1 && value.trim().eq_ignore_ascii_case("VEVENT") {
+                    break;
+                } else if event_depth > 1 {
+                    event_depth -= 1;
+                }
+            }
+            "UID" if event_depth == 1 => uid = Some(value.trim().to_owned()),
+            "SUMMARY" if event_depth == 1 => summary = Some(unescape(value.trim())),
+            "DTSTART" if event_depth == 1 => {
                 if let Some((ts, date)) = parse_dt(&key, value.trim()) {
                     start = Some(ts);
                     all_day = date.is_some();
                     start_date = date;
                 }
             }
-            "ORGANIZER" if in_event => {
-                organizer = value.trim().strip_prefix("mailto:").or_else(|| value.trim().strip_prefix("MAILTO:")).map(|e| e.to_ascii_lowercase());
+            "ORGANIZER" if event_depth == 1 => {
+                let trimmed = value.trim();
+                if trimmed.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("mailto:")) {
+                    organizer = Some(trimmed[7..].to_ascii_lowercase());
+                }
             }
             _ => {}
         }
@@ -154,5 +208,50 @@ mod tests {
         let legacy: Invitation = serde_json::from_value(serde_json::json!({"uid":"old", "method":"REQUEST", "summary":null, "start":0, "all_day":true, "organizer_email":null})).unwrap();
         assert_eq!(legacy.start_date, None);
         assert_eq!(legacy.start_in_zone(&crate::tz::TimeZone::UTC), Some(0));
+    }
+
+    #[test]
+    fn handles_malformed_dates_valarm_nesting_case_and_escaping() {
+        // Non-ASCII and malformed date values must not panic.
+        for bad in [
+            "DTSTART;VALUE=DATE:2026",
+            "DTSTART;VALUE=DATE:2026éééé",
+            "DTSTART:🎉🎉🎉🎉🎉🎉🎉🎉",
+            "DTSTART:20261014X160000Z",
+            "DTSTART:20261014T16éé00Z",
+        ] {
+            let ics = format!("BEGIN:VEVENT\nUID:bad\n{bad}\nEND:VEVENT");
+            let inv = parse_invitation(&ics).unwrap();
+            assert_eq!(inv.start, None, "{bad}");
+        }
+
+        // Single-pass unescaping preserves literal `\\n` as `\n`, handles `\N`, `\,`, `\;`, `\\`.
+        assert_eq!(unescape(r"a\\nb\nc\Nd\,e\;f\\g"), "a\\nb\nc\nd,e;f\\g");
+
+        // Nested VALARM must not clobber VEVENT UID/SUMMARY; quoted/mixed-case TZID and MailTo work.
+        let ics = "\
+BEGIN:VCALENDAR\r\n\
+METHOD:REQUEST\r\n\
+BEGIN:VEVENT\r\n\
+UID:event-uid@example\r\n\
+SUMMARY:Project\\\\notes\\NLine 2\r\n\
+DTSTART;tzid=\"America/Phoenix\":20261014T090000\r\n\
+ORGANIZER:MailTo:Maya@Northstar.Example\r\n\
+BEGIN:VALARM\r\n\
+ACTION:DISPLAY\r\n\
+UID:alarm-uid\r\n\
+SUMMARY:Alarm reminder\r\n\
+END:VALARM\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+        let inv = parse_invitation(ics).unwrap();
+        assert_eq!(inv.uid, "event-uid@example");
+        assert_eq!(inv.summary.as_deref(), Some("Project\\notes\nLine 2"));
+        assert_eq!(inv.organizer_email.as_deref(), Some("maya@northstar.example"));
+        assert_eq!(inv.start, Some(crate::tz::parse_rfc3339("2026-10-14T09:00:00-07:00").unwrap()));
+
+        let lower_date = parse_invitation("BEGIN:VEVENT\nUID:d\nDTSTART;value=date:20261020\nEND:VEVENT").unwrap();
+        assert!(lower_date.all_day);
+        assert_eq!(lower_date.start_date.as_deref(), Some("2026-10-20"));
     }
 }
