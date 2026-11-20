@@ -779,29 +779,7 @@ impl Store {
         focused: Option<bool>,
         sender: Option<&str>,
     ) -> Result<()> {
-        self.with_tx(|tx| {
-            ensure_owned(tx, Owned::Message, account, ids.iter().map(|i| i.0.as_str()))?;
-            if !ids.is_empty() {
-                let mut stmt = tx.prepare_cached("UPDATE messages SET focus_override=?2 WHERE id=?1")?;
-                for id in ids {
-                    stmt.execute(params![id.0, focused])?;
-                }
-            }
-            if let Some(email) = sender.map(str::to_ascii_lowercase) {
-                match focused {
-                    Some(f) => {
-                        tx.execute(
-                            "INSERT INTO focus_rules(account_id, email, focused) VALUES(?1,?2,?3) ON CONFLICT(account_id, email) DO UPDATE SET focused=excluded.focused",
-                            params![account.0, email, f],
-                        )?;
-                    }
-                    None => {
-                        tx.execute("DELETE FROM focus_rules WHERE account_id=?1 AND email=?2", params![account.0, email])?;
-                    }
-                }
-            }
-            Ok(())
-        })
+        self.with_tx(|tx| set_focus_override_and_rule_tx(tx, account, ids, focused, sender))
     }
 
     /// Lowercase addresses the account owner has sent mail to.
@@ -1093,28 +1071,7 @@ impl Store {
     /// Applies a local change and records its pending operation atomically.
     pub fn apply_change(&self, account: &AccountId, change: LocalChange) -> Result<PendingOperation> {
         let ts = now();
-        self.with_tx(|tx| {
-            // A permanent delete removes the rows, so read their provider ids first.
-            let provider_ids = match &change {
-                LocalChange::DeleteForever { message_ids, .. } => {
-                    ensure_owned(tx, Owned::Message, account, message_ids.iter().map(|i| i.0.as_str()))?;
-                    let mut out = Vec::new();
-                    for id in message_ids {
-                        let pid: Option<String> = tx.query_row("SELECT provider_id FROM messages WHERE id=?1", [&id.0], |r| r.get(0)).optional()?.flatten();
-                        out.extend(pid.map(ProviderId));
-                    }
-                    Some(out)
-                }
-                _ => None,
-            };
-            apply_change_tx(tx, account, &change)?;
-            let mut kind = change.into_operation();
-            if let (OperationKind::DeleteForever { provider_ids: slot, .. }, Some(ids)) = (&mut kind, provider_ids) {
-                *slot = ids;
-            }
-            let op = insert_operation_tx(tx, account, kind, ts)?;
-            Ok(op)
-        })
+        self.with_tx(|tx| apply_queued_change_tx(tx, account, change, ts))
     }
 
     pub fn pending_operations(&self, account: &AccountId) -> Result<Vec<PendingOperation>> {
@@ -2011,6 +1968,36 @@ fn labels_tx(c: &Connection, account: &AccountId) -> Result<Vec<Label>> {
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
+fn set_focus_override_and_rule_tx(
+    tx: &Connection,
+    account: &AccountId,
+    ids: &[MessageId],
+    focused: Option<bool>,
+    sender: Option<&str>,
+) -> Result<()> {
+    ensure_owned(tx, Owned::Message, account, ids.iter().map(|i| i.0.as_str()))?;
+    if !ids.is_empty() {
+        let mut stmt = tx.prepare_cached("UPDATE messages SET focus_override=?2 WHERE id=?1")?;
+        for id in ids {
+            stmt.execute(params![id.0, focused])?;
+        }
+    }
+    if let Some(email) = sender.map(str::to_ascii_lowercase) {
+        match focused {
+            Some(f) => {
+                tx.execute(
+                    "INSERT INTO focus_rules(account_id, email, focused) VALUES(?1,?2,?3) ON CONFLICT(account_id, email) DO UPDATE SET focused=excluded.focused",
+                    params![account.0, email, f],
+                )?;
+            }
+            None => {
+                tx.execute("DELETE FROM focus_rules WHERE account_id=?1 AND email=?2", params![account.0, email])?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn focus_rules_tx(c: &Connection, account: &AccountId) -> Result<Vec<FocusRule>> {
     let mut stmt = c.prepare_cached("SELECT email, focused FROM focus_rules WHERE account_id=?1 ORDER BY email")?;
     let rows = stmt.query_map([&account.0], |r| Ok(FocusRule { email: r.get(0)?, focused: r.get(1)? }))?;
@@ -2557,6 +2544,28 @@ impl RawMessage {
             invitation,
         })
     }
+}
+
+fn apply_queued_change_tx(tx: &Connection, account: &AccountId, change: LocalChange, ts: Timestamp) -> Result<PendingOperation> {
+    // A permanent delete removes the rows, so read their provider ids first.
+    let provider_ids = match &change {
+        LocalChange::DeleteForever { message_ids, .. } => {
+            ensure_owned(tx, Owned::Message, account, message_ids.iter().map(|i| i.0.as_str()))?;
+            let mut out = Vec::new();
+            for id in message_ids {
+                let pid: Option<String> = tx.query_row("SELECT provider_id FROM messages WHERE id=?1", [&id.0], |r| r.get(0)).optional()?.flatten();
+                out.extend(pid.map(ProviderId));
+            }
+            Some(out)
+        }
+        _ => None,
+    };
+    apply_change_tx(tx, account, &change)?;
+    let mut kind = change.into_operation();
+    if let (OperationKind::DeleteForever { provider_ids: slot, .. }, Some(ids)) = (&mut kind, provider_ids) {
+        *slot = ids;
+    }
+    insert_operation_tx(tx, account, kind, ts)
 }
 
 fn apply_change_tx(tx: &Connection, account: &AccountId, change: &LocalChange) -> Result<()> {
