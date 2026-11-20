@@ -57,24 +57,34 @@ impl AccountMark {
         }
     }
 
-    /// The mark in a circle `size` across. Logos sit on white in every theme, as the
-    /// services draw them; Overlook's icons sit on the theme's quiet chip.
+    /// The small account badge in the status bar.
     pub(crate) fn render(self, size: f32, p: &Palette) -> AnyElement {
+        self.render_badge(size, size / 2., 0.62, p)
+    }
+
+    /// The sidebar has room for a rounded square with more space for the artwork.
+    pub(super) fn render_sidebar(self, size: f32, p: &Palette) -> AnyElement {
+        self.render_badge(size, 5., 0.9, p)
+    }
+
+    fn render_badge(self, size: f32, corner_radius: f32, logo_fill: f32, p: &Palette) -> AnyElement {
         let plate = div()
             .flex_none()
             .size(px(size))
-            .rounded_full()
+            .rounded(px(corner_radius))
             .flex()
             .items_center()
             .justify_center()
             .overflow_hidden();
         match self {
-            Self::Logo(path, scale) => plate
-                .bg(white())
-                .border_1()
-                .border_color(p.divider)
-                .child(img(path).size(px((size * 0.62 * scale).round())).flex_none())
-                .into_any_element(),
+            Self::Logo(path, scale) => {
+                let logo_size = (size * logo_fill * scale).round().min(size - 2.);
+                plate.bg(white())
+                    .border_1()
+                    .border_color(p.divider)
+                    .child(img(path).size(px(logo_size)).flex_none())
+                    .into_any_element()
+            }
             Self::Own(icon) => plate.bg(p.chip).child(color_icon(icon, (size * 0.72).round(), p)).into_any_element(),
             Self::Overlook => super::brand_tile(size).into_any_element(),
         }
