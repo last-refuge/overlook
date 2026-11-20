@@ -17,6 +17,8 @@ const TOTAL_LIMIT: usize = 192 * 1024 * 1024;
 const BATCH: usize = 25;
 const MAX_BOOKS: usize = 64;
 const MAX_CARDS: usize = 50_000;
+/// Each `<d:response>` in a CardDAV PROPFIND listing contributes ~15-20 XML nodes.
+const MAX_XML_NODES: u32 = (MAX_CARDS as u32) * 24;
 
 /// A contacts service Overlook recognises from an account's mail servers.
 #[derive(Debug, Clone, Copy)]
@@ -463,7 +465,7 @@ fn xml_escape(value: &str) -> String {
 }
 
 fn document(body: &str) -> Result<Document<'_>, CardDavError> {
-    let doc = Document::parse_with_options(body, ParsingOptions { allow_dtd: false, nodes_limit: 200_000, ..Default::default() }).map_err(|_| CardDavError::InvalidResponse)?;
+    let doc = Document::parse_with_options(body, ParsingOptions { allow_dtd: false, nodes_limit: MAX_XML_NODES, ..Default::default() }).map_err(|_| CardDavError::InvalidResponse)?;
     if !doc.root_element().has_tag_name(("DAV:", "multistatus")) || doc.descendants().any(|n| n.ancestors().take(65).count() > 64) {
         return Err(CardDavError::InvalidResponse);
     }

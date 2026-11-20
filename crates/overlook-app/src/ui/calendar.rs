@@ -57,6 +57,8 @@ pub struct NewEvent {
     /// Free/busy of each guest for the chosen time, after "Check availability".
     pub availability: Vec<(String, Option<bool>)>,
     pub checking: bool,
+    /// Monotonic request id bumped whenever form/guests/times/calendar change so stale free/busy responses are discarded.
+    pub availability_request_id: u64,
     pub calendar: Option<CalendarId>,
     pub all_day: bool,
     pub error: Option<String>,
@@ -73,6 +75,8 @@ pub struct NewEvent {
     pub dragged: Option<(i64, i64)>,
     /// Enter in the title saves a dragged-out event.
     pub _title_enter: Option<Subscription>,
+    /// Input change subscriptions that invalidate pending/shown availability results.
+    pub _availability_subs: Vec<Subscription>,
 }
 
 /// The question asked before editing or deleting one occurrence of a repeating event.
@@ -220,7 +224,7 @@ impl MailWindow {
     }
 
     pub(crate) fn reload_calendar(&mut self) {
-        self.invite_rows.borrow_mut().clear();
+        self.refresh_invite_events(true);
         self.calendars = self.store.calendars(&self.account.id).unwrap_or_default();
         let (from, to) = self.cal_range();
         self.cal_events = self.store.events_between(&self.account.id, from, to).unwrap_or_default();
@@ -387,6 +391,7 @@ impl MailWindow {
         self.leave_event_modal(window, cx);
         self.cal_selected = None;
         self.cal_contact_card = None;
+        self.cal_desc_cache.borrow_mut().take();
         cx.notify();
     }
 
@@ -417,48 +422,83 @@ impl MailWindow {
     }
 
     /// Fires due reminders: a desktop notification plus an in-app toast, once per event
-    /// and offset per session.
+    /// and offset per session. SQLite reads run off the UI thread.
     pub(crate) fn check_reminders(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.reminders_enabled {
+        if !self.reminders_enabled || self.checking_reminders {
             return;
         }
+        self.checking_reminders = true;
         let now_ms = now();
         let horizon = now_ms + 2 * 3_600_000;
-        let accounts = self.accounts.clone();
-        for account in accounts {
-            if self.store.calendar_connection(&account.id).ok().flatten().is_some_and(|c| !self.store.caldav_timezone_matches(&c.id, &tz::cache_key()).unwrap_or(false)) { continue; }
-            let calendars = self.store.calendars(&account.id).unwrap_or_default();
-            let Ok(events) = self.store.events_starting_between(&account.id, now_ms - 60_000, horizon) else { continue };
-            for event in events {
-                if event.my_response() == Some(ResponseStatus::Declined) || event.is_working_location() {
-                    continue;
+        let accounts: Vec<AccountId> = self.accounts.iter().map(|a| a.id.clone()).collect();
+        let store = self.store.clone();
+        let tz_key = tz::cache_key();
+        let fallback = self.prefs.default_reminder_minutes as i32;
+        cx.spawn_in(window, async move |this, cx| {
+            let candidates: Vec<(Event, Vec<i32>)> = cx
+                .background_spawn(async move {
+                    let mut out = Vec::new();
+                    for account_id in accounts {
+                        if store
+                            .calendar_connection(&account_id)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|c| !store.caldav_timezone_matches(&c.id, &tz_key).unwrap_or(false))
+                        {
+                            continue;
+                        }
+                        let calendars = store.calendars(&account_id).unwrap_or_default();
+                        let Ok(events) = store.events_starting_between(&account_id, now_ms - 60_000, horizon) else {
+                            continue;
+                        };
+                        for event in events {
+                            if event.my_response() == Some(ResponseStatus::Declined) || event.is_working_location() {
+                                continue;
+                            }
+                            let defaults: Vec<i32> = calendars
+                                .iter()
+                                .find(|c| c.id == event.calendar_id)
+                                .map(|c| c.default_reminders.clone())
+                                .filter(|d| !d.is_empty())
+                                .unwrap_or_else(|| if fallback > 0 { vec![fallback] } else { Vec::new() });
+                            let offsets: Vec<i32> = event.effective_reminders(&defaults).to_vec();
+                            out.push((event, offsets));
+                        }
+                    }
+                    out
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.checking_reminders = false;
+                if !this.reminders_enabled {
+                    return;
                 }
-                // A snoozed reminder comes back once, when its time is up.
-                if let Some(until) = self.snoozed_reminders.get(&event.id).copied() {
-                    if now_ms < until {
+                let now_ms = now();
+                this.prune_reminder_memory(now_ms);
+                for (event, offsets) in candidates {
+                    // A snoozed reminder comes back once, when its time is up.
+                    if let Some(until) = this.snoozed_reminders.get(&event.id).copied() {
+                        if now_ms < until {
+                            continue;
+                        }
+                        this.snoozed_reminders.remove(&event.id);
+                        if event.start > now_ms - 60_000 {
+                            this.fire_reminder(&event, now_ms, window, cx);
+                        }
                         continue;
                     }
-                    self.snoozed_reminders.remove(&event.id);
-                    if event.start > now_ms - 60_000 {
-                        self.fire_reminder(&event, now_ms, window, cx);
-                    }
-                    continue;
-                }
-                // Google reports no default for some calendars; 10 minutes is Google's own
-                // default and close to Outlook's 15, and reminders can be switched off.
-                let fallback = self.prefs.default_reminder_minutes as i32;
-                let defaults: Vec<i32> = calendars.iter().find(|c| c.id == event.calendar_id).map(|c| c.default_reminders.clone()).filter(|d| !d.is_empty()).unwrap_or_else(|| if fallback > 0 { vec![fallback] } else { Vec::new() });
-                let offsets: Vec<i32> = event.effective_reminders(&defaults).to_vec();
-                for minutes in offsets {
-                    let fire_at = event.start - i64::from(minutes) * 60_000;
-                    let key = (event.id.clone(), minutes);
-                    if fire_at <= now_ms && event.start > now_ms - 60_000 && !self.notified.contains(&key) {
-                        self.notified.insert(key);
-                        self.fire_reminder(&event, now_ms, window, cx);
+                    for minutes in offsets {
+                        let fire_at = event.start - i64::from(minutes) * 60_000;
+                        let key = (event.id.clone(), minutes);
+                        if fire_at <= now_ms && event.start > now_ms - 60_000 && !this.notified.contains_key(&key) {
+                            this.notified.insert(key, event.start);
+                            this.fire_reminder(&event, now_ms, window, cx);
+                        }
                     }
                 }
-            }
-        }
+            });
+        })
+        .detach();
     }
 
     /// Shows one reminder: a desktop notification and an in-app toast with Snooze.
@@ -583,6 +623,30 @@ impl MailWindow {
         cx.notify();
     }
 
+    fn subscribe_availability_invalidation(
+        inputs: [&Entity<InputState>; 5],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<Subscription> {
+        inputs
+            .into_iter()
+            .map(|input| {
+                cx.subscribe_in(input, window, |this, _, event: &InputEvent, _, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        if let Some(f) = this.new_event.as_mut() {
+                            f.availability_request_id = f.availability_request_id.wrapping_add(1);
+                            if f.checking || !f.availability.is_empty() {
+                                f.checking = false;
+                                f.availability.clear();
+                                cx.notify();
+                            }
+                        }
+                    }
+                })
+            })
+            .collect()
+    }
+
     /// The event form with `event`'s fields in it, its title focused.
     fn form_from_event(event: &Event, guests: String, window: &mut Window, cx: &mut Context<Self>) -> NewEvent {
         let guests = cx.new(|cx| InputState::new(window, cx).placeholder("Guests, comma separated").default_value(guests));
@@ -593,8 +657,9 @@ impl MailWindow {
         let end = cx.new(|cx| InputState::new(window, cx).placeholder("10:00 AM").default_value(clock_text(if event.all_day { event.start + 3_600_000 } else { event.end })));
         let location = cx.new(|cx| InputState::new(window, cx).placeholder("Add a location").default_value(event.location.clone().unwrap_or_default()));
         let description = cx.new(|cx| TextareaState::new(window, cx).placeholder("Add a description").default_value(event.description.clone().unwrap_or_default()));
+        let availability_subs = Self::subscribe_availability_invalidation([&guests, &date, &end_date, &start, &end], window, cx);
         title.update(cx, |s, cx| s.focus(window, cx));
-        NewEvent { time_zone: tz::current_zone(), title, date, end_date, start, end, location, description, guests, add_meet: false, availability: Vec::new(), checking: false, calendar: Some(event.calendar_id.clone()), all_day: event.all_day, error: None, editing: None, original: None, scope: RecurrenceScope::This, duplicate_of: None, dragged: None, _title_enter: None }
+        NewEvent { time_zone: tz::current_zone(), title, date, end_date, start, end, location, description, guests, add_meet: false, availability: Vec::new(), checking: false, availability_request_id: 0, calendar: Some(event.calendar_id.clone()), all_day: event.all_day, error: None, editing: None, original: None, scope: RecurrenceScope::This, duplicate_of: None, dragged: None, _title_enter: None, _availability_subs: availability_subs }
     }
 
     /// The right-click menu of an event anywhere in the calendar. Edit and Delete ask the same
@@ -631,8 +696,11 @@ impl MailWindow {
     }
 
     /// Asks the provider whether each guest is free at the time in the form.
+    /// Tags each request with a monotonic `availability_request_id` and form identity so stale
+    /// responses after editing guests/times/calendar or switching accounts are discarded.
     pub(crate) fn check_availability(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(form) = self.new_event.as_ref() else { return };
+        let form_id = form.guests.entity_id();
         let emails: Vec<String> = Address::parse_list(&form.guests.read(cx).value()).into_iter().map(|a| a.email).collect();
         let Some((start, end)) = self.form_times(form, cx) else {
             if let Some(f) = self.new_event.as_mut() {
@@ -645,23 +713,37 @@ impl MailWindow {
         if emails.is_empty() {
             return;
         }
-        if let Some(f) = self.new_event.as_mut() {
+        let req_id = if let Some(f) = self.new_event.as_mut() {
+            f.availability_request_id = f.availability_request_id.wrapping_add(1);
             f.checking = true;
             f.error = None;
-        }
+            f.availability_request_id
+        } else {
+            return;
+        };
         cx.notify();
         let account = self.account.clone();
+        let account_id = account.id.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let result = cx.background_spawn(async move { provider.free_busy(&account, &emails, start, end).await }).await;
+            let result = super::spawn_blocking_async(async move { provider.free_busy(&account, &emails, start, end).await })
+                .await
+                .unwrap_or_else(|| Err(overlook_provider::ProviderError::Temporary("availability check cancelled".into())));
             let _ = this.update(cx, |this, cx| {
-                if let Some(f) = this.new_event.as_mut() {
+                if this.account.id != account_id {
+                    return;
+                }
+                if let Some(f) = this
+                    .new_event
+                    .as_mut()
+                    .filter(|f| f.guests.entity_id() == form_id && f.availability_request_id == req_id)
+                {
                     f.checking = false;
                     match result {
                         Ok(list) => f.availability = list,
                         Err(e) => f.error = Some(format!("Couldn’t check availability: {e}")),
                     }
+                    cx.notify();
                 }
-                cx.notify();
             });
         })
         .detach();
@@ -788,8 +870,9 @@ impl MailWindow {
         let location = cx.new(|cx| InputState::new(window, cx).placeholder("Add a location"));
         let description = cx.new(|cx| TextareaState::new(window, cx).placeholder("Add a description"));
         let guests = cx.new(|cx| InputState::new(window, cx).placeholder("Guests, comma separated"));
+        let availability_subs = Self::subscribe_availability_invalidation([&guests, &date, &end_date, &start, &end], window, cx);
         title.update(cx, |s, cx| s.focus(window, cx));
-        NewEvent { time_zone: tz::current_zone(), title, date, end_date, start, end, location, description, guests, add_meet: false, availability: Vec::new(), checking: false, calendar, all_day: false, error: None, editing: None, original: None, scope: RecurrenceScope::This, duplicate_of: None, dragged: None, _title_enter: None }
+        NewEvent { time_zone: tz::current_zone(), title, date, end_date, start, end, location, description, guests, add_meet: false, availability: Vec::new(), checking: false, availability_request_id: 0, calendar, all_day: false, error: None, editing: None, original: None, scope: RecurrenceScope::This, duplicate_of: None, dragged: None, _title_enter: None, _availability_subs: availability_subs }
     }
 
     /// A window position as a distance from the top of the day in the time grid.
@@ -1213,20 +1296,22 @@ impl MailWindow {
         }));
 
         let now_ms = now();
-        // While a block is dragged, every column sees it at the proposed time.
-        let previewed: Vec<Event> = self
-            .cal_events
-            .iter()
-            .cloned()
-            .map(|mut e| {
-                if let Some(d) = self.cal_drag.as_ref().filter(|d| d.event_id == e.id && d.moved) {
-                    let (s, en) = d.proposed();
-                    e.start = s;
-                    e.end = en;
-                }
-                e
-            })
-            .collect();
+        // Only clone `cal_events` while actively dragging an event; otherwise borrow directly.
+        let dragged_events: Option<Vec<Event>> = self.cal_drag.as_ref().filter(|d| d.moved).map(|d| {
+            let (s, en) = d.proposed();
+            self.cal_events
+                .iter()
+                .cloned()
+                .map(|mut e| {
+                    if e.id == d.event_id {
+                        e.start = s;
+                        e.end = en;
+                    }
+                    e
+                })
+                .collect()
+        });
+        let previewed: &[Event] = dragged_events.as_deref().unwrap_or(&self.cal_events);
         // The time being dragged out, or the one the open modal was started from.
         let marked = self.cal_range_drag.filter(CalRangeDrag::moved).map(|r| r.times()).or_else(|| self.new_event.as_ref().and_then(|f| f.dragged));
         let columns = day_starts.iter().enumerate().map(|(ci, &d)| {
@@ -1685,7 +1770,17 @@ impl MailWindow {
                 .when(my == Some(response), |b| b.primary())
                 .on_click(cx.listener(move |this, _, window, cx| this.respond_to_event(id.clone(), response, window, cx)))
         };
-        let description_html = e.description.as_deref().map(|d| if d.contains('<') { sanitize_html(d, RemoteContent::Blocked).html } else { text_to_html(d) });
+        let description_html = e.description.as_deref().map(|d| {
+            let mut cache = self.cal_desc_cache.borrow_mut();
+            if let Some((cid, raw, html)) = cache.as_ref() {
+                if cid == &e.id && raw == d {
+                    return html.clone();
+                }
+            }
+            let html = if d.contains('<') { sanitize_html(d, RemoteContent::Blocked).html } else { text_to_html(d) };
+            *cache = Some((e.id.clone(), d.to_owned(), html.clone()));
+            html
+        });
 
         let prompt = self.cal_scope_prompt.clone().filter(|p| p.event_id == e.id);
         let scope_card = prompt.map(|prompt| {
@@ -1989,6 +2084,9 @@ impl MailWindow {
             .child(h_flex().items_center().gap(px(10.)).child(Switch::new("all-day").checked(form.all_day).label("All day").on_click(cx.listener(|this, checked: &bool, _w, cx| {
                 if let Some(f) = this.new_event.as_mut() {
                     f.all_day = *checked;
+                    f.availability_request_id = f.availability_request_id.wrapping_add(1);
+                    f.checking = false;
+                    f.availability.clear();
                 }
                 cx.notify();
             }))))
@@ -2051,6 +2149,9 @@ impl MailWindow {
                                 let _ = t.update(cx, |this, cx| {
                                     if let Some(f) = this.new_event.as_mut() {
                                         f.calendar = Some(id.clone());
+                                        f.availability_request_id = f.availability_request_id.wrapping_add(1);
+                                        f.checking = false;
+                                        f.availability.clear();
                                     }
                                     cx.notify();
                                 });

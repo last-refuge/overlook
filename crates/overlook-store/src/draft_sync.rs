@@ -43,7 +43,7 @@ pub struct DraftEditGuard {
 
 impl Drop for DraftEditGuard {
     fn drop(&mut self) {
-        let mut editing = self.store.editing_drafts.lock().unwrap();
+        let mut editing = self.store.editing_drafts.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(count) = editing.get_mut(&self.id) {
             *count -= 1;
             if *count == 0 {
@@ -58,7 +58,7 @@ impl Store {
         *self
             .editing_drafts
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .entry(id.clone())
             .or_default() += 1;
         DraftEditGuard {
@@ -68,7 +68,7 @@ impl Store {
     }
 
     pub fn draft_is_open(&self, id: &DraftId) -> bool {
-        self.editing_drafts.lock().unwrap().contains_key(id)
+        self.editing_drafts.lock().unwrap_or_else(|e| e.into_inner()).contains_key(id)
     }
 
     pub fn draft_sync_entries(&self, account: &AccountId) -> Result<Vec<DraftSyncEntry>> {
@@ -130,46 +130,59 @@ impl Store {
         draft: &Draft,
         conflict: Option<&Draft>,
     ) -> Result<bool> {
-        let editing = self.editing_drafts.lock().unwrap();
+        // Fast path: skip DB work when the draft is already open in an editor.
+        if self.draft_is_open(&draft.id) {
+            return Ok(false);
+        }
+        // Strict lock order: always acquire `conn` (and SQLite write tx) before `editing_drafts`
+        // so `edit_draft` / `Drop` never wait on a busy writer and deadlock is impossible.
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current = load_drafts(&tx, "WHERE d.id=?1", params![draft.id.0])?.pop();
+        if !matches_expected(current.as_ref(), expected) { return Ok(false); }
+        let pending: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM draft_sync WHERE draft_id=?1 AND pending_json IS NOT NULL)", [&draft.id.0], |r| r.get(0))?;
+        if pending { return Ok(false); }
+        if let Some(conflict) = conflict {
+            ensure_same_account(&conflict.account_id, &draft.account_id, "draft")?;
+            save_draft_tx(&tx, conflict)?;
+        }
+        save_draft_tx(&tx, draft)?;
+        tx.execute("UPDATE draft_sync SET remote_json=?3,base_json=?4 WHERE draft_id=?1 AND account_id=?2",
+            params![draft.id.0, draft.account_id.0, serde_json::to_string(remote)?, serde_json::to_string(draft)?])?;
+        tx.execute("UPDATE drafts SET provider_id=?2 WHERE id=?1", params![draft.id.0, remote.id.0])?;
+        let editing = self.editing_drafts.lock().unwrap_or_else(|e| e.into_inner());
         if editing.contains_key(&draft.id) {
             return Ok(false);
         }
-        self.with_tx(|tx| {
-            let current = load_drafts(tx, "WHERE d.id=?1", params![draft.id.0])?.pop();
-            if !matches_expected(current.as_ref(), expected) { return Ok(false); }
-            let pending: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM draft_sync WHERE draft_id=?1 AND pending_json IS NOT NULL)", [&draft.id.0], |r| r.get(0))?;
-            if pending { return Ok(false); }
-            if let Some(conflict) = conflict {
-                ensure_same_account(&conflict.account_id, &draft.account_id, "draft")?;
-                save_draft_tx(tx, conflict)?;
-            }
-            save_draft_tx(tx, draft)?;
-            tx.execute("UPDATE draft_sync SET remote_json=?3,base_json=?4 WHERE draft_id=?1 AND account_id=?2",
-                params![draft.id.0, draft.account_id.0, serde_json::to_string(remote)?, serde_json::to_string(draft)?])?;
-            tx.execute("UPDATE drafts SET provider_id=?2 WHERE id=?1", params![draft.id.0, remote.id.0])?;
-            Ok(true)
-        })
+        tx.commit()?;
+        drop(editing);
+        Ok(true)
     }
 
     /// Remote deletion removes an unchanged closed draft. A modified draft is detached
     /// from the deleted server copy and will be uploaded as a new draft.
     pub fn remote_draft_removed(&self, expected: &Draft, recover: bool) -> Result<bool> {
-        let editing = self.editing_drafts.lock().unwrap();
+        if self.draft_is_open(&expected.id) {
+            return Ok(false);
+        }
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current = load_drafts(&tx, "WHERE d.id=?1 AND d.account_id=?2", params![expected.id.0, expected.account_id.0])?.pop();
+        if !matches_expected(current.as_ref(), Some(expected)) { return Ok(false); }
+        if recover {
+            tx.execute("UPDATE draft_sync SET remote_json=NULL,base_json=NULL WHERE draft_id=?1 AND account_id=?2 AND pending_json IS NULL", params![expected.id.0, expected.account_id.0])?;
+            tx.execute("UPDATE drafts SET provider_id=NULL WHERE id=?1", [&expected.id.0])?;
+        } else {
+            tx.execute("DELETE FROM drafts WHERE id=?1", [&expected.id.0])?;
+            tx.execute("DELETE FROM draft_sync WHERE draft_id=?1 AND account_id=?2 AND pending_json IS NULL", params![expected.id.0, expected.account_id.0])?;
+        }
+        let editing = self.editing_drafts.lock().unwrap_or_else(|e| e.into_inner());
         if editing.contains_key(&expected.id) {
             return Ok(false);
         }
-        self.with_tx(|tx| {
-            let current = load_drafts(tx, "WHERE d.id=?1 AND d.account_id=?2", params![expected.id.0, expected.account_id.0])?.pop();
-            if !matches_expected(current.as_ref(), Some(expected)) { return Ok(false); }
-            if recover {
-                tx.execute("UPDATE draft_sync SET remote_json=NULL,base_json=NULL WHERE draft_id=?1 AND account_id=?2 AND pending_json IS NULL", params![expected.id.0, expected.account_id.0])?;
-                tx.execute("UPDATE drafts SET provider_id=NULL WHERE id=?1", [&expected.id.0])?;
-            } else {
-                tx.execute("DELETE FROM drafts WHERE id=?1", [&expected.id.0])?;
-                tx.execute("DELETE FROM draft_sync WHERE draft_id=?1 AND account_id=?2 AND pending_json IS NULL", params![expected.id.0, expected.account_id.0])?;
-            }
-            Ok(true)
-        })
+        tx.commit()?;
+        drop(editing);
+        Ok(true)
     }
 
     pub fn finish_draft_deletion(&self, account: &AccountId, entry: &DraftSyncEntry) -> Result<()> {
@@ -190,7 +203,10 @@ impl Store {
             tx.execute("UPDATE draft_sync SET remote_json=NULL,base_json=NULL WHERE draft_id=?1 AND account_id=?2", params![expected.id.0, expected.account_id.0])?;
             // Remove the unsent intent entirely. The explicit Resend action can create a
             // new operation; an automatic replay must never submit this paused message.
-            tx.execute("DELETE FROM pending_operations WHERE account_id=?1 AND kind_json=?2 AND state IN ('pending','failed')", params![expected.account_id.0, serde_json::to_string(&OperationKind::SendDraft { draft_id: expected.id.clone() })?])?;
+            tx.execute(
+                "DELETE FROM pending_operations WHERE account_id=?1 AND state IN ('pending','failed') AND json_valid(kind_json) AND json_extract(kind_json,'$.op')='send-draft' AND json_extract(kind_json,'$.draft_id')=?2",
+                params![expected.account_id.0, expected.id.0],
+            )?;
             Ok(true)
         })
     }

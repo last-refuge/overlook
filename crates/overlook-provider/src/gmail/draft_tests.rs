@@ -57,6 +57,7 @@ impl Server {
                 let (method, target) = (words[0].to_owned(), words[1].to_owned());
                 let mut length = 0;
                 let mut chunked = false;
+                let mut content_type = String::new();
                 loop {
                     let mut header = String::new();
                     reader.read_line(&mut header).unwrap();
@@ -69,6 +70,9 @@ impl Server {
                         }
                         if key.eq_ignore_ascii_case("transfer-encoding") {
                             chunked = value.trim().eq_ignore_ascii_case("chunked");
+                        }
+                        if key.eq_ignore_ascii_case("content-type") {
+                            content_type = value.trim().to_owned();
                         }
                     }
                 }
@@ -93,6 +97,63 @@ impl Server {
                 let url = url::Url::parse(&format!("http://localhost{target}")).unwrap();
                 let mut state = worker_state.lock().unwrap();
                 let path = url.path().trim_start_matches('/');
+                if method == "POST" && path == "batch" {
+                    let req_boundary = content_type
+                        .split(';')
+                        .map(str::trim)
+                        .find_map(|p| p.strip_prefix("boundary="))
+                        .unwrap()
+                        .trim_matches('"');
+                    let text = String::from_utf8_lossy(&bytes);
+                    let reply_boundary = "batch_test_reply";
+                    let mut reply = String::new();
+                    for part in text.split(&format!("--{req_boundary}")).skip(1) {
+                        let part = part.trim_start_matches("\r\n");
+                        if part.starts_with("--") || part.trim().is_empty() {
+                            continue;
+                        }
+                        let Some((outer, inner)) = part.split_once("\r\n\r\n") else { continue };
+                        let cid = outer
+                            .lines()
+                            .find_map(|l| l.strip_prefix("Content-ID:"))
+                            .map(|v| v.trim().trim_matches(['<', '>']))
+                            .unwrap_or("item0");
+                        let req_line = inner.lines().next().unwrap_or("");
+                        let sub_target = req_line.split_whitespace().nth(1).unwrap_or("/");
+                        let sub_url = url::Url::parse(&format!("http://localhost{sub_target}")).unwrap();
+                        let sub_path = sub_url.path().trim_start_matches("/gmail/v1/users/me/").trim_start_matches('/');
+                        let (sub_status, sub_val) = if let Some(id) = sub_path.strip_prefix("drafts/") {
+                            match state.items.get(id) {
+                                Some(item) => {
+                                    let mut item = item.clone();
+                                    if sub_url.query_pairs().any(|(k, v)| k == "format" && v == "metadata") {
+                                        let raw = super::super::mapping::base64url_decode(item["message"]["raw"].as_str().unwrap());
+                                        let parsed = mail_parser::MessageParser::default().parse(&raw).unwrap();
+                                        item["message"]["payload"] = json!({"headers":[{"name":"Message-ID","value":format!("<{}>", parsed.message_id().unwrap())}]});
+                                        item["message"].as_object_mut().unwrap().remove("raw");
+                                    }
+                                    (200, item)
+                                }
+                                None => (404, json!({})),
+                            }
+                        } else {
+                            (404, json!({}))
+                        };
+                        let sub_body = sub_val.to_string();
+                        reply.push_str(&format!(
+                            "--{reply_boundary}\r\nContent-Type: application/http\r\nContent-ID: <response-{cid}>\r\n\r\nHTTP/1.1 {sub_status} Test\r\nContent-Type: application/json\r\n\r\n{sub_body}\r\n"
+                        ));
+                    }
+                    reply.push_str(&format!("--{reply_boundary}--\r\n"));
+                    drop(state);
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: multipart/mixed; boundary={reply_boundary}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    )
+                    .unwrap();
+                    continue;
+                }
                 let id = path.strip_prefix("drafts/");
                 let (status, value) = match (method.as_str(), path, id) {
                     ("POST", "drafts/send", _) => {

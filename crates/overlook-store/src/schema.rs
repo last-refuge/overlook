@@ -2,7 +2,103 @@
 
 use rusqlite::Connection;
 
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17, V18, V19, V20, V21, V22];
+const MIGRATIONS: &[&str] = &[
+    V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17, V18, V19, V20,
+    V21, V22, V23,
+];
+
+/// Split message bodies out of `messages`, add `WHEN`-guarded FTS5 triggers, add
+/// `message_references` and missing indexes, and add monotonic counters for contacts.
+const V23: &str = r#"
+CREATE TABLE message_bodies (
+    message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    body_text TEXT,
+    body_html TEXT,
+    search_text TEXT NOT NULL
+);
+INSERT INTO message_bodies(message_id, body_text, body_html, search_text)
+    SELECT id, body_text, body_html, search_text FROM messages;
+
+DROP TRIGGER IF EXISTS messages_fts_insert;
+DROP TRIGGER IF EXISTS messages_fts_delete;
+DROP TRIGGER IF EXISTS messages_fts_update;
+DROP TABLE IF EXISTS messages_fts;
+
+ALTER TABLE messages DROP COLUMN body_text;
+ALTER TABLE messages DROP COLUMN body_html;
+ALTER TABLE messages DROP COLUMN search_text;
+
+CREATE VIRTUAL TABLE messages_fts USING fts5(
+    subject, search_text,
+    content='', contentless_delete=1,
+    tokenize='unicode61 remove_diacritics 2'
+);
+INSERT INTO messages_fts(rowid, subject, search_text)
+    SELECT m.rowid, m.subject, COALESCE(b.search_text, '')
+    FROM messages m LEFT JOIN message_bodies b ON b.message_id = m.id;
+
+CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, subject, search_text) VALUES (new.rowid, new.subject, '');
+END;
+CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages BEGIN
+    DELETE FROM messages_fts WHERE rowid = old.rowid;
+END;
+CREATE TRIGGER messages_fts_update AFTER UPDATE OF subject ON messages WHEN old.subject IS NOT new.subject BEGIN
+    DELETE FROM messages_fts WHERE rowid = new.rowid;
+    INSERT INTO messages_fts(rowid, subject, search_text)
+        VALUES (new.rowid, new.subject, COALESCE((SELECT search_text FROM message_bodies WHERE message_id = new.id), ''));
+END;
+CREATE TRIGGER message_bodies_fts_insert AFTER INSERT ON message_bodies WHEN new.search_text != '' BEGIN
+    DELETE FROM messages_fts WHERE rowid = (SELECT rowid FROM messages WHERE id = new.message_id);
+    INSERT INTO messages_fts(rowid, subject, search_text)
+        SELECT rowid, subject, new.search_text FROM messages WHERE id = new.message_id;
+END;
+CREATE TRIGGER message_bodies_fts_update AFTER UPDATE OF search_text ON message_bodies WHEN old.search_text IS NOT new.search_text BEGIN
+    DELETE FROM messages_fts WHERE rowid = (SELECT rowid FROM messages WHERE id = new.message_id);
+    INSERT INTO messages_fts(rowid, subject, search_text)
+        SELECT rowid, subject, new.search_text FROM messages WHERE id = new.message_id;
+END;
+CREATE TRIGGER message_bodies_fts_delete AFTER DELETE ON message_bodies BEGIN
+    DELETE FROM messages_fts WHERE rowid = (SELECT rowid FROM messages WHERE id = old.message_id);
+    INSERT INTO messages_fts(rowid, subject, search_text)
+        SELECT rowid, subject, '' FROM messages WHERE id = old.message_id;
+END;
+
+CREATE INDEX messages_in_reply_to ON messages(account_id, in_reply_to, date DESC) WHERE in_reply_to IS NOT NULL;
+CREATE TABLE message_references (
+    account_id TEXT NOT NULL,
+    rfc_id TEXT NOT NULL,
+    message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    PRIMARY KEY (account_id, rfc_id, message_id)
+) WITHOUT ROWID;
+CREATE INDEX message_references_message ON message_references(message_id);
+INSERT OR IGNORE INTO message_references(account_id, rfc_id, message_id)
+    SELECT m.account_id, j.value, m.id
+    FROM messages m, json_each(m.references_json) j
+    WHERE m.references_json IS NOT NULL
+      AND json_valid(m.references_json)
+      AND json_type(m.references_json) = 'array'
+      AND typeof(j.value) = 'text';
+
+CREATE INDEX events_calendar_range ON events(calendar_id, start, end);
+CREATE INDEX draft_attachments_draft ON draft_attachments(draft_id);
+CREATE INDEX pending_operations_active ON pending_operations(account_id, seq) WHERE state != 'applied';
+CREATE INDEX pending_operations_applied ON pending_operations(state, updated_at) WHERE state = 'applied';
+CREATE INDEX caldav_collections_connection ON caldav_collections(connection_id);
+CREATE INDEX caldav_outbox_connection ON caldav_outbox(connection_id);
+CREATE INDEX calendars_account ON calendars(account_id);
+CREATE INDEX change_history_at ON change_history(at);
+
+ALTER TABLE contact_connections ADD COLUMN generation INTEGER NOT NULL DEFAULT 1;
+CREATE TABLE contact_connection_generations (
+    account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+    generation INTEGER NOT NULL,
+    last_connected_at INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO contact_connection_generations(account_id, generation, last_connected_at)
+    SELECT account_id, generation, created_at FROM contact_connections;
+ALTER TABLE people ADD COLUMN edit_revision INTEGER NOT NULL DEFAULT 0;
+"#;
 
 /// Contacts servers other than Fastmail may take a password of their own.
 const V22: &str = "
@@ -13,7 +109,6 @@ ALTER TABLE contact_connections ADD COLUMN credential TEXT NOT NULL DEFAULT 'inc
 /// each card's version as last seen, which edits are applied against. Tables of their own,
 /// so nothing that exists is altered.
 const V21: &str = "
-BEGIN;
 CREATE TABLE contact_connections (
     account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
     server_url TEXT NOT NULL,
@@ -30,13 +125,10 @@ CREATE TABLE contact_cards (
     base_json TEXT NOT NULL,
     PRIMARY KEY(account_id, contact_id)
 );
-PRAGMA user_version = 21;
-COMMIT;
 ";
 
 /// The change history behind Undo, Ctrl+Z and the History view.
 const V20: &str = "
-BEGIN;
 CREATE TABLE change_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -47,12 +139,9 @@ CREATE TABLE change_history (
     undone_at INTEGER
 );
 CREATE INDEX change_history_account ON change_history(account_id, at);
-PRAGMA user_version = 20;
-COMMIT;
 ";
 
 const V19: &str = "
-BEGIN;
 CREATE TABLE draft_imports (
     draft_id TEXT PRIMARY KEY REFERENCES drafts(id) ON DELETE CASCADE,
     source_json TEXT NOT NULL
@@ -69,8 +158,6 @@ CREATE TABLE draft_sync (
 );
 CREATE INDEX draft_sync_account ON draft_sync(account_id);
 INSERT INTO draft_sync(draft_id, account_id) SELECT d.id, d.account_id FROM drafts d JOIN accounts a ON a.id=d.account_id WHERE a.provider IN ('gmail','imap');
-PRAGMA user_version = 19;
-COMMIT;
 ";
 
 /// The signature chosen for a draft, as it was when chosen. A table of its own, so nothing
@@ -88,7 +175,6 @@ ALTER TABLE draft_attachments ADD COLUMN content_id TEXT;
 ";
 
 const V16: &str = "
-BEGIN;
 CREATE TABLE caldav_checkpoints (
     calendar_id TEXT PRIMARY KEY REFERENCES caldav_collections(calendar_id) ON DELETE CASCADE,
     token TEXT NOT NULL,
@@ -96,8 +182,6 @@ CREATE TABLE caldav_checkpoints (
     range_end INTEGER NOT NULL,
     timezone TEXT NOT NULL
 );
-PRAGMA user_version = 16;
-COMMIT;
 ";
 
 const V15: &str = "
@@ -113,28 +197,32 @@ CREATE TABLE caldav_outbox (
 ";
 
 /// Check before changing journal mode or migrating, leaving newer databases untouched.
-pub fn ensure_supported(conn: &Connection) -> super::Result<()> {
+/// Returns the current `PRAGMA user_version`.
+pub fn ensure_supported(conn: &Connection) -> super::Result<i64> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version > MIGRATIONS.len() as i64 {
         return Err(super::StoreError::Invalid("This database was created by a newer version of Overlook. Update Overlook before opening it.".into()));
     }
-    Ok(())
+    Ok(version)
 }
 
-pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+/// Applies each pending migration atomically inside a transaction together with
+/// `PRAGMA user_version`, so DDL can never commit without advancing the schema version.
+pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     for (i, sql) in MIGRATIONS.iter().enumerate() {
         let version = (i + 1) as i64;
         if version > current {
-            conn.execute_batch(sql)?;
-            conn.pragma_update(None, "user_version", version)?;
+            let tx = conn.transaction()?;
+            tx.execute_batch(sql)?;
+            tx.pragma_update(None, "user_version", version)?;
+            tx.commit()?;
         }
     }
     Ok(())
 }
 
 const V1: &str = r#"
-BEGIN;
 CREATE TABLE accounts (
     id TEXT PRIMARY KEY,
     provider TEXT NOT NULL,
@@ -269,11 +357,9 @@ CREATE TRIGGER messages_fts_update AFTER UPDATE OF subject, search_text ON messa
     INSERT INTO messages_fts(messages_fts, rowid, subject, search_text) VALUES ('delete', old.rowid, old.subject, old.search_text);
     INSERT INTO messages_fts(rowid, subject, search_text) VALUES (new.rowid, new.subject, new.search_text);
 END;
-COMMIT;
 "#;
 
 const V2: &str = r#"
-BEGIN;
 ALTER TABLE messages ADD COLUMN category TEXT;
 ALTER TABLE messages ADD COLUMN is_important INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE messages ADD COLUMN focus_override INTEGER;
@@ -283,11 +369,9 @@ CREATE TABLE focus_rules (
     focused INTEGER NOT NULL,
     PRIMARY KEY (account_id, email)
 );
-COMMIT;
 "#;
 
 const V3: &str = r#"
-BEGIN;
 CREATE TABLE calendars (
     id TEXT PRIMARY KEY,
     account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -321,47 +405,35 @@ CREATE TABLE events (
 );
 CREATE INDEX events_range ON events(account_id, start, end);
 CREATE UNIQUE INDEX events_provider ON events(calendar_id, provider_id) WHERE provider_id IS NOT NULL;
-COMMIT;
 "#;
 
 const V4: &str = r#"
-BEGIN;
 ALTER TABLE events ADD COLUMN event_type TEXT;
-COMMIT;
 "#;
 
 const V5: &str = r#"
-BEGIN;
 ALTER TABLE events ADD COLUMN color TEXT;
 ALTER TABLE events ADD COLUMN reminders_json TEXT;
 ALTER TABLE calendars ADD COLUMN default_reminders_json TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE messages ADD COLUMN invitation_json TEXT;
 CREATE INDEX events_ical ON events(account_id, ical_uid);
-COMMIT;
 "#;
 
 const V6: &str = r#"
-BEGIN;
 ALTER TABLE attachments ADD COLUMN content_id TEXT;
-COMMIT;
 "#;
 
 const V7: &str = r#"
-BEGIN;
 ALTER TABLE drafts ADD COLUMN include_quote INTEGER NOT NULL DEFAULT 0;
-COMMIT;
 "#;
 
 const V8: &str = r#"
-BEGIN;
 ALTER TABLE events ADD COLUMN original_start INTEGER;
 ALTER TABLE events ADD COLUMN wants_conference INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX events_series ON events(account_id, recurring_event_id);
-COMMIT;
 "#;
 
 const V9: &str = r#"
-BEGIN;
 CREATE TABLE contacts (
     account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     email TEXT NOT NULL,
@@ -371,11 +443,9 @@ CREATE TABLE contacts (
     updated INTEGER NOT NULL,
     PRIMARY KEY(account_id, email)
 );
-COMMIT;
 "#;
 
 const V10: &str = r#"
-BEGIN;
 CREATE TABLE people (
     id TEXT NOT NULL,
     account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -399,14 +469,12 @@ INSERT INTO people(id, account_id, email, emails_json, name, photo_url, in_addre
     SELECT 'legacy:' || email, account_id, email, '["' || email || '"]', name, photo_url, in_address_book, updated FROM contacts;
 DROP TABLE contacts;
 CREATE INDEX people_email ON people(account_id, email);
-COMMIT;
 "#;
 
 // IMAP/POP3 plumbing: server settings, folder sync cursors, the POP3 download ledger,
 // the References header for threading, and a fast lookup by Message-ID for move
 // reconciliation.
 const V11: &str = r#"
-BEGIN;
 CREATE TABLE account_servers (
     account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
     servers_json TEXT NOT NULL
@@ -431,20 +499,15 @@ CREATE TABLE pop3_seen (
 );
 ALTER TABLE messages ADD COLUMN references_json TEXT;
 CREATE INDEX messages_rfc_id ON messages(account_id, rfc_message_id);
-COMMIT;
 "#;
 
 /// Loading a message's attachments looks them up by message.
 const V12: &str = r#"
-BEGIN;
 CREATE INDEX attachments_message ON attachments(message_id);
-COMMIT;
 "#;
 
 // CalDAV setup only. Existing Google calendars, tokens and queued operations are untouched.
-// Keep the version in this transaction so reopening after a crash cannot replay the DDL.
 const V13: &str = r#"
-BEGIN;
 CREATE TABLE calendar_connections (
     id TEXT PRIMARY KEY,
     account_id TEXT NOT NULL UNIQUE REFERENCES accounts(id) ON DELETE CASCADE,
@@ -452,12 +515,9 @@ CREATE TABLE calendar_connections (
     enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
     generation INTEGER NOT NULL CHECK(generation > 0)
 );
-PRAGMA user_version = 13;
-COMMIT;
 "#;
 
 const V14: &str = r#"
-BEGIN;
 CREATE TABLE caldav_collections (
     calendar_id TEXT PRIMARY KEY REFERENCES calendars(id) ON DELETE CASCADE,
     connection_id TEXT NOT NULL REFERENCES calendar_connections(id) ON DELETE CASCADE
@@ -484,8 +544,6 @@ CREATE TABLE caldav_coverage (
     synced_at INTEGER NOT NULL,
     PRIMARY KEY(connection_id, range_start, range_end, timezone)
 );
-PRAGMA user_version = 14;
-COMMIT;
 "#;
 
 #[cfg(test)]
@@ -494,7 +552,7 @@ mod calendar_migration_tests {
 
     #[test]
     fn upgrade_from_v12_preserves_accounts_events_and_pending_operations() {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         for sql in &MIGRATIONS[..12] {
             conn.execute_batch(sql).unwrap();
         }
@@ -510,28 +568,28 @@ mod calendar_migration_tests {
         let queued_json = serde_json::to_string(&operation).unwrap();
         conn.execute("INSERT INTO pending_operations(id, account_id, seq, kind_json, state, created_at, updated_at)
             VALUES('operation', 'test', 1, ?1, 'pending', 1, 1)", [&queued_json]).unwrap();
-        // Existing tables must retain their definitions; queued operation JSON needs no rewrite.
+        // Existing unrelated tables must retain their definitions; queued operation JSON needs no rewrite.
         let before: Vec<(String, String)> = conn.prepare("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name").unwrap()
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect();
-        migrate(&conn).unwrap();
+        migrate(&mut conn).unwrap();
         assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0)).unwrap(), MIGRATIONS.len() as u32);
         assert_eq!(conn.query_row("SELECT email FROM accounts WHERE id='test'", [], |r| r.get::<_, String>(0)).unwrap(), "test@example.com");
         assert_eq!(conn.query_row("SELECT summary FROM events WHERE id='event'", [], |r| r.get::<_, String>(0)).unwrap(), "Unsynced title");
         assert_eq!(conn.query_row("SELECT kind_json FROM pending_operations WHERE id='operation' AND state='pending'", [], |r| r.get::<_, String>(0)).unwrap(), queued_json);
         for (name, definition) in before {
-            // V17 adds a column to the draft attachments, which have nothing to do with calendars.
-            if name == "draft_attachments" {
+            // V17 adds content_id to draft_attachments; V23 splits messages bodies / rebuilds messages_fts / adds edit_revision to people.
+            if matches!(name.as_str(), "draft_attachments" | "messages" | "people") || name.starts_with("messages_fts") {
                 continue;
             }
-            assert_eq!(conn.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name=?1", [name], |r| r.get::<_, String>(0)).unwrap(), definition);
+            assert_eq!(conn.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name=?1", [&name], |r| r.get::<_, String>(0)).unwrap(), definition);
         }
-        migrate(&conn).unwrap(); // Reopening does not replay the new table creation.
+        migrate(&mut conn).unwrap(); // Reopening does not replay the new table creation.
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM calendar_connections", [], |r| r.get::<_, u32>(0)).unwrap(), 0);
     }
 
     #[test]
     fn upgrade_from_v16_keeps_draft_attachments_without_a_content_id() {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         for sql in &MIGRATIONS[..16] {
             conn.execute_batch(sql).unwrap();
         }
@@ -540,12 +598,139 @@ mod calendar_migration_tests {
         conn.execute("INSERT INTO drafts(id, account_id, kind, to_json, cc_json, bcc_json, subject, body_text, state_json, created_at, updated_at)
             VALUES('draft', 'test', 'forward', '[]', '[]', '[]', 'Fwd: Plans', '', '{\"state\":\"editing\"}', 1, 1)", []).unwrap();
         conn.execute("INSERT INTO draft_attachments(id, draft_id, filename, mime_type, size_bytes, local_path) VALUES('att', 'draft', 'plan.pdf', 'application/pdf', 8, '/outgoing/plan.pdf')", []).unwrap();
-        migrate(&conn).unwrap();
+        migrate(&mut conn).unwrap();
         assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0)).unwrap(), MIGRATIONS.len() as u32);
         let (name, content_id) = conn.query_row("SELECT filename, content_id FROM draft_attachments WHERE id='att'", [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))).unwrap();
         assert_eq!((name.as_str(), content_id), ("plan.pdf", None));
         let (account, base, pending) = conn.query_row("SELECT account_id,base_json,pending_json FROM draft_sync WHERE draft_id='draft'", [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?))).unwrap();
         assert_eq!((account.as_str(), base, pending), ("test", None, None), "existing offline drafts are enrolled without claiming they are uploaded");
+    }
+
+    #[test]
+    fn upgrade_from_v22_splits_bodies_backfills_references_and_keeps_fts_and_relations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade-v22.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            for sql in &MIGRATIONS[..22] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 22).unwrap();
+            conn.execute(
+                "INSERT INTO accounts(id, provider, display_name, email, created_at) VALUES('acct', 'imap', 'Me', 'me@example.com', 1)",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO labels(id, account_id, kind, name) VALUES('inbox', 'acct', 'inbox', 'Inbox')",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO messages(id, account_id, conversation_id, provider_id, from_json, to_json, cc_json, bcc_json, subject, snippet, body_text, body_html, search_text, date, rfc_message_id, in_reply_to, references_json)
+                 VALUES('m1', 'acct', 'conv-1', 'INBOX\x1f1\x1f10', '{\"name\":\"Maya\",\"email\":\"maya@example.com\"}', '[]', '[]', '[]', 'Quarterly roadmap', 'Launch snippet', 'Full text body about rockets', '<p>HTML rockets</p>', 'Maya maya@example.com\nFull text body about rockets', 1000, '<m1@x>', '<root@x>', '[\"<grand@x>\",\"<root@x>\"]')",
+                [],
+            ).unwrap();
+            conn.execute("INSERT INTO message_labels(message_id, label_id) VALUES('m1', 'inbox')", []).unwrap();
+            conn.execute(
+                "INSERT INTO attachments(id, message_id, filename, mime_type, size_bytes) VALUES('att1', 'm1', 'doc.pdf', 'application/pdf', 42)",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO contact_connections(account_id, server_url, username, created_at, credential) VALUES('acct', 'https://dav.test/', 'me', 500, 'incoming-mail')",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO people(id, account_id, email, emails_json, name, updated) VALUES('p1', 'acct', 'maya@example.com', '[\"maya@example.com\"]', 'Maya', 10)",
+                [],
+            ).unwrap();
+        }
+
+        let store = crate::Store::open(&path).unwrap();
+        let acct = overlook_core::AccountId::from("acct");
+
+        // Verify messages columns no longer contain body_text, body_html, search_text.
+        let cols: Vec<String> = store.with_read(|c| {
+            let mut stmt = c.prepare("PRAGMA table_info(messages)")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        }).unwrap();
+        assert!(!cols.contains(&"body_text".to_owned()));
+        assert!(!cols.contains(&"body_html".to_owned()));
+        assert!(!cols.contains(&"search_text".to_owned()));
+
+        // Verify full message, labels, attachments, and bodies survived intact.
+        let m = store.message(&overlook_core::MessageId::from("m1")).unwrap().unwrap();
+        assert_eq!(m.body.text.as_deref(), Some("Full text body about rockets"));
+        assert_eq!(m.body.html.as_deref(), Some("<p>HTML rockets</p>"));
+        assert!(m.has_label(&overlook_core::LabelId::from("inbox")));
+        assert_eq!(m.attachments.len(), 1);
+        assert_eq!(m.attachments[0].filename, "doc.pdf");
+
+        // Verify FTS5 works after upgrade.
+        assert_eq!(store.search(&acct, "rockets").unwrap(), vec![overlook_core::MessageId::from("m1")]);
+        assert_eq!(store.search(&acct, "roadmap").unwrap(), vec![overlook_core::MessageId::from("m1")]);
+
+        // Verify message_references backfill and conversation_for_rfc_id.
+        assert_eq!(store.conversation_for_rfc_id(&acct, "<grand@x>").unwrap(), Some(overlook_core::ConversationId::from("conv-1")));
+        assert_eq!(store.conversation_for_rfc_id(&acct, "<root@x>").unwrap(), Some(overlook_core::ConversationId::from("conv-1")));
+
+        // Verify has_cached_body & search_coverage.
+        assert!(store.has_cached_body(&acct, &overlook_core::ProviderId("INBOX\x1f1\x1f10".into())).unwrap());
+        let cov = store.search_coverage(&acct).unwrap();
+        assert_eq!((cov.messages_total, cov.bodies_cached), (1, 1));
+
+        // Verify contact_connections generation and contact_connection_generations backfill.
+        let conn = store.contacts_connection(&acct).unwrap().unwrap();
+        assert_eq!(conn.connected_at, 500);
+        let gen: i64 = store.with_read(|c| Ok(c.query_row("SELECT generation FROM contact_connections WHERE account_id='acct'", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(gen, 1);
+
+        // Verify foreign key integrity across the entire upgraded database.
+        let fk_issues: i64 = store.with_read(|c| {
+            let mut stmt = c.prepare("PRAGMA foreign_key_check")?;
+            let count = stmt.query_map([], |_| Ok(()))?.count() as i64;
+            Ok(count)
+        }).unwrap();
+        assert_eq!(fk_issues, 0);
+    }
+
+    #[test]
+    fn fresh_file_db_sets_expected_pragmas_tables_and_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh.sqlite");
+        let store = crate::Store::open(&path).unwrap();
+        let (version, sync_mode, auto_vacuum, journal_mode): (i64, i64, i64, String) = store.with_conn(|c| {
+            Ok((
+                c.query_row("PRAGMA user_version", [], |r| r.get(0))?,
+                c.query_row("PRAGMA synchronous", [], |r| r.get(0))?,
+                c.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?,
+                c.query_row("PRAGMA journal_mode", [], |r| r.get(0))?,
+            ))
+        }).unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+        assert_eq!(sync_mode, 2, "PRAGMA synchronous must remain FULL");
+        assert_eq!(auto_vacuum, 2, "fresh DBs enable INCREMENTAL auto_vacuum");
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+
+        let indexes: std::collections::HashSet<String> = store.with_read(|c| {
+            let mut stmt = c.prepare("SELECT name FROM sqlite_master WHERE type='index'")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        }).unwrap();
+        for expected in [
+            "messages_in_reply_to",
+            "message_references_message",
+            "events_calendar_range",
+            "draft_attachments_draft",
+            "pending_operations_active",
+            "pending_operations_applied",
+            "caldav_collections_connection",
+            "caldav_outbox_connection",
+            "calendars_account",
+            "change_history_at",
+        ] {
+            assert!(indexes.contains(expected), "missing index {expected}");
+        }
     }
 
     #[test]

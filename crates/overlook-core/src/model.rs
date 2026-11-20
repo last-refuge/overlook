@@ -3,7 +3,7 @@
 use crate::ids::*;
 use crate::time::Timestamp;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 /// The kind of service or protocol an account uses. Gmail is a service; IMAP and POP3 are
 /// protocols. The sample provider exists for the design prototype and automated tests.
@@ -117,6 +117,11 @@ impl Address {
         }
     }
 
+    /// Whether a display name contains RFC 5322 specials requiring quoting in headers.
+    pub(crate) fn name_needs_quoting(name: &str) -> bool {
+        name.contains([',', ';', '"', '\\', '<', '>', '(', ')', ':', '@', '[', ']'])
+    }
+
     /// `Name <email>` or just the address.
     pub fn to_header(&self) -> String {
         match &self.name {
@@ -124,7 +129,7 @@ impl Address {
                 let name = n.trim();
                 // Composer text must round-trip through parse_list, including
                 // display names such as Doe, Jane or names containing quotes.
-                let name = if name.contains([',', ';', '"', '\\', '<', '>', '(', ')', ':', '@', '[', ']']) {
+                let name = if Self::name_needs_quoting(name) {
                     format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
                 } else {
                     name.to_owned()
@@ -434,19 +439,30 @@ impl ConversationSummary {
         owner_email: &str,
         pending_ids: &BTreeSet<MessageId>,
     ) -> Option<Self> {
-        let latest = messages.iter().max_by_key(|m| m.date)?;
-        let mut sorted: Vec<&Message> = messages.iter().collect();
+        let refs: Vec<&Message> = messages.iter().collect();
+        Self::from_message_refs(&refs, owner_email, pending_ids)
+    }
+
+    /// Builds a summary from message references without requiring a contiguous owned slice.
+    pub fn from_message_refs(
+        messages: &[&Message],
+        owner_email: &str,
+        pending_ids: &BTreeSet<MessageId>,
+    ) -> Option<Self> {
+        if messages.is_empty() {
+            return None;
+        }
+        let mut sorted: Vec<&Message> = messages.to_vec();
         sorted.sort_by_key(|m| std::cmp::Reverse(m.date));
+        let latest = sorted[0];
+        let mut seen_participants: HashSet<String> = HashSet::new();
         let mut participants = Vec::new();
         for m in &sorted {
             let addr = &m.from;
             if addr.email.eq_ignore_ascii_case(owner_email) {
                 continue;
             }
-            if !participants
-                .iter()
-                .any(|p: &Address| p.email.eq_ignore_ascii_case(&addr.email))
-            {
+            if seen_participants.insert(addr.email.to_ascii_lowercase()) {
                 participants.push(addr.clone());
             }
         }
@@ -454,22 +470,34 @@ impl ConversationSummary {
             // Conversation only has our own messages (e.g. Sent): show recipients.
             for m in &sorted {
                 for addr in m.to.iter().chain(m.cc.iter()) {
-                    if !participants
-                        .iter()
-                        .any(|p: &Address| p.email.eq_ignore_ascii_case(&addr.email))
-                    {
+                    if seen_participants.insert(addr.email.to_ascii_lowercase()) {
                         participants.push(addr.clone());
                     }
                 }
             }
         }
         let mut label_ids = BTreeSet::new();
+        let mut unread_count = 0usize;
+        let mut starred = false;
+        let mut has_attachments = false;
+        let mut pending = false;
         for m in messages {
             label_ids.extend(m.label_ids.iter().cloned());
+            if !m.is_read {
+                unread_count += 1;
+            }
+            starred |= m.is_starred;
+            has_attachments |= m.has_attachments();
+            pending |= pending_ids.contains(&m.id);
         }
+        let mut seen_attachments: HashSet<&str> = HashSet::new();
         let mut attachment_names: Vec<String> = Vec::new();
-        for a in sorted.iter().flat_map(|m| &m.attachments).filter(|a| !a.is_inline_image()) {
-            if !attachment_names.contains(&a.filename) {
+        for a in sorted
+            .iter()
+            .flat_map(|m| &m.attachments)
+            .filter(|a| !a.is_inline_image())
+        {
+            if seen_attachments.insert(a.filename.as_str()) {
                 attachment_names.push(a.filename.clone());
             }
         }
@@ -480,15 +508,15 @@ impl ConversationSummary {
             snippet: latest.snippet.clone(),
             latest: latest.date,
             message_count: messages.len(),
-            unread_count: messages.iter().filter(|m| !m.is_read).count(),
-            starred: messages.iter().any(|m| m.is_starred),
-            has_attachments: messages.iter().any(Message::has_attachments),
+            unread_count,
+            starred,
+            has_attachments,
             attachment_names,
             invitation: sorted.iter().find_map(|m| m.invitation.clone()),
             participants,
             latest_message_id: latest.id.clone(),
             label_ids,
-            pending: messages.iter().any(|m| pending_ids.contains(&m.id)),
+            pending,
         })
     }
 
@@ -969,6 +997,40 @@ mod tests {
         assert_eq!(summary.unread_count, 2);
         assert_eq!(summary.participant_line(), "Maya Chen");
         assert_eq!(summary.latest, 3000);
+    }
+
+    #[test]
+    fn conversation_summary_from_message_refs_and_consistent_tie_breaking() {
+        let mut first = msg(Address::named("Alice", "alice@example.com"), 5000);
+        first.id = MessageId::from("m1");
+        first.subject = "First subject".into();
+        let mut second = msg(Address::named("Bob", "bob@example.com"), 5000);
+        second.id = MessageId::from("m2");
+        second.subject = "Second subject".into();
+        let mut dup_alice = msg(Address::named("ALICE", "ALICE@EXAMPLE.COM"), 4000);
+        dup_alice.id = MessageId::from("m3");
+
+        let refs = [&first, &second, &dup_alice];
+        let from_refs =
+            ConversationSummary::from_message_refs(&refs, "jason@example.com", &BTreeSet::new())
+                .unwrap();
+        let from_slice = ConversationSummary::from_messages(
+            &[first.clone(), second.clone(), dup_alice.clone()],
+            "jason@example.com",
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(from_refs, from_slice);
+        // `latest` and `participants[0]` agree on equal timestamps.
+        assert_eq!(from_refs.latest_message_id, MessageId::from("m1"));
+        assert_eq!(from_refs.subject, "First subject");
+        assert_eq!(from_refs.participants.len(), 2);
+        assert_eq!(from_refs.participants[0].email, "alice@example.com");
+        assert_eq!(from_refs.participants[1].email, "bob@example.com");
+        assert!(
+            ConversationSummary::from_message_refs(&[], "jason@example.com", &BTreeSet::new())
+                .is_none()
+        );
     }
 
     #[test]

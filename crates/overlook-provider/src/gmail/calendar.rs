@@ -324,6 +324,7 @@ impl CalendarProvider for GoogleCalendarProvider {
             let zone = tz::current_zone();
             let mut changes = EventChanges::default();
             let mut page: Option<String> = None;
+            let mut seen_pages = std::collections::HashSet::new();
             let now = overlook_core::time::now();
             let time_min = tz::to_rfc3339(tz::add_days(now, -PAST_DAYS));
             let time_max = tz::to_rfc3339(tz::add_days(now, FUTURE_DAYS));
@@ -358,10 +359,16 @@ impl CalendarProvider for GoogleCalendarProvider {
                         }
                     }
                 }
-                page = v.get("nextPageToken").and_then(|t| t.as_str()).map(str::to_owned);
-                if page.is_none() {
-                    changes.next_sync_token = v.get("nextSyncToken").and_then(|t| t.as_str()).map(str::to_owned);
-                    break;
+                page = v.get("nextPageToken").and_then(|t| t.as_str()).filter(|t| !t.is_empty()).map(str::to_owned);
+                match &page {
+                    None => {
+                        changes.next_sync_token = v.get("nextSyncToken").and_then(|t| t.as_str()).map(str::to_owned);
+                        break;
+                    }
+                    Some(p) if !seen_pages.insert(p.clone()) => {
+                        return Err(ProviderError::Temporary("Google Calendar repeated an events page".into()));
+                    }
+                    Some(_) => {}
                 }
             }
             info!("calendar {}: {} changes, {} removed", calendar.name, changes.upserts.len(), changes.deleted.len());

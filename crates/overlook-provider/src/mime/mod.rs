@@ -20,13 +20,23 @@ pub fn decode_rfc2047(input: &str) -> String {
         if !(last_was_word && before.trim().is_empty()) {
             out.push_str(before);
         }
-        let Some(end_rel) = rest[start + 2..].find("?=") else {
+        let after_start = &rest[start + 2..];
+        let Some(q1) = after_start.find('?') else {
             out.push_str(&rest[start..]);
             return out;
         };
-        let word = &rest[start + 2..start + 2 + end_rel];
-        let mut pieces = word.splitn(3, '?');
-        let (charset, encoding, payload) = (pieces.next().unwrap_or(""), pieces.next().unwrap_or(""), pieces.next().unwrap_or(""));
+        let Some(q2_rel) = after_start[q1 + 1..].find('?') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let q2 = q1 + 1 + q2_rel;
+        let Some(end_rel) = after_start[q2 + 1..].find("?=") else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let charset = &after_start[..q1];
+        let encoding = &after_start[q1 + 1..q2];
+        let payload = &after_start[q2 + 1..q2 + 1 + end_rel];
         let bytes = match encoding.to_ascii_uppercase().as_str() {
             "B" => base64::engine::general_purpose::STANDARD.decode(payload).unwrap_or_default(),
             "Q" => decode_q(payload),
@@ -38,11 +48,20 @@ pub fn decode_rfc2047(input: &str) -> String {
             String::from_utf8_lossy(&bytes).into_owned()
         };
         out.push_str(&decoded);
-        rest = &rest[start + 2 + end_rel + 2..];
+        rest = &after_start[q2 + 1 + end_rel + 2..];
         last_was_word = true;
     }
     out.push_str(rest);
     out
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn decode_q(payload: &str) -> Vec<u8> {
@@ -55,10 +74,10 @@ fn decode_q(payload: &str) -> Vec<u8> {
                 out.push(b' ');
                 i += 1;
             }
-            b'=' if i + 2 < bytes.len() + 1 && i + 2 <= bytes.len() - 1 + 1 && i + 2 < bytes.len() + 1 => {
-                if i + 2 < bytes.len() + 1 && i + 3 <= bytes.len() {
-                    if let Ok(v) = u8::from_str_radix(&payload[i + 1..i + 3], 16) {
-                        out.push(v);
+            b'=' => {
+                if i + 2 < bytes.len() {
+                    if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                        out.push((hi << 4) | lo);
                         i += 3;
                         continue;
                     }
@@ -86,5 +105,19 @@ mod tests {
         assert_eq!(decode_rfc2047("plain"), "plain");
         assert_eq!(decode_rfc2047("=?UTF-8?B?YQ==?= =?UTF-8?B?Yg==?="), "ab");
         assert_eq!(decode_rfc2047("=?ISO-8859-1?Q?Caf=E9?="), "Café");
+    }
+
+    #[test]
+    fn decode_q_handles_malformed_multibyte_and_truncated_escapes_without_panicking() {
+        assert_eq!(decode_q("=aé"), "=aé".as_bytes());
+        assert_eq!(decode_q("=é"), "=é".as_bytes());
+        assert_eq!(decode_rfc2047("=?UTF-8?Q?=C3=A9?="), "é");
+        assert_eq!(decode_rfc2047("=?UTF-8?Q?=aé?="), "=aé");
+        assert_eq!(decode_rfc2047("=?UTF-8?Q?=é?="), "=é");
+        assert_eq!(decode_rfc2047("=?UTF-8?Q?=😀?="), "=😀");
+        assert_eq!(decode_rfc2047("=?UTF-8?Q?trail=?="), "trail=");
+        assert_eq!(decode_rfc2047("=?UTF-8?Q?trail=A?="), "trail=A");
+        assert_eq!(decode_rfc2047("=?UTF-8?Q?=ZZ_ok=21?="), "=ZZ ok!");
+        assert_eq!(decode_rfc2047("=?UTF-8?Q?caf=c3=a9?="), "café");
     }
 }

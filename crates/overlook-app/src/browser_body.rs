@@ -9,9 +9,34 @@ use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
     rc::Rc,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
+
+/// Coalesced async wakeup for `BrowserBody` and `prerender`. Keeps at most one pending
+/// wakeup token in the channel and costs zero CPU while idle.
+#[derive(Clone)]
+struct EventWaker {
+    notified: Arc<AtomicBool>,
+    tx: tokio::sync::mpsc::UnboundedSender<()>,
+}
+
+impl EventWaker {
+    fn new() -> (Self, Arc<AtomicBool>, tokio::sync::mpsc::UnboundedReceiver<()>) {
+        let notified = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (Self { notified: notified.clone(), tx }, notified, rx)
+    }
+
+    fn wake(&self) {
+        if !self.notified.swap(true, Ordering::SeqCst) {
+            let _ = self.tx.send(());
+        }
+    }
+}
 
 const VIEWPORT_HEIGHT: u32 = 900;
 const MAX_DOCUMENT_HEIGHT: u32 = 100_000;
@@ -236,13 +261,25 @@ pub fn prerender(document: String, allow_remote: bool, dark_paper: Option<u32>, 
     let key = render_key(document_hash(&document, allow_remote, dark_paper), size);
     let browser = BrowserHandle::new_sized(document, allow_remote, dark_paper, Some(size));
     browser.visible_range(0, VIEWPORT_HEIGHT);
+    let (waker, notified, mut rx) = EventWaker::new();
+    let event_waker = waker.clone();
+    browser.on_event(move || event_waker.wake());
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let timeout_flag = timed_out.clone();
+    let timeout_waker = waker;
+    let timer = cx.background_executor().timer(Duration::from_secs(10));
+    let _timeout = cx.background_executor().spawn(async move {
+        timer.await;
+        timeout_flag.store(true, Ordering::Release);
+        timeout_waker.wake();
+    });
     cx.spawn(async move |cx| {
-        let started = std::time::Instant::now();
+        let _timeout = _timeout;
         let mut height = None;
         let mut encoded: Vec<EncodedTile> = Vec::new();
         let mut revision = None;
         loop {
-            cx.background_executor().timer(Duration::from_millis(16)).await;
+            notified.store(false, Ordering::SeqCst);
             for event in browser.drain_events() {
                 match event {
                     BrowserEvent::Layout { width, height: h } if width == size.0 => height = Some(h.clamp(1, MAX_DOCUMENT_HEIGHT)),
@@ -268,10 +305,14 @@ pub fn prerender(document: String, allow_remote: bool, dark_paper: Option<u32>, 
                     break;
                 }
             }
-            if started.elapsed() > Duration::from_secs(10) {
+            if timed_out.load(Ordering::Acquire) {
+                return;
+            }
+            if rx.recv().await.is_none() {
                 return;
             }
         }
+        drop(_timeout);
         drop(browser);
         let Some(height) = height else { return };
         let decoded = cx
@@ -401,6 +442,7 @@ struct PendingContextMenu {
 
 pub struct BrowserBody {
     browser: BrowserHandle,
+    waker: EventWaker,
     prepared: RetryDocument,
     document_hash: u64,
     focus: FocusHandle,
@@ -441,14 +483,15 @@ impl BrowserBody {
         placeholder: Option<SharedString>,
         cx: &mut Context<Self>,
     ) -> Self {
-        // Only the weak entity is retained across awaits. Dropping the view drops
-        // its last browser handle and cancels/reaps the engine worker.
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor()
-                .timer(Duration::from_millis(16))
-                .await;
-            if this.update(cx, |view, cx| view.poll(cx)).is_err() {
-                break;
+        let (waker, notified, mut rx) = EventWaker::new();
+        // Event-driven wakeup loop: sleeps with zero wakeups while idle, and exits
+        // immediately once `BrowserBody` and its `BrowserHandle` are dropped.
+        cx.spawn(async move |this, cx| {
+            while rx.recv().await.is_some() {
+                notified.store(false, Ordering::SeqCst);
+                if this.update(cx, |view, cx| view.poll(cx)).is_err() {
+                    break;
+                }
             }
         })
         .detach();
@@ -463,9 +506,13 @@ impl BrowserBody {
                 tiles.insert(*top, *h, image.clone());
             }
         }
+        let browser = BrowserHandle::new_sized(prepared.html.to_string(), allow_remote, dark_paper, size);
+        let event_waker = waker.clone();
+        browser.on_event(move || event_waker.wake());
         Self {
             document_hash,
-            browser: BrowserHandle::new_sized(prepared.html.to_string(), allow_remote, dark_paper, size),
+            browser,
+            waker,
             prepared,
             focus: cx.focus_handle(),
             bounds: Rc::new(Cell::new(Bounds::default())),
@@ -513,6 +560,11 @@ impl BrowserBody {
 
     pub fn layout_is_ready(&self) -> bool { self.layout_ready || self.error.is_some() }
 
+    fn attach_browser_waker(&self) {
+        let waker = self.waker.clone();
+        self.browser.on_event(move || waker.wake());
+    }
+
     pub fn set_document(
         &mut self,
         document: String,
@@ -537,12 +589,14 @@ impl BrowserBody {
             self.tiles.awaiting_revision = false;
             self.requested.set(None);
             self.browser = self.prepared.start();
+            self.attach_browser_waker();
             self.error = None;
             self.buttons = 0;
             self.auto_scroll.stop();
             self.last_resize = None;
             self.pending_context_menu = None;
             self.context_link = None;
+            self.waker.wake();
             cx.notify();
         } else {
             self.retry(cx);
@@ -553,6 +607,7 @@ impl BrowserBody {
         self.tiles.reset();
         self.requested.set(None);
         self.browser = self.prepared.start();
+        self.attach_browser_waker();
         self.height = 300;
         self.error = None;
         self.has_rendered = false;
@@ -563,6 +618,7 @@ impl BrowserBody {
         self.last_resize = None;
         self.pending_context_menu = None;
         self.context_link = None;
+        self.waker.wake();
         cx.notify();
     }
 
@@ -884,7 +940,7 @@ impl BrowserBody {
         true
     }
 
-    fn request_context_menu(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+    fn request_context_menu(&mut self, position: Point<Pixels>, _cx: &mut Context<Self>) {
         self.context_menu_seq = self.context_menu_seq.wrapping_add(1);
         let request_id = self.context_menu_seq;
         let (x, y) = self.position(position);
@@ -894,13 +950,6 @@ impl BrowserBody {
             ready: None,
         });
         self.browser.context_menu(x, y, request_id);
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(4))
-                .await;
-            let _ = this.update(cx, |view, cx| view.poll(cx));
-        })
-        .detach();
     }
 
     fn keyboard(&mut self, stroke: &Keystroke, down: bool) {
@@ -989,6 +1038,7 @@ impl Render for BrowserBody {
         let visible = self.visible.clone();
         let requested = self.requested.clone();
         let browser = self.browser.clone();
+        let waker = self.waker.clone();
         let height = self.height;
         let live = self.error.is_none();
         let warning = self.error.map(|code| {
@@ -1028,16 +1078,9 @@ impl Render for BrowserBody {
             .flex_shrink_0()
             .key_context("TextView")
             .track_focus(&self.focus)
-            .on_action(cx.listener(|this, _: &gpui_kit::component::input::Copy, _, cx| {
+            .on_action(cx.listener(|this, _: &gpui_kit::component::input::Copy, _, _| {
                 if this.error.is_none() {
                     this.browser.copy_selection();
-                    cx.spawn(async move |this, cx| {
-                        cx.background_executor()
-                            .timer(Duration::from_millis(4))
-                            .await;
-                        let _ = this.update(cx, |view, cx| view.poll(cx));
-                    })
-                    .detach();
                 }
             }))
             .on_action(cx.listener(|this, _: &gpui_kit::component::input::SelectAll, _, _| {
@@ -1060,6 +1103,9 @@ impl Render for BrowserBody {
             .child(
                 canvas(
                     move |actual, window, _| {
+                        let prev_width = bounds.get().size.width;
+                        let prev_scale = scale.get();
+                        let prev_visible = visible.get();
                         bounds.set(actual);
                         if let Some(scroll) = &prepaint_scroll {
                             bounds_scroll_y.set(scroll.offset().y);
@@ -1067,12 +1113,19 @@ impl Render for BrowserBody {
                         scale.set(current_scale);
                         let range = visible_range(actual, window.content_mask().bounds, height);
                         visible.set(range);
-                        let range = request_range(range, height);
-                        if live && requested.get() != Some(range) {
-                            requested.set(Some(range));
+                        let req = request_range(range, height);
+                        if live && requested.get() != Some(req) {
+                            requested.set(Some(req));
                             // Native scroll prepaint sends directly; no polling latency
                             // and no browser wheel/root scrolling or UI image decode.
-                            browser.visible_range(range.0, range.1);
+                            browser.visible_range(req.0, req.1);
+                        }
+                        if live
+                            && (actual.size.width != prev_width
+                                || current_scale.to_bits() != prev_scale.to_bits()
+                                || range != prev_visible)
+                        {
+                            waker.wake();
                         }
                     },
                     {

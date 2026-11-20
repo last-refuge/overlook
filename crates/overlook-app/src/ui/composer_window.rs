@@ -266,7 +266,7 @@ impl MailWindow {
                         parent
                             .update(cx, |this, cx| {
                                 this.detached_composers.remove(&closed_id);
-                                this.reload(cx);
+                                this.reload_mail(cx);
                             })
                             .ok();
                     }
@@ -421,7 +421,7 @@ impl MailWindow {
             cx.defer(move |cx| {
                 parent.update(cx, |this, cx| {
                     this.mark_counts_stale([changed.clone()]);
-                    this.reload(cx);
+                    this.reload_mail(cx);
                     this.reload_folder_windows([changed], cx);
                 });
             });

@@ -111,39 +111,39 @@ fn state() -> &'static RwLock<ZoneState> {
 }
 
 pub fn current_zone() -> TimeZone {
-    state().read().unwrap().zone().clone()
+    state().read().unwrap_or_else(|e| e.into_inner()).zone().clone()
 }
 pub fn system_zone() -> TimeZone {
-    state().read().unwrap().system.zone.clone()
+    state().read().unwrap_or_else(|e| e.into_inner()).system.zone.clone()
 }
 pub fn system_definition() -> ZoneDefinition {
-    state().read().unwrap().system.definition.clone()
+    state().read().unwrap_or_else(|e| e.into_inner()).system.definition.clone()
 }
 pub fn revision() -> u64 {
-    state().read().unwrap().revision
+    state().read().unwrap_or_else(|e| e.into_inner()).revision
 }
 /// Preserve existing named-zone coverage keys. Unnamed TZif files also need a
 /// fingerprint: two different /etc/localtime copies can both be called "Local".
 pub fn cache_key() -> String {
-    state().read().unwrap().cache_key()
+    state().read().unwrap_or_else(|e| e.into_inner()).cache_key()
 }
 /// A coherent zone and coverage key for a calendar download.
 pub fn zone_with_cache_key() -> (TimeZone, String) {
-    let state = state().read().unwrap();
+    let state = state().read().unwrap_or_else(|e| e.into_inner());
     (state.zone().clone(), state.cache_key())
 }
 pub fn current_definition() -> ZoneDefinition {
-    let state = state().read().unwrap();
+    let state = state().read().unwrap_or_else(|e| e.into_inner());
     match &state.manual {
         Some((definition, _)) => definition.clone(),
         None => state.system.definition.clone(),
     }
 }
 pub fn set_override(definition: Option<&ZoneDefinition>) -> Result<bool, String> {
-    state().write().unwrap().set_override(definition)
+    state().write().unwrap_or_else(|e| e.into_inner()).set_override(definition)
 }
 pub fn update_system_zone(detected: DetectedZone) -> bool {
-    state().write().unwrap().update_system(detected)
+    state().write().unwrap_or_else(|e| e.into_inner()).update_system(detected)
 }
 
 pub fn zone_label(zone: &TimeZone) -> String {

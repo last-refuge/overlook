@@ -54,10 +54,7 @@ struct Lifecycle {
     /// Every mail window can own a draft that must be saved before Quit.
     editors: Vec<(AnyWindowHandle, WeakEntity<MailWindow>)>,
     replaced_noticed: bool,
-    tray: Option<crate::tray::TrayIcon>,
-    /// The tray icon couldn't start (no session bus): not tried again until keep-running is
-    /// switched off and on.
-    tray_failed: bool,
+    tray: crate::tray::TrayWorker,
 }
 
 impl Global for Lifecycle {}
@@ -75,13 +72,21 @@ pub fn start(store: Arc<Store>, sample: SampleProvider, hidden: bool, cx: &mut A
         after_show: Vec::new(),
         editors: Vec::new(),
         replaced_noticed: false,
-        tray: None,
-        tray_failed: false,
+        tray: crate::tray::TrayWorker::new(),
     });
     cx.on_window_closed(window_closed).detach();
     cx.on_app_quit(|cx| {
+        if cx.has_global::<Lifecycle>() {
+            cx.global_mut::<Lifecycle>().tray.shutdown();
+        }
         crate::browser_engine::set_prewarm(false);
-        cx.background_executor().spawn(async { crate::browser_engine::drain_workers() })
+        cx.background_executor().spawn(async {
+            crate::browser_engine::drain_workers();
+            crate::persist::flush();
+        })
+    }).detach();
+    cx.background_executor().spawn(async {
+        crate::pdf_preview::prune_cache();
     }).detach();
     if hidden {
         crate::browser_engine::set_prewarm(false);
@@ -369,7 +374,7 @@ fn serve_in_main_with(cx: &mut App, f: impl FnOnce(&mut MailWindow, &mut Context
 
 /// Shows the tray icon while keep-running is on, with the unread count, and takes it away
 /// when it's switched off. Checked every two seconds: cheap, and the count needs no hook into
-/// every change that moves it.
+/// every change that moves it. D-Bus work runs on the dedicated tray worker thread.
 fn keep_tray(cx: &mut App) {
     cx.spawn(async move |cx| loop {
         cx.update(|cx| {
@@ -379,21 +384,8 @@ fn keep_tray(cx: &mut App) {
                 .as_ref()
                 .and_then(|m| m.view.upgrade())
                 .map(|view| view.read(cx).unread_inbox_total());
-            let l = cx.global_mut::<Lifecycle>();
-            match (&mut l.tray, keep_running()) {
-                (None, true) if !l.tray_failed => {
-                    l.tray = crate::tray::TrayIcon::start(unread.unwrap_or(0));
-                    l.tray_failed = l.tray.is_none();
-                }
-                (None, true) => {}
-                (Some(_), false) => l.tray = None,
-                (Some(tray), true) => {
-                    if let Some(unread) = unread {
-                        tray.set_unread(unread);
-                    }
-                }
-                (None, false) => l.tray_failed = false,
-            }
+            let enabled = keep_running();
+            cx.global_mut::<Lifecycle>().tray.sync(enabled, unread);
         });
         cx.background_executor().timer(Duration::from_secs(2)).await;
     })

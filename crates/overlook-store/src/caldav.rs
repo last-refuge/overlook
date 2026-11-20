@@ -155,38 +155,52 @@ fn snapshot_tx(
             "DELETE FROM events WHERE calendar_id=?1 AND start<?3 AND MAX(end,start+1)>?2 AND NOT EXISTS(SELECT 1 FROM caldav_event_resources m JOIN caldav_outbox o ON o.calendar_id=m.calendar_id AND o.href=m.href WHERE m.event_id=events.id)",
             params![c.id.0, snapshot.from, snapshot.to],
         )?;
-        for resource in &entry.resources {
-            let protected: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM caldav_outbox WHERE calendar_id=?1 AND href=?2)",
-                params![c.id.0, resource.href],
-                |r| r.get(0),
+        // Preload outbox state and existing resource etags once per calendar instead of per resource.
+        let outbox_hrefs: HashSet<String> = {
+            let mut stmt = tx.prepare_cached("SELECT href FROM caldav_outbox WHERE calendar_id=?1")?;
+            let rows = stmt.query_map([&c.id.0], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let outbox_uids: HashSet<String> = {
+            let mut stmt = tx.prepare_cached(
+                "SELECT COALESCE(json_extract(payload_json,'$.edits[0].after.ical_uid'),json_extract(payload_json,'$.edits[0].before.ical_uid'))
+                 FROM caldav_outbox WHERE calendar_id=?1",
             )?;
-            if protected {
-                continue;
-            }
-            let mut moved_pending = false;
-            for event in &resource.events {
-                if let Some(uid) = &event.ical_uid {
-                    moved_pending |= tx.query_row("SELECT EXISTS(SELECT 1 FROM caldav_outbox WHERE calendar_id=?1 AND COALESCE(json_extract(payload_json,'$.edits[0].after.ical_uid'),json_extract(payload_json,'$.edits[0].before.ical_uid'))=?2)",params![c.id.0,uid],|r|r.get::<_,bool>(0))?;
+            let rows = stmt.query_map([&c.id.0], |r| r.get::<_, Option<String>>(0))?;
+            let mut set = HashSet::new();
+            for row in rows {
+                if let Some(uid) = row? {
+                    set.insert(uid);
                 }
             }
+            set
+        };
+        let mut existing_etags: HashMap<String, String> = {
+            let mut stmt = tx.prepare_cached("SELECT href, etag FROM caldav_resources WHERE calendar_id=?1")?;
+            let rows = stmt.query_map([&c.id.0], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        for resource in &entry.resources {
+            if outbox_hrefs.contains(&resource.href) {
+                continue;
+            }
+            let moved_pending = resource
+                .events
+                .iter()
+                .filter_map(|e| e.ical_uid.as_ref())
+                .any(|uid| outbox_uids.contains(uid));
             if moved_pending {
                 continue;
             }
-            let previous: Option<String> = tx
-                .query_row(
-                    "SELECT etag FROM caldav_resources WHERE calendar_id=?1 AND href=?2",
-                    params![c.id.0, resource.href],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if previous.as_ref().is_some_and(|etag| etag != &resource.etag) {
+            if existing_etags.get(&resource.href).is_some_and(|etag| etag != &resource.etag) {
                 // A changed master invalidates older projections outside this range too.
-                tx.execute("DELETE FROM events WHERE id IN (SELECT event_id FROM caldav_event_resources WHERE calendar_id=?1 AND href=?2)", params![c.id.0, resource.href])?;
+                tx.prepare_cached("DELETE FROM events WHERE id IN (SELECT event_id FROM caldav_event_resources WHERE calendar_id=?1 AND href=?2)")?
+                    .execute(params![c.id.0, resource.href])?;
                 invalidated = true;
             }
-            tx.execute("INSERT INTO caldav_resources(calendar_id,href,etag,icalendar) VALUES(?1,?2,?3,?4) ON CONFLICT(calendar_id,href) DO UPDATE SET etag=excluded.etag,icalendar=excluded.icalendar",
-                params![c.id.0, resource.href, resource.etag, resource.icalendar])?;
+            tx.prepare_cached("INSERT INTO caldav_resources(calendar_id,href,etag,icalendar) VALUES(?1,?2,?3,?4) ON CONFLICT(calendar_id,href) DO UPDATE SET etag=excluded.etag,icalendar=excluded.icalendar")?
+                .execute(params![c.id.0, resource.href, resource.etag, resource.icalendar])?;
+            existing_etags.insert(resource.href.clone(), resource.etag.clone());
             for e in &resource.events {
                 if e.account_id != connection.account_id
                     || e.calendar_id != c.id
@@ -199,8 +213,8 @@ fn snapshot_tx(
                     ));
                 }
                 upsert_event_tx(tx, e)?;
-                tx.execute("INSERT INTO caldav_event_resources(event_id,calendar_id,href) VALUES(?1,?2,?3) ON CONFLICT(event_id) DO UPDATE SET calendar_id=excluded.calendar_id,href=excluded.href",
-                    params![e.id.0, c.id.0, resource.href])?;
+                tx.prepare_cached("INSERT INTO caldav_event_resources(event_id,calendar_id,href) VALUES(?1,?2,?3) ON CONFLICT(event_id) DO UPDATE SET calendar_id=excluded.calendar_id,href=excluded.href")?
+                    .execute(params![e.id.0, c.id.0, resource.href])?;
             }
         }
     }

@@ -167,7 +167,7 @@ async fn sync_contacts(store: &Store, provider: &dyn MailProvider, account: &Acc
 
 /// Downloads calendars and events. Errors are recorded in the calendar status only; they
 /// never block mail.
-fn sync_calendar(store: &Store, provider: &dyn CalendarProvider, account: &Account, outcome: &mut SyncOutcome) {
+async fn sync_calendar(store: &Store, provider: &dyn CalendarProvider, account: &Account, outcome: &mut SyncOutcome) {
     let acct = &account.id;
     let projection = overlook_core::tz::current_definition();
     let zone_revision = overlook_core::tz::revision();
@@ -176,7 +176,7 @@ fn sync_calendar(store: &Store, provider: &dyn CalendarProvider, account: &Accou
         return;
     }
     set_calendar_status(store, acct, &SyncState::Syncing);
-    let calendars = match pollster_block(provider.list_calendars(account)) {
+    let calendars = match provider.list_calendars(account).await {
         Ok(c) => c,
         Err(e) => {
             set_calendar_status(store, acct, &state_for(&e));
@@ -196,9 +196,9 @@ fn sync_calendar(store: &Store, provider: &dyn CalendarProvider, account: &Accou
     for calendar in calendars.iter().filter(|c| c.visible) {
         let key = calendar_token_key(&calendar.id);
         let token = if refresh { None } else { store.setting::<String>(&key).ok().flatten() };
-        let changes = match pollster_block(provider.fetch_events(account, calendar, token.as_deref())) {
+        let changes = match provider.fetch_events(account, calendar, token.as_deref()).await {
             Ok(c) => c,
-            Err(ProviderError::CheckpointExpired) => match pollster_block(provider.fetch_events(account, calendar, None)) {
+            Err(ProviderError::CheckpointExpired) => match provider.fetch_events(account, calendar, None).await {
                 Ok(c) => c,
                 Err(e) => {
                     set_calendar_status(store, acct, &state_for(&e));
@@ -254,9 +254,13 @@ fn coverage_key(account: &AccountId) -> String {
 fn enqueue(store: &Store, account: &AccountId, ids: Vec<ProviderId>, only_missing: bool) {
     let key = if only_missing { backlog_key(account) } else { redownload_key(account) };
     let mut queued = queue(store, &key);
+    let mut seen: std::collections::HashSet<ProviderId> = queued.iter().cloned().collect();
     for pid in ids {
+        if seen.contains(&pid) {
+            continue;
+        }
         let present = only_missing && store.message_id_for_provider_id(account, &pid).ok().flatten().is_some();
-        if !present && !queued.contains(&pid) {
+        if !present && seen.insert(pid.clone()) {
             queued.push(pid);
         }
     }
@@ -267,14 +271,11 @@ fn enqueue(store: &Store, account: &AccountId, ids: Vec<ProviderId>, only_missin
 /// Unlike [`enqueue`], a row that exists without a cached body is still queued.
 fn enqueue_bodies(store: &Store, account: &AccountId, ids: Vec<ProviderId>) {
     let mut backlog = backlog(store, account);
-    for pid in ids {
-        let cached = store
-            .message_id_for_provider_id(account, &pid)
-            .ok()
-            .flatten()
-            .and_then(|id| store.message(&id).ok().flatten())
-            .is_some_and(|m| m.body.is_cached());
-        if !cached && !backlog.contains(&pid) {
+    let mut seen: std::collections::HashSet<ProviderId> = backlog.iter().cloned().collect();
+    let candidates: Vec<ProviderId> = ids.into_iter().filter(|pid| seen.insert(pid.clone())).collect();
+    let cached = store.cached_body_provider_ids(account, &candidates).unwrap_or_default();
+    for pid in candidates {
+        if !cached.contains(&pid) {
             backlog.push(pid);
         }
     }
@@ -402,11 +403,18 @@ fn split_redownloads(store: &Store, account: &AccountId) {
     if store.setting::<bool>(&marker).ok().flatten() == Some(true) {
         return;
     }
-    let (again, missing): (Vec<ProviderId>, Vec<ProviderId>) = backlog(store, account).into_iter().partition(|p| body_cached(store, account, p) == Some(true));
+    let current = backlog(store, account);
+    let cached = store.cached_body_provider_ids(account, &current).unwrap_or_default();
+    let (again, missing): (Vec<ProviderId>, Vec<ProviderId>) = current.into_iter().partition(|p| cached.contains(p));
     if !again.is_empty() {
         info!("{} queued re-downloads for {} moved to their own queue", again.len(), account.0);
         let mut queued = queue(store, &redownload_key(account));
-        queued.extend(again.into_iter().filter(|p| !queued.contains(p)).collect::<Vec<_>>());
+        let mut seen: std::collections::HashSet<ProviderId> = queued.iter().cloned().collect();
+        for pid in again {
+            if seen.insert(pid.clone()) {
+                queued.push(pid);
+            }
+        }
         save_queue(store, &redownload_key(account), &queued);
         save_backlog(store, account, &missing);
     }
@@ -423,24 +431,14 @@ fn enqueue_front(store: &Store, key: &str, ids: &[ProviderId]) {
     save_queue(store, key, &merged);
 }
 
-fn body_cached(store: &Store, account: &AccountId, pid: &ProviderId) -> Option<bool> {
-    let id = store.message_id_for_provider_id(account, pid).ok().flatten()?;
-    Some(store.message(&id).ok().flatten().is_some_and(|m| m.body.is_cached()))
-}
-
 /// Queues messages to download, ahead of older work. With a provider whose headers cost
 /// less (Gmail), more than [`DIRECT_DOWNLOAD`] are listed by their headers first, so the
 /// message list fills in quickly, and their bodies follow. `limit` keeps the first that many.
 fn queue_downloads(store: &Store, provider: &dyn MailProvider, account: &AccountId, ids: Vec<ProviderId>, limit: Option<usize>) {
     let mut seen = std::collections::HashSet::new();
-    let mut wanted: Vec<(ProviderId, bool)> = ids
-        .into_iter()
-        .filter(|p| seen.insert(p.clone()))
-        .filter_map(|p| match body_cached(store, account, &p) {
-            Some(true) => None,
-            stored => Some((p, stored.is_some())),
-        })
-        .collect();
+    let unique: Vec<ProviderId> = ids.into_iter().filter(|p| seen.insert(p.clone())).collect();
+    let cached = store.cached_body_provider_ids(account, &unique).unwrap_or_default();
+    let mut wanted: Vec<ProviderId> = unique.into_iter().filter(|p| !cached.contains(p)).collect();
     if let Some(limit) = limit {
         if wanted.len() > limit {
             info!("{} new messages for {}; downloading the newest {limit}", wanted.len(), account.0);
@@ -448,11 +446,14 @@ fn queue_downloads(store: &Store, provider: &dyn MailProvider, account: &Account
         }
     }
     if provider.has_cheap_headers() && wanted.len() > DIRECT_DOWNLOAD {
-        let unlisted: Vec<ProviderId> = wanted.iter().filter(|(_, stored)| !stored).map(|(p, _)| p.clone()).collect();
+        let unlisted: Vec<ProviderId> = wanted
+            .iter()
+            .filter(|p| store.message_id_for_provider_id(account, p).ok().flatten().is_none())
+            .cloned()
+            .collect();
         enqueue_front(store, &headers_key(account), &unlisted);
     }
-    let ids: Vec<ProviderId> = wanted.into_iter().map(|(p, _)| p).collect();
-    enqueue_front(store, &backlog_key(account), &ids);
+    enqueue_front(store, &backlog_key(account), &wanted);
 }
 
 /// Applies label changes the provider reported without content to the stored copies.
@@ -490,14 +491,14 @@ fn apply_relabels(store: &Store, account: &AccountId, relabeled: &[overlook_prov
 
 /// Downloads queued headers in batches, committing each, until the queue is empty or the
 /// slice is used up: label refreshes of stored messages first, then new mail to list.
-fn drain_headers(store: &Store, provider: &dyn MailProvider, account: &Account, outcome: &mut SyncOutcome, deadline: Instant) -> Result<(), ProviderError> {
-    drain_header_queue(store, provider, account, outcome, deadline, &refresh_key(&account.id), false)?;
-    drain_header_queue(store, provider, account, outcome, deadline, &headers_key(&account.id), true)
+async fn drain_headers(store: &Store, provider: &dyn MailProvider, account: &Account, outcome: &mut SyncOutcome, deadline: Instant) -> Result<(), ProviderError> {
+    drain_header_queue(store, provider, account, outcome, deadline, &refresh_key(&account.id), false).await?;
+    drain_header_queue(store, provider, account, outcome, deadline, &headers_key(&account.id), true).await
 }
 
 /// `skip_stored`: a message stored meanwhile (opened, or downloaded in full) needs no
 /// headers. Label refreshes are of stored messages, so they don't skip.
-fn drain_header_queue(store: &Store, provider: &dyn MailProvider, account: &Account, outcome: &mut SyncOutcome, deadline: Instant, key: &str, skip_stored: bool) -> Result<(), ProviderError> {
+async fn drain_header_queue(store: &Store, provider: &dyn MailProvider, account: &Account, outcome: &mut SyncOutcome, deadline: Instant, key: &str, skip_stored: bool) -> Result<(), ProviderError> {
     let acct = &account.id;
     let key = key.to_owned();
     let mut ids = queue(store, &key);
@@ -513,7 +514,7 @@ fn drain_header_queue(store: &Store, provider: &dyn MailProvider, account: &Acco
         let mut take = 0;
         let mut batch = Vec::new();
         while batch.len() < HEADER_BATCH && take < ids.len() {
-            if !skip_stored || body_cached(store, acct, &ids[take]).is_none() {
+            if !skip_stored || store.message_id_for_provider_id(acct, &ids[take]).ok().flatten().is_none() {
                 batch.push(ids[take].clone());
             }
             take += 1;
@@ -524,7 +525,7 @@ fn drain_header_queue(store: &Store, provider: &dyn MailProvider, account: &Acco
             continue;
         }
         let protected = store.pending_message_ids(acct).unwrap_or_default();
-        let mut messages = match pollster_block(provider.fetch_headers(account, &batch, &labels)) {
+        let mut messages = match provider.fetch_headers(account, &batch, &labels).await {
             Ok(m) => m,
             Err(e) => {
                 save_queue(store, &key, &ids);
@@ -550,16 +551,16 @@ pub fn queued_downloads(store: &Store, account: &AccountId) -> usize {
 /// interruption (quota, offline, crash) keeps what was fetched. Headers waiting to be listed
 /// go first, then bodies not downloaded yet, then deliberate re-downloads. Stops when the
 /// slice ending at `deadline` is used up.
-fn drain_backlog(store: &Store, provider: &dyn MailProvider, account: &Account, outcome: &mut SyncOutcome, deadline: Instant) -> Result<(), ProviderError> {
-    drain_headers(store, provider, account, outcome, deadline)?;
-    drain_body_queue(store, provider, account, outcome, deadline, &backlog_key(&account.id), true)?;
-    drain_body_queue(store, provider, account, outcome, deadline, &redownload_key(&account.id), false)
+async fn drain_backlog(store: &Store, provider: &dyn MailProvider, account: &Account, outcome: &mut SyncOutcome, deadline: Instant) -> Result<(), ProviderError> {
+    drain_headers(store, provider, account, outcome, deadline).await?;
+    drain_body_queue(store, provider, account, outcome, deadline, &backlog_key(&account.id), true).await?;
+    drain_body_queue(store, provider, account, outcome, deadline, &redownload_key(&account.id), false).await
 }
 
 /// `skip_cached`: a body that arrived meanwhile (the message was opened, and downloaded
 /// then) is not fetched again. Only this sync writes the queues (one sync per account at a
 /// time), so the window never edits them and nothing it does can lose a queued message.
-fn drain_body_queue(store: &Store, provider: &dyn MailProvider, account: &Account, outcome: &mut SyncOutcome, deadline: Instant, key: &str, skip_cached: bool) -> Result<(), ProviderError> {
+async fn drain_body_queue(store: &Store, provider: &dyn MailProvider, account: &Account, outcome: &mut SyncOutcome, deadline: Instant, key: &str, skip_cached: bool) -> Result<(), ProviderError> {
     let acct = &account.id;
     let mut ids = queue(store, key);
     if ids.is_empty() {
@@ -573,11 +574,20 @@ fn drain_body_queue(store: &Store, provider: &dyn MailProvider, account: &Accoun
         }
         let mut take = 0;
         let mut batch = Vec::new();
-        while batch.len() < DOWNLOAD_BATCH && take < ids.len() {
-            if !skip_cached || body_cached(store, acct, &ids[take]) != Some(true) {
-                batch.push(ids[take].clone());
+        if !skip_cached {
+            take = ids.len().min(DOWNLOAD_BATCH);
+            batch.extend_from_slice(&ids[..take]);
+        } else {
+            while batch.len() < DOWNLOAD_BATCH && take < ids.len() {
+                let end = (take + DOWNLOAD_BATCH * 4).min(ids.len());
+                let cached = store.cached_body_provider_ids(acct, &ids[take..end]).unwrap_or_default();
+                while batch.len() < DOWNLOAD_BATCH && take < end {
+                    if !cached.contains(&ids[take]) {
+                        batch.push(ids[take].clone());
+                    }
+                    take += 1;
+                }
             }
-            take += 1;
         }
         if batch.is_empty() {
             ids.drain(..take);
@@ -585,7 +595,7 @@ fn drain_body_queue(store: &Store, provider: &dyn MailProvider, account: &Accoun
             continue;
         }
         let protected = store.pending_message_ids(acct).unwrap_or_default();
-        let mut messages = match pollster_block(provider.fetch_messages(account, &batch, &labels)) {
+        let mut messages = match provider.fetch_messages(account, &batch, &labels).await {
             Ok(m) => m,
             Err(e) => {
                 save_queue(store, key, &ids);
@@ -638,10 +648,65 @@ fn pending_moves(store: &Store, account: &AccountId) -> std::collections::BTreeS
     store.pending_operations(account).unwrap_or_default().iter().filter(|op| op.kind.is_move()).flat_map(|op| op.kind.message_ids().iter().cloned()).collect()
 }
 
+async fn download_full(
+    store: &Store,
+    provider: &dyn MailProvider,
+    account: &Account,
+    protected: &std::collections::BTreeSet<MessageId>,
+    outcome: &mut SyncOutcome,
+    deadline: Instant,
+) -> Result<usize, ProviderError> {
+    let acct = &account.id;
+    let mut snapshot = provider.fetch_snapshot(account).await?;
+    store_snapshot_labels(store, acct, &snapshot.labels)?;
+    reconcile_incoming(store, acct, &mut snapshot.messages, &mut Vec::new());
+    store.merge_remote_messages(&snapshot.messages, protected).map_err(|e| ProviderError::Temporary(e.to_string()))?;
+    store.set_checkpoint(acct, snapshot.checkpoint.as_deref()).map_err(|e| ProviderError::Temporary(e.to_string()))?;
+    mirror_provider_state(store, provider, acct, snapshot.checkpoint.as_deref());
+    outcome.downloaded += snapshot.messages.len();
+    // Queue what is not on disk yet; the queues survive restarts. With cheap headers
+    // (Gmail) the list fills in first; other providers keep their header-only rows as
+    // they chose them.
+    if provider.has_cheap_headers() {
+        queue_downloads(store, provider, acct, snapshot.message_ids, None);
+    } else {
+        enqueue(store, acct, snapshot.message_ids, true);
+    }
+    let _ = store.set_setting(&coverage_key(acct), &COVERAGE_VERSION);
+    drain_backlog(store, provider, account, outcome, deadline).await?;
+    Ok(outcome.downloaded)
+}
+
+/// An account downloaded before the current view coverage lists the new views and queues
+/// what is missing. The existing checkpoint stays valid, so nothing is skipped.
+async fn extend_coverage(
+    store: &Store,
+    provider: &dyn MailProvider,
+    account: &Account,
+    protected: &std::collections::BTreeSet<MessageId>,
+    outcome: &mut SyncOutcome,
+    deadline: Instant,
+) -> Result<(), ProviderError> {
+    let acct = &account.id;
+    let covered = store.setting::<u32>(&coverage_key(acct)).ok().flatten().unwrap_or(1);
+    if covered >= COVERAGE_VERSION {
+        return Ok(());
+    }
+    let mut snapshot = provider.fetch_snapshot(account).await?;
+    store_snapshot_labels(store, acct, &snapshot.labels)?;
+    reconcile_incoming(store, acct, &mut snapshot.messages, &mut Vec::new());
+    store.merge_remote_messages(&snapshot.messages, protected).map_err(|e| ProviderError::Temporary(e.to_string()))?;
+    // Version 3 added category/importance hints to the mapping: refresh what is stored.
+    enqueue(store, acct, snapshot.message_ids, covered >= 4);
+    let _ = store.set_setting(&coverage_key(acct), &COVERAGE_VERSION);
+    info!("extended download coverage for {}", account.email);
+    drain_backlog(store, provider, account, outcome, deadline).await
+}
+
 /// `deferred` collects messages whose remote deletion was held back for a pending move,
 /// with the provider id that vanished; `run_sync` deletes them after the replay when the
 /// move could not find them either.
-fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outcome: &mut SyncOutcome, deferred: &mut Vec<(MessageId, ProviderId)>, verify: bool) -> Result<usize, ProviderError> {
+async fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outcome: &mut SyncOutcome, deferred: &mut Vec<(MessageId, ProviderId)>, verify: bool) -> Result<usize, ProviderError> {
     let acct = &account.id;
     let deadline = Instant::now() + DOWNLOAD_SLICE;
     // First, before anything is queued the new way.
@@ -651,144 +716,113 @@ fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outco
     let checkpoint = store.checkpoint(acct).ok().flatten();
     let have_messages = store.message_count(acct).unwrap_or(0) > 0 || !backlog(store, acct).is_empty();
 
-    let full = |outcome: &mut SyncOutcome| -> Result<usize, ProviderError> {
-        let mut snapshot = pollster_block(provider.fetch_snapshot(account))?;
-        store_snapshot_labels(store, acct, &snapshot.labels)?;
-        reconcile_incoming(store, acct, &mut snapshot.messages, &mut Vec::new());
-        store.merge_remote_messages(&snapshot.messages, &protected).map_err(|e| ProviderError::Temporary(e.to_string()))?;
-        store.set_checkpoint(acct, snapshot.checkpoint.as_deref()).map_err(|e| ProviderError::Temporary(e.to_string()))?;
-        mirror_provider_state(store, provider, acct, snapshot.checkpoint.as_deref());
-        outcome.downloaded += snapshot.messages.len();
-        // Queue what is not on disk yet; the queues survive restarts. With cheap headers
-        // (Gmail) the list fills in first; other providers keep their header-only rows as
-        // they chose them.
-        if provider.has_cheap_headers() {
-            queue_downloads(store, provider, acct, snapshot.message_ids, None);
-        } else {
-            enqueue(store, acct, snapshot.message_ids, true);
-        }
-        let _ = store.set_setting(&coverage_key(acct), &COVERAGE_VERSION);
-        drain_backlog(store, provider, account, outcome, deadline)?;
-        Ok(outcome.downloaded)
-    };
-
-    // An account downloaded before the current view coverage lists the new views and queues
-    // what is missing. The existing checkpoint stays valid, so nothing is skipped.
-    let extend_coverage = |outcome: &mut SyncOutcome| -> Result<(), ProviderError> {
-        let covered = store.setting::<u32>(&coverage_key(acct)).ok().flatten().unwrap_or(1);
-        if covered >= COVERAGE_VERSION {
-            return Ok(());
-        }
-        let mut snapshot = pollster_block(provider.fetch_snapshot(account))?;
-        store_snapshot_labels(store, acct, &snapshot.labels)?;
-        reconcile_incoming(store, acct, &mut snapshot.messages, &mut Vec::new());
-        store.merge_remote_messages(&snapshot.messages, &protected).map_err(|e| ProviderError::Temporary(e.to_string()))?;
-        // Version 3 added category/importance hints to the mapping: refresh what is stored.
-        enqueue(store, acct, snapshot.message_ids, covered >= 4);
-        let _ = store.set_setting(&coverage_key(acct), &COVERAGE_VERSION);
-        info!("extended download coverage for {}", account.email);
-        drain_backlog(store, provider, account, outcome, deadline)
-    };
-
     match checkpoint {
-        Some(cp) if have_messages => match pollster_block(if verify { provider.verify_changes(account, &cp) } else { provider.fetch_changes(account, &cp) }) {
-            Ok(mut changes) => {
-                if let Some(labels) = &changes.labels {
-                    store.replace_labels(acct, labels).map_err(|e| ProviderError::Temporary(e.to_string()))?;
-                }
-                // Label changes reported without content update the stored copies in place.
-                let (refresh, relisted) = apply_relabels(store, acct, &changes.relabeled, &protected)?;
-                // New mail, newest and Inbox first, ahead of older queued work. Queued before
-                // the checkpoint moves past it, so a stop or a crash keeps it, and the next sync
-                // carries on from the queue instead of reading the history again.
-                let mut wanted = std::mem::take(&mut changes.to_download);
-                wanted.extend(relisted);
-                queue_downloads(store, provider, acct, wanted, Some(CATCH_UP_LIMIT));
-                if !refresh.is_empty() {
-                    if provider.has_cheap_headers() {
-                        enqueue_front(store, &refresh_key(acct), &refresh);
-                    } else {
-                        enqueue(store, acct, refresh, false);
+        Some(cp) if have_messages => {
+            let fetched = if verify {
+                provider.verify_changes(account, &cp).await
+            } else {
+                provider.fetch_changes(account, &cp).await
+            };
+            match fetched {
+                Ok(mut changes) => {
+                    if let Some(labels) = &changes.labels {
+                        store.replace_labels(acct, labels).map_err(|e| ProviderError::Temporary(e.to_string()))?;
                     }
-                }
-                // Providers that mint local ids on first sight report deletions by provider id.
-                for pid in std::mem::take(&mut changes.deleted_provider_ids) {
-                    if let Ok(Some(id)) = store.message_id_for_provider_id(acct, &pid) {
-                        if moving.contains(&id) {
-                            deferred.push((id, pid));
-                        } else if !changes.deleted.contains(&id) {
-                            changes.deleted.push(id);
+                    // Label changes reported without content update the stored copies in place.
+                    let (refresh, relisted) = apply_relabels(store, acct, &changes.relabeled, &protected)?;
+                    // New mail, newest and Inbox first, ahead of older queued work. Queued before
+                    // the checkpoint moves past it, so a stop or a crash keeps it, and the next sync
+                    // carries on from the queue instead of reading the history again.
+                    let mut wanted = std::mem::take(&mut changes.to_download);
+                    wanted.extend(relisted);
+                    queue_downloads(store, provider, acct, wanted, Some(CATCH_UP_LIMIT));
+                    if !refresh.is_empty() {
+                        if provider.has_cheap_headers() {
+                            enqueue_front(store, &refresh_key(acct), &refresh);
+                        } else {
+                            enqueue(store, acct, refresh, false);
                         }
                     }
-                }
-                // A message that vanished from one folder and appeared in another is a move,
-                // not a deletion plus a new message.
-                reconcile_incoming(store, acct, &mut changes.upserts, &mut changes.deleted);
-                store.merge_remote_messages(&changes.upserts, &protected).map_err(|e| ProviderError::Temporary(e.to_string()))?;
-                if !changes.deleted.is_empty() {
-                    // Respect remote deletions even if a local change was pending on them.
-                    let _ = store.delete_messages(&changes.deleted);
-                }
-                if let Some(new_cp) = changes.checkpoint.as_deref() {
-                    store.set_checkpoint(acct, Some(new_cp)).map_err(|e| ProviderError::Temporary(e.to_string()))?;
-                    mirror_provider_state(store, provider, acct, Some(new_cp));
-                }
-                outcome.downloaded += changes.upserts.len();
-                if !changes.message_ids.is_empty() {
-                    enqueue_bodies(store, acct, std::mem::take(&mut changes.message_ids));
-                }
-                if let Some(complete) = changes.complete.take() {
-                    // Pending changes may have been queued meanwhile; read them again.
-                    let protected = store.pending_message_ids(acct).unwrap_or_default();
-                    let withheld = pending_deletions(store, acct);
-                    let rows = store.message_states(acct).unwrap_or_default();
-                    let repair = plan_repair(&rows, &complete, &changes.untracked, &protected, &withheld);
-                    if repair.len() > 0 {
-                        info!("sync check for {}: {} stale, {} missing, {} flags fixed", account.email, repair.stale.len(), repair.missing.len(), repair.flags.len());
+                    // Providers that mint local ids on first sight report deletions by provider id.
+                    let mut deleted_set: std::collections::HashSet<MessageId> = changes.deleted.iter().cloned().collect();
+                    for pid in std::mem::take(&mut changes.deleted_provider_ids) {
+                        if let Ok(Some(id)) = store.message_id_for_provider_id(acct, &pid) {
+                            if moving.contains(&id) {
+                                deferred.push((id, pid));
+                            } else if deleted_set.insert(id.clone()) {
+                                changes.deleted.push(id);
+                            }
+                        }
                     }
-                    if !repair.stale.is_empty() {
-                        store.delete_messages(&repair.stale).map_err(|e| ProviderError::Temporary(e.to_string()))?;
+                    // A message that vanished from one folder and appeared in another is a move,
+                    // not a deletion plus a new message.
+                    reconcile_incoming(store, acct, &mut changes.upserts, &mut changes.deleted);
+                    store.merge_remote_messages(&changes.upserts, &protected).map_err(|e| ProviderError::Temporary(e.to_string()))?;
+                    if !changes.deleted.is_empty() {
+                        // Respect remote deletions even if a local change was pending on them.
+                        let _ = store.delete_messages(&changes.deleted);
                     }
-                    if !repair.flags.is_empty() {
-                        store.set_remote_flags(acct, &repair.flags).map_err(|e| ProviderError::Temporary(e.to_string()))?;
+                    if let Some(new_cp) = changes.checkpoint.as_deref() {
+                        store.set_checkpoint(acct, Some(new_cp)).map_err(|e| ProviderError::Temporary(e.to_string()))?;
+                        mirror_provider_state(store, provider, acct, Some(new_cp));
                     }
-                    outcome.repaired += repair.len();
-                    outcome.compared = true;
-                    enqueue(store, acct, repair.missing, true);
+                    outcome.downloaded += changes.upserts.len();
+                    if !changes.message_ids.is_empty() {
+                        enqueue_bodies(store, acct, std::mem::take(&mut changes.message_ids));
+                    }
+                    if let Some(complete) = changes.complete.take() {
+                        // Pending changes may have been queued meanwhile; read them again.
+                        let protected = store.pending_message_ids(acct).unwrap_or_default();
+                        let withheld = pending_deletions(store, acct);
+                        let rows = store.message_states(acct).unwrap_or_default();
+                        let repair = plan_repair(&rows, &complete, &changes.untracked, &protected, &withheld);
+                        if repair.len() > 0 {
+                            info!("sync check for {}: {} stale, {} missing, {} flags fixed", account.email, repair.stale.len(), repair.missing.len(), repair.flags.len());
+                        }
+                        if !repair.stale.is_empty() {
+                            store.delete_messages(&repair.stale).map_err(|e| ProviderError::Temporary(e.to_string()))?;
+                        }
+                        if !repair.flags.is_empty() {
+                            store.set_remote_flags(acct, &repair.flags).map_err(|e| ProviderError::Temporary(e.to_string()))?;
+                        }
+                        outcome.repaired += repair.len();
+                        outcome.compared = true;
+                        enqueue(store, acct, repair.missing, true);
+                    }
+                    outcome.verified |= verify;
+                    drain_backlog(store, provider, account, outcome, deadline).await?;
+                    extend_coverage(store, provider, account, &protected, outcome, deadline).await?;
+                    // One-time: re-fetch messages whose calendar part was stored before
+                    // invitation parsing existed.
+                    let invite_key = format!("invites_parsed:{}", acct.0);
+                    if store.setting::<bool>(&invite_key).ok().flatten() != Some(true) {
+                        let ids = store.messages_needing_invitation_parse(acct).unwrap_or_default();
+                        if !ids.is_empty() {
+                            enqueue(store, acct, ids, false);
+                            drain_backlog(store, provider, account, outcome, deadline).await?;
+                        }
+                        let _ = store.set_setting(&invite_key, &true);
+                    }
+                    // One-time: re-fetch messages with cid: images stored before Content-ID was kept.
+                    let inline_key = format!("inline_cids_parsed:{}", acct.0);
+                    if store.setting::<bool>(&inline_key).ok().flatten() != Some(true) {
+                        let ids = store.messages_needing_inline_parse(acct).unwrap_or_default();
+                        if !ids.is_empty() {
+                            enqueue(store, acct, ids, false);
+                            drain_backlog(store, provider, account, outcome, deadline).await?;
+                        }
+                        let _ = store.set_setting(&inline_key, &true);
+                    }
+                    Ok(outcome.downloaded)
                 }
-                outcome.verified |= verify;
-                drain_backlog(store, provider, account, outcome, deadline)?;
-                extend_coverage(outcome)?;
-                // One-time: re-fetch messages whose calendar part was stored before
-                // invitation parsing existed.
-                let invite_key = format!("invites_parsed:{}", acct.0);
-                if store.setting::<bool>(&invite_key).ok().flatten() != Some(true) {
-                    let ids = store.messages_needing_invitation_parse(acct).unwrap_or_default();
-                    if !ids.is_empty() {
-                        enqueue(store, acct, ids, false);
-                        drain_backlog(store, provider, account, outcome, deadline)?;
-                    }
-                    let _ = store.set_setting(&invite_key, &true);
+                Err(ProviderError::CheckpointExpired) => {
+                    info!("checkpoint expired for {}; full resynchronization", account.email);
+                    download_full(store, provider, account, &protected, outcome, deadline).await
                 }
-                // One-time: re-fetch messages with cid: images stored before Content-ID was kept.
-                let inline_key = format!("inline_cids_parsed:{}", acct.0);
-                if store.setting::<bool>(&inline_key).ok().flatten() != Some(true) {
-                    let ids = store.messages_needing_inline_parse(acct).unwrap_or_default();
-                    if !ids.is_empty() {
-                        enqueue(store, acct, ids, false);
-                        drain_backlog(store, provider, account, outcome, deadline)?;
-                    }
-                    let _ = store.set_setting(&inline_key, &true);
-                }
-                Ok(outcome.downloaded)
+                Err(e) => Err(e),
             }
-            Err(ProviderError::CheckpointExpired) => {
-                info!("checkpoint expired for {}; full resynchronization", account.email);
-                full(outcome)
-            }
-            Err(e) => Err(e),
-        },
-        _ => full(outcome),
+        }
+        _ => download_full(store, provider, account, &protected, outcome, deadline).await,
     }
 }
 
@@ -1051,7 +1085,8 @@ pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calend
         let state = state_for(&err);
         let _ = store.set_sync_state(&acct, &state, None);
         outcome.state = Some(state);
-        outcome.stopped_offline = true;
+        outcome.stopped_offline = matches!(err, ProviderError::Offline);
+        outcome.rate_limited = matches!(err, ProviderError::RateLimited(_));
         return outcome;
     }
     let _ = store.set_sync_state(&acct, &SyncState::Syncing, None);
@@ -1090,7 +1125,7 @@ pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calend
     let mut deferred: Vec<(MessageId, ProviderId)> = Vec::new();
     // Downloading is background work: a metered provider (Gmail) leaves part of its quota
     // for what the user opens or sends meanwhile.
-    let downloaded = overlook_provider::as_background(|| download(&store, provider.as_ref(), &account, &mut outcome, &mut deferred, verify));
+    let downloaded = AsBackground(download(&store, provider.as_ref(), &account, &mut outcome, &mut deferred, verify)).await;
     if let Err(err) = downloaded {
         warn!("download paused for {}: {err}", account.email);
         outcome.rate_limited = matches!(err, ProviderError::RateLimited(_));
@@ -1102,7 +1137,7 @@ pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calend
     }
 
     if let Some(cal) = &calendar {
-        sync_calendar(&store, cal.as_ref(), &account, &mut outcome);
+        sync_calendar(&store, cal.as_ref(), &account, &mut outcome).await;
     }
     sync_contacts(&store, provider.as_ref(), &account, &mut outcome).await;
 
@@ -1135,23 +1170,63 @@ pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calend
     outcome
 }
 
-/// Minimal executor for provider futures inside the already-blocking download step.
-/// Provider futures do blocking I/O and never return `Pending`.
-pub(crate) fn pollster_block<F: std::future::Future>(f: F) -> F::Output {
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-    fn noop(_: *const ()) {}
-    fn clone(p: *const ()) -> RawWaker {
-        RawWaker::new(p, &VTABLE)
+/// Runs `F` while marking each poll on the current thread as background work so metered
+/// providers keep quota headroom for foreground actions.
+struct AsBackground<F>(F);
+
+impl<F: std::future::Future> std::future::Future for AsBackground<F> {
+    type Output = F::Output;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        // SAFETY: structural projection to the pinned inner future.
+        let inner = unsafe { self.map_unchecked_mut(|s| &mut s.0) };
+        overlook_provider::as_background(|| inner.poll(cx))
     }
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-    let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
-    let mut cx = Context::from_waker(&waker);
-    let mut f = Box::pin(f);
-    loop {
-        if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {
-            return v;
+}
+
+/// Blocks the current thread on a future using a condvar waker (never spin-yielding).
+pub(crate) fn pollster_block<F: std::future::Future>(f: F) -> F::Output {
+    use std::sync::{Condvar, Mutex};
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct Signal {
+        notified: Mutex<bool>,
+        cvar: Condvar,
+    }
+
+    impl Wake for Signal {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
         }
-        std::thread::yield_now();
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            let mut notified = self.notified.lock().unwrap_or_else(|e| e.into_inner());
+            *notified = true;
+            self.cvar.notify_one();
+        }
+    }
+
+    let signal = Arc::new(Signal {
+        notified: Mutex::new(false),
+        cvar: Condvar::new(),
+    });
+    let waker = Waker::from(signal.clone());
+    let mut cx = Context::from_waker(&waker);
+    let mut f = std::pin::pin!(f);
+    loop {
+        {
+            let mut notified = signal.notified.lock().unwrap_or_else(|e| e.into_inner());
+            *notified = false;
+        }
+        match f.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => return v,
+            Poll::Pending => {
+                let mut notified = signal.notified.lock().unwrap_or_else(|e| e.into_inner());
+                while !*notified {
+                    notified = signal.cvar.wait(notified).unwrap_or_else(|e| e.into_inner());
+                }
+            }
+        }
     }
 }
 
@@ -1537,6 +1612,94 @@ mod tests {
         assert_eq!(rows[0].body.text.as_deref(), Some("body 7"));
         assert!(!rows[0].conversation_id.0.is_empty());
         assert!(backlog(&store, &account.id).is_empty());
+    }
+
+    #[test]
+    fn enqueue_and_enqueue_bodies_deduplicate_preserving_order() {
+        let (store, account, provider) = imap_seeded();
+        block_on(run_sync(store.clone(), provider.clone(), None, account.clone(), false));
+        let pid = |n: usize| ProviderId(format!("INBOX\u{1f}1\u{1f}{n}"));
+
+        // Pre-store one header-only message and one cached-body message.
+        let header_only = raw_message("10", "INBOX", "<h10@x>", None, &[], 100, false);
+        let cached = raw_message("11", "INBOX", "<c11@x>", None, &[], 100, true);
+        store.upsert_messages(&[header_only, cached]).unwrap();
+
+        enqueue(&store, &account.id, vec![pid(20), pid(21), pid(20), pid(10), pid(22), pid(21)], true);
+        assert_eq!(backlog(&store, &account.id), vec![pid(20), pid(21), pid(22)]);
+
+        // enqueue_bodies queues header-only (10), skips cached (11), and deduplicates against existing backlog (20).
+        enqueue_bodies(&store, &account.id, vec![pid(20), pid(10), pid(11), pid(10), pid(23), pid(23)]);
+        assert_eq!(backlog(&store, &account.id), vec![pid(20), pid(21), pid(22), pid(10), pid(23)]);
+    }
+
+    #[test]
+    fn probe_errors_only_set_stopped_offline_for_offline_error() {
+        struct ProbeErrorProvider(ProviderError);
+        impl MailProvider for ProbeErrorProvider {
+            fn kind(&self) -> ProviderKind { ProviderKind::Imap }
+            fn probe(&self) -> BoxFuture<'_, Result<(), ProviderError>> {
+                let err = self.0.clone();
+                Box::pin(async move { Err(err) })
+            }
+            fn fetch_snapshot(&self, _: &Account) -> BoxFuture<'_, Result<MailboxSnapshot, ProviderError>> { unreachable!() }
+            fn fetch_changes(&self, _: &Account, _: &str) -> BoxFuture<'_, Result<RemoteChanges, ProviderError>> { unreachable!() }
+            fn apply(&self, _: &Account, _: &PendingOperation, _: &[Message], _: &[Label]) -> BoxFuture<'_, Result<AppliedChanges, ProviderError>> { unreachable!() }
+            fn send(&self, _: &Account, _: &Draft, _: SendContext) -> BoxFuture<'_, Result<SentReceipt, ProviderError>> { unreachable!() }
+            fn reconcile_send(&self, _: &Account, _: &Draft) -> BoxFuture<'_, Result<SendOutcome, ProviderError>> { unreachable!() }
+        }
+
+        let (store, account, _) = imap_seeded();
+        let offline = block_on(run_sync(store.clone(), Arc::new(ProbeErrorProvider(ProviderError::Offline)), None, account.clone(), false));
+        assert!(offline.stopped_offline);
+        assert!(!offline.rate_limited);
+
+        let signin = block_on(run_sync(store.clone(), Arc::new(ProbeErrorProvider(ProviderError::SignInRequired)), None, account.clone(), false));
+        assert!(!signin.stopped_offline, "SignInRequired from probe must not set stopped_offline");
+        assert_eq!(signin.state, Some(SyncState::SignInRequired));
+
+        let limited = block_on(run_sync(store.clone(), Arc::new(ProbeErrorProvider(ProviderError::RateLimited("slow".into()))), None, account.clone(), false));
+        assert!(!limited.stopped_offline);
+        assert!(limited.rate_limited);
+    }
+
+    #[test]
+    fn pollster_block_parks_until_woken_by_background_thread() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::task::{Context, Poll};
+
+        struct Delayed {
+            ready: Arc<AtomicBool>,
+            polls: Arc<AtomicUsize>,
+            started: bool,
+        }
+        impl Future for Delayed {
+            type Output = usize;
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                self.polls.fetch_add(1, Ordering::Relaxed);
+                if self.ready.load(Ordering::Acquire) {
+                    return Poll::Ready(42);
+                }
+                if !self.started {
+                    self.started = true;
+                    let ready = self.ready.clone();
+                    let waker = cx.waker().clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(30));
+                        ready.store(true, Ordering::Release);
+                        waker.wake();
+                    });
+                }
+                Poll::Pending
+            }
+        }
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let value = pollster_block(Delayed { ready: Arc::new(AtomicBool::new(false)), polls: polls.clone(), started: false });
+        assert_eq!(value, 42);
+        assert!(polls.load(Ordering::Relaxed) <= 3, "must park on condvar instead of spin-yielding (got {} polls)", polls.load(Ordering::Relaxed));
     }
 
     /// The whole read path against a real IMAP server through the store: two syncs on a
@@ -2704,7 +2867,7 @@ mod tests {
         *provider.allowance.lock().unwrap() = 1_000_000;
         save_backlog(&store, &account.id, &[ProviderId(format!("{:016x}", 9))]);
         let mut outcome = SyncOutcome::default();
-        drain_backlog(&store, &provider, &account, &mut outcome, Instant::now()).unwrap();
+        block_on(drain_backlog(&store, &provider, &account, &mut outcome, Instant::now())).unwrap();
         assert!(outcome.more_to_download, "the next sync carries on");
         assert!(provider.bodies.lock().unwrap().is_empty());
         assert_eq!(backlog(&store, &account.id).len(), 1, "nothing lost");
@@ -2740,7 +2903,7 @@ mod tests {
         // A one-time re-parse asks for the opened one again on purpose.
         enqueue(&store, &account.id, vec![pid(&opened)], false);
         let mut outcome = SyncOutcome::default();
-        drain_backlog(&store, &provider, &account, &mut outcome, Instant::now() + Duration::from_secs(5)).unwrap();
+        block_on(drain_backlog(&store, &provider, &account, &mut outcome, Instant::now() + Duration::from_secs(5))).unwrap();
         assert_eq!(*provider.bodies.lock().unwrap(), vec![pid(&waiting).0, pid(&opened).0], "the backlog skips the opened message; the re-download fetches it");
         assert_eq!(queued_downloads(&store, &account.id), 0);
     }

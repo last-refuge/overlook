@@ -4,7 +4,8 @@ use super::{
 };
 use overlook_core::AccountId;
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::future::Future;
+use std::sync::{Arc, OnceLock};
 
 /// True only when this process really runs inside a Flatpak or Snap sandbox, where the
 /// secrets portal is the way to the keyring. The same test `oo7` makes through `ashpd`
@@ -49,16 +50,21 @@ fn in_snap(cgroup: &str) -> bool {
     })
 }
 
+fn is_sandboxed() -> bool {
+    static SANDBOXED: OnceLock<bool> = OnceLock::new();
+    *SANDBOXED.get_or_init(sandboxed)
+}
+
 /// The keyring to use: the Secret Service outside a sandbox, the portal's file backend inside
 /// one. Chosen here rather than by `oo7::Keyring::new`, which asks `ashpd` whether the process
 /// is sandboxed and counts `GTK_USE_PORTAL` as proof. Like `oo7`, a sandbox without the
 /// secrets portal uses the Secret Service, which the Flatpak is allowed to reach.
-async fn keyring() -> Result<oo7::Keyring, oo7::Error> {
-    if sandboxed() {
+async fn open_keyring() -> Result<oo7::Keyring, oo7::Error> {
+    if is_sandboxed() {
         match oo7::file::Keyring::load_default().await {
             Ok(file) => {
                 tracing::debug!(target: "overlook::diag", "sandboxed: using the secrets portal file keyring");
-                return Ok(oo7::Keyring::File(std::sync::Arc::new(file)));
+                return Ok(oo7::Keyring::File(Arc::new(file)));
             }
             Err(oo7::file::Error::Portal(oo7::ashpd::Error::PortalNotFound(_))) => {
                 tracing::debug!(target: "overlook::diag", "sandboxed without the secrets portal: using the Secret Service");
@@ -68,6 +74,55 @@ async fn keyring() -> Result<oo7::Keyring, oo7::Error> {
     }
     let service = oo7::dbus::Service::<'static>::new().await?;
     Ok(oo7::Keyring::DBus(service.default_collection().await?))
+}
+
+fn cached_keyring() -> &'static tokio::sync::Mutex<Option<Arc<oo7::Keyring>>> {
+    static KEYRING: OnceLock<tokio::sync::Mutex<Option<Arc<oo7::Keyring>>>> = OnceLock::new();
+    KEYRING.get_or_init(|| tokio::sync::Mutex::new(None))
+}
+
+async fn get_keyring() -> Result<Arc<oo7::Keyring>, oo7::Error> {
+    let mut guard = cached_keyring().lock().await;
+    if let Some(existing) = guard.as_ref() {
+        return Ok(existing.clone());
+    }
+    let fresh = Arc::new(open_keyring().await?);
+    *guard = Some(fresh.clone());
+    Ok(fresh)
+}
+
+async fn reconnect_keyring(stale: &Arc<oo7::Keyring>) -> Result<Arc<oo7::Keyring>, oo7::Error> {
+    let mut guard = cached_keyring().lock().await;
+    if let Some(existing) = guard.as_ref() {
+        if !Arc::ptr_eq(existing, stale) {
+            return Ok(existing.clone());
+        }
+    }
+    *guard = None;
+    let fresh = Arc::new(open_keyring().await?);
+    *guard = Some(fresh.clone());
+    Ok(fresh)
+}
+
+fn should_reconnect(err: &oo7::Error) -> bool {
+    matches!(err, oo7::Error::DBus(dbus_err) if !matches!(dbus_err, oo7::dbus::Error::Dismissed))
+}
+
+async fn with_keyring<T, F, Fut>(op: F) -> Result<T, oo7::Error>
+where
+    F: Fn(Arc<oo7::Keyring>) -> Fut,
+    Fut: Future<Output = Result<T, oo7::Error>>,
+{
+    let kr = get_keyring().await?;
+    match op(kr.clone()).await {
+        Ok(value) => Ok(value),
+        Err(err) if should_reconnect(&err) => {
+            tracing::debug!(target: "overlook::diag", "keyring D-Bus error; reconnecting once");
+            let fresh = reconnect_keyring(&kr).await?;
+            op(fresh).await
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn runtime() -> &'static tokio::runtime::Runtime {
@@ -117,36 +172,48 @@ fn label(account: &AccountId, kind: &str) -> String {
 }
 
 pub(super) fn save(account: &AccountId, kind: &str, secret: Vec<u8>) -> Result<(), oo7::Error> {
-    let attrs = attributes(account, kind);
-    let label = label(account, kind);
-    runtime().block_on(async move {
-        keyring()
-            .await?
-            .create_item(&label, &borrow(&attrs), secret, true)
-            .await
-    })
+    let attrs = Arc::new(attributes(account, kind));
+    let label = Arc::new(label(account, kind));
+    let secret = Arc::new(secret);
+    runtime().block_on(with_keyring(move |kr| {
+        let attrs = attrs.clone();
+        let label = label.clone();
+        let secret = secret.clone();
+        async move {
+            kr.create_item(&label, &borrow(&attrs), secret.as_slice(), true)
+                .await
+        }
+    }))
 }
 
 pub(super) fn load(account: &AccountId, kind: &str) -> Result<Option<Vec<u8>>, oo7::Error> {
-    let attrs = attributes(account, kind);
-    runtime().block_on(async move {
-        let keyring = keyring().await?;
-        let items = keyring.search_items(&borrow(&attrs)).await?;
-        let Some(item) = items.into_iter().next() else {
-            return Ok(None);
-        };
-        Ok(Some(item.secret().await?.as_bytes().to_vec()))
-    })
+    let attrs = Arc::new(attributes(account, kind));
+    runtime().block_on(with_keyring(move |kr| {
+        let attrs = attrs.clone();
+        async move {
+            let items = kr.search_items(&borrow(&attrs)).await?;
+            let Some(item) = items.into_iter().next() else {
+                return Ok(None);
+            };
+            Ok(Some(item.secret().await?.as_bytes().to_vec()))
+        }
+    }))
 }
 
 pub(super) fn delete(account: &AccountId, kind: &str) -> Result<(), oo7::Error> {
-    let attrs = attributes(account, kind);
-    runtime().block_on(async move { keyring().await?.delete(&borrow(&attrs)).await })
+    let attrs = Arc::new(attributes(account, kind));
+    runtime().block_on(with_keyring(move |kr| {
+        let attrs = attrs.clone();
+        async move { kr.delete(&borrow(&attrs)).await }
+    }))
 }
 
 pub(super) fn delete_all(account: &AccountId) -> Result<(), oo7::Error> {
-    let attrs = account_attributes(account);
-    runtime().block_on(async move { keyring().await?.delete(&borrow(&attrs)).await })
+    let attrs = Arc::new(account_attributes(account));
+    runtime().block_on(with_keyring(move |kr| {
+        let attrs = attrs.clone();
+        async move { kr.delete(&borrow(&attrs)).await }
+    }))
 }
 
 #[cfg(test)]

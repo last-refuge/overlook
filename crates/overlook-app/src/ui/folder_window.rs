@@ -243,6 +243,8 @@ impl MailWindow {
         if fonts_changed && crate::theme::current_fonts(cx) != self.prefs.fonts {
             crate::theme::apply_fonts(&self.prefs.fonts, cx);
         }
+        self.prepare_outbox_preview(cx);
+        self.prepare_composer_preview(cx);
         self.reload(cx);
         cx.notify();
     }

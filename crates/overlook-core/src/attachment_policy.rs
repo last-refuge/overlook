@@ -30,7 +30,7 @@ pub const MAX_ATTACHMENTS_ENCODED_BYTES: u64 = 25 * 1024 * 1024;
 
 /// The size a set of attachments occupies once base64-encoded for mail.
 pub fn encoded_size(raw_bytes: u64) -> u64 {
-    raw_bytes.div_ceil(3) * 4
+    raw_bytes.div_ceil(3).saturating_mul(4)
 }
 
 /// Whether attachments totalling `raw_bytes` fit in one message.
@@ -170,18 +170,18 @@ fn archive_entries(filename: &str, content: &[u8]) -> Vec<String> {
         return zip_entries(content);
     }
     if content.starts_with(&[0x1f, 0x8b]) && (name.ends_with(".tar.gz") || name.ends_with(".tgz")) {
-        let mut tar = Vec::new();
-        // Bound decompression so a gzip bomb cannot exhaust memory.
-        let _ = flate2::read::GzDecoder::new(content).take(MAX_INFLATED_TAR).read_to_end(&mut tar);
-        return tar_entries(&tar);
+        // Stream tar headers directly without inflating up to MAX_INFLATED_TAR into RAM.
+        let decoder = flate2::read::GzDecoder::new(content).take(MAX_INFLATED_TAR);
+        return tar_entries_from_reader(decoder);
     }
     if name.ends_with(".tar") {
-        return tar_entries(content);
+        return tar_entries_from_reader(content);
     }
     Vec::new()
 }
 
 const MAX_INFLATED_TAR: u64 = 256 * 1024 * 1024;
+const MAX_TAR_ENTRIES: usize = 65_536;
 
 /// File names from a zip's central directory. No entry is decompressed.
 fn zip_entries(content: &[u8]) -> Vec<String> {
@@ -204,23 +204,34 @@ fn zip_entries(content: &[u8]) -> Vec<String> {
     names
 }
 
-/// File names from a tar stream's headers (ustar prefix included).
-fn tar_entries(content: &[u8]) -> Vec<String> {
+/// File names from a tar stream's headers (ustar prefix included), skipping entry
+/// payloads directly to `io::sink()` rather than buffering the inflated stream.
+fn tar_entries_from_reader<R: Read>(mut reader: R) -> Vec<String> {
     let field = |header: &[u8], range: std::ops::Range<usize>| {
         let raw = &header[range];
         String::from_utf8_lossy(&raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())]).into_owned()
     };
     let mut names = Vec::new();
-    let mut at = 0;
-    while let Some(header) = content.get(at..at + 512) {
+    let mut header = [0u8; 512];
+    while names.len() < MAX_TAR_ENTRIES {
+        if reader.read_exact(&mut header).is_err() {
+            break;
+        }
         if header.iter().all(|&b| b == 0) {
             break;
         }
-        let name = field(header, 0..100);
-        let prefix = if &header[257..262] == b"ustar" { field(header, 345..500) } else { String::new() };
+        let name = field(&header, 0..100);
+        let prefix = if &header[257..262] == b"ustar" { field(&header, 345..500) } else { String::new() };
         names.push(if prefix.is_empty() { name } else { format!("{prefix}/{name}") });
-        let size = usize::from_str_radix(field(header, 124..136).trim(), 8).unwrap_or(0);
-        at += 512 + size.div_ceil(512) * 512;
+        let size = u64::from_str_radix(field(&header, 124..136).trim(), 8).unwrap_or(0);
+        let skip = size.div_ceil(512).saturating_mul(512);
+        if skip > 0 {
+            let mut limited = reader.by_ref().take(skip);
+            match std::io::copy(&mut limited, &mut std::io::sink()) {
+                Ok(n) if n == skip => {}
+                _ => break,
+            }
+        }
     }
     names
 }
@@ -396,8 +407,42 @@ mod tests {
     fn size_limit_counts_base64_overhead() {
         assert_eq!(encoded_size(3), 4);
         assert_eq!(encoded_size(4), 8);
+        assert_eq!(encoded_size(u64::MAX), u64::MAX);
+        assert!(!within_size_limit(u64::MAX));
         assert!(within_size_limit(18 * 1024 * 1024));
         assert!(!within_size_limit(19 * 1024 * 1024));
+    }
+
+    #[test]
+    fn tar_gz_streaming_handles_large_payloads_and_truncation() {
+        // Entry 1 has a 64 KB payload; entry 2 is a blocked executable.
+        let mut tar = Vec::new();
+        let mut h1 = [0u8; 512];
+        h1[..9].copy_from_slice(b"large.bin");
+        h1[124..135].copy_from_slice(b"00000200000"); // 65536 in octal
+        h1[257..262].copy_from_slice(b"ustar");
+        tar.extend_from_slice(&h1);
+        tar.extend_from_slice(&vec![b'A'; 65536]);
+        let mut h2 = [0u8; 512];
+        h2[..8].copy_from_slice(b"evil.exe");
+        h2[124..135].copy_from_slice(b"00000000000");
+        h2[257..262].copy_from_slice(b"ustar");
+        tar.extend_from_slice(&h2);
+        tar.extend_from_slice(&[0u8; 1024]);
+
+        let mut gz = Vec::new();
+        {
+            use std::io::Write;
+            let mut encoder = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::fast());
+            encoder.write_all(&tar).unwrap();
+            encoder.finish().unwrap();
+        }
+        assert_eq!(
+            check_outgoing("archive.tar.gz", &gz),
+            Err(Refusal::BlockedInArchive { entry: "evil.exe".into() })
+        );
+        // Truncated gzip stream does not panic.
+        assert!(check_outgoing("cut.tgz", &gz[..gz.len() / 2]).is_ok());
     }
 
     #[test]

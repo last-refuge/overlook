@@ -46,11 +46,22 @@ use client::Client;
 use overlook_core::time::now;
 use overlook_core::*;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 use tracing::{info, warn};
+
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
 
 /// Socket connect/read/write timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -239,6 +250,23 @@ impl Pop3Provider {
         MessageId(format!("{}:{}", account.id.0, MessageId::generate().0))
     }
 
+    /// Deterministic local message id for a server UIDL, so a restart that drains a
+    /// persisted backlog before `fetch_changes` loads the checkpoint never mints a duplicate
+    /// UUID or orphans an existing `.eml` file on disk.
+    fn local_id_for_uidl(account: &Account, uidl: &str) -> MessageId {
+        let digest = crate::oauth::sha256(uidl.as_bytes());
+        let hex: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+        MessageId(format!(
+            "{}:{}-{}-{}-{}-{}",
+            account.id.0,
+            &hex[0..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32]
+        ))
+    }
+
     fn inbox_flags(account: &Account, uidl: &str, received_at: i64) -> MessageFlags {
         MessageFlags { provider_id: Some(ProviderId(uidl.to_owned())), label_ids: [label_id(&account.id, LabelKind::Inbox)].into_iter().collect(), is_read: false, is_starred: false, received_at: Some(received_at) }
     }
@@ -247,10 +275,28 @@ impl Pop3Provider {
         let path = self.raw_path(id);
         let io = |e: std::io::Error| ProviderError::Temporary(format!("could not save the message to {}: {e}", path.display()));
         std::fs::create_dir_all(&self.raw_dir).map_err(io)?;
-        // Write, then rename, so a crash never leaves a half-written primary copy.
-        let tmp = path.with_extension("eml.part");
-        std::fs::write(&tmp, bytes).map_err(io)?;
-        std::fs::rename(&tmp, &path).map_err(io)
+        // Write to a unique temporary file, sync its data, rename into place, and sync the
+        // parent directory so a power loss before server DELE retention cannot lose the copy.
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("message.eml");
+        let tmp = self.raw_dir.join(format!(".{file_name}.{}.part", MessageId::generate().0));
+        let written = (|| {
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(bytes)?;
+            file.sync_all()
+        })();
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(io(e));
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(io(e));
+        }
+        if let Err(e) = sync_dir(&self.raw_dir) {
+            let _ = std::fs::remove_file(&path);
+            return Err(io(e));
+        }
+        Ok(())
     }
 
     /// Whether the server copy may be deleted now, per the policy.
@@ -274,7 +320,7 @@ impl Pop3Provider {
         let mut ids = Vec::with_capacity(unseen.len());
         for (n, uidl) in &unseen {
             let size = sizes.get(n).copied().unwrap_or(0);
-            let id = Self::local_id(account);
+            let id = Self::local_id_for_uidl(account, uidl);
             if size > self.top_above {
                 match client.top(*n, 0) {
                     Ok(bytes) => upserts.push(headers_from_rfc822(account, &bytes, id.clone(), &Self::inbox_flags(account, uidl, now))),
@@ -296,10 +342,11 @@ impl Pop3Provider {
         }
 
         // Retention: only messages whose bytes are on disk, never ones listed just now.
+        let newly_listed: HashSet<&str> = ids.iter().map(|p| p.0.as_str()).collect();
         let mut deleted = 0;
         for (uidl, entry) in cp.entries.iter_mut() {
             let Some(n) = on_server.get(uidl.as_str()) else { continue };
-            if ids.iter().any(|p| &p.0 == uidl) || !Self::should_delete(&policy, entry.seen_at, now) || !self.raw_path(&MessageId(entry.id.clone())).exists() {
+            if newly_listed.contains(uidl.as_str()) || !Self::should_delete(&policy, entry.seen_at, now) || !self.raw_path(&MessageId(entry.id.clone())).exists() {
                 continue;
             }
             match client.dele(*n) {
@@ -345,9 +392,33 @@ impl Pop3Provider {
     }
 
     fn changes(&self, account: &Account, checkpoint: &str) -> Result<RemoteChanges, ProviderError> {
-        let cp = self.with_ledger(|l| match &l.json {
-            Some(json) if json == checkpoint => Ok(l.cp.clone()),
-            _ => Checkpoint::parse(checkpoint),
+        let cp = self.with_ledger(|l| -> Result<Checkpoint, ProviderError> {
+            match &l.json {
+                Some(json) if json == checkpoint => Ok(l.cp.clone()),
+                prev_json => {
+                    let mut parsed = Checkpoint::parse(checkpoint)?;
+                    // Reconcile entries downloaded by `fetch_messages` before this checkpoint was
+                    // loaded (e.g. backlog drain after restart), preserving any already-saved `.eml`.
+                    let was_unloaded = prev_json.is_none();
+                    for (uidl, mem) in &l.cp.entries {
+                        match parsed.entries.get_mut(uidl) {
+                            Some(disk) => {
+                                if disk.id != mem.id
+                                    && !self.raw_path(&MessageId(disk.id.clone())).exists()
+                                    && self.raw_path(&MessageId(mem.id.clone())).exists()
+                                {
+                                    disk.id = mem.id.clone();
+                                }
+                            }
+                            None if was_unloaded => {
+                                parsed.entries.insert(uidl.clone(), mem.clone());
+                            }
+                            None => {}
+                        }
+                    }
+                    Ok(parsed)
+                }
+            }
         })?;
         let (upserts, message_ids, checkpoint) = self.run_cycle(account, cp)?;
         Ok(RemoteChanges { labels: None, upserts, deleted: Vec::new(), deleted_provider_ids: Vec::new(), message_ids, checkpoint: Some(checkpoint), complete: None, untracked: Vec::new(), ..Default::default() })
@@ -356,30 +427,48 @@ impl Pop3Provider {
     /// Full messages: from disk when the `.eml` exists, otherwise `RETR` (saved first). Ids
     /// the server no longer has and that were never saved are skipped.
     fn messages(&self, account: &Account, ids: &[ProviderId]) -> Result<Vec<Message>, ProviderError> {
-        let mut guard = self.ledger.lock().unwrap_or_else(|p| p.into_inner());
-        let mut out = Vec::with_capacity(ids.len());
+        let fallback_now = now();
+        let plan: Vec<(ProviderId, MessageId, i64, bool)> = self.with_ledger(|l| {
+            ids.iter()
+                .filter(|pid| !is_sent_copy(pid))
+                .map(|pid| match l.cp.entries.get(&pid.0) {
+                    Some(entry) => (pid.clone(), MessageId(entry.id.clone()), entry.seen_at, true),
+                    None => (pid.clone(), Self::local_id_for_uidl(account, &pid.0), fallback_now, false),
+                })
+                .collect()
+        });
+        let mut out = Vec::with_capacity(plan.len());
         let mut need = Vec::new();
-        for pid in ids {
-            if is_sent_copy(pid) {
-                continue;
-            }
-            match guard.cp.entries.get(&pid.0) {
-                Some(entry) if self.raw_path(&MessageId(entry.id.clone())).exists() => {
-                    let id = MessageId(entry.id.clone());
-                    match std::fs::read(self.raw_path(&id)) {
-                        Ok(bytes) => out.push(message_from_rfc822(account, &bytes, id, &Self::inbox_flags(account, &pid.0, entry.seen_at))),
-                        Err(_) => need.push(pid.clone()),
+        let mut disk_entries = Vec::new();
+        for (pid, id, seen_at, in_ledger) in plan {
+            let path = self.raw_path(&id);
+            if path.exists() {
+                match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        if !in_ledger {
+                            disk_entries.push((pid.0.clone(), id.0.clone(), seen_at, bytes.len() as u64));
+                        }
+                        out.push(message_from_rfc822(account, &bytes, id, &Self::inbox_flags(account, &pid.0, seen_at)));
+                        continue;
                     }
+                    Err(_) => {}
                 }
-                _ => need.push(pid.clone()),
             }
+            need.push((pid, id, seen_at));
+        }
+        if !disk_entries.is_empty() {
+            self.with_ledger(|l| {
+                for (uidl, id, seen_at, size) in disk_entries {
+                    l.cp.entries.entry(uidl).or_insert(SeenEntry { id, seen_at, size, deleted_on_server: false, deleted_at: None });
+                }
+            });
         }
         if need.is_empty() {
             return Ok(out);
         }
         let mut client = self.connect()?;
         let numbers: BTreeMap<String, u32> = client.uidl()?.into_iter().map(|(n, u)| (u, n)).collect();
-        for pid in need {
+        for (pid, fallback_id, fallback_seen_at) in need {
             let Some(n) = numbers.get(&pid.0) else {
                 info!("pop3: {} is no longer on the server; skipped", pid.0);
                 continue;
@@ -392,10 +481,12 @@ impl Pop3Provider {
                 }
                 Err(e) => return Err(e),
             };
-            let entry = guard.cp.entries.entry(pid.0.clone()).or_insert_with(|| SeenEntry { id: Self::local_id(account).0, seen_at: now(), size: bytes.len() as u64, deleted_on_server: false, deleted_at: None });
-            let id = MessageId(entry.id.clone());
+            let (id, seen_at) = self.with_ledger(|l| {
+                let entry = l.cp.entries.entry(pid.0.clone()).or_insert_with(|| SeenEntry { id: fallback_id.0.clone(), seen_at: fallback_seen_at, size: bytes.len() as u64, deleted_on_server: false, deleted_at: None });
+                (MessageId(entry.id.clone()), entry.seen_at)
+            });
             self.write_raw(&id, &bytes)?;
-            out.push(message_from_rfc822(account, &bytes, id, &Self::inbox_flags(account, &pid.0, entry.seen_at)));
+            out.push(message_from_rfc822(account, &bytes, id, &Self::inbox_flags(account, &pid.0, seen_at)));
         }
         // Nothing to commit; a dropped QUIT is not worth failing the batch over.
         let _ = client.quit();

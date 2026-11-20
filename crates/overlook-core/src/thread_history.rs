@@ -114,7 +114,12 @@ fn normalized(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn attr(node: &Handle, key: &str) -> Option<String> {
+const MAX_HEADER_SCAN_BYTES: usize = 1024;
+const MAX_HEADER_SCAN_NODES: usize = 128;
+const MAX_FORWARD_SCAN_BYTES: usize = 4096;
+const MAX_FORWARD_SCAN_NODES: usize = 256;
+
+fn with_attr<R>(node: &Handle, key: &str, f: impl FnOnce(&str) -> R) -> Option<R> {
     let NodeData::Element { attrs, .. } = &node.data else {
         return None;
     };
@@ -122,15 +127,49 @@ fn attr(node: &Handle, key: &str) -> Option<String> {
         .borrow()
         .iter()
         .find(|a| a.name.local.as_ref() == key)
-        .map(|a| a.value.to_string())
+        .map(|a| f(&a.value))
+}
+
+fn has_attr(node: &Handle, key: &str) -> bool {
+    with_attr(node, key, |_| ()).is_some()
+}
+
+fn attr(node: &Handle, key: &str) -> Option<String> {
+    with_attr(node, key, str::to_owned)
+}
+
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+fn is_hidden_style(style: &str) -> bool {
+    for decl in style.split(';').take(128) {
+        let Some((k, v)) = decl.split_once(':') else {
+            continue;
+        };
+        let k = k.trim();
+        let v = v.trim();
+        if (k.eq_ignore_ascii_case("display")
+            && v.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("none")))
+            || (k.eq_ignore_ascii_case("visibility")
+                && v.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("hidden")))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn class(node: &Handle, value: &str) -> bool {
-    attr(node, "class").is_some_and(|classes| {
+    with_attr(node, "class", |classes| {
         classes
             .split_whitespace()
             .any(|c| c.eq_ignore_ascii_case(value))
     })
+    .unwrap_or(false)
 }
 
 fn tag(node: &Handle) -> &str {
@@ -180,13 +219,36 @@ fn attribution(node: &Handle) -> bool {
 }
 
 fn forward_marker(node: &Handle) -> bool {
-    if let NodeData::Text { contents } = &node.data {
-        let text = contents.borrow();
-        if text.contains("Forwarded message") || text.contains("Begin forwarded message") {
-            return true;
+    fn visit(node: &Handle, nodes_left: &mut usize, bytes_left: &mut usize) -> bool {
+        if *nodes_left == 0 || *bytes_left == 0 {
+            return false;
         }
+        *nodes_left -= 1;
+        if let NodeData::Text { contents } = &node.data {
+            let text = contents.borrow();
+            let check = if text.len() > *bytes_left {
+                let mut end = *bytes_left;
+                while end > 0 && !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                *bytes_left = 0;
+                &text[..end]
+            } else {
+                *bytes_left -= text.len();
+                &text[..]
+            };
+            if check.contains("Forwarded message") || check.contains("Begin forwarded message") {
+                return true;
+            }
+        }
+        node.children
+            .borrow()
+            .iter()
+            .any(|child| visit(child, nodes_left, bytes_left))
     }
-    node.children.borrow().iter().any(forward_marker)
+    let mut nodes_left = MAX_FORWARD_SCAN_NODES;
+    let mut bytes_left = MAX_FORWARD_SCAN_BYTES;
+    visit(node, &mut nodes_left, &mut bytes_left)
 }
 
 fn signature(nodes: &[Handle]) -> Option<Signature> {
@@ -206,14 +268,7 @@ fn signature(nodes: &[Handle]) -> Option<Signature> {
         if matches!(local, "head" | "style" | "script" | "template") || attribution(node) {
             return Some(());
         }
-        if attr(node, "hidden").is_some() {
-            return Some(());
-        }
-        let style = attr(node, "style")
-            .unwrap_or_default()
-            .replace(char::is_whitespace, "")
-            .to_ascii_lowercase();
-        if style.contains("display:none") || style.contains("visibility:hidden") {
+        if has_attr(node, "hidden") || with_attr(node, "style", is_hidden_style).unwrap_or(false) {
             return Some(());
         }
         if matches!(local, "video" | "audio" | "object" | "svg" | "iframe") {
@@ -270,31 +325,94 @@ fn signature(nodes: &[Handle]) -> Option<Signature> {
     })
 }
 
+/// Bounded scan for an Outlook-style `border-top` header block (`From: ... Sent:/To: ...`),
+/// avoiding full 128 KB `signature()` traversals on ordinary bordered divs.
+fn is_outlook_header_block(node: &Handle) -> bool {
+    fn visit(node: &Handle, out: &mut String, nodes_left: &mut usize) -> bool {
+        if *nodes_left == 0 || out.len() >= MAX_HEADER_SCAN_BYTES {
+            return true;
+        }
+        *nodes_left -= 1;
+        if let NodeData::Text { contents } = &node.data {
+            let text = contents.borrow();
+            let remaining = MAX_HEADER_SCAN_BYTES.saturating_sub(out.len());
+            if text.len() <= remaining {
+                out.push_str(&text);
+            } else {
+                let mut end = remaining;
+                while end > 0 && !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                out.push_str(&text[..end]);
+            }
+            let trimmed = out.trim_start();
+            if trimmed.len() >= 5 && !trimmed.starts_with("From:") {
+                return false;
+            }
+            return true;
+        }
+        let local = tag(node);
+        if matches!(local, "head" | "style" | "script" | "template")
+            || has_attr(node, "hidden")
+            || with_attr(node, "style", is_hidden_style).unwrap_or(false)
+        {
+            return true;
+        }
+        let block = matches!(
+            local,
+            "div" | "p" | "br" | "table" | "tr" | "td" | "li" | "blockquote" | "hr"
+        );
+        if block {
+            out.push(' ');
+        }
+        for child in node.children.borrow().iter() {
+            if !visit(child, out, nodes_left) {
+                return false;
+            }
+        }
+        if block {
+            out.push(' ');
+        }
+        true
+    }
+    let mut raw = String::new();
+    let mut nodes_left = MAX_HEADER_SCAN_NODES;
+    if !visit(node, &mut raw, &mut nodes_left) {
+        return false;
+    }
+    let text = normalized(&raw);
+    text.starts_with("From:") && (text.contains("Sent:") || text.contains("To:"))
+}
+
 #[derive(Clone, Copy)]
 enum Boundary {
     Quote,
     Header,
 }
 
-fn boundary(node: &Handle) -> Option<Boundary> {
+fn boundary(node: &Handle, remaining: &mut usize) -> Option<(Boundary, bool)> {
     let local = tag(node);
-    let id = attr(node, "id").unwrap_or_default().to_ascii_lowercase();
-    if id == "divrplyfwdmsg" || class(node, "moz-cite-prefix") {
-        return Some(Boundary::Header);
+    if with_attr(node, "id", |id| id.eq_ignore_ascii_case("divrplyfwdmsg")).unwrap_or(false)
+        || class(node, "moz-cite-prefix")
+    {
+        return Some((Boundary::Header, false));
     }
-    if (local == "blockquote" && attr(node, "type").is_some_and(|t| t.eq_ignore_ascii_case("cite")))
+    if (local == "blockquote"
+        && with_attr(node, "type", |t| t.eq_ignore_ascii_case("cite")).unwrap_or(false))
         || class(node, "gmail_quote")
         || class(node, "gmail_quote_container")
         || class(node, "yahoo_quoted")
     {
-        return Some(Boundary::Quote);
+        return Some((Boundary::Quote, false));
     }
     if matches!(local, "div" | "p")
-        && attr(node, "style").is_some_and(|s| s.to_ascii_lowercase().contains("border-top"))
+        && *remaining > 0
+        && with_attr(node, "style", |s| contains_ignore_ascii_case(s, "border-top"))
+            .unwrap_or(false)
     {
-        let text = signature(std::slice::from_ref(node))?.text;
-        if text.starts_with("From:") && (text.contains("Sent:") || text.contains("To:")) {
-            return Some(Boundary::Header);
+        *remaining -= 1;
+        if is_outlook_header_block(node) {
+            return Some((Boundary::Header, true));
         }
     }
     None
@@ -314,11 +432,13 @@ fn fold(
         if !current() || *remaining == 0 {
             return false;
         }
-        if let Some(boundary) = boundary(child) {
+        if let Some((boundary, counted)) = boundary(child, remaining) {
             if forward_marker(child) {
                 continue;
             }
-            *remaining -= 1;
+            if !counted {
+                *remaining -= 1;
+            }
             let content = match boundary {
                 Boundary::Header => &children[index + 1..],
                 Boundary::Quote => &children[index..],
@@ -506,5 +626,17 @@ mod tests {
         let old_image = format!("{OLD}<img src=cid:chart srcset='https://example.test/old 2x'>");
         let changed_image = old_image.replace("/old", "/new");
         assert!(prepared(&old_image, &format!("{HEADER}{changed_image}"), "Re: Test").is_none());
+    }
+
+    #[test]
+    fn bordered_div_scans_are_bounded_and_still_fold_real_outlook_headers() {
+        let dividers = "<div style='border-top:1px solid #eee'>Section text</div>".repeat(10);
+        let reply = format!("<div>{dividers}{HEADER}{OLD}</div>");
+        assert!(prepared(OLD, &reply, "Re: Test").is_some());
+
+        // Excessive bordered divs stay within the candidate budget without hanging.
+        let many_dividers = "<div style='border-top:1px solid #eee'>Card content</div>".repeat(200);
+        let big_reply = format!("<div>{many_dividers}{HEADER}{OLD}</div>");
+        assert!(prepared(OLD, &big_reply, "Re: Test").is_none());
     }
 }

@@ -220,24 +220,27 @@ pub struct ReplayPlan {
 ///
 /// Order between different kinds is kept, so the provider ends in the same state.
 pub fn plan_replay(ops: Vec<PendingOperation>) -> ReplayPlan {
-    fn merge_key(kind: &OperationKind) -> Option<String> {
+    #[derive(PartialEq, Eq)]
+    enum MergeKey {
+        Read(bool),
+        Star(bool),
+        AddLabel(LabelId),
+        RemoveLabel(LabelId),
+        Archive,
+        Trash,
+        Untrash,
+    }
+    fn merge_key(kind: &OperationKind) -> Option<MergeKey> {
         Some(match kind {
-            OperationKind::SetRead { read, .. } => format!("read:{read}"),
-            OperationKind::SetStarred { starred, .. } => format!("star:{starred}"),
-            OperationKind::AddLabel { label_id, .. } => format!("add:{}", label_id.0),
-            OperationKind::RemoveLabel { label_id, .. } => format!("remove:{}", label_id.0),
-            OperationKind::Archive { .. } => "archive".into(),
-            OperationKind::Trash { .. } => "trash".into(),
-            OperationKind::Untrash { .. } => "untrash".into(),
+            OperationKind::SetRead { read, .. } => MergeKey::Read(*read),
+            OperationKind::SetStarred { starred, .. } => MergeKey::Star(*starred),
+            OperationKind::AddLabel { label_id, .. } => MergeKey::AddLabel(label_id.clone()),
+            OperationKind::RemoveLabel { label_id, .. } => MergeKey::RemoveLabel(label_id.clone()),
+            OperationKind::Archive { .. } => MergeKey::Archive,
+            OperationKind::Trash { .. } => MergeKey::Trash,
+            OperationKind::Untrash { .. } => MergeKey::Untrash,
             _ => return None,
         })
-    }
-    fn flag(kind: &OperationKind) -> Option<&'static str> {
-        match kind {
-            OperationKind::SetRead { .. } => Some("read"),
-            OperationKind::SetStarred { .. } => Some("star"),
-            _ => None,
-        }
     }
     fn ids_mut(kind: &mut OperationKind) -> Option<&mut Vec<MessageId>> {
         match kind {
@@ -253,31 +256,57 @@ pub fn plan_replay(ops: Vec<PendingOperation>) -> ReplayPlan {
     }
 
     let mut plan = ReplayPlan::default();
-    let mut kept: Vec<PendingOperation> = Vec::new();
-    for (i, op) in ops.iter().enumerate() {
-        if let Some(f) = flag(&op.kind) {
-            let later: std::collections::HashSet<&MessageId> =
-                ops[i + 1..].iter().filter(|o| flag(&o.kind) == Some(f)).flat_map(|o| o.kind.message_ids()).collect();
-            if !op.kind.message_ids().is_empty() && op.kind.message_ids().iter().all(|id| later.contains(id)) {
-                plan.superseded.push(op.id.clone());
-                continue;
+    let mut seen_read: std::collections::HashSet<MessageId> = std::collections::HashSet::new();
+    let mut seen_star: std::collections::HashSet<MessageId> = std::collections::HashSet::new();
+    let mut kept: Vec<PendingOperation> = Vec::with_capacity(ops.len());
+    for op in ops.into_iter().rev() {
+        let superseded = match &op.kind {
+            OperationKind::SetRead { message_ids, .. } => {
+                let sup = !message_ids.is_empty() && message_ids.iter().all(|id| seen_read.contains(id));
+                if !sup {
+                    seen_read.extend(message_ids.iter().cloned());
+                }
+                sup
             }
+            OperationKind::SetStarred { message_ids, .. } => {
+                let sup = !message_ids.is_empty() && message_ids.iter().all(|id| seen_star.contains(id));
+                if !sup {
+                    seen_star.extend(message_ids.iter().cloned());
+                }
+                sup
+            }
+            _ => false,
+        };
+        if superseded {
+            plan.superseded.push(op.id);
+        } else {
+            kept.push(op);
         }
-        kept.push(op.clone());
     }
+    plan.superseded.reverse();
+    kept.reverse();
+
+    let mut last_key: Option<MergeKey> = None;
+    let mut last_ids: std::collections::HashSet<MessageId> = std::collections::HashSet::new();
     for op in kept {
-        if let (Some((last, covered)), Some(key)) = (plan.send.last_mut(), merge_key(&op.kind)) {
-            if merge_key(&last.kind).as_deref() == Some(key.as_str()) {
+        let key = merge_key(&op.kind);
+        if key.is_some() && key == last_key {
+            if let Some((last, covered)) = plan.send.last_mut() {
                 let ids = ids_mut(&mut last.kind).expect("mergeable kinds carry message ids");
                 for id in op.kind.message_ids() {
-                    if !ids.contains(id) {
+                    if last_ids.insert(id.clone()) {
                         ids.push(id.clone());
                     }
                 }
-                covered.push(op.id.clone());
+                covered.push(op.id);
                 continue;
             }
         }
+        last_ids.clear();
+        if key.is_some() {
+            last_ids.extend(op.kind.message_ids().iter().cloned());
+        }
+        last_key = key;
         let id = op.id.clone();
         plan.send.push((op, vec![id]));
     }
@@ -352,5 +381,23 @@ mod plan_tests {
         ]);
         assert_eq!(plan.send.len(), 2);
         assert_eq!(plan.send[0].1, vec![OperationId("op1".into()), OperationId("op2".into())]);
+    }
+
+    #[test]
+    fn reverse_pass_superseding_and_dedup_merging_preserve_semantics() {
+        let plan = plan_replay(vec![
+            op(1, OperationKind::SetRead { message_ids: ids(&["a", "b"]), read: true }),
+            op(2, OperationKind::SetRead { message_ids: ids(&["a"]), read: false }),
+            op(3, OperationKind::Archive { message_ids: ids(&["x", "y"]) }),
+            op(4, OperationKind::Archive { message_ids: ids(&["y", "z", "x"]) }),
+            op(5, OperationKind::SetRead { message_ids: ids(&["b"]), read: false }),
+        ]);
+        // op1 is fully superseded because both `a` (op2) and `b` (op5) are overwritten later.
+        assert_eq!(plan.superseded, vec![OperationId("op1".into())]);
+        assert_eq!(plan.send.len(), 3);
+        assert_eq!(plan.send[0].0.seq, 2);
+        assert_eq!(plan.send[1].0.kind, OperationKind::Archive { message_ids: ids(&["x", "y", "z"]) });
+        assert_eq!(plan.send[1].1, vec![OperationId("op3".into()), OperationId("op4".into())]);
+        assert_eq!(plan.send[2].0.seq, 5);
     }
 }

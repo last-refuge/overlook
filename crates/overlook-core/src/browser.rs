@@ -6,6 +6,7 @@
 //! a network sandbox. This function does not fetch resources or change stored mail.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
 use cssparser::{Parser, Token};
 use html5ever::serialize::{serialize, SerializeOpts, TraversalScope};
@@ -27,7 +28,7 @@ pub struct BrowserDocument {
 /// The original stored message is never modified by preparation.
 pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TAG_STARTS: usize = 50_000;
-const MAX_DOM_DEPTH: usize = 128;
+pub(crate) const MAX_DOM_DEPTH: usize = 128;
 const MAX_DOM_NODES: usize = 100_000;
 const MAX_CSS_DEPTH: usize = 32;
 
@@ -140,20 +141,20 @@ pub(crate) fn parse_bounded_document(source: &str) -> Option<RcDom> {
     Some(dom)
 }
 
-fn prepare_dom(dom: RcDom, defaults: &str, typography: &BrowserTypography) -> BrowserDocument {
-    let mut styles = String::new();
-    prepare_nodes(&dom.document, false, &mut styles);
-    // Only the parser's actual document roots may supply root attributes. No
-    // sender-controlled marker or nested element can impersonate these nodes.
-    let html_root = element_child(&dom.document, "html").expect("HTML parser creates html");
-    let body_root = element_child(&html_root, "body").expect("HTML parser creates body");
-    let fragment = body_root
-        .children
-        .borrow()
-        .iter()
-        .map(serialize_node)
-        .collect::<String>();
-    let override_sender = typography.override_sender;
+static CLEANER_DEFAULT: LazyLock<ammonia::Builder<'static>> =
+    LazyLock::new(|| build_cleaner(false));
+static CLEANER_OVERRIDE: LazyLock<ammonia::Builder<'static>> =
+    LazyLock::new(|| build_cleaner(true));
+
+fn cleaner_for(override_sender: bool) -> &'static ammonia::Builder<'static> {
+    if override_sender {
+        &CLEANER_OVERRIDE
+    } else {
+        &CLEANER_DEFAULT
+    }
+}
+
+fn build_cleaner(override_sender: bool) -> ammonia::Builder<'static> {
     let mut cleaner = ammonia::Builder::default();
     cleaner
         .tags(words("a abbr address article aside b bdi bdo blockquote br button caption center cite code col colgroup dd del details div dl dt em figcaption figure font footer h1 h2 h3 h4 h5 h6 header hr i img ins kbd li main mark nav ol p pre q s samp section small span strong sub summary sup table tbody td tfoot th thead time tr tt u ul var wbr style"))
@@ -192,12 +193,35 @@ fn prepare_dom(dom: RcDom, defaults: &str, typography: &BrowserTypography) -> Br
                 Some(value.into())
             }
         });
+    cleaner
+}
+
+fn prepare_dom(dom: RcDom, defaults: &str, typography: &BrowserTypography) -> BrowserDocument {
+    let mut styles = String::new();
+    prepare_nodes(&dom.document, false, &mut styles);
+    // Only the parser's actual document roots may supply root attributes. No
+    // sender-controlled marker or nested element can impersonate these nodes.
+    // Documents like `<frameset>` have no `<body>`; fail gracefully instead of panicking.
+    let Some(html_root) = element_child(&dom.document, "html") else {
+        return preparation_error(defaults);
+    };
+    let Some(body_root) = element_child(&html_root, "body") else {
+        return preparation_error(defaults);
+    };
+    let fragment = body_root
+        .children
+        .borrow()
+        .iter()
+        .map(serialize_node)
+        .collect::<String>();
+    let override_sender = typography.override_sender;
+    let cleaner = cleaner_for(override_sender);
     let body = cleaner.clean(&fragment).to_string();
     // Head styles are processed separately so no sender head element can precede
     // or replace the policy. Use the same allowlist for their serialization.
     let styles = cleaner.clean(&styles).to_string();
-    let html_attrs = clean_root_attributes(&html_root, &cleaner, false);
-    let body_attrs = clean_root_attributes(&body_root, &cleaner, true);
+    let html_attrs = clean_root_attributes(&html_root, cleaner, false);
+    let body_attrs = clean_root_attributes(&body_root, cleaner, true);
     let body_font = crate::prefs::css_sans_font_stack(typography.font_family.as_deref());
     let body_size = typography.font_size_px.clamp(12, crate::prefs::FontPrefs::MAX_EMAIL_SIZE);
     let mono_size = typography
@@ -321,17 +345,24 @@ fn words(s: &'static str) -> HashSet<&'static str> {
     s.split_whitespace().collect()
 }
 
+fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+    s.get(..prefix.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(prefix))
+}
+
 fn remote_url(url: &str) -> bool {
-    let url = url.trim().to_ascii_lowercase();
-    url.starts_with("https://") || url.starts_with("http://") || url.starts_with("//")
+    let url = url.trim();
+    starts_with_ignore_ascii_case(url, "https://")
+        || starts_with_ignore_ascii_case(url, "http://")
+        || url.starts_with("//")
 }
 
 fn resource_url(url: &str) -> bool {
-    let url = url.trim().to_ascii_lowercase();
+    let url = url.trim();
     !url.chars().any(char::is_control)
-        && (remote_url(&url)
-            || url.starts_with("data:")
-            || url.starts_with("cid:")
+        && (remote_url(url)
+            || starts_with_ignore_ascii_case(url, "data:")
+            || starts_with_ignore_ascii_case(url, "cid:")
             || url.starts_with('#'))
 }
 
@@ -346,11 +377,11 @@ fn normalize_protocol_relative(url: &str) -> std::borrow::Cow<'_, str> {
 }
 
 fn navigation_url(url: &str) -> bool {
-    let url = url.trim().to_ascii_lowercase();
+    let url = url.trim();
     !url.chars().any(char::is_control)
-        && (remote_url(&url)
-            || url.starts_with("mailto:")
-            || url.starts_with("tel:")
+        && (remote_url(url)
+            || starts_with_ignore_ascii_case(url, "mailto:")
+            || starts_with_ignore_ascii_case(url, "tel:")
             || url.starts_with('#'))
 }
 
@@ -378,7 +409,7 @@ fn prepare_nodes(node: &Handle, in_head: bool, styles: &mut String) {
         head |= name.local.as_ref() == "head";
         for attr in attrs.borrow_mut().iter_mut() {
             match attr.name.local.as_ref() {
-                "style" => attr.value = clean_css(&attr.value, &mut 0).into(),
+                "style" => attr.value = clean_css(&attr.value).into(),
                 "srcset" => attr.value = clean_srcset(&attr.value).into(),
                 "src" | "background" | "href" => {
                     attr.value = normalize_protocol_relative(&attr.value).as_ref().into();
@@ -389,7 +420,7 @@ fn prepare_nodes(node: &Handle, in_head: bool, styles: &mut String) {
         if name.local.as_ref() == "style" {
             for child in node.children.borrow().iter() {
                 if let NodeData::Text { contents } = &child.data {
-                    let css = clean_css(&contents.borrow(), &mut 0).replace('<', "\\3c ");
+                    let css = clean_css(&contents.borrow()).replace('<', "\\3c ");
                     *contents.borrow_mut() = css.into();
                 }
             }
@@ -413,19 +444,23 @@ fn prepare_nodes(node: &Handle, in_head: bool, styles: &mut String) {
 // Insert the scheme into the authored URL token, retaining quotes, CSS escapes,
 // function spelling and whitespace. Leading whitespace *inside* a quoted URL
 // needs canonical serialization so it cannot precede the newly added scheme.
-fn normalize_css_url(raw: &str, url: &str) -> String {
+fn push_normalized_css_url(out: &mut String, raw: &str, url: &str) {
     if !url.trim().starts_with("//") {
-        return raw.to_owned();
+        out.push_str(raw);
+        return;
     }
     if !url.starts_with("//") {
-        let mut quoted = String::new();
-        cssparser::serialize_string(&normalize_protocol_relative(url), &mut quoted)
-            .expect("serializing CSS into memory");
-        return if raw.starts_with(['\'', '"']) {
-            quoted
+        let normalized = normalize_protocol_relative(url);
+        if raw.starts_with(['\'', '"']) {
+            cssparser::serialize_string(&normalized, out)
+                .expect("serializing CSS into memory");
         } else {
-            format!("url({quoted})")
-        };
+            out.push_str("url(");
+            cssparser::serialize_string(&normalized, out)
+                .expect("serializing CSS into memory");
+            out.push(')');
+        }
+        return;
     }
     let offset = if raw.starts_with(['\'', '"']) {
         1
@@ -436,7 +471,9 @@ fn normalize_css_url(raw: &str, url: &str) -> String {
             + 1;
         opening + raw[opening..].len() - raw[opening..].trim_start().len()
     };
-    format!("{}https:{}", &raw[..offset], &raw[offset..])
+    out.push_str(&raw[..offset]);
+    out.push_str("https:");
+    out.push_str(&raw[offset..]);
 }
 
 /// Strips inline `font`, `font-family` (and optionally `font-size`/`line-height`)
@@ -507,58 +544,76 @@ fn strip_inline_font_declarations(style: &str, strip_size: bool) -> String {
 
 // Tokenize CSS rather than regex-matching: CSS escapes and nested blocks must
 // not conceal URL schemes. Leave ordinary tokens byte-for-byte unchanged.
-fn clean_css(css: &str, count: &mut usize) -> String {
+fn clean_css(css: &str) -> String {
+    let mut parser = Parser::new(css);
+    parser.set_nested_block_limit(MAX_CSS_DEPTH as u8);
+    let mut out = String::with_capacity(css.len());
+    let mut count = 0;
+    match css_tokens(&mut parser, &mut count, Some(&mut out), false, 0) {
+        Some(()) => out,
+        None => String::new(),
+    }
+}
+
+fn count_css_resources(css: &str, count: &mut usize) {
+    // Every CSS URL reference (`url(...)`, `u\72l(...)`, `image-set(...)`) contains `(`.
+    if !css.contains('(') {
+        return;
+    }
     let original_count = *count;
     let mut parser = Parser::new(css);
     parser.set_nested_block_limit(MAX_CSS_DEPTH as u8);
-    match css_tokens(&mut parser, count, false, 0) {
-        Some(css) => css,
-        None => {
-            *count = original_count;
-            String::new()
-        }
+    if css_tokens(&mut parser, count, None, false, 0).is_none() {
+        *count = original_count;
     }
 }
 
 fn css_tokens(
     parser: &mut Parser<'_>,
     count: &mut usize,
+    mut out: Option<&mut String>,
     image_set: bool,
     depth: usize,
-) -> Option<String> {
+) -> Option<()> {
     // Reject the entire stylesheet/attribute, not a partially rewritten rule.
     // cssparser skips unconsumed nested blocks iteratively on return, including
     // blocks inside rejected url()/expression() and @import constructs.
     if depth >= MAX_CSS_DEPTH {
         return None;
     }
-    let mut out = String::new();
     let mut import = false;
     loop {
         let start = parser.position();
         let Ok(token) = parser.next_including_whitespace_and_comments().cloned() else {
             break;
         };
-        let raw = parser.slice_from(start).to_owned();
         if matches!(&token, Token::AtKeyword(name) if name.eq_ignore_ascii_case("import")) {
             import = true;
             continue;
         }
-        let rendered = match &token {
+        match &token {
             Token::QuotedString(url) if image_set => {
-                if resource_url(url) {
-                    *count += usize::from(remote_url(url));
-                    normalize_css_url(&raw, url)
-                } else {
-                    "\"\"".into()
+                if !import {
+                    if resource_url(url) {
+                        *count += usize::from(remote_url(url));
+                        if let Some(buf) = out.as_deref_mut() {
+                            push_normalized_css_url(buf, parser.slice_from(start), url);
+                        }
+                    } else if let Some(buf) = out.as_deref_mut() {
+                        buf.push_str("\"\"");
+                    }
                 }
             }
             Token::UnquotedUrl(url) => {
-                if resource_url(&url) {
-                    *count += usize::from(remote_url(&url));
-                    normalize_css_url(&raw, url)
-                } else {
-                    "url(\"\")".into()
+                if !import {
+                    if resource_url(url) {
+                        *count += usize::from(remote_url(url));
+                        if let Some(buf) = out.as_deref_mut() {
+                            push_normalized_css_url(buf, parser.slice_from(start), url);
+                        }
+                    } else if let Some(buf) = out.as_deref_mut() {
+                        buf.push_str("url(\"\")");
+                    }
                 }
             }
             Token::Function(ref name) if name.eq_ignore_ascii_case("url") => {
@@ -581,17 +636,26 @@ fn css_tokens(
                         }
                     })
                     .ok();
-                match url {
-                    Some((url, token_start, token_end)) if resource_url(&url) => {
-                        *count += usize::from(remote_url(&url));
-                        format!(
-                            "{}{}{}",
-                            parser.slice(start..token_start),
-                            normalize_css_url(parser.slice(token_start..token_end), &url),
-                            parser.slice_from(token_end),
-                        )
+                if !import {
+                    match url {
+                        Some((url, token_start, token_end)) if resource_url(&url) => {
+                            *count += usize::from(remote_url(&url));
+                            if let Some(buf) = out.as_deref_mut() {
+                                buf.push_str(parser.slice(start..token_start));
+                                push_normalized_css_url(
+                                    buf,
+                                    parser.slice(token_start..token_end),
+                                    &url,
+                                );
+                                buf.push_str(parser.slice_from(token_end));
+                            }
+                        }
+                        _ => {
+                            if let Some(buf) = out.as_deref_mut() {
+                                buf.push_str("url(\"\")");
+                            }
+                        }
                     }
-                    _ => "url(\"\")".into(),
                 }
             }
             Token::Function(name) if name.eq_ignore_ascii_case("expression") => {
@@ -599,7 +663,6 @@ fn css_tokens(
                     while p.next_including_whitespace_and_comments().is_ok() {}
                     Ok::<_, cssparser::ParseError<()>>(())
                 });
-                String::new()
             }
             Token::Function(_)
             | Token::ParenthesisBlock
@@ -612,25 +675,43 @@ fn css_tokens(
                     Token::CurlyBracketBlock => "}",
                     _ => ")",
                 };
-                let inner = parser
+                if !import {
+                    if let Some(buf) = out.as_deref_mut() {
+                        buf.push_str(parser.slice_from(start));
+                    }
+                }
+                let mut ignored_count = 0;
+                parser
                     .parse_nested_block(|p| {
-                        css_tokens(p, count, nested_image_set, depth + 1)
+                        let (target_count, target_out) = if import {
+                            (&mut ignored_count, None)
+                        } else {
+                            (&mut *count, out.as_deref_mut())
+                        };
+                        css_tokens(p, target_count, target_out, nested_image_set, depth + 1)
                             .ok_or_else(|| cssparser::ParseError::<()>::custom(()))
                     })
                     .ok()?;
-                format!("{raw}{inner}{closing}")
+                if !import {
+                    if let Some(buf) = out.as_deref_mut() {
+                        buf.push_str(closing);
+                    }
+                }
             }
-            Token::BadUrl(_) | Token::BadString(_) => String::new(),
-            _ => raw,
-        };
-        if !import {
-            out.push_str(&rendered);
+            Token::BadUrl(_) | Token::BadString(_) => {}
+            _ => {
+                if !import {
+                    if let Some(buf) = out.as_deref_mut() {
+                        buf.push_str(parser.slice_from(start));
+                    }
+                }
+            }
         }
         if matches!(token, Token::Semicolon | Token::CurlyBracketBlock) {
             import = false;
         }
     }
-    Some(out)
+    Some(())
 }
 
 // HTML srcset URLs end at whitespace; trailing commas delimit candidates.
@@ -685,7 +766,7 @@ fn count_resources(node: &Handle) -> usize {
                         .count()
                 }
                 "style" => {
-                    clean_css(&attr.value, &mut count);
+                    count_css_resources(&attr.value, &mut count);
                 }
                 _ => {}
             }
@@ -693,7 +774,7 @@ fn count_resources(node: &Handle) -> usize {
         if name.local.as_ref() == "style" {
             for child in node.children.borrow().iter() {
                 if let NodeData::Text { contents } = &child.data {
-                    clean_css(&contents.borrow(), &mut count);
+                    count_css_resources(&contents.borrow(), &mut count);
                 }
             }
         }

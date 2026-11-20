@@ -15,8 +15,13 @@ use crate::imap::connection::{tcp_connect, unencrypted_refusal, wrap_tls, Stream
 use crate::ProviderError;
 use overlook_core::{Security, ServerEndpoint};
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::time::Duration;
+
+/// Maximum length of a single POP3 response line (64 KiB).
+const MAX_LINE_BYTES: usize = 64 * 1024;
+/// Maximum total size of a POP3 multi-line response (50 MiB).
+const MAX_MULTILINE_BYTES: usize = 50 * 1024 * 1024;
 
 pub struct Client {
     stream: BufReader<Stream>,
@@ -134,13 +139,22 @@ impl Client {
         })
     }
 
+    fn read_line_into(&mut self, buf: &mut Vec<u8>) -> Result<(), ProviderError> {
+        buf.clear();
+        let n = self.stream.by_ref().take((MAX_LINE_BYTES + 1) as u64).read_until(b'\n', buf).map_err(|_| ProviderError::Offline)?;
+        if n == 0 {
+            return Err(ProviderError::Offline);
+        }
+        if buf.len() > MAX_LINE_BYTES {
+            return Err(ProviderError::Rejected("POP3 server sent a line exceeding the 64 KiB limit".into()));
+        }
+        Ok(())
+    }
+
     fn read_line(&mut self) -> Result<String, ProviderError> {
         let mut buf = Vec::new();
-        match self.stream.read_until(b'\n', &mut buf) {
-            Ok(0) => Err(ProviderError::Offline),
-            Ok(_) => Ok(String::from_utf8_lossy(&buf).into_owned()),
-            Err(_) => Err(ProviderError::Offline),
-        }
+        self.read_line_into(&mut buf)?;
+        Ok(String::from_utf8_lossy(&buf).into_owned())
     }
 
     fn send(&mut self, line: &str, logged: &str) -> Result<(), ProviderError> {
@@ -174,20 +188,17 @@ impl Client {
     /// undone. CRLF line endings are kept.
     fn multiline(&mut self) -> Result<Vec<u8>, ProviderError> {
         let mut out = Vec::new();
+        let mut buf = Vec::new();
         loop {
-            let mut buf = Vec::new();
-            match self.stream.read_until(b'\n', &mut buf) {
-                Ok(0) | Err(_) => return Err(ProviderError::Offline),
-                Ok(_) => {}
-            }
+            self.read_line_into(&mut buf)?;
             if buf == b".\r\n" || buf == b".\n" {
                 return Ok(out);
             }
-            if buf.starts_with(b"..") {
-                out.extend_from_slice(&buf[1..]);
-            } else {
-                out.extend_from_slice(&buf);
+            let slice = if buf.starts_with(b"..") { &buf[1..] } else { &buf[..] };
+            if out.len().saturating_add(slice.len()) > MAX_MULTILINE_BYTES {
+                return Err(ProviderError::Rejected("POP3 server response exceeded the 50 MiB limit".into()));
             }
+            out.extend_from_slice(slice);
         }
     }
 
@@ -353,5 +364,24 @@ mod tests {
         assert_eq!(Client::connect(&ServerEndpoint::new("127.0.0.1", addr.port(), Security::None, "j"), &"pw".into(), Duration::from_secs(2)).err(), Some(ProviderError::Temporary("maildrop locked".into())));
         let addr = scripted(vec!["* OK I am IMAP\r\n"]);
         assert!(matches!(Client::connect(&ServerEndpoint::new("127.0.0.1", addr.port(), Security::None, "j"), &"pw".into(), Duration::from_secs(2)).err(), Some(ProviderError::Rejected(_))));
+    }
+
+    #[test]
+    fn rejects_overlong_lines_without_unbounded_allocation() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut huge = vec![b'A'; MAX_LINE_BYTES + 128];
+            huge[0] = b'+';
+            huge[1] = b'O';
+            huge[2] = b'K';
+            huge[3] = b' ';
+            huge.extend_from_slice(b"\r\n");
+            let _ = stream.write_all(&huge);
+        });
+        let err = Client::connect(&ServerEndpoint::new("127.0.0.1", addr.port(), Security::None, "j"), &"pw".into(), Duration::from_secs(2)).err();
+        assert!(matches!(err, Some(ProviderError::Rejected(_))), "expected Rejected, got {err:?}");
+        let _ = worker.join();
     }
 }

@@ -10,6 +10,7 @@
 use ksni::blocking::{Handle, TrayMethods};
 use ksni::menu::{MenuItem, StandardItem};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, Sender};
 use std::sync::OnceLock;
 
 const PLAIN_ICON: &str = "ai.lastrefuge.Overlook-symbolic";
@@ -52,6 +53,145 @@ impl Drop for TrayIcon {
     fn drop(&mut self) {
         let _ = self.handle.shutdown();
     }
+}
+
+enum TrayCommand {
+    Sync { enabled: bool, unread: Option<usize> },
+    Shutdown,
+}
+
+/// Non-blocking handle to a dedicated tray worker thread so D-Bus startup, updates and
+/// shutdown never block the GPUI UI thread.
+#[derive(Default)]
+pub struct TrayWorker {
+    tx: Option<Sender<TrayCommand>>,
+    last_enabled: bool,
+    last_unread: Option<usize>,
+}
+
+impl TrayWorker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reconciles the tray icon with `enabled` and `unread` asynchronously off the UI thread.
+    pub fn sync(&mut self, enabled: bool, unread: Option<usize>) {
+        if enabled == self.last_enabled && (!enabled || unread.is_none() || unread == self.last_unread) {
+            return;
+        }
+        self.last_enabled = enabled;
+        if enabled {
+            if unread.is_some() {
+                self.last_unread = unread;
+            }
+        } else {
+            self.last_unread = None;
+        }
+        if !enabled && self.tx.is_none() {
+            return;
+        }
+        let tx = self.tx.get_or_insert_with(spawn_tray_worker);
+        if tx.send(TrayCommand::Sync { enabled, unread }).is_err() {
+            // Worker exited unexpectedly; recreate if still enabled.
+            self.tx = None;
+            if enabled {
+                let fresh = spawn_tray_worker();
+                let _ = fresh.send(TrayCommand::Sync { enabled, unread });
+                self.tx = Some(fresh);
+            }
+        }
+    }
+
+    /// Asks the tray worker to shut down the icon and exit without blocking the caller.
+    pub fn shutdown(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(TrayCommand::Shutdown);
+        }
+        self.last_enabled = false;
+        self.last_unread = None;
+    }
+}
+
+impl Drop for TrayWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CoalescedTrayCommand {
+    Sync { enabled: bool, unread: Option<usize>, reset_failed: bool },
+    Shutdown,
+}
+
+fn coalesce_tray_commands(first: TrayCommand, rest: impl IntoIterator<Item = TrayCommand>) -> CoalescedTrayCommand {
+    let (mut enabled, mut unread, mut reset_failed) = match first {
+        TrayCommand::Shutdown => return CoalescedTrayCommand::Shutdown,
+        TrayCommand::Sync { enabled, unread } => (enabled, if enabled { unread } else { None }, !enabled),
+    };
+    for next in rest {
+        match next {
+            TrayCommand::Shutdown => return CoalescedTrayCommand::Shutdown,
+            TrayCommand::Sync { enabled: next_enabled, unread: next_unread } => {
+                if !next_enabled {
+                    reset_failed = true;
+                    unread = None;
+                } else if next_unread.is_some() {
+                    unread = next_unread;
+                }
+                enabled = next_enabled;
+            }
+        }
+    }
+    CoalescedTrayCommand::Sync { enabled, unread, reset_failed }
+}
+
+fn spawn_tray_worker() -> Sender<TrayCommand> {
+    let (tx, rx) = channel::<TrayCommand>();
+    let _ = std::thread::Builder::new().name("overlook-tray".into()).spawn(move || {
+        let mut tray: Option<TrayIcon> = None;
+        let mut failed = false;
+        while let Ok(first) = rx.recv() {
+            // Coalesce queued state updates so only the latest state hits D-Bus,
+            // while preserving any disabled edge so a prior start failure retries.
+            let mut rest = Vec::new();
+            while let Ok(newer) = rx.try_recv() {
+                let is_shutdown = matches!(newer, TrayCommand::Shutdown);
+                rest.push(newer);
+                if is_shutdown {
+                    break;
+                }
+            }
+            match coalesce_tray_commands(first, rest) {
+                CoalescedTrayCommand::Shutdown => break,
+                CoalescedTrayCommand::Sync { enabled, unread, reset_failed } => {
+                    if reset_failed {
+                        failed = false;
+                    }
+                    match (&mut tray, enabled) {
+                        (None, true) if !failed => {
+                            tray = TrayIcon::start(unread.unwrap_or(0));
+                            failed = tray.is_none();
+                        }
+                        (None, true) => {}
+                        (Some(_), false) => {
+                            tray = None;
+                        }
+                        (Some(icon), true) => {
+                            if let Some(count) = unread {
+                                icon.set_unread(count);
+                            }
+                        }
+                        (None, false) => {
+                            failed = false;
+                        }
+                    }
+                }
+            }
+        }
+        drop(tray);
+    });
+    tx
 }
 
 struct OverlookTray {
@@ -202,5 +342,51 @@ mod tests {
     fn the_unread_icon_is_well_formed() {
         assert!(UNREAD_SVG.starts_with("<svg") && UNREAD_SVG.ends_with("</svg>"));
         assert!(PLAIN_SVG.contains("currentColor"));
+    }
+
+    #[test]
+    fn tray_worker_clears_last_unread_on_disable_and_shutdown() {
+        let (tx, rx) = channel();
+        let mut worker = TrayWorker {
+            tx: Some(tx),
+            last_enabled: false,
+            last_unread: None,
+        };
+        worker.sync(true, Some(5));
+        worker.sync(false, None);
+        worker.sync(true, None);
+        worker.sync(true, Some(5));
+        worker.shutdown();
+        assert_eq!(worker.last_unread, None);
+        assert!(!worker.last_enabled);
+
+        let sent: Vec<_> = rx.try_iter().collect();
+        assert_eq!(sent.len(), 5, "re-enabling with None must not suppress subsequent Some(5)");
+        assert!(matches!(sent[0], TrayCommand::Sync { enabled: true, unread: Some(5) }));
+        assert!(matches!(sent[1], TrayCommand::Sync { enabled: false, unread: None }));
+        assert!(matches!(sent[2], TrayCommand::Sync { enabled: true, unread: None }));
+        assert!(matches!(sent[3], TrayCommand::Sync { enabled: true, unread: Some(5) }));
+        assert!(matches!(sent[4], TrayCommand::Shutdown));
+    }
+
+    #[test]
+    fn coalescing_preserves_disabled_edge_for_failed_reset() {
+        let res = coalesce_tray_commands(
+            TrayCommand::Sync { enabled: false, unread: None },
+            [TrayCommand::Sync { enabled: true, unread: Some(3) }],
+        );
+        assert_eq!(res, CoalescedTrayCommand::Sync { enabled: true, unread: Some(3), reset_failed: true });
+
+        let res = coalesce_tray_commands(
+            TrayCommand::Sync { enabled: true, unread: Some(5) },
+            [TrayCommand::Sync { enabled: true, unread: None }],
+        );
+        assert_eq!(res, CoalescedTrayCommand::Sync { enabled: true, unread: Some(5), reset_failed: false });
+
+        let res = coalesce_tray_commands(
+            TrayCommand::Sync { enabled: true, unread: Some(5) },
+            [TrayCommand::Shutdown],
+        );
+        assert_eq!(res, CoalescedTrayCommand::Shutdown);
     }
 }

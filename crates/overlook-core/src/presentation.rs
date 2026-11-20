@@ -4,18 +4,23 @@
 //! at most 96px/72pt/6em/rem. Line heights: .5–6 or 2–144px/2–108pt/.5–6em/50–600%.
 //! Font families are limited to eight ASCII names (48 bytes each, 200 bytes total).
 use html5ever::serialize::{serialize, SerializeOpts, TraversalScope};
-use html5ever::tendril::TendrilSink;
-use html5ever::{parse_document, ParseOpts};
 use markup5ever_rcdom::{Handle, NodeData, RcDom, SerializableHandle};
 
 pub(super) fn document(html: &str) -> RcDom {
-    parse_document(RcDom::default(), ParseOpts::default()).one(html)
+    crate::browser::parse_bounded_document(html).unwrap_or_default()
 }
 
 pub(super) fn walk(node: &Handle, f: &mut impl FnMut(&Handle)) {
-    f(node);
-    for child in node.children.borrow().iter() {
-        walk(child, f);
+    let mut stack = vec![(node.clone(), 0usize)];
+    while let Some((n, depth)) = stack.pop() {
+        if depth > crate::browser::MAX_DOM_DEPTH {
+            continue;
+        }
+        f(&n);
+        let children = n.children.borrow();
+        for child in children.iter().rev() {
+            stack.push((child.clone(), depth + 1));
+        }
     }
 }
 
@@ -80,30 +85,37 @@ pub(super) fn serialize_body(dom: &RcDom) -> String {
 
 /// Remove invisible/active subtrees without changing history, links, spacing or tables.
 pub(super) fn visible_document(html: &str) -> RcDom {
-    fn prune(n: &Handle) {
-        n.children.borrow_mut().retain(|c| match &c.data {
-            NodeData::Element { name, attrs, .. } => {
-                !matches!(
-                    &*name.local,
-                    "head"
-                        | "script"
-                        | "style"
-                        | "title"
-                        | "template"
-                        | "noscript"
-                        | "iframe"
-                        | "object"
-                        | "embed"
-                        | "svg"
-                        | "math"
-                        | "audio"
-                        | "video"
-                ) && !crate::prepass::is_hidden(&name.local, &attrs.borrow())
+    fn prune(root: &Handle) {
+        let mut stack = vec![(root.clone(), 0usize)];
+        while let Some((n, depth)) = stack.pop() {
+            if depth >= crate::browser::MAX_DOM_DEPTH {
+                n.children.borrow_mut().clear();
+                continue;
             }
-            _ => true,
-        });
-        for c in n.children.borrow().iter() {
-            prune(c);
+            n.children.borrow_mut().retain(|c| match &c.data {
+                NodeData::Element { name, attrs, .. } => {
+                    !matches!(
+                        &*name.local,
+                        "head"
+                            | "script"
+                            | "style"
+                            | "title"
+                            | "template"
+                            | "noscript"
+                            | "iframe"
+                            | "object"
+                            | "embed"
+                            | "svg"
+                            | "math"
+                            | "audio"
+                            | "video"
+                    ) && !crate::prepass::is_hidden(&name.local, &attrs.borrow())
+                }
+                _ => true,
+            });
+            for c in n.children.borrow().iter() {
+                stack.push((c.clone(), depth + 1));
+            }
         }
     }
     let dom = document(html);

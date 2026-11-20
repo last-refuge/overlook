@@ -109,14 +109,29 @@ impl SearchCoverage {
         if self.messages_total == 0 {
             return "No downloaded mail to search yet.".to_owned();
         }
-        if self.bodies_cached == self.messages_total {
+        if self.bodies_cached >= self.messages_total {
             format!("Searching {} downloaded messages on this device.", self.messages_total)
         } else {
             format!(
                 "Searching {} downloaded messages on this device. {} have headers only.",
                 self.messages_total,
-                self.messages_total - self.bodies_cached
+                self.messages_total.saturating_sub(self.bodies_cached)
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_coverage_does_not_underflow_when_cached_exceeds_total() {
+        let c = SearchCoverage {
+            messages_indexed: 5,
+            messages_total: 5,
+            bodies_cached: 8,
+        };
+        assert_eq!(c.sentence(), "Searching 5 downloaded messages on this device.");
     }
 }

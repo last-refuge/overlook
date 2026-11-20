@@ -163,8 +163,27 @@ pub(super) fn put(
     } else {
         // A create's response can be lost. List directly rather than rely on search's
         // indexing delay; only this upload's persisted Message-ID can be adopted.
-        for item in list(client)? {
-            if let Some(v) = metadata(client, &item.id.0)? {
+        // Fetch draft metadata in batches instead of sequential per-draft round trips.
+        let items = list(client)?;
+        for chunk in items.chunks(super::api::BATCH_SIZE) {
+            let values: Vec<Option<Value>> = if chunk.len() == 1 {
+                vec![metadata(client, &chunk[0].id.0)?]
+            } else {
+                let paths: Vec<String> = chunk
+                    .iter()
+                    .map(|item| format!("drafts/{}?format=metadata", url_encode(&item.id.0)))
+                    .collect();
+                let mut out = Vec::with_capacity(paths.len());
+                for result in client.batch_get(&paths)? {
+                    match result {
+                        Ok(v) => out.push(Some(v)),
+                        Err(ApiError::NotFound) => out.push(None),
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                out
+            };
+            for v in values.into_iter().flatten() {
                 if has_message_id(&v, message_id) {
                     let current = descriptor(&v)?;
                     return match fetch(client, &current)? {

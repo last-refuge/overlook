@@ -6,7 +6,7 @@
 //! updates at once), and replaces it with a fresh copy built on a background thread once
 //! the change is written and after every sync.
 
-use crate::{LocalChange, MailboxView, ListFilter};
+use crate::{ListFilter, LocalChange, MailboxView};
 use overlook_core::focus::{classify_focus, FocusTab};
 use overlook_core::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 #[derive(Clone, Debug, Default)]
 pub struct MailIndex {
     pub(crate) labels: Vec<Label>,
+    pub(crate) label_kinds: HashMap<LabelId, LabelKind>,
     pub(crate) by_conv: BTreeMap<ConversationId, Vec<Message>>,
     /// Which conversation each message belongs to.
     pub(crate) conv_of: HashMap<MessageId, ConversationId>,
@@ -24,9 +25,10 @@ pub struct MailIndex {
 
 impl MailIndex {
     pub(crate) fn new(labels: Vec<Label>, messages: Vec<Message>, pending: BTreeSet<MessageId>, rules: HashMap<String, bool>) -> Self {
+        let label_kinds = labels.iter().map(|l| (l.id.clone(), l.kind)).collect();
         let mut correspondents = HashSet::new();
         let mut by_conv: BTreeMap<ConversationId, Vec<Message>> = BTreeMap::new();
-        let mut conv_of = HashMap::new();
+        let mut conv_of = HashMap::with_capacity(messages.len());
         for m in messages {
             if m.is_outgoing {
                 for a in m.to.iter().chain(m.cc.iter()) {
@@ -36,7 +38,7 @@ impl MailIndex {
             conv_of.insert(m.id.clone(), m.conversation_id.clone());
             by_conv.entry(m.conversation_id.clone()).or_default().push(m);
         }
-        Self { labels, by_conv, conv_of, pending, rules, correspondents }
+        Self { labels, label_kinds, by_conv, conv_of, pending, rules, correspondents }
     }
 
     pub fn labels(&self) -> &[Label] {
@@ -91,18 +93,23 @@ impl MailIndex {
 
     /// Keeps one open conversation in the Unread list if it still belongs to this view.
     pub fn conversations_including(&self, owner_email: &str, view: &MailboxView, filter: ListFilter, focus: Option<FocusTab>, open: Option<&ConversationId>) -> Vec<ConversationSummary> {
+        let trash = self.label_of_kind(LabelKind::Trash);
+        let trash_view = matches!(view, MailboxView::Kind(LabelKind::Trash));
         let mut out = Vec::new();
-        for visible in self.visible_conversations(view, focus) {
+        let mut visible: Vec<&Message> = Vec::new();
+        for msgs in self.matching_conversations(view, focus) {
+            let is_visible = |m: &&Message| trash.as_ref().is_some_and(|t| m.has_label(t)) == trash_view;
             let keep = match filter {
                 ListFilter::All => true,
-                ListFilter::Unread => visible.iter().any(|m| !m.is_read || Some(&m.conversation_id) == open),
-                ListFilter::Attachments => visible.iter().any(|m| Message::has_attachments(m)),
+                ListFilter::Unread => msgs.iter().filter(is_visible).any(|m| !m.is_read || Some(&m.conversation_id) == open),
+                ListFilter::Attachments => msgs.iter().filter(is_visible).any(Message::has_attachments),
             };
             if !keep {
                 continue;
             }
-            let msgs: Vec<Message> = visible.into_iter().cloned().collect();
-            if let Some(summary) = ConversationSummary::from_messages(&msgs, owner_email, &self.pending) {
+            visible.clear();
+            visible.extend(msgs.iter().filter(is_visible));
+            if let Some(summary) = ConversationSummary::from_message_refs(&visible, owner_email, &self.pending) {
                 out.push(summary);
             }
         }
@@ -110,22 +117,22 @@ impl MailIndex {
         out
     }
 
-    /// The messages shown for each conversation in a view, in index order: the
-    /// conversations with a message in the view, filtered by `focus`, each reduced to the
-    /// messages visible there. Shared by the list and the sidebar counts so they agree.
-    fn visible_conversations<'a>(&'a self, view: &'a MailboxView, focus: Option<FocusTab>) -> impl Iterator<Item = Vec<&'a Message>> + 'a {
-        let kind_of = |id: &LabelId| self.labels.iter().find(|l| &l.id == id).map(|l| l.kind);
+    /// Conversations belonging to `view` (and `focus`), yielded without per-conversation
+    /// `Vec` allocations. Callers filter each slice by `in_trash == trash_view` to inspect
+    /// only the messages visible in `view`. Shared by the list, `unread_in`, and sidebar counts.
+    fn matching_conversations<'a>(&'a self, view: &'a MailboxView, focus: Option<FocusTab>) -> impl Iterator<Item = &'a [Message]> + 'a {
         let inbox = self.label_of_kind(LabelKind::Inbox);
         let trash = self.label_of_kind(LabelKind::Trash);
         let spam = self.label_of_kind(LabelKind::Spam);
         let sent = self.label_of_kind(LabelKind::Sent);
-        let in_trash = move |m: &Message| trash.as_ref().is_some_and(|t| m.has_label(t));
-        let in_spam = move |m: &Message| spam.as_ref().is_some_and(|t| m.has_label(t));
+        let trash_view = matches!(view, MailboxView::Kind(LabelKind::Trash));
 
         // Every message of a conversation decides whether it belongs to the view. This
         // keeps conversation counts consistent across views (a thread in Inbox still shows
         // all its messages).
         self.by_conv.values().filter_map(move |msgs| {
+            let in_trash = |m: &Message| trash.as_ref().is_some_and(|t| m.has_label(t));
+            let in_spam = |m: &Message| spam.as_ref().is_some_and(|s| m.has_label(s));
             let matches_view = msgs.iter().any(|m| match view {
                 MailboxView::Label(id) => m.has_label(id) && !in_trash(m),
                 MailboxView::Kind(LabelKind::Inbox) => inbox.as_ref().is_some_and(|i| m.has_label(i)) && !in_trash(m),
@@ -140,29 +147,29 @@ impl MailIndex {
                         && !sent.as_ref().is_some_and(|s| m.has_label(s))
                 }
                 MailboxView::Kind(LabelKind::Drafts | LabelKind::Outbox | LabelKind::Container) => false,
-                MailboxView::Kind(LabelKind::User) => m.label_ids.iter().any(|l| kind_of(l) == Some(LabelKind::User)),
+                MailboxView::Kind(LabelKind::User) => m.label_ids.iter().any(|l| self.label_kinds.get(l).copied() == Some(LabelKind::User)),
             });
             if !matches_view {
                 return None;
             }
             // Inside Trash show only trashed messages; elsewhere hide trashed ones.
-            let visible: Vec<&Message> = match view {
-                MailboxView::Kind(LabelKind::Trash) => msgs.iter().filter(|m| in_trash(m)).collect(),
-                _ => msgs.iter().filter(|m| !in_trash(m)).collect(),
-            };
-            if visible.is_empty() {
+            if !msgs.iter().any(|m| in_trash(m) == trash_view) {
                 return None;
             }
             if let Some(tab) = focus {
                 // A conversation follows its newest incoming message; threads with only our
                 // own mail count as Focused.
-                let decisive = visible.iter().filter(|m| !m.is_outgoing).max_by_key(|m| m.date).or_else(|| visible.iter().max_by_key(|m| m.date));
+                let decisive = msgs
+                    .iter()
+                    .filter(|m| in_trash(m) == trash_view && !m.is_outgoing)
+                    .max_by_key(|m| m.date)
+                    .or_else(|| msgs.iter().filter(|m| in_trash(m) == trash_view).max_by_key(|m| m.date));
                 let focused = decisive.map(|m| classify_focus(m, &self.rules, &self.correspondents)).unwrap_or(true);
                 if focused != (tab == FocusTab::Focused) {
                     return None;
                 }
             }
-            Some(visible)
+            Some(msgs.as_slice())
         })
     }
 
@@ -187,24 +194,34 @@ impl MailIndex {
 
     /// The unread messages shown in a view, for "Mark All as Read". Like the list, a
     /// conversation's trashed messages count only in Trash.
-    pub fn unread_in(&self, owner_email: &str, view: &MailboxView) -> Vec<MessageId> {
+    pub fn unread_in(&self, _owner_email: &str, view: &MailboxView) -> Vec<MessageId> {
         let trash = self.label_of_kind(LabelKind::Trash);
-        let in_trash = |m: &Message| trash.as_ref().is_some_and(|t| m.has_label(t));
         let trash_view = matches!(view, MailboxView::Kind(LabelKind::Trash));
-        self.conversations(owner_email, view, ListFilter::Unread, None)
-            .iter()
-            .filter_map(|c| self.by_conv.get(&c.id))
-            .flatten()
-            .filter(|m| !m.is_read && in_trash(m) == trash_view)
-            .map(|m| m.id.clone())
-            .collect()
+        let mut out = Vec::new();
+        for msgs in self.matching_conversations(view, None) {
+            for m in msgs {
+                if !m.is_read && trash.as_ref().is_some_and(|t| m.has_label(t)) == trash_view {
+                    out.push(m.id.clone());
+                }
+            }
+        }
+        out
     }
 
     /// Unread conversation count for Inbox and labels, conversation count otherwise, for
     /// sidebar badges.
     pub fn view_count(&self, _owner_email: &str, view: &MailboxView, focus: Option<FocusTab>) -> usize {
         let unread_only = matches!(view, MailboxView::Kind(LabelKind::Inbox) | MailboxView::Label(_));
-        self.visible_conversations(view, focus).filter(|visible| !unread_only || visible.iter().any(|m| !m.is_read)).count()
+        let trash = self.label_of_kind(LabelKind::Trash);
+        let trash_view = matches!(view, MailboxView::Kind(LabelKind::Trash));
+        self.matching_conversations(view, focus)
+            .filter(|msgs| {
+                !unread_only
+                    || msgs
+                        .iter()
+                        .any(|m| !m.is_read && trash.as_ref().is_some_and(|t| m.has_label(t)) == trash_view)
+            })
+            .count()
     }
 
     /// Summaries of the conversations containing any of `hits` (search results), newest

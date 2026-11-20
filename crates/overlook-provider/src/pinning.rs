@@ -25,7 +25,7 @@
 //! credentials are sent, and the setup dialog offers the new one for the person to trust or
 //! not.
 
-use crate::imap::connection::{starttls_by_hand, tcp_connect};
+use crate::imap::connection::{read_bounded_line, starttls_by_hand, tcp_connect, MAX_HANDSHAKE_LINE_BYTES};
 use crate::secure_error::{self, CERTIFICATE_CHANGED, CERTIFICATE_NOT_TRUSTED};
 use crate::ProviderError;
 use overlook_core::{Security, ServerEndpoint, ServerProtocol};
@@ -33,7 +33,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{CertificateError, DigitallySignedStruct, SignatureScheme};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -243,18 +243,13 @@ pub fn fetch_certificate(endpoint: &ServerEndpoint, protocol: ServerProtocol, ti
 fn stls_by_hand(host: &str, tcp: TcpStream) -> Result<TcpStream, ProviderError> {
     let mut reader = BufReader::new(tcp.try_clone().map_err(|_| ProviderError::Offline)?);
     let mut writer = tcp;
-    let mut line = String::new();
-    if reader.read_line(&mut line).map_err(|_| ProviderError::Offline)? == 0 {
-        return Err(ProviderError::Offline);
-    }
+    let mut buf = Vec::new();
+    let line = read_bounded_line(&mut reader, &mut buf, MAX_HANDSHAKE_LINE_BYTES, host)?;
     if !line.starts_with("+OK") {
         return Err(ProviderError::Rejected(format!("{host} did not greet like a POP3 server")));
     }
     writer.write_all(b"STLS\r\n").and_then(|_| writer.flush()).map_err(|_| ProviderError::Offline)?;
-    line.clear();
-    if reader.read_line(&mut line).map_err(|_| ProviderError::Offline)? == 0 {
-        return Err(ProviderError::Offline);
-    }
+    let line = read_bounded_line(&mut reader, &mut buf, MAX_HANDSHAKE_LINE_BYTES, host)?;
     if !line.starts_with("+OK") {
         return Err(ProviderError::Rejected(format!("{host} refused STLS")));
     }

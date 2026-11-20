@@ -91,11 +91,26 @@ fn pool_paused() -> bool {
 
 /// Keeps a spare Chromium ready, or lets the spare go and stops keeping one.
 pub fn set_prewarm(on: bool) {
-    POOL_PAUSED.store(!on, Ordering::Release);
-    if on {
-        POOL_WAKE.notify_all();
-    } else {
-        drop(take_warm());
+    let warm = {
+        let mut pool = POOL.lock().unwrap();
+        POOL_PAUSED.store(!on, Ordering::Release);
+        if on {
+            POOL_WAKE.notify_all();
+            None
+        } else {
+            pool.take()
+        }
+    };
+    if let Some(warm) = warm {
+        // Reap Chromium and its TempDir off the UI thread. `warm.slot` stays held until the
+        // background thread finishes dropping `warm`, so `drain_workers()` still observes it.
+        if thread::Builder::new()
+            .name("browser-reap".into())
+            .spawn(move || drop(warm))
+            .is_err()
+        {
+            // Spawn failure falls back to dropping `warm` when the closure is dropped above.
+        }
     }
 }
 
@@ -114,7 +129,7 @@ pub fn prewarm() {
         let _ = thread::Builder::new().name("browser-pool".into()).spawn(|| loop {
             let mut pool = POOL.lock().unwrap();
             while pool.is_some() || pool_paused() {
-                pool = POOL_WAKE.wait_timeout(pool, Duration::from_millis(500)).unwrap().0;
+                pool = POOL_WAKE.wait(pool).unwrap();
             }
             drop(pool);
             let Some(slot) = WorkerSlot::acquire() else {
@@ -126,10 +141,17 @@ pub fn prewarm() {
             let stop = Arc::new(AtomicBool::new(false));
             match Actor::start(stop.clone(), false) {
                 Ok(actor) => {
-                    let mut pool = POOL.lock().unwrap();
-                    if !pool_paused() {
-                        *pool = Some(Warm { actor, stop, slot });
-                    }
+                    let unused = {
+                        let mut pool = POOL.lock().unwrap();
+                        if !pool_paused() && pool.is_none() {
+                            *pool = Some(Warm { actor, stop, slot });
+                            None
+                        } else {
+                            Some(Warm { actor, stop, slot })
+                        }
+                    };
+                    // Drop any unused Chromium process after releasing `POOL`.
+                    drop(unused);
                 }
                 // No Chromium (or it cannot start): documents report that themselves.
                 Err(_) => {
@@ -195,16 +217,87 @@ const CHROMIUM_FLAGS: &[&str] = &[
     "--use-mock-keychain",
 ];
 
+/// Coalesced non-blocking wakeup pipe so a worker blocked in `libc::poll` wakes
+/// immediately when commands, cancellation, or completed resource fetches arrive.
+struct WakePipe {
+    read: UnixStream,
+    write: UnixStream,
+    signaled: AtomicBool,
+}
+
+impl WakePipe {
+    fn new() -> std::io::Result<Self> {
+        let (read, write) = UnixStream::pair()?;
+        read.set_nonblocking(true)?;
+        write.set_nonblocking(true)?;
+        Ok(Self {
+            read,
+            write,
+            signaled: AtomicBool::new(false),
+        })
+    }
+
+    fn wake(&self) {
+        if !self.signaled.swap(true, Ordering::SeqCst) {
+            let _ = (&self.write).write(&[1u8]);
+        }
+    }
+
+    fn drain(&self) {
+        let mut buf = [0u8; 64];
+        loop {
+            match (&self.read).read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        self.signaled.store(false, Ordering::SeqCst);
+    }
+
+    fn raw_fd(&self) -> libc::c_int {
+        self.read.as_raw_fd()
+    }
+}
+
+fn poll_fds(primary_fd: libc::c_int, primary_events: libc::c_short, wake_fd: Option<libc::c_int>, timeout_ms: libc::c_int) -> bool {
+    let mut fds = [
+        libc::pollfd {
+            fd: primary_fd,
+            events: primary_events,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: wake_fd.unwrap_or(-1),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    let nfds: libc::nfds_t = if wake_fd.is_some() { 2 } else { 1 };
+    // SAFETY: `fds` points to `nfds` valid `pollfd` entries for the duration of the call.
+    unsafe {
+        let _ = libc::poll(fds.as_mut_ptr(), nfds, timeout_ms);
+    }
+    wake_fd.is_some() && fds[1].revents != 0
+}
+
+type EventWakerFn = Arc<dyn Fn() + Send + Sync>;
+
 #[derive(Clone)]
 pub struct BrowserHandle(Arc<Inner>);
 struct Inner {
     commands: Mutex<VecDeque<Input>>,
     events: Mutex<VecDeque<BrowserEvent>>,
+    waker: Mutex<Option<EventWakerFn>>,
+    wake: Option<Arc<WakePipe>>,
     stop: Arc<AtomicBool>,
 }
 impl Drop for Inner {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        if let Some(wake) = &self.wake {
+            wake.wake();
+        }
     }
 }
 #[derive(Debug)]
@@ -258,9 +351,12 @@ impl BrowserHandle {
     /// the first tiles are not a throwaway render at a default width.
     pub fn new_sized(html: String, allow_remote: bool, dark_paper: Option<u32>, size: Option<(u32, f64)>) -> Self {
         let warm = if html.len() > MAX_HTML { None } else { take_warm() };
+        let wake = WakePipe::new().ok().map(Arc::new);
         let inner = Arc::new(Inner {
             commands: Mutex::new(VecDeque::new()),
             events: Mutex::new(VecDeque::new()),
+            waker: Mutex::new(None),
+            wake: wake.clone(),
             stop: warm.as_ref().map(|w| w.stop.clone()).unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
         });
         let handle = Self(inner.clone());
@@ -315,6 +411,7 @@ impl BrowserHandle {
                         }
                         None => Actor::start(stop.clone(), allow_remote)?,
                     };
+                    actor.set_wake(wake.clone());
                     if let Some((width, scale)) = size {
                         actor.width = width.clamp(1, 2048);
                         actor.scale = if scale.is_finite() { scale.clamp(0.5, 2.0) } else { 1.0 };
@@ -322,11 +419,22 @@ impl BrowserHandle {
                     actor.load(&html, dark_paper)?;
                     actor.cdp.call("Page.stopScreencast", json!({}))?;
                     actor.refresh_layout(&emit)?;
+                    const MEASURE_INTERVAL: Duration = Duration::from_millis(250);
+                    const SETTLE_WINDOW: Duration = Duration::from_secs(2);
                     let mut layout_dirty = false;
                     let mut hover_dirty = false;
                     let mut next_hover_repaint = Instant::now();
-                    let mut next_measure = Instant::now();
+                    let mut measure_until: Option<Instant> = Some(Instant::now() + SETTLE_WINDOW);
+                    let mut next_measure = Instant::now() + MEASURE_INTERVAL;
                     while !stop.load(Ordering::Acquire) {
+                        // Drain wake pipe BEFORE inspecting stop/commands/resources so any
+                        // producer that arrives after we inspect will write a fresh wakeup.
+                        if let Some(w) = &wake {
+                            w.drain();
+                        }
+                        if stop.load(Ordering::Acquire) {
+                            break;
+                        }
                         actor.cdp.poll()?;
                         if actor.pump()? {
                             layout_dirty = true;
@@ -353,21 +461,76 @@ impl BrowserHandle {
                         }
                         let now = Instant::now();
                         let repaint = layout_dirty || (hover_dirty && now >= next_hover_repaint);
-                        if !repaint && now >= next_measure {
-                            // Measure only: no periodic screenshots on native scroll.
-                            layout_dirty = actor.measure_height()? != actor.document_height;
-                            next_measure = now + Duration::from_millis(250);
-                        }
-                        if repaint || layout_dirty {
+                        if repaint {
                             actor.refresh_layout(&emit)?;
                             layout_dirty = false;
                             hover_dirty = false;
                             // Keep the latest hover state when sweeping across a message,
                             // and let clicks, keyboard input and resizing repaint immediately.
-                            next_hover_repaint = Instant::now() + Duration::from_millis(100);
+                            let after = Instant::now();
+                            next_hover_repaint = after + Duration::from_millis(100);
+                            measure_until = Some(after + SETTLE_WINDOW);
+                            next_measure = after + MEASURE_INTERVAL;
+                        } else if actor.resource_pending > 0 {
+                            if measure_until.is_none() {
+                                measure_until = Some(now + SETTLE_WINDOW);
+                                next_measure = now + MEASURE_INTERVAL;
+                            } else if now >= next_measure {
+                                if actor.measure_height()? != actor.document_height {
+                                    actor.refresh_layout(&emit)?;
+                                }
+                                measure_until = Some(now + SETTLE_WINDOW);
+                                next_measure = now + MEASURE_INTERVAL;
+                            }
+                        } else if let Some(until) = measure_until {
+                            if now >= next_measure {
+                                // Measure only during the brief post-load/interaction settling window.
+                                if actor.measure_height()? != actor.document_height {
+                                    actor.refresh_layout(&emit)?;
+                                    measure_until = Some(now + SETTLE_WINDOW);
+                                } else if now >= until {
+                                    measure_until = None;
+                                }
+                                next_measure = now + MEASURE_INTERVAL;
+                            }
                         }
                         actor.capture_next_tile(&emit)?;
-                        thread::sleep(Duration::from_millis(2));
+                        if !actor.cdp.take_woke()
+                            && actor.pending_tiles.is_empty()
+                            && actor.cdp.events.is_empty()
+                            && !actor.cdp.buffer.has_unscanned_bytes()
+                            && !layout_dirty
+                        {
+                            let timeout_ms = {
+                                let now = Instant::now();
+                                let mut wait: Option<Duration> = None;
+                                if hover_dirty {
+                                    wait = Some(next_hover_repaint.saturating_duration_since(now));
+                                }
+                                if measure_until.is_some() || actor.resource_pending > 0 {
+                                    let m = next_measure.saturating_duration_since(now);
+                                    wait = Some(match wait {
+                                        Some(w) => w.min(m),
+                                        None => m,
+                                    });
+                                }
+                                if let Some(d) = wait {
+                                    d.as_millis().clamp(1, 250) as libc::c_int
+                                } else if wake.is_some() {
+                                    // Completely idle: block with zero wakeups until CDP data, pipe EOF,
+                                    // a UI command, or handle drop arrives.
+                                    -1
+                                } else {
+                                    100
+                                }
+                            };
+                            poll_fds(
+                                actor.cdp.read.as_raw_fd(),
+                                libc::POLLIN,
+                                wake.as_deref().map(WakePipe::raw_fd),
+                                timeout_ms,
+                            );
+                        }
                     }
                     Ok(())
                 })();
@@ -402,6 +565,10 @@ impl BrowserHandle {
             *old_y = *y;
             *old_dx = (*old_dx + dx).clamp(-10000., 10000.);
             *old_dy = (*old_dy + dy).clamp(-10000., 10000.);
+            drop(q);
+            if let Some(wake) = &self.0.wake {
+                wake.wake();
+            }
             return;
         }
         // Never reorder discrete input transitions.
@@ -415,12 +582,19 @@ impl BrowserHandle {
         if q.len() >= 256 {
             drop(q);
             self.0.stop.store(true, Ordering::Release);
+            if let Some(wake) = &self.0.wake {
+                wake.wake();
+            }
             push_event(
                 &self.0,
                 BrowserEvent::Error("Browser input queue overflow".into()),
             );
         } else {
             q.push_back(input);
+            drop(q);
+            if let Some(wake) = &self.0.wake {
+                wake.wake();
+            }
         }
     }
     /// CSS width clamped to 1..=2048, DPR to 0.5..=2. CSS viewport height is always 900.
@@ -472,6 +646,15 @@ impl BrowserHandle {
     pub fn context_menu(&self, x: f64, y: f64, request_id: u64) {
         self.send(Input::ContextMenu { x, y, request_id });
     }
+    /// Registers a callback invoked whenever a [`BrowserEvent`] is queued.
+    /// Fires immediately if events are already waiting.
+    pub fn on_event(&self, wake: impl Fn() + Send + Sync + 'static) {
+        let wake: EventWakerFn = Arc::new(wake);
+        *self.0.waker.lock().unwrap() = Some(wake.clone());
+        if !self.0.events.lock().unwrap().is_empty() {
+            wake();
+        }
+    }
     pub fn drain_events(&self) -> Vec<BrowserEvent> {
         self.0.events.lock().unwrap().drain(..).collect()
     }
@@ -501,6 +684,58 @@ fn push_event(inner: &Inner, event: BrowserEvent) {
         q.pop_front();
     }
     q.push_back(event);
+    drop(q);
+    let waker = inner.waker.lock().unwrap().clone();
+    if let Some(wake) = waker {
+        wake();
+    }
+}
+
+/// Null-delimited CDP frame buffer with incremental O(N) scanning.
+struct CdpBuffer {
+    bytes: Vec<u8>,
+    scan_offset: usize,
+}
+
+impl CdpBuffer {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            scan_offset: 0,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Result<()> {
+        if self.bytes.len() + chunk.len() > MAX_PACKET {
+            return Err("Chromium protocol size limit exceeded".into());
+        }
+        self.bytes.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    fn take_frame(&mut self) -> Result<Option<Value>> {
+        if let Some(rel) = self.bytes[self.scan_offset..].iter().position(|b| *b == 0) {
+            let end = self.scan_offset + rel;
+            let parsed = serde_json::from_slice(&self.bytes[..end])
+                .map(Some)
+                .map_err(|_| "Invalid Chromium protocol response".to_owned());
+            self.bytes.drain(..=end);
+            self.scan_offset = 0;
+            return parsed;
+        }
+        self.scan_offset = self.bytes.len();
+        Ok(None)
+    }
+
+    fn has_unscanned_bytes(&self) -> bool {
+        self.scan_offset < self.bytes.len()
+    }
+}
+
+enum ReadStep {
+    Frame(Value),
+    MoreData,
+    WouldBlock,
 }
 
 /// Owns all OS resources, including partially initialized startup failures.
@@ -509,11 +744,13 @@ struct Cdp {
     profile: tempfile::TempDir,
     read: UnixStream,
     write: UnixStream,
-    buffer: Vec<u8>,
+    buffer: CdpBuffer,
     events: VecDeque<Value>,
     id: u64,
     session: Option<String>,
     stop: Arc<AtomicBool>,
+    wake: Option<Arc<WakePipe>>,
+    woke_during_call: bool,
     memory_checked: Instant,
 }
 impl Drop for Cdp {
@@ -608,13 +845,18 @@ impl Cdp {
             profile,
             read,
             write,
-            buffer: Vec::new(),
+            buffer: CdpBuffer::new(),
             events: VecDeque::new(),
             id: 0,
             session: None,
             stop,
+            wake: None,
+            woke_during_call: false,
             memory_checked: Instant::now() - Duration::from_secs(1),
         })
+    }
+    fn take_woke(&mut self) -> bool {
+        std::mem::replace(&mut self.woke_during_call, false)
     }
     fn check(&mut self, deadline: Instant) -> Result<()> {
         if self.stop.load(Ordering::Acquire) {
@@ -645,25 +887,19 @@ impl Cdp {
         }
         Ok(())
     }
-    fn next(&mut self) -> Result<Option<Value>> {
-        if let Some(end) = self.buffer.iter().position(|b| *b == 0) {
-            let data: Vec<_> = self.buffer.drain(..=end).collect();
-            return serde_json::from_slice(&data[..end])
-                .map(Some)
-                .map_err(|_| "Invalid Chromium protocol response".into());
+    fn next(&mut self) -> Result<ReadStep> {
+        if let Some(frame) = self.buffer.take_frame()? {
+            return Ok(ReadStep::Frame(frame));
         }
         let mut chunk = [0; 65536];
         match self.read.read(&mut chunk) {
             Ok(0) => Err("Chromium pipe closed".into()),
             Ok(n) => {
-                if self.buffer.len() + n > MAX_PACKET {
-                    return Err("Chromium protocol size limit exceeded".into());
-                }
-                self.buffer.extend_from_slice(&chunk[..n]);
+                self.buffer.push(&chunk[..n])?;
                 // Let the caller iterate, avoiding recursion on large screenshots.
-                Ok(None)
+                Ok(ReadStep::MoreData)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(ReadStep::WouldBlock),
             Err(_) => Err("Cannot read Chromium pipe".into()),
         }
     }
@@ -680,11 +916,10 @@ impl Cdp {
         self.check(Instant::now() + COMMAND_TIMEOUT)?;
         // Bounded work per tick; next() may read without yielding a complete packet.
         for _ in 0..128 {
-            let before = self.buffer.len();
             match self.next()? {
-                Some(v) => self.queue(v)?,
-                None if self.buffer.len() == before => break,
-                None => {}
+                ReadStep::Frame(v) => self.queue(v)?,
+                ReadStep::MoreData => {}
+                ReadStep::WouldBlock => break,
             }
         }
         Ok(())
@@ -703,6 +938,7 @@ impl Cdp {
         }
         bytes.push(0);
         let deadline = Instant::now() + COMMAND_TIMEOUT;
+        let wake_fd = self.wake.as_deref().map(WakePipe::raw_fd);
         let mut written = 0;
         while written < bytes.len() {
             self.check(deadline)?;
@@ -710,29 +946,51 @@ impl Cdp {
                 Ok(0) => return Err("Chromium pipe closed".into()),
                 Ok(n) => written += n,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(1))
+                    let wait_ms = deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_millis()
+                        .clamp(1, 250) as libc::c_int;
+                    if poll_fds(self.write.as_raw_fd(), libc::POLLOUT, wake_fd, wait_ms) {
+                        if let Some(wake) = &self.wake {
+                            wake.drain();
+                        }
+                        self.woke_during_call = true;
+                    }
                 }
                 Err(_) => return Err("Cannot write Chromium pipe".into()),
             }
         }
         loop {
             self.check(deadline)?;
-            if let Some(response) = self.next()? {
-                if response["id"].as_u64() == Some(id) {
-                    if let Some(error) = response.get("error") {
-                        // Responsive resources can be cancelled while an anonymous
-                        // fetch is pending (resize/srcset/reflow). Resolving that
-                        // obsolete interception is harmless, not a renderer failure.
-                        if cancelled_resource_reply(method, error) {
-                            return Ok(json!({}));
+            match self.next()? {
+                ReadStep::Frame(response) => {
+                    if response["id"].as_u64() == Some(id) {
+                        if let Some(error) = response.get("error") {
+                            // Responsive resources can be cancelled while an anonymous
+                            // fetch is pending (resize/srcset/reflow). Resolving that
+                            // obsolete interception is harmless, not a renderer failure.
+                            if cancelled_resource_reply(method, error) {
+                                return Ok(json!({}));
+                            }
+                            return Err(format!("Chromium rejected {method}"));
                         }
-                        return Err(format!("Chromium rejected {method}"));
+                        return Ok(response["result"].clone());
                     }
-                    return Ok(response["result"].clone());
+                    self.queue(response)?;
                 }
-                self.queue(response)?;
-            } else {
-                thread::sleep(Duration::from_millis(1));
+                ReadStep::MoreData => {}
+                ReadStep::WouldBlock => {
+                    let wait_ms = deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_millis()
+                        .clamp(1, 250) as libc::c_int;
+                    if poll_fds(self.read.as_raw_fd(), libc::POLLIN, wake_fd, wait_ms) {
+                        if let Some(wake) = &self.wake {
+                            wake.drain();
+                        }
+                        self.woke_during_call = true;
+                    }
+                }
             }
         }
     }
@@ -827,6 +1085,7 @@ struct ResourceCompletion {
 struct ResourceWorkers {
     jobs: std::sync::mpsc::SyncSender<ResourceJob>,
     results: std::sync::mpsc::Receiver<ResourceCompletion>,
+    wake: Arc<Mutex<Option<Arc<WakePipe>>>>,
     stop: Arc<AtomicBool>,
 }
 impl ResourceWorkers {
@@ -834,12 +1093,14 @@ impl ResourceWorkers {
         let (jobs, receiver) = std::sync::mpsc::sync_channel::<ResourceJob>(MAX_PENDING_RESOURCES);
         let receiver = Arc::new(Mutex::new(receiver));
         let (sender, results) = std::sync::mpsc::sync_channel(MAX_PENDING_RESOURCES);
+        let wake: Arc<Mutex<Option<Arc<WakePipe>>>> = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         for _ in 0..2 {
-            let (receiver, sender, agent, stop, view_stop) = (
+            let (receiver, sender, agent, wake, stop, view_stop) = (
                 receiver.clone(),
                 sender.clone(),
                 agent.clone(),
+                wake.clone(),
                 stop.clone(),
                 view_stop.clone(),
             );
@@ -847,14 +1108,10 @@ impl ResourceWorkers {
                 if stop.load(Ordering::Acquire) || view_stop.load(Ordering::Acquire) {
                     break;
                 }
-                let job = receiver
-                    .lock()
-                    .unwrap()
-                    .recv_timeout(Duration::from_millis(50));
-                let job = match job {
-                    Ok(job) => job,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(_) => break,
+                // Blocking `recv()` sleeps with zero wakeups while idle; dropping `jobs`
+                // on `ResourceWorkers` drop disconnects the channel immediately.
+                let Ok(job) = receiver.lock().unwrap().recv() else {
+                    break;
                 };
                 if stop.load(Ordering::Acquire) || view_stop.load(Ordering::Acquire) {
                     break;
@@ -875,13 +1132,21 @@ impl ResourceWorkers {
                 {
                     break;
                 }
+                if let Some(pipe) = wake.lock().unwrap().clone() {
+                    pipe.wake();
+                }
             });
         }
         Self {
             jobs,
             results,
+            wake,
             stop,
         }
+    }
+
+    fn set_wake(&self, pipe: Option<Arc<WakePipe>>) {
+        *self.wake.lock().unwrap() = pipe;
     }
 }
 impl Drop for ResourceWorkers {
@@ -988,6 +1253,10 @@ impl Actor {
             resource_failed: false,
             resource_error_reported: false,
         })
+    }
+    fn set_wake(&mut self, wake: Option<Arc<WakePipe>>) {
+        self.cdp.wake = wake.clone();
+        self.resources.set_wake(wake);
     }
     fn load(&mut self, html: &str, dark_paper: Option<u32>) -> Result<()> {
         self.dark = dark_paper.is_some();
@@ -1270,7 +1539,9 @@ impl Actor {
                     }
                 }
                 self.cdp.call("Input.dispatchMouseEvent", json!({"type":kind,"x":x,"y":viewport_y,"button":button,"buttons":buttons & 31,"clickCount":count.min(3)}))?;
-                return Ok(self.update_pointer_state(x, viewport_y, emit)? || repaint);
+                if self.dark {
+                    return Ok(self.update_pointer_state(x, viewport_y, emit)? || repaint);
+                }
             }
             // The native pane exclusively owns scrolling; never dispatch root wheels.
             Input::Scroll(..) => {}
@@ -1648,6 +1919,86 @@ mod cancelled_resource_tests {
         assert!(!cancelled_resource_reply("Fetch.continueRequest", &stale));
         assert!(!cancelled_resource_reply("Fetch.fulfillRequest", &json!({"code":-32000,"message":"Target closed"})));
         assert!(!cancelled_resource_reply("Fetch.failRequest", &json!({"code":-32602,"message":"Other invalid parameter"})));
+    }
+
+    #[test]
+    fn cdp_buffer_handles_chunked_and_multiple_frames_incrementally() {
+        let mut buf = CdpBuffer::new();
+        assert!(buf.take_frame().unwrap().is_none());
+        assert!(!buf.has_unscanned_bytes());
+
+        // Partial first frame across multiple chunks advances scan_offset without rescanning.
+        buf.push(b"{\"id\":1,\"re").unwrap();
+        assert!(buf.has_unscanned_bytes());
+        assert!(buf.take_frame().unwrap().is_none());
+        assert_eq!(buf.scan_offset, 11);
+        assert!(!buf.has_unscanned_bytes());
+
+        buf.push(b"sult\":{\"ok\":true}}\0{\"id\":2,\"method\":\"Page.loadEventFired\"}\0{\"id\":3").unwrap();
+        assert!(buf.has_unscanned_bytes());
+
+        let first = buf.take_frame().unwrap().expect("first frame");
+        assert_eq!(first["id"], 1);
+        assert_eq!(first["result"]["ok"], true);
+        assert_eq!(buf.scan_offset, 0);
+        assert!(buf.has_unscanned_bytes(), "second frame remains buffered");
+
+        let second = buf.take_frame().unwrap().expect("second frame");
+        assert_eq!(second["id"], 2);
+        assert_eq!(second["method"], "Page.loadEventFired");
+        assert_eq!(buf.scan_offset, 0);
+
+        // Trailing partial frame stays buffered with scan_offset at its end.
+        assert!(buf.take_frame().unwrap().is_none());
+        assert_eq!(buf.scan_offset, 7);
+        buf.push(b"}\0").unwrap();
+        let third = buf.take_frame().unwrap().expect("third frame");
+        assert_eq!(third["id"], 3);
+        assert!(buf.bytes.is_empty());
+        assert_eq!(buf.scan_offset, 0);
+    }
+
+    #[test]
+    fn cdp_buffer_rejects_oversized_packet_and_invalid_json() {
+        let mut buf = CdpBuffer::new();
+        buf.push(b"not-json\0").unwrap();
+        assert_eq!(buf.take_frame().unwrap_err(), "Invalid Chromium protocol response");
+        assert!(buf.bytes.is_empty());
+
+        let mut huge = CdpBuffer::new();
+        huge.bytes.resize(MAX_PACKET, b'a');
+        assert_eq!(huge.push(b"b").unwrap_err(), "Chromium protocol size limit exceeded");
+    }
+
+    #[test]
+    fn wake_pipe_coalesces_and_wakes_poll() {
+        let pipe = Arc::new(WakePipe::new().unwrap());
+        let (dummy_r, _dummy_w) = UnixStream::pair().unwrap();
+        let p = pipe.clone();
+        let t = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            p.wake();
+            p.wake();
+        });
+        let started = Instant::now();
+        poll_fds(dummy_r.as_raw_fd(), libc::POLLIN, Some(pipe.raw_fd()), 2000);
+        assert!(started.elapsed() < Duration::from_secs(1), "wake pipe should unblock poll promptly");
+        t.join().unwrap();
+        pipe.drain();
+        assert!(!pipe.signaled.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn browser_handle_on_event_fires_immediately_for_queued_events() {
+        let handle = BrowserHandle::new("x".repeat(MAX_HTML + 1), false, None);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        handle.on_event(move || {
+            h.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "already-queued error event triggers waker");
+        let events = handle.drain_events();
+        assert!(matches!(events.as_slice(), [BrowserEvent::Error(_)]));
     }
 
     #[test]
@@ -2052,6 +2403,8 @@ mod tests {
         let handle = BrowserHandle(Arc::new(Inner {
             commands: Mutex::new(VecDeque::new()),
             events: Mutex::new(VecDeque::new()),
+            waker: Mutex::new(None),
+            wake: None,
             stop: Arc::new(AtomicBool::new(false)),
         }));
         for _ in 0..100 {
@@ -2393,6 +2746,8 @@ mod tests {
         let inner = Inner {
             commands: Mutex::new(VecDeque::new()),
             events: Mutex::new(VecDeque::new()),
+            waker: Mutex::new(None),
+            wake: None,
             stop: Arc::new(AtomicBool::new(false)),
         };
         for (top, revision) in [(0, 1), (512, 1), (0, 1)] {

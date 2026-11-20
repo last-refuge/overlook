@@ -6,7 +6,7 @@ use crate::{draft_message_id, folder_name_problem, AppliedChanges, BoxFuture, Ma
 use overlook_core::time::Timestamp;
 use overlook_core::*;
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -251,6 +251,7 @@ impl GmailProvider {
     fn list_ids(&self, search: &str, limit: usize) -> Result<Vec<String>, ApiError> {
         let mut ids = Vec::new();
         let mut page: Option<String> = None;
+        let mut seen_pages = HashSet::new();
         while ids.len() < limit {
             let remaining = (limit - ids.len()).min(100).to_string();
             let mut query = vec![("maxResults", remaining.as_str()), ("q", search), ("includeSpamTrash", "true")];
@@ -267,9 +268,13 @@ impl GmailProvider {
                 break;
             }
             ids.extend(batch);
-            page = v.get("nextPageToken").and_then(|t| t.as_str()).map(str::to_owned);
-            if page.is_none() {
-                break;
+            page = v.get("nextPageToken").and_then(|t| t.as_str()).filter(|t| !t.is_empty()).map(str::to_owned);
+            match &page {
+                None => break,
+                Some(p) if !seen_pages.insert(p.clone()) => {
+                    return Err(ApiError::Server("Gmail repeated a message list page".into()));
+                }
+                Some(_) => {}
             }
         }
         ids.truncate(limit);
@@ -282,6 +287,30 @@ impl GmailProvider {
         }
         for chunk in ids.chunks(500) {
             self.client.post("messages/batchModify", &json!({ "ids": chunk, "addLabelIds": add, "removeLabelIds": remove }))?;
+        }
+        Ok(())
+    }
+
+    /// Runs a per-message action (`trash` / `untrash`) across `ids`, batching multiple ids
+    /// into multipart Gmail batch POST requests and ignoring `404 NotFound` per message.
+    fn batch_action(&self, ids: &[String], action: &str) -> Result<(), ProviderError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        if ids.len() == 1 {
+            return match self.client.post(&format!("messages/{}/{action}", ids[0]), &Value::Null) {
+                Ok(_) | Err(ApiError::NotFound) => Ok(()),
+                Err(e) => Err(e.into()),
+            };
+        }
+        for chunk in ids.chunks(super::api::BATCH_SIZE) {
+            let paths: Vec<String> = chunk.iter().map(|id| format!("messages/{id}/{action}")).collect();
+            for result in self.client.batch_post(&paths)? {
+                match result {
+                    Ok(_) | Err(ApiError::NotFound) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
         }
         Ok(())
     }
@@ -459,6 +488,7 @@ impl MailProvider for GmailProvider {
                 (format!("{PEOPLE_BASE}/otherContacts?readMask=names,emailAddresses,phoneNumbers&pageSize=1000"), "otherContacts", false),
             ] {
                 let mut page: Option<String> = None;
+                let mut seen_pages = HashSet::new();
                 loop {
                     let full = match &page {
                         Some(p) => format!("{url}&pageToken={}", super::oauth::url_encode(p)),
@@ -476,9 +506,13 @@ impl MailProvider for GmailProvider {
                             out.push(c);
                         }
                     }
-                    page = v.get("nextPageToken").and_then(|t| t.as_str()).map(str::to_owned);
-                    if page.is_none() {
-                        break;
+                    page = v.get("nextPageToken").and_then(|t| t.as_str()).filter(|t| !t.is_empty()).map(str::to_owned);
+                    match &page {
+                        None => break,
+                        Some(p) if !seen_pages.insert(p.clone()) => {
+                            return Err(ProviderError::Temporary("Google repeated a contacts page".into()));
+                        }
+                        Some(_) => {}
                     }
                 }
             }
@@ -604,6 +638,7 @@ impl MailProvider for GmailProvider {
             let mut history = HistoryReplay::default();
             let mut new_checkpoint = checkpoint.clone();
             let mut page: Option<String> = None;
+            let mut seen_pages = HashSet::new();
             loop {
                 let mut query = vec![("startHistoryId", checkpoint.as_str()), ("maxResults", "500")];
                 if let Some(p) = page.as_deref() {
@@ -620,9 +655,13 @@ impl MailProvider for GmailProvider {
                 for record in v.get("history").and_then(|h| h.as_array()).into_iter().flatten() {
                     history.record(record);
                 }
-                page = v.get("nextPageToken").and_then(|t| t.as_str()).map(str::to_owned);
-                if page.is_none() {
-                    break;
+                page = v.get("nextPageToken").and_then(|t| t.as_str()).filter(|t| !t.is_empty()).map(str::to_owned);
+                match &page {
+                    None => break,
+                    Some(p) if !seen_pages.insert(p.clone()) => {
+                        return Err(ProviderError::Temporary("Gmail repeated a history page".into()));
+                    }
+                    Some(_) => {}
                 }
             }
             let labels = if history.is_empty() { None } else { Some(self.labels(&account)?) };
@@ -669,22 +708,8 @@ impl MailProvider for GmailProvider {
                     let l = provider_label(label_id)?;
                     self.batch_modify(&ids, &[], &[l.as_str()])?
                 }
-                OperationKind::Trash { .. } => {
-                    for id in &ids {
-                        match self.client.post(&format!("messages/{id}/trash"), &Value::Null) {
-                            Ok(_) | Err(ApiError::NotFound) => {}
-                            Err(e) => return Err(e.into()),
-                        }
-                    }
-                }
-                OperationKind::Untrash { .. } => {
-                    for id in &ids {
-                        match self.client.post(&format!("messages/{id}/untrash"), &Value::Null) {
-                            Ok(_) | Err(ApiError::NotFound) => {}
-                            Err(e) => return Err(e.into()),
-                        }
-                    }
-                }
+                OperationKind::Trash { .. } => self.batch_action(&ids, "trash")?,
+                OperationKind::Untrash { .. } => self.batch_action(&ids, "untrash")?,
                 OperationKind::SendDraft { .. } => return Err(ProviderError::Rejected("sends go through send()".into())),
                 // Needs the full mail.google.com scope, which Overlook does not request.
                 OperationKind::DeleteForever { .. } => return Err(ProviderError::Rejected("Gmail messages can only be moved to Trash".into())),

@@ -874,9 +874,13 @@ impl MailWindow {
             }
         };
         let id = account.id.clone();
+        self.bump_provider_generation(&id);
+        self.providers_loading.remove(&id);
         self.providers.insert(id.clone(), providers::microsoft_providers(&account, servers, session));
         self.provider_issues.remove(&id);
         self.next_retry.remove(&id);
+        self.refresh_account_metadata();
+        self.refresh_settings_cache();
         self.refresh_idle_watchers();
         let _ = self.store.set_sync_state(&id, &SyncState::Syncing, None);
         match note {
@@ -1410,6 +1414,8 @@ impl MailWindow {
         let calendar_result = caldav_sync::add_fastmail_calendars(&self.store, &account, &servers, connect_calendars);
         // Contacts likewise: only with the person's consent, and never rolling back the mail.
         let contacts_result = if connect_contacts { crate::carddav_sync::connect(&self.store, &account, &servers).map(Some) } else { Ok(None) };
+        self.bump_provider_generation(&account.id);
+        self.providers_loading.remove(&account.id);
         self.providers.insert(account.id.clone(), bundle);
         self.provider_issues.remove(&account.id);
         // The IDLE watcher follows the provider: started for a new account, restarted when
@@ -1417,7 +1423,8 @@ impl MailWindow {
         self.refresh_idle_watchers();
         let _ = self.store.set_sync_state(&account.id, &SyncState::Syncing, None);
         self.accounts = self.store.accounts().unwrap_or_default();
-        self.account_marks.borrow_mut().clear();
+        self.refresh_account_metadata();
+        self.refresh_settings_cache();
         if self.account.id == account.id {
             self.account = account.clone();
         }

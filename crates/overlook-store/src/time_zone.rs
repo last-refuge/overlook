@@ -15,7 +15,7 @@ impl Store {
         id: &EventId,
         fallback: &ZoneDefinition,
     ) -> Result<(Option<Event>, ZoneDefinition)> {
-        self.with_tx(|tx| {
+        self.with_read_tx(|tx| {
             let projection: Option<String> = tx
                 .query_row(
                     "SELECT value FROM settings WHERE key=?1",
@@ -65,7 +65,13 @@ impl Store {
     pub fn save_preferences(&self, prefs: &Prefs) -> Result<()> {
         self.with_tx(|tx| {
             let current: Option<String> = tx.query_row("SELECT value FROM settings WHERE key='prefs'", [], |r| r.get(0)).optional()?;
-            let zone = current.and_then(|value| serde_json::from_str::<Prefs>(&value).ok()).and_then(|p| p.time_zone);
+            let zone = current.and_then(|value| match serde_json::from_str::<Prefs>(&value) {
+                Ok(p) => p.time_zone,
+                Err(e) => {
+                    tracing::warn!(error = %e, "ignoring corrupt prefs JSON when preserving time_zone");
+                    None
+                }
+            });
             let mut prefs = prefs.clone();
             prefs.time_zone = zone;
             tx.execute("INSERT INTO settings(key,value) VALUES('prefs',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [serde_json::to_string(&prefs)?])?;
@@ -114,7 +120,13 @@ impl Store {
                     rows.collect::<std::result::Result<_, _>>()?
                 };
                 for (id, json) in invitations {
-                    let Ok(mut invitation) = serde_json::from_str::<overlook_core::ics::Invitation>(&json) else { continue };
+                    let mut invitation = match serde_json::from_str::<overlook_core::ics::Invitation>(&json) {
+                        Ok(inv) => inv,
+                        Err(e) => {
+                            tracing::warn!(message_id = %id, error = %e, "ignoring corrupt invitation_json during time zone projection");
+                            continue;
+                        }
+                    };
                     if invitation.all_day && invitation.start_date.is_none() {
                         if let Some(start) = invitation.start {
                             invitation.start_date = Some(tz::in_zone(start, &old).date().to_string());
@@ -409,7 +421,7 @@ mod tests {
         let next = ZoneDefinition::Named("America/Phoenix".into());
         let legacy = serde_json::json!({"uid":"old", "method":"REQUEST", "start":event.start, "all_day":true});
         store.with_tx(|tx| {
-            tx.execute("INSERT INTO messages(id,account_id,conversation_id,from_json,to_json,cc_json,bcc_json,subject,snippet,search_text,date,invitation_json) VALUES('invite',?1,'thread','{}','[]','[]','[]','','','',0,?2)", params![account.id.0, legacy.to_string()])?;
+            tx.execute("INSERT INTO messages(id,account_id,conversation_id,from_json,to_json,cc_json,bcc_json,subject,snippet,date,invitation_json) VALUES('invite',?1,'thread','{}','[]','[]','[]','','',0,?2)", params![account.id.0, legacy.to_string()])?;
             Ok(())
         }).unwrap();
         store

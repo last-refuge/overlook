@@ -121,6 +121,26 @@ fn strip_id(id: Option<&str>) -> Option<String> {
     id.map(|v| v.trim().trim_start_matches('<').trim_end_matches('>').to_owned()).filter(|v| !v.is_empty())
 }
 
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn unique_boundary(parts: &[(Vec<u8>, Vec<u8>)]) -> String {
+    loop {
+        let bytes: [u8; 16] = rand::random();
+        let mut candidate = String::with_capacity("overlook-partial-".len() + 32);
+        candidate.push_str("overlook-partial-");
+        for b in bytes {
+            use std::fmt::Write;
+            let _ = write!(&mut candidate, "{b:02x}");
+        }
+        let needle = candidate.as_bytes();
+        if !parts.iter().any(|(h, b)| contains_bytes(h, needle) || contains_bytes(b, needle)) {
+            return candidate;
+        }
+    }
+}
+
 /// Builds the message the MIME parser sees: the original headers minus their body framing,
 /// plus one synthetic multipart holding the fetched text sections with their own MIME
 /// headers. `parts` is `(section MIME headers, section body)`.
@@ -134,17 +154,17 @@ pub fn synthetic_message(header: &[u8], parts: &[(Vec<u8>, Vec<u8>)], single_par
         }
         return out;
     }
-    const BOUNDARY: &str = "overlook-partial-fetch";
+    let boundary = unique_boundary(parts);
     out.extend_from_slice(&strip_framing_headers(header));
-    out.extend_from_slice(format!("MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"{BOUNDARY}\"\r\n\r\n").as_bytes());
+    out.extend_from_slice(format!("MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n").as_bytes());
     for (mime, body) in parts {
-        out.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+        out.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
         out.extend_from_slice(mime.trim_ascii_end());
         out.extend_from_slice(b"\r\n\r\n");
         out.extend_from_slice(body);
         out.extend_from_slice(b"\r\n");
     }
-    out.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+    out.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
     out
 }
 
@@ -251,5 +271,27 @@ mod tests {
         let single = synthetic_message(b"From: a@b.example\r\nSubject: Plain\r\nContent-Type: text/plain\r\n\r\n", &[(Vec::new(), b"hello".to_vec())], true);
         let m = crate::mime::message_from_rfc822(&account, &single, MessageId::from("m"), &crate::mime::MessageFlags::default());
         assert_eq!(m.body.text.as_deref().map(str::trim), Some("hello"));
+    }
+
+    #[test]
+    fn synthetic_message_uses_unique_random_boundary_per_call_and_resists_spoofing() {
+        let header = b"From: a@b.example\r\nSubject: Spoof\r\n\r\n";
+        let spoofed = b"Before\r\n--overlook-partial-fetch\r\nContent-Type: text/html\r\n\r\n<script>evil</script>".to_vec();
+        let parts = vec![(b"Content-Type: text/plain; charset=utf-8\r\n".to_vec(), spoofed.clone())];
+        let a = synthetic_message(header, &parts, false);
+        let b = synthetic_message(header, &parts, false);
+        let a_text = String::from_utf8_lossy(&a);
+        let b_text = String::from_utf8_lossy(&b);
+        let extract_boundary = |s: &str| {
+            s.split("boundary=\"").nth(1).and_then(|rest| rest.split('"').next()).unwrap().to_owned()
+        };
+        let ba = extract_boundary(&a_text);
+        let bb = extract_boundary(&b_text);
+        assert_ne!(ba, bb, "each call generates a distinct random boundary");
+        assert_ne!(ba, "overlook-partial-fetch");
+        let account = Account { id: AccountId::from("imap:j"), provider: ProviderKind::Imap, display_name: "J".into(), email: "j@example.com".into(), created_at: 0 };
+        let m = crate::mime::message_from_rfc822(&account, &a, MessageId::from("m"), &crate::mime::MessageFlags::default());
+        assert!(m.body.html.is_none(), "spoofed boundary in body must not inject an HTML part");
+        assert!(m.body.text.as_deref().unwrap().contains("--overlook-partial-fetch"));
     }
 }

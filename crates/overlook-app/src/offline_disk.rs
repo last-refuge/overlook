@@ -56,23 +56,39 @@ fn path_id(path: &Path) -> ProviderId {
     ProviderId(path.to_string_lossy().into_owned())
 }
 
-/// The folder (label) a message is filed in.
-fn folder_of<'a>(place: &MessagePlace, labels: &'a [Label]) -> Option<&'a Label> {
-    place.label_ids.iter().find_map(|id| labels.iter().find(|l| &l.id == id))
+/// O(1) lookup index over an account's offline folder labels.
+struct LabelIndex<'a> {
+    by_id: HashMap<&'a LabelId, &'a Label>,
+    roots_by_name: HashMap<&'a str, &'a Label>,
 }
 
-/// Writes the manifest of top-level folder `root` from what the store knows.
-fn write_manifest(root: &Label, labels: &[Label], places: &[MessagePlace]) -> std::io::Result<()> {
+impl<'a> LabelIndex<'a> {
+    fn new(labels: &'a [Label]) -> Self {
+        let by_id = labels.iter().map(|l| (&l.id, l)).collect();
+        let roots_by_name = labels.iter().filter(|l| !l.name.contains('/')).map(|l| (l.name.as_str(), l)).collect();
+        Self { by_id, roots_by_name }
+    }
+
+    /// The folder (label) a message is filed in.
+    fn folder_of(&self, place: &MessagePlace) -> Option<&'a Label> {
+        place.label_ids.iter().find_map(|id| self.by_id.get(id).copied())
+    }
+
+    /// The top-level folder `label` is in (itself, at the top).
+    fn root_of(&self, label: &Label) -> Option<&'a Label> {
+        let top = label.name.split('/').next().unwrap_or(&label.name);
+        self.roots_by_name.get(top).copied()
+    }
+}
+
+/// Writes the manifest of top-level folder `root` from the messages belonging to it.
+fn write_manifest_for_root(root: &Label, places: &[&MessagePlace]) -> std::io::Result<()> {
     let Some(dir) = local::dir_of(root) else { return Ok(()) };
     if !dir.is_dir() {
         return Ok(());
     }
     let mut manifest = Manifest { version: 1, ..Default::default() };
     for place in places {
-        let Some(folder) = folder_of(place, labels) else { continue };
-        if local::root_of(folder, labels).map(|r| &r.id) != Some(&root.id) {
-            continue;
-        }
         let Some(rel) = place.provider_id.as_ref().and_then(|p| local::relative(&dir, Path::new(&p.0))) else { continue };
         manifest.messages.insert(rel, Kept { id: place.id.0.clone(), conversation: place.conversation_id.0.clone(), read: place.is_read, starred: place.is_starred });
     }
@@ -89,10 +105,11 @@ fn write_manifest(root: &Label, labels: &[Label], places: &[MessagePlace]) -> st
 pub fn reconcile(store: &Store, offline: &AccountId, legacy_dir: &Path, doomed: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
     let _files = lock();
     let labels = store.labels(offline).map_err(|e| e.to_string())?;
+    let index = LabelIndex::new(&labels);
     let mut places = store.message_places(offline).map_err(|e| e.to_string())?;
     let mut moved: Vec<(MessageId, Option<ProviderId>)> = Vec::new();
     for place in places.iter_mut() {
-        let Some(dir) = folder_of(place, &labels).and_then(local::dir_of) else { continue };
+        let Some(dir) = index.folder_of(place).and_then(local::dir_of) else { continue };
         if !dir.is_dir() {
             continue;
         }
@@ -140,8 +157,15 @@ pub fn reconcile(store: &Store, offline: &AccountId, legacy_dir: &Path, doomed: 
             }
         }
     }
+    let mut by_root: HashMap<&LabelId, Vec<&MessagePlace>> = HashMap::new();
+    for place in &places {
+        if let Some(root) = index.folder_of(place).and_then(|f| index.root_of(f)) {
+            by_root.entry(&root.id).or_default().push(place);
+        }
+    }
     for root in labels.iter().filter(|l| !l.name.contains('/')) {
-        if let Err(e) = write_manifest(root, &labels, &places) {
+        let root_places = by_root.get(&root.id).map(Vec::as_slice).unwrap_or(&[]);
+        if let Err(e) = write_manifest_for_root(root, root_places) {
             tracing::warn!("offline folders: could not save the state of “{}”: {e}", root.name);
         }
     }
@@ -279,17 +303,22 @@ pub fn save_before_disconnect(store: &Store, offline: &AccountId, root: &Label) 
     reconcile(store, offline, &crate::providers::offline_dir(), &[])?;
     let _files = lock();
     let labels = store.labels(offline).map_err(|e| e.to_string())?;
+    let index = LabelIndex::new(&labels);
     let places = store.message_places(offline).map_err(|e| e.to_string())?;
     let dir = local::dir_of(root).ok_or_else(|| "this folder has no place on disk".to_owned())?;
     let mut unsaved = 0;
     let mut strays = 0;
+    let mut root_places = Vec::new();
     for place in &places {
         let file = place.provider_id.as_ref().map(|p| PathBuf::from(&p.0)).filter(|p| p.is_absolute());
-        let mine = folder_of(place, &labels).and_then(|f| local::root_of(f, &labels)).is_some_and(|r| r.id == root.id);
+        let mine = index.folder_of(place).and_then(|f| index.root_of(f)).is_some_and(|r| r.id == root.id);
         let here = file.as_ref().is_some_and(|f| f.starts_with(&dir));
-        if mine && !(here && file.as_ref().is_some_and(|f| f.is_file())) {
-            unsaved += 1;
-        } else if !mine && here {
+        if mine {
+            if !(here && file.as_ref().is_some_and(|f| f.is_file())) {
+                unsaved += 1;
+            }
+            root_places.push(place);
+        } else if here {
             strays += 1;
         }
     }
@@ -299,7 +328,7 @@ pub fn save_before_disconnect(store: &Store, offline: &AccountId, root: &Label) 
     if strays > 0 {
         return Err(format!("{} moved out of it {} still on disk in {}. Try again once {} been moved.", messages_phrase(strays), if strays == 1 { "is" } else { "are" }, shown_path(&dir), if strays == 1 { "it has" } else { "they have" }));
     }
-    write_manifest(root, &labels, &places).map_err(|e| e.to_string())
+    write_manifest_for_root(root, &root_places).map_err(|e| e.to_string())
 }
 
 fn messages_phrase(n: usize) -> String {
@@ -319,39 +348,26 @@ pub struct Opened {
 /// computer, or any folder of `.eml` files. Its subdirectories become subfolders. The
 /// manifest, when there is one, restores ids, conversations, and read and starred state.
 pub fn open_folder(store: &Store, offline: &Account, dir: &Path) -> Result<Opened, String> {
-    let _files = lock();
     let dir = dir.canonicalize().map_err(|e| format!("{} can’t be opened: {e}", shown_path(dir)))?;
     if !dir.is_dir() {
         return Err(format!("{} is not a folder.", shown_path(&dir)));
     }
-    let mut labels = store.labels(&offline.id).map_err(|e| e.to_string())?;
-    if overlaps_open(&dir, &labels) {
-        return Err(format!("{} is already open in Overlook, or inside or around a folder that is.", shown_path(&dir)));
+    {
+        let _files = lock();
+        let existing = store.labels(&offline.id).map_err(|e| e.to_string())?;
+        if overlaps_open(&dir, &existing) {
+            return Err(format!("{} is already open in Overlook, or inside or around a folder that is.", shown_path(&dir)));
+        }
     }
+    // Scan and parse .eml files off the global FILES lock so large imports don't stall
+    // unrelated offline folder operations.
     let scanned = local::scan(&dir).map_err(|e| format!("{} can’t be read: {e}", shown_path(&dir)))?;
     let manifest = local::read_manifest(&dir);
 
-    let name = local::opened_name(&dir, &labels);
-    let root = Label { provider_id: Some(path_id(&dir)), ..local::new_folder(&offline.id, &name, None, &labels).map_err(|e| e.to_string())? };
-    labels.push(root.clone());
-    let mut by_rel: HashMap<String, LabelId> = HashMap::new();
-    by_rel.insert(String::new(), root.id.clone());
-    let mut new_labels = vec![root.clone()];
-    for rel in &scanned.folders {
-        let (parent_rel, leaf) = rel.rsplit_once('/').map(|(p, l)| (p.to_owned(), l.to_owned())).unwrap_or((String::new(), rel.clone()));
-        let Some(parent) = by_rel.get(&parent_rel).and_then(|id| labels.iter().find(|l| &l.id == id)).cloned() else { continue };
-        let Ok(mut label) = local::new_folder(&offline.id, &leaf, Some(&parent), &labels) else { continue };
-        label.provider_id = Some(path_id(&dir.join(rel)));
-        by_rel.insert(rel.clone(), label.id.clone());
-        labels.push(label.clone());
-        new_labels.push(label);
-    }
-
-    let mut messages = Vec::new();
+    let mut raw_messages: Vec<(String, Message)> = Vec::new();
     let mut skipped = 0;
     let mut taken: BTreeSet<String> = BTreeSet::new();
     for (rel_dir, path) in &scanned.files {
-        let Some(folder) = by_rel.get(rel_dir) else { skipped += 1; continue };
         let Ok(bytes) = std::fs::read(path) else { skipped += 1; continue };
         let kept = local::relative(&dir, path).and_then(|rel| manifest.messages.get(&rel).cloned());
         // A remembered id is used again unless another message already has it.
@@ -363,7 +379,7 @@ pub fn open_folder(store: &Store, offline: &Account, dir: &Path) -> Result<Opene
         taken.insert(id.0.clone());
         let flags = MessageFlags {
             provider_id: Some(path_id(path)),
-            label_ids: [folder.clone()].into_iter().collect(),
+            label_ids: Default::default(),
             is_read: kept.as_ref().is_none_or(|k| k.read),
             is_starred: kept.as_ref().is_some_and(|k| k.starred),
             received_at: path.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as i64),
@@ -372,18 +388,47 @@ pub fn open_folder(store: &Store, offline: &Account, dir: &Path) -> Result<Opene
         if let Some(conversation) = kept.as_ref().map(|k| k.conversation.clone()).filter(|c| !c.is_empty()) {
             message.conversation_id = ConversationId(conversation);
         }
-        messages.push(message);
+        raw_messages.push((rel_dir.clone(), message));
     }
-    overlook_core::threading::assign_conversations(&mut messages, |_| None);
 
-    for label in &new_labels {
-        store.upsert_label(label).map_err(|e| e.to_string())?;
-    }
-    for chunk in messages.chunks(200) {
-        store.upsert_messages(chunk).map_err(|e| e.to_string())?;
-    }
-    let count = messages.len();
-    drop(_files);
+    let (root, count) = {
+        let _files = lock();
+        let mut labels = store.labels(&offline.id).map_err(|e| e.to_string())?;
+        if overlaps_open(&dir, &labels) {
+            return Err(format!("{} is already open in Overlook, or inside or around a folder that is.", shown_path(&dir)));
+        }
+        let name = local::opened_name(&dir, &labels);
+        let root = Label { provider_id: Some(path_id(&dir)), ..local::new_folder(&offline.id, &name, None, &labels).map_err(|e| e.to_string())? };
+        labels.push(root.clone());
+        let mut by_rel: HashMap<String, LabelId> = HashMap::new();
+        by_rel.insert(String::new(), root.id.clone());
+        let mut new_labels = vec![root.clone()];
+        for rel in &scanned.folders {
+            let (parent_rel, leaf) = rel.rsplit_once('/').map(|(p, l)| (p.to_owned(), l.to_owned())).unwrap_or((String::new(), rel.clone()));
+            let Some(parent) = by_rel.get(&parent_rel).and_then(|id| labels.iter().find(|l| &l.id == id)).cloned() else { continue };
+            let Ok(mut label) = local::new_folder(&offline.id, &leaf, Some(&parent), &labels) else { continue };
+            label.provider_id = Some(path_id(&dir.join(rel)));
+            by_rel.insert(rel.clone(), label.id.clone());
+            labels.push(label.clone());
+            new_labels.push(label);
+        }
+
+        let mut messages = Vec::with_capacity(raw_messages.len());
+        for (rel_dir, mut message) in raw_messages {
+            let Some(folder) = by_rel.get(&rel_dir) else { skipped += 1; continue };
+            message.label_ids.insert(folder.clone());
+            messages.push(message);
+        }
+        overlook_core::threading::assign_conversations(&mut messages, |_| None);
+
+        for label in &new_labels {
+            store.upsert_label(label).map_err(|e| e.to_string())?;
+        }
+        for chunk in messages.chunks(200) {
+            store.upsert_messages(chunk).map_err(|e| e.to_string())?;
+        }
+        (root, messages.len())
+    };
     reconcile(store, &offline.id, &crate::providers::offline_dir(), &[])?;
     Ok(Opened { root, messages: count, skipped })
 }

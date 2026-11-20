@@ -364,8 +364,11 @@ impl CalDavClient {
                         .and_then(|h| h.to_str().ok())
                         .ok_or(CalDavError::InvalidResponse(
                             "The calendar service returned an invalid redirect.",
-                        ))?;
-                    url = self.resolve(&url, location)?;
+                        ))?
+                        .to_owned();
+                    // Drain any redirect body so ureq can reuse the keep-alive connection.
+                    let _ = response.body_mut().with_config().limit(64 * 1024).read_to_vec();
+                    url = self.resolve(&url, &location)?;
                 }
                 207 => {
                     let bytes = response

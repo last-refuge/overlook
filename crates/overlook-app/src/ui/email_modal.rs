@@ -284,7 +284,7 @@ impl MailWindow {
                             .update(cx, |this, cx| {
                                 this.message_windows
                                     .retain(|m| m.window.window_id() != closed);
-                                this.reload(cx);
+                                this.reload_mail(cx);
                             })
                             .ok();
                     }

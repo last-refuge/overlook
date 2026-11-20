@@ -36,9 +36,13 @@ fn move_queued_edits_tx(tx: &Connection, account: &AccountId, local_id: &str, se
     drop(stmt);
     let mut deleted = false;
     for (id, json) in ops {
-        let moved = match serde_json::from_str::<OperationKind>(&json) {
-            Ok(OperationKind::CreateContact { contact_id } | OperationKind::UpdateContact { contact_id }) if contact_id == local_id => OperationKind::UpdateContact { contact_id: server_id.to_owned() },
-            Ok(OperationKind::DeleteContact { contact_id, .. }) if contact_id == local_id => {
+        let kind: OperationKind = serde_json::from_str(&json).map_err(|e| {
+            tracing::warn!(account = %account.0, op_id = %id, error = %e, "unparseable pending_operations.kind_json in move_queued_edits_tx");
+            e
+        })?;
+        let moved = match kind {
+            OperationKind::CreateContact { contact_id } | OperationKind::UpdateContact { contact_id } if contact_id == local_id => OperationKind::UpdateContact { contact_id: server_id.to_owned() },
+            OperationKind::DeleteContact { contact_id, .. } if contact_id == local_id => {
                 deleted = true;
                 OperationKind::DeleteContact { contact_id: server_id.to_owned(), resource_name: Some(server_id.to_owned()) }
             }
@@ -59,11 +63,11 @@ fn to_card(row: (String, String, String, String, String)) -> Result<ContactCard>
 }
 
 fn upsert_card_tx(tx: &Connection, account: &AccountId, card: &ContactCard) -> Result<()> {
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO contact_cards(account_id, contact_id, address_book, url, etag, base_json) VALUES(?1,?2,?3,?4,?5,?6)
          ON CONFLICT(account_id, contact_id) DO UPDATE SET address_book=excluded.address_book, url=excluded.url, etag=excluded.etag, base_json=excluded.base_json",
-        params![account.0, card.contact_id, card.address_book, card.url, card.etag, serde_json::to_string(&card.base)?],
-    )?;
+    )?
+    .execute(params![account.0, card.contact_id, card.address_book, card.url, card.etag, serde_json::to_string(&card.base)?])?;
     Ok(())
 }
 
@@ -72,11 +76,17 @@ fn upsert_card_tx(tx: &Connection, account: &AccountId, card: &ContactCard) -> R
 fn queued_contact_ids(tx: &Connection, account: &AccountId) -> Result<HashSet<String>> {
     let mut stmt = tx.prepare("SELECT kind_json FROM pending_operations WHERE account_id=?1 AND state NOT IN ('applied', 'failed')")?;
     let kinds = stmt.query_map([&account.0], |r| r.get::<_, String>(0))?.collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(kinds
-        .iter()
-        .filter_map(|json| serde_json::from_str::<OperationKind>(json).ok())
-        .filter_map(|kind| kind.contact_id().map(str::to_owned))
-        .collect())
+    let mut out = HashSet::new();
+    for json in &kinds {
+        let kind: OperationKind = serde_json::from_str(json).map_err(|e| {
+            tracing::warn!(account = %account.0, error = %e, "unparseable pending_operations.kind_json in queued_contact_ids");
+            e
+        })?;
+        if let Some(id) = kind.contact_id() {
+            out.insert(id.to_owned());
+        }
+    }
+    Ok(out)
 }
 
 impl Store {
@@ -97,14 +107,44 @@ impl Store {
     }
 
     /// Saves a connection the person agreed to. Saving it again keeps the cards already read
-    /// and the time it was first made.
+    /// and the time it was first made. Each new connection after a disconnect receives a
+    /// strictly greater monotonic `generation` and `created_at` so rapid disconnect/reconnect
+    /// or backward clock skew can never collide with an older sync.
     pub fn save_contacts_connection(&self, connection: &ContactsConnection) -> Result<()> {
-        self.with_conn(|c| {
-            c.execute(
-                "INSERT INTO contact_connections(account_id, server_url, username, default_book, credential, created_at) VALUES(?1,?2,?3,?4,?5,?6)
-                 ON CONFLICT(account_id) DO UPDATE SET server_url=excluded.server_url, username=excluded.username, default_book=excluded.default_book, credential=excluded.credential",
-                params![connection.account_id.0, connection.server_url, connection.username, connection.default_book, connection.credential.as_key(), now()],
+        let ts = now();
+        self.with_tx(|tx| {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM contact_connections WHERE account_id=?1)",
+                [&connection.account_id.0],
+                |r| r.get(0),
             )?;
+            if exists {
+                tx.execute(
+                    "UPDATE contact_connections SET server_url=?2, username=?3, default_book=?4, credential=?5 WHERE account_id=?1",
+                    params![connection.account_id.0, connection.server_url, connection.username, connection.default_book, connection.credential.as_key()],
+                )?;
+            } else {
+                let prev: Option<(i64, Timestamp)> = tx
+                    .query_row(
+                        "SELECT generation, last_connected_at FROM contact_connection_generations WHERE account_id=?1",
+                        [&connection.account_id.0],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                let (generation, created_at) = match prev {
+                    Some((prev_gen, prev_ts)) => (prev_gen + 1, ts.max(prev_ts + 1)),
+                    None => (1, ts),
+                };
+                tx.execute(
+                    "INSERT INTO contact_connection_generations(account_id, generation, last_connected_at) VALUES(?1,?2,?3)
+                     ON CONFLICT(account_id) DO UPDATE SET generation=excluded.generation, last_connected_at=excluded.last_connected_at",
+                    params![connection.account_id.0, generation, created_at],
+                )?;
+                tx.execute(
+                    "INSERT INTO contact_connections(account_id, server_url, username, default_book, credential, created_at, generation) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    params![connection.account_id.0, connection.server_url, connection.username, connection.default_book, connection.credential.as_key(), created_at, generation],
+                )?;
+            }
             Ok(())
         })
     }
@@ -131,7 +171,11 @@ impl Store {
             let ops = stmt.query_map([&account.0], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?.collect::<std::result::Result<Vec<_>, _>>()?;
             drop(stmt);
             for (id, json) in ops {
-                if serde_json::from_str::<OperationKind>(&json).ok().and_then(|k| k.contact_id().map(from_server)).unwrap_or(false) {
+                let kind: OperationKind = serde_json::from_str(&json).map_err(|e| {
+                    tracing::warn!(account = %account.0, op_id = %id, error = %e, "unparseable pending_operations.kind_json in remove_contacts_connection");
+                    e
+                })?;
+                if kind.contact_id().is_some_and(from_server) {
                     tx.execute("DELETE FROM pending_operations WHERE id=?1", [&id])?;
                 }
             }
@@ -516,5 +560,61 @@ mod tests {
         store.delete_account(&account).unwrap();
         assert!(store.contacts_connection(&account).unwrap().is_none());
         assert!(store.contact_cards(&account).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rapid_same_ms_reconnect_and_same_ms_edits_never_clobber() {
+        let (store, account) = store();
+        let first = connect(&store, &account);
+        store.remove_contacts_connection(&account).unwrap();
+        // Immediately reconnect with zero sleep: monotonic generation and connected_at still distinguish them.
+        let second = connect(&store, &account);
+        assert!(second.connected_at > first.connected_at, "same-ms reconnect must produce strictly greater connected_at");
+        let gen: i64 = store
+            .with_read(|c| Ok(c.query_row("SELECT generation FROM contact_connections WHERE account_id=?1", [&account.0], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(gen, 2);
+        // Old connection's download must be ignored.
+        store.apply_contact_download(&first, &[card(&account, 1, "Stale")]).unwrap();
+        assert!(store.contact_cards(&account).unwrap().is_empty());
+
+        // Rapid same-ms local edits without sleep must strictly advance updated & edit_revision.
+        store.apply_contact_download(&second, &[card(&account, 1, "Maya")]).unwrap();
+        let mut edit1 = store.contact_by_id(&account, &card(&account, 1, "").contact_id).unwrap().unwrap();
+        edit1.name = Some("Maya v1".into());
+        store.save_contact_locally(&account, &edit1).unwrap();
+        let sent1 = store.contact_by_id(&account, &edit1.id).unwrap().unwrap().updated;
+
+        let mut edit2 = store.contact_by_id(&account, &edit1.id).unwrap().unwrap();
+        edit2.name = Some("Maya v2".into());
+        store.save_contact_locally(&account, &edit2).unwrap();
+        let after2 = store.contact_by_id(&account, &edit1.id).unwrap().unwrap();
+        assert!(after2.updated > sent1, "same-ms edit must have strictly greater updated timestamp");
+        let rev: i64 = store
+            .with_read(|c| Ok(c.query_row("SELECT edit_revision FROM people WHERE account_id=?1 AND id=?2", params![account.0, edit1.id], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(rev, 2);
+
+        // Server reply for edit1 arrives: must NOT clobber edit2.
+        store.save_synced_contact(&second, &edit1.id, sent1, &card(&account, 1, "Maya v1")).unwrap();
+        let shown = store.contact_by_id(&account, &edit1.id).unwrap().unwrap();
+        assert_eq!((shown.name.as_deref(), shown.pending), (Some("Maya v2"), true));
+    }
+
+    #[test]
+    fn corrupt_pending_operation_json_is_not_silently_skipped_by_contact_sync() {
+        let (store, account) = store();
+        let conn = connect(&store, &account);
+        store
+            .with_tx(|tx| {
+                tx.execute(
+                    "INSERT INTO pending_operations(id, account_id, seq, kind_json, state, created_at, updated_at) VALUES('bad-op', ?1, 1, '{not-json', 'pending', 1, 1)",
+                    [&account.0],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.apply_contact_download(&conn, &[card(&account, 1, "Maya")]).is_err());
+        assert!(store.remove_contacts_connection(&account).is_err());
     }
 }

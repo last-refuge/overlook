@@ -97,6 +97,8 @@ impl CalDavClient {
             String::from_utf8(bytes)
                 .map_err(|_| CalDavError::InvalidResponse("The calendar resource is not UTF-8."))?
         } else {
+            // Drain any response body so ureq can return the connection to its keep-alive pool.
+            let _ = response.body_mut().with_config().limit(64 * 1024).read_to_vec();
             String::new()
         };
         Ok((status, etag, data))

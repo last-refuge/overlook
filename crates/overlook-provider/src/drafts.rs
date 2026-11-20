@@ -24,9 +24,10 @@ pub fn import(
     let parsed = mail_parser::MessageParser::default()
         .parse(raw)
         .ok_or_else(|| ProviderError::Rejected("Could not read a server draft".into()))?;
-    let message = mime::message_from_rfc822(
+    let message = mime::parse::message_from_parsed(
         account,
         raw,
+        Some(&parsed),
         MessageId::generate(),
         &mime::MessageFlags::default(),
     );
@@ -75,7 +76,7 @@ pub fn import(
             .provider_id
             .as_ref()
             .ok_or_else(|| ProviderError::Rejected("A draft attachment has no MIME part".into()))?;
-        let bytes = mime::part_bytes(raw, &section.0)
+        let bytes = mime::parse::part_bytes_from_parsed(&parsed, &section.0)
             .ok_or_else(|| ProviderError::Rejected("Could not read a draft attachment".into()))?;
         total = total.saturating_add(bytes.len() as u64);
         if !overlook_core::attachment_policy::within_size_limit(total) {
@@ -213,5 +214,34 @@ mod tests {
                 Address::new(None, "unfinished")
             ]
         );
+    }
+
+    #[test]
+    fn import_extracts_multiple_attachments_from_single_parse_and_compares_content() {
+        let account = Account {
+            id: AccountId::from("a"),
+            provider: ProviderKind::Gmail,
+            display_name: "Test".into(),
+            email: "me@example.com".into(),
+            created_at: 0,
+        };
+        let remote = RemoteDraft {
+            id: ProviderId::from("d1"),
+            revision: "r1".into(),
+            thread_id: Some("t1".into()),
+        };
+        let raw = b"From: me@example.com\r\nTo: friend@example.com\r\nSubject: Multi\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"bnd\"\r\n\r\n--bnd\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nHello draft.\r\n--bnd\r\nContent-Type: application/pdf; name=\"a.pdf\"\r\nContent-Disposition: attachment; filename=\"a.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\nJVBERi0xLjQK\r\n--bnd\r\nContent-Type: text/plain; name=\"b.txt\"\r\nContent-Disposition: attachment; filename=\"b.txt\"\r\n\r\nsecond file\r\n--bnd--\r\n";
+        let imported = import(&account, &remote, raw).unwrap();
+        assert_eq!(imported.draft.subject, "Multi");
+        assert_eq!(imported.draft.body_text.trim(), "Hello draft.");
+        assert_eq!(imported.draft.attachments.len(), 2);
+        assert_eq!(imported.files.len(), 2);
+        assert_eq!(imported.files[0], b"%PDF-1.4\n");
+        assert_eq!(imported.files[1], b"second file");
+        assert!(same_content(raw, raw).unwrap());
+        let edited = raw.to_vec();
+        let mut modified = String::from_utf8(edited).unwrap().replace("Hello draft.", "Changed.");
+        assert!(!same_content(raw, modified.as_bytes()).unwrap());
+        modified.clear();
     }
 }

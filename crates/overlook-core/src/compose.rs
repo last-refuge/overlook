@@ -155,6 +155,9 @@ fn emphasis_closes(rest: &str) -> bool {
 
 /// `[text](url)` at the start of `s`: (text, url, consumed length).
 pub fn parse_link(s: &str) -> Option<(&str, &str, usize)> {
+    if !s.starts_with('[') {
+        return None;
+    }
     let close = s.find("](")?;
     let text = &s[1..close];
     if text.contains('[') || text.contains('\n') {
@@ -237,14 +240,7 @@ pub fn outgoing_bodies_with_font(
         DraftKind::Forward => {
             let header = forward_header(source);
             text = format!("{text}\n\n{header}\n\n{source_text}");
-            let header_html = header
-                .lines()
-                .map(|l| match l.split_once(": ") {
-                    Some((k, v)) if !l.starts_with('-') => format!("<b>{}:</b> {}", escape_html(k), escape_html(v)),
-                    _ => escape_html(l),
-                })
-                .collect::<Vec<_>>()
-                .join("<br>");
+            let header_html = format_forward_header_html(&header);
             html = format!("{html}<br><div class=\"overlook_forward\"><p>{header_html}</p>{source_html}</div>");
         }
         _ => {
@@ -259,21 +255,74 @@ pub fn outgoing_bodies_with_font(
     OutgoingBodies { text, html }
 }
 
+fn format_forward_header_html(header: &str) -> String {
+    header
+        .lines()
+        .map(|l| match l.split_once(": ") {
+            Some((k, v)) if !l.starts_with('-') => format!("<b>{}:</b> {}", escape_html(k), escape_html(v)),
+            _ => escape_html(l),
+        })
+        .collect::<Vec<_>>()
+        .join("<br>")
+}
+
+fn quoted_html_with_policy(source: &Message, policy: RemoteContent) -> String {
+    match (&source.body.html, &source.body.text) {
+        (Some(h), _) => clean_only(h, policy),
+        (None, Some(t)) => clean_only(&text_to_html(t), policy),
+        (None, None) => clean_only(&text_to_html(&source.snippet), policy),
+    }
+}
+
 /// Local quote previews enforce resource consent independently of the outgoing
 /// serialization. Keep the full visible history, rather than folding it for display.
 pub fn quote_preview(draft: &Draft, source: &Message, policy: RemoteContent) -> String {
-    outgoing_preview(&Draft { body_text: String::new(), signature_html: None, ..draft.clone() }, Some(source), policy)
+    if !draft.include_quote {
+        return String::new();
+    }
+    history_preview(draft, source, policy)
 }
 
 /// Read the original history even after it was excluded from the outgoing message.
 /// Visibility is a display choice; it never changes the draft's quote setting.
 pub fn history_preview(draft: &Draft, source: &Message, policy: RemoteContent) -> String {
-    quote_preview(&Draft { include_quote: true, ..draft.clone() }, source, policy)
+    let source_html = quoted_html_with_policy(source, policy);
+    match draft.kind {
+        DraftKind::Forward => {
+            let header = forward_header(source);
+            let header_html = format_forward_header_html(&header);
+            format!("<br><div><p>{header_html}</p>{source_html}</div>")
+        }
+        _ => {
+            let header = quote_header(source);
+            format!(
+                "<br><div><p>{}</p><blockquote>{source_html}</blockquote></div>",
+                escape_html(&header)
+            )
+        }
+    }
 }
 
 /// Preview a draft (including Outbox items) without bypassing local image consent.
 pub fn outgoing_preview(draft: &Draft, source: Option<&Message>, policy: RemoteContent) -> String {
-    clean_only(&outgoing_bodies(draft, source).html, policy)
+    let original = draft.imported.as_ref().filter(|s| s.text == draft.body_text);
+    let mut html = original.map_or_else(
+        || clean_only(&render_markdown(&draft.body_text), policy),
+        |s| {
+            s.html
+                .as_deref()
+                .map(|h| clean_only(h, policy))
+                .unwrap_or_else(|| clean_only(&text_to_html(&s.text), policy))
+        },
+    );
+    if let Some(signature) = draft.signature_html.as_deref().filter(|s| !s.trim().is_empty()) {
+        let signature = clean_only(signature, policy);
+        html = format!("{html}<br><div>{signature}</div>");
+    }
+    if let Some(source) = source.filter(|_| draft.include_quote) {
+        html.push_str(&history_preview(draft, source, policy));
+    }
+    html
 }
 
 #[cfg(test)]
@@ -518,5 +567,52 @@ mod tests {
         assert!(out.html.contains("font-size: 17px;"));
         assert!(out.html.contains("<strong>world</strong>"));
         assert_eq!(out.text, "Hello world");
+    }
+
+    #[test]
+    fn parse_link_requires_leading_bracket_without_panicking() {
+        assert_eq!(parse_link(""), None);
+        assert_eq!(parse_link("](https://example.com)"), None);
+        assert_eq!(parse_link("é](https://example.com)"), None);
+        assert_eq!(parse_link("text](https://example.com)"), None);
+        assert_eq!(
+            parse_link("[docs](https://example.com) tail"),
+            Some(("docs", "https://example.com", 27))
+        );
+    }
+
+    #[test]
+    fn preview_helpers_match_cleaned_outgoing_html_without_extra_clones() {
+        let src = message_with_body(
+            "<p>Hello</p><img src='https://images.example/pic.png'><div style='display:none'>secret</div>",
+        );
+        for kind in [DraftKind::Reply, DraftKind::ReplyAll, DraftKind::Forward] {
+            for policy in [RemoteContent::Blocked, RemoteContent::Allowed] {
+                let mut draft = Draft::new(AccountId::from("a"), kind, 0);
+                draft.body_text = "My **note**".into();
+                draft.signature_html = Some("<p>Sig</p><img src='https://images.example/sig.png'>".into());
+                draft.include_quote = true;
+                assert_eq!(
+                    outgoing_preview(&draft, Some(&src), policy),
+                    clean_only(&outgoing_bodies(&draft, Some(&src)).html, policy)
+                );
+                let quote_only_draft = Draft {
+                    body_text: String::new(),
+                    signature_html: None,
+                    include_quote: true,
+                    ..draft.clone()
+                };
+                assert_eq!(
+                    history_preview(&draft, &src, policy),
+                    clean_only(&outgoing_bodies(&quote_only_draft, Some(&src)).html, policy)
+                );
+                assert_eq!(
+                    quote_preview(&draft, &src, policy),
+                    history_preview(&draft, &src, policy)
+                );
+                draft.include_quote = false;
+                assert_eq!(quote_preview(&draft, &src, policy), "");
+            }
+        }
     }
 }

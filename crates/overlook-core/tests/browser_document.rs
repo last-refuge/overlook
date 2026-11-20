@@ -374,3 +374,11 @@ fn body_styles_cannot_escape_into_markup() {
         .contains("&lt;script&gt;literal&lt;/script&gt;"));
     assert!(prepared.html.contains("padding: 9px"));
 }
+
+#[test]
+fn frameset_document_without_body_returns_inert_error_instead_of_panicking() {
+    let prepared = prepare_document(
+        "<html><frameset cols=\"50%,50%\"><frame src=\"https://example.test/a\"><frame src=\"https://example.test/b\"></frameset></html>",
+    );
+    assert_inert_error(&prepared);
+}
