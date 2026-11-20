@@ -27,6 +27,7 @@ struct Inner {
     counter: AtomicU64,
     /// Message-IDs the "server" has accepted, for reconciliation.
     accepted: Mutex<HashSet<String>>,
+    complete_send_history: bool,
     applied_ops: Mutex<Vec<OperationId>>,
     /// Calendar events created or changed through the provider in this session.
     event_overrides: Mutex<Vec<Event>>,
@@ -50,6 +51,7 @@ impl SampleProvider {
                 latency: Duration::from_millis(350),
                 counter: AtomicU64::new(1),
                 accepted: Mutex::new(HashSet::new()),
+                complete_send_history: true,
                 applied_ops: Mutex::new(Vec::new()),
                 event_overrides: Mutex::new(Vec::new()),
                 deleted_events: Mutex::new(HashSet::new()),
@@ -61,6 +63,13 @@ impl SampleProvider {
 
     pub fn with_latency(mut self, latency: Duration) -> Self {
         Arc::get_mut(&mut self.inner).expect("unshared").latency = latency;
+        self
+    }
+
+    /// A freshly opened sample provider cannot rule out a submission from an
+    /// earlier process when its local draft and queue have been persisted.
+    pub fn with_incomplete_send_history(mut self) -> Self {
+        Arc::get_mut(&mut self.inner).expect("unshared").complete_send_history = false;
         self
     }
 
@@ -286,8 +295,10 @@ impl MailProvider for SampleProvider {
             let rfc_id = format!("<{}@overlook.sample>", draft.id);
             if self.inner.accepted.lock().unwrap().contains(&rfc_id) {
                 Ok(SendOutcome::Delivered(ProviderId(format!("sent-{}", DraftId::generate()))))
-            } else {
+            } else if self.inner.complete_send_history {
                 Ok(SendOutcome::NotDelivered)
+            } else {
+                Ok(SendOutcome::Unknown)
             }
         })
     }
@@ -772,6 +783,9 @@ mod tests {
         p.drop_next_send();
         assert_eq!(block_on(p.send(&account(), &draft, SendContext::default())).err(), Some(ProviderError::Uncertain));
         assert!(matches!(block_on(p.reconcile_send(&account(), &draft)), Ok(SendOutcome::Delivered(_))));
+        let reopened = SampleProvider::new().with_latency(Duration::ZERO).with_incomplete_send_history();
+        reopened.set_online(true);
+        assert_eq!(block_on(reopened.reconcile_send(&account(), &draft)), Ok(SendOutcome::Unknown));
         let other = Draft::new(AccountId::from("sample"), DraftKind::New, 0);
         assert_eq!(block_on(p.reconcile_send(&account(), &other)), Ok(SendOutcome::NotDelivered));
     }

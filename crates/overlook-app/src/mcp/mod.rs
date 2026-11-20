@@ -199,6 +199,11 @@ fn serve_sample(profile: &Path, online: bool) -> Result<()> {
         store.set_setting("mcp_sample_initialized", &true)?;
     }
     let sample = SampleProvider::new().with_latency(std::time::Duration::ZERO);
+    let sample = if initialized {
+        sample.with_incomplete_send_history()
+    } else {
+        sample
+    };
     sample.set_online(online);
     let _server = service::start(profile, store.clone(), sample.clone())?;
     if online && initialized {

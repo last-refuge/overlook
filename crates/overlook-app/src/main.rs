@@ -347,7 +347,7 @@ fn main() {
     if let Some(link) = mailto {
         single_instance::push(link);
     }
-    let provider = SampleProvider::new();
+    let provider = SampleProvider::new().with_incomplete_send_history();
     // The sample account's connection is simulated. Start it connected when asked, so a
     // restart-while-offline test can be followed by a reconnect at launch.
     if std::env::var("OVERLOOK_SAMPLE_ONLINE").is_ok_and(|v| v == "1") {
