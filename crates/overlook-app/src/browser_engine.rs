@@ -250,13 +250,13 @@ fn chromium_executable() -> Option<PathBuf> {
 }
 
 impl BrowserHandle {
-    pub fn new(html: String, allow_remote: bool, dark: bool) -> Self {
-        Self::new_sized(html, allow_remote, dark, None)
+    pub fn new(html: String, allow_remote: bool, dark_paper: Option<u32>) -> Self {
+        Self::new_sized(html, allow_remote, dark_paper, None)
     }
 
     /// Like [`Self::new`], laid out from the start at `size` (CSS width, device scale) so
     /// the first tiles are not a throwaway render at a default width.
-    pub fn new_sized(html: String, allow_remote: bool, dark: bool, size: Option<(u32, f64)>) -> Self {
+    pub fn new_sized(html: String, allow_remote: bool, dark_paper: Option<u32>, size: Option<(u32, f64)>) -> Self {
         let warm = if html.len() > MAX_HTML { None } else { take_warm() };
         let inner = Arc::new(Inner {
             commands: Mutex::new(VecDeque::new()),
@@ -319,7 +319,7 @@ impl BrowserHandle {
                         actor.width = width.clamp(1, 2048);
                         actor.scale = if scale.is_finite() { scale.clamp(0.5, 2.0) } else { 1.0 };
                     }
-                    actor.load(&html, dark)?;
+                    actor.load(&html, dark_paper)?;
                     actor.cdp.call("Page.stopScreencast", json!({}))?;
                     actor.refresh_layout(&emit)?;
                     let mut layout_dirty = false;
@@ -883,6 +883,7 @@ impl Drop for ResourceWorkers {
 struct Actor {
     cdp: Cdp,
     allow_remote: bool,
+    dark: bool,
     agent: ureq::Agent,
     resources: ResourceWorkers,
     resource_pending: usize,
@@ -956,6 +957,7 @@ impl Actor {
         Ok(Self {
             cdp,
             allow_remote,
+            dark: false,
             resources: ResourceWorkers::new(agent.clone(), stop),
             resource_pending: 0,
             agent,
@@ -976,13 +978,14 @@ impl Actor {
             resource_error_reported: false,
         })
     }
-    fn load(&mut self, html: &str, dark: bool) -> Result<()> {
+    fn load(&mut self, html: &str, dark_paper: Option<u32>) -> Result<()> {
+        self.dark = dark_paper.is_some();
         self.metrics()?;
         self.cdp.call(
             "Emulation.setAutoDarkModeOverride",
-            json!({"enabled": dark}),
+            json!({"enabled": self.dark}),
         )?;
-        self.cdp.call("Emulation.setEmulatedMedia", json!({"features": [{"name":"prefers-color-scheme", "value": if dark { "dark" } else { "light" }}]}))?;
+        self.cdp.call("Emulation.setEmulatedMedia", json!({"features": [{"name":"prefers-color-scheme", "value": if self.dark { "dark" } else { "light" }}]}))?;
         let tree = self.cdp.call("Page.getFrameTree", json!({}))?;
         let frame = tree["frameTree"]["frame"]["id"]
             .as_str()
@@ -991,8 +994,9 @@ impl Actor {
         // inert tree; remove navigation/embedding surfaces before installing it.
         let policy = "default-src 'none'; script-src 'none'; style-src 'unsafe-inline' data: http: https:; img-src data: http: https:; font-src data: http: https:; frame-src 'none'; child-src 'none'; object-src 'none'; connect-src 'none'; form-action 'none'; base-uri 'none'; media-src 'none'";
         self.cdp.call("Page.setDocumentContent", json!({"frameId":frame,"html":format!("<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\" content=\"{policy}\"></head><body></body></html>")}))?;
-        let args = serde_json::to_string(&json!([html, dark])).unwrap();
-        self.cdp.eval(format!(r#"(([html,dark]) => {{
+        let paper = dark_paper.map(|rgb| format!("#{:06x}", rgb & 0xFFFFFF));
+        let args = serde_json::to_string(&json!([html, paper])).unwrap();
+        self.cdp.eval(format!(r#"(([html,paper]) => {{
             const p = new DOMParser().parseFromString(html, 'text/html');
             p.querySelectorAll('script,iframe,frame,frameset,object,embed,applet,base,meta,portal,fencedframe,template,foreignObject,animate,animateMotion,animateTransform,set,mpath,discard').forEach(e=>e.remove());
             p.querySelectorAll('link').forEach(e=>{{if(e.rel.toLowerCase()!=='stylesheet')e.remove()}});
@@ -1021,6 +1025,34 @@ impl Actor {
             const style=document.createElement('style');
             style.textContent='html{{overflow:auto!important;scrollbar-width:none!important}} html::-webkit-scrollbar{{display:none!important;width:0!important;height:0!important}} body{{overflow:visible!important;overflow-wrap:anywhere}} *,*::before,*::after{{animation:none!important;transition:none!important;caret-color:transparent!important}}';
             document.head.append(style);
+            globalThis.overlookApplyDarkPaper = undefined;
+            if (paper !== null) {{
+                const originals = new Map();
+                globalThis.overlookApplyDarkPaper = () => {{
+                    // Re-read the sender's styles when the pane crosses a media-query
+                    // breakpoint. Read all computed colors before writing any overrides.
+                    for (const [node, inline] of originals) {{
+                        if (inline === null) node.removeAttribute('style');
+                        else node.setAttribute('style', inline);
+                    }}
+                    originals.clear();
+                    for (const node of document.querySelectorAll('html, body, body *')) {{
+                        if (!(node instanceof HTMLElement)) continue;
+                        const computed = getComputedStyle(node);
+                        if (computed.backgroundImage !== 'none') continue;
+                        const rgb = /^rgb\((\d+), (\d+), (\d+)\)$/.exec(computed.backgroundColor);
+                        const max = rgb ? Math.max(rgb[1], rgb[2], rgb[3]) : 0;
+                        const min = rgb ? Math.min(rgb[1], rgb[2], rgb[3]) : 0;
+                        // Chrome paints white sections nearly black. Match neutral paper
+                        // fills to the shell while leaving colored sections and images alone.
+                        const neutralPaper = rgb && max - min <= 12 && (min >= 232 || max <= 24);
+                        const clearRoot = node === document.documentElement && computed.backgroundColor === 'rgba(0, 0, 0, 0)';
+                        if (neutralPaper || clearRoot) originals.set(node, node.getAttribute('style'));
+                    }}
+                    for (const node of originals.keys()) node.style.setProperty('background-color', paper, 'important');
+                }};
+                globalThis.overlookApplyDarkPaper();
+            }}
             return true;
         }})({args})"#))?;
         self.pump()?;
@@ -1155,6 +1187,8 @@ impl Actor {
                 }
             }
             Input::Resize(w, _h, s) => {
+                let previous_width = self.width;
+                let previous_scale = self.scale;
                 self.width = w.clamp(1, 2048);
                 self.cap = 900;
                 self.scale = if s.is_finite() {
@@ -1164,6 +1198,9 @@ impl Actor {
                 };
                 self.height = 900;
                 self.metrics()?;
+                if self.dark && (self.width != previous_width || self.scale != previous_scale) {
+                    self.cdp.eval("globalThis.overlookApplyDarkPaper()".into())?;
+                }
             }
             Input::Mouse(kind, x, y, button, buttons, count) => {
                 if !x.is_finite()
@@ -1591,7 +1628,7 @@ mod cancelled_resource_tests {
     fn browser_private_runtime_avoids_tmp_quota_and_long_socket_paths() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let mut actor = Actor::start(Arc::new(AtomicBool::new(false)), false).unwrap();
-        actor.load("<p>Fictional private runtime</p>", false).unwrap();
+        actor.load("<p>Fictional private runtime</p>", None).unwrap();
         let profile = actor.cdp.profile.path().to_path_buf();
         #[cfg(target_os = "linux")]
         assert_eq!(profile.parent(), Some(std::path::Path::new("/dev/shm")));
@@ -1612,7 +1649,7 @@ mod cancelled_resource_tests {
     #[ignore = "runs real sandboxed Chromium"]
     fn browser_cancelled_resource_does_not_destroy_rendered_document() {
         let mut actor = Actor::start(Arc::new(AtomicBool::new(false)), false).unwrap();
-        actor.load("<p>Fictional retained message</p>", false).unwrap();
+        actor.load("<p>Fictional retained message</p>", None).unwrap();
         actor.cdp.call("Fetch.failRequest", json!({"requestId":"fictional-obsolete-request","errorReason":"BlockedByClient"})).unwrap();
         actor.cdp.call("Fetch.fulfillRequest", json!({"requestId":"fictional-obsolete-request","responseCode":200,"body":""})).unwrap();
         actor.refresh_layout(&|_| {}).unwrap();
@@ -1690,7 +1727,7 @@ mod tests {
         for &scale in REPRO_SCALES {
             for &height in REPRO_HEIGHTS {
                 let mut actor = Actor::start(Arc::new(AtomicBool::new(false)), false).unwrap();
-                actor.load(&repro_fixed_document(height), false).unwrap();
+                actor.load(&repro_fixed_document(height), None).unwrap();
                 actor.input(Input::Resize(760, 900, scale), &|_| {}).unwrap();
                 actor.cdp.call("Page.stopScreencast", json!({})).unwrap();
                 actor.refresh_layout(&|_| {}).unwrap();
@@ -1761,7 +1798,7 @@ mod tests {
             }
         }
         let doc = repro_outlook_document();
-        let cold = BrowserHandle::new_sized(doc.clone(), false, false, Some((760, 1.25)));
+        let cold = BrowserHandle::new_sized(doc.clone(), false, None, Some((760, 1.25)));
         let cold_time = first_tile(&cold);
         drop(cold);
         prewarm();
@@ -1770,7 +1807,7 @@ mod tests {
             assert!(Instant::now() < deadline, "pool never filled");
             thread::sleep(Duration::from_millis(10));
         }
-        let warm = BrowserHandle::new_sized(doc, false, false, Some((760, 1.25)));
+        let warm = BrowserHandle::new_sized(doc, false, None, Some((760, 1.25)));
         let warm_time = first_tile(&warm);
         eprintln!("first tile: cold {cold_time:?}, warm {warm_time:?}");
         // Leave no process behind for diagnostics that count them.
@@ -1793,7 +1830,7 @@ mod tests {
             let documents = REPRO_HEIGHTS.iter().map(|&h| (format!("height={h}"), repro_fixed_document(h)))
                 .chain(std::iter::once(("Outlook-like CID/data signature + long quote".into(), repro_outlook_document())));
             for (label, html) in documents {
-                let handle = BrowserHandle::new(html, false, false);
+                let handle = BrowserHandle::new(html, false, None);
                 handle.resize(760, 900, scale);
                 handle.visible_range(0, 100_000);
                 let started = Instant::now();
@@ -1841,7 +1878,7 @@ mod tests {
     fn chromium_repro_prepared_inline_image_layout() {
         for &scale in REPRO_SCALES {
             let mut actor = Actor::start(Arc::new(AtomicBool::new(false)), false).unwrap();
-            actor.load(&repro_outlook_document(), false).unwrap();
+            actor.load(&repro_outlook_document(), None).unwrap();
             actor.input(Input::Resize(760, 900, scale), &|_| {}).unwrap();
             actor.refresh_layout(&|_| {}).unwrap();
             let deadline = Instant::now() + Duration::from_secs(1);
@@ -1909,7 +1946,7 @@ mod tests {
                 // Drop all old handles then immediately replace, matching asynchronous GUI teardown.
                 handles.clear();
                 for i in 0..count {
-                    let h = BrowserHandle::new(repro_outlook_document(), false, round % 2 == 1);
+                    let h = BrowserHandle::new(repro_outlook_document(), false, (round % 2 == 1).then_some(0x17242C));
                     h.resize(if i % 2 == 0 { 760 } else { 1200 }, 900, if i % 2 == 0 { 1.25 } else { 2.0 });
                     h.visible_range(0, 1800);
                     handles.push(h);
@@ -1967,7 +2004,7 @@ mod tests {
     fn browser_drag_selection_survives_tile_capture() {
         for (button, top) in [("none", 0), ("left", 0), ("none", 1100), ("left", 1100)] {
             let mut actor = Actor::start(Arc::new(AtomicBool::new(false)), false).unwrap();
-            actor.load(&format!("<style>body{{margin:0;font:20px monospace}}p{{margin:0}}</style><div style='height:{top}px'></div><p>Synthetic selectable text for copying café 日本語</p>"), false).unwrap();
+            actor.load(&format!("<style>body{{margin:0;font:20px monospace}}p{{margin:0}}</style><div style='height:{top}px'></div><p>Synthetic selectable text for copying café 日本語</p>"), None).unwrap();
             actor.input(Input::Resize(800, 900, 1.), &|_| {}).unwrap();
             actor.input(Input::VisibleRange(top, top + 512), &|_| {}).unwrap();
             let y = f64::from(top) + 12.;
@@ -2019,7 +2056,7 @@ mod tests {
                 assert_eq!(mime, "image/png");
                 assert!(image::load_from_memory(&bytes).unwrap().width() > 0);
             }
-            actor.load(&document.html, false).unwrap();
+            actor.load(&document.html, None).unwrap();
             let deadline = Instant::now() + Duration::from_secs(15);
             loop {
                 actor.cdp.poll().unwrap();
@@ -2147,7 +2184,7 @@ mod tests {
             );
             actor.resources = ResourceWorkers::new(agent, stop);
             let started = Instant::now();
-            actor.load("<img id=public src='https://synthetic.example/public'><img id=private src='https://synthetic.example/private'>", false).unwrap();
+            actor.load("<img id=public src='https://synthetic.example/public'><img id=private src='https://synthetic.example/private'>", None).unwrap();
             actor.cdp.poll().unwrap();
             actor.pump().unwrap();
             assert_eq!(actor.cdp.eval("document.images.length".into()).unwrap(), 2);
@@ -2387,7 +2424,7 @@ mod tests {
             .eval("globalThis.untrustedRan || null".into())
             .unwrap()
             .is_null());
-        actor.load(r#"<style>#proof{color:rgb(12, 34, 56);height:1200px}</style><div id=proof>synthetic selectable text</div><script>document.body.dataset.pwned='yes'</script><a href='https://example.org/'>link</a><iframe src='file:///etc/passwd'></iframe>"#, false).unwrap();
+        actor.load(r#"<style>#proof{color:rgb(12, 34, 56);height:1200px}</style><div id=proof>synthetic selectable text</div><script>document.body.dataset.pwned='yes'</script><a href='https://example.org/'>link</a><iframe src='file:///etc/passwd'></iframe>"#, None).unwrap();
         assert_eq!(
             actor
                 .cdp
@@ -2424,7 +2461,7 @@ mod tests {
             .unwrap();
         thread::sleep(Duration::from_millis(150));
         assert_eq!(actor.cdp.eval("scrollY".into()).unwrap(), 0);
-        actor.load("<style>a{display:block;height:30px}</style><a href='https://example.org/'>synthetic link</a><svg><a href='https://example.org/'><set attributeName='href' to='file:///etc/passwd'/></a></svg><link rel=stylesheet href='https://example.invalid/probe.css'>", true).unwrap();
+        actor.load("<style>a{display:block;height:30px}</style><a href='https://example.org/'>synthetic link</a><svg><a href='https://example.org/'><set attributeName='href' to='file:///etc/passwd'/></a></svg><link rel=stylesheet href='https://example.invalid/probe.css'>", Some(0x17242C)).unwrap();
         actor.input(Input::Resize(320, 900, 2.0), &|_| {}).unwrap();
         let (_, w, h) = actor.frame().unwrap();
         assert_eq!(w, 320);
@@ -2484,7 +2521,7 @@ mod tests {
     #[ignore = "runs real sandboxed Chromium"]
     fn chromium_document_tiles_and_interaction() {
         let mut actor = Actor::start(Arc::new(AtomicBool::new(false)), false).unwrap();
-        actor.load("<style>body{margin:0}html{scroll-behavior:smooth}</style><div style='height:1024px;background:red'>Unicode café 日本語 🦀</div><a style='display:block;height:1024px;background:blue' href='https://example.org/deep'>Deep link</a><div style='height:4000px;background:green'></div>", false).unwrap();
+        actor.load("<style>body{margin:0}html{scroll-behavior:smooth}</style><div style='height:1024px;background:red'>Unicode café 日本語 🦀</div><a style='display:block;height:1024px;background:blue' href='https://example.org/deep'>Deep link</a><div style='height:4000px;background:green'></div>", None).unwrap();
         actor.input(Input::Resize(760, 100, 2.0), &|_| {}).unwrap();
         let events = Mutex::new(Vec::new());
         let emit = |e| events.lock().unwrap().push(e);
@@ -2548,7 +2585,7 @@ mod tests {
         actor.input(Input::VisibleRange(0, 100_000), &emit).unwrap();
         while !actor.pending_tiles.is_empty() { actor.capture_next_tile(&emit).unwrap(); }
         assert!(actor.tiles.len() <= 12);
-        actor.load("<style>body{margin:0}</style><div style='height:100px'></div>", false).unwrap();
+        actor.load("<style>body{margin:0}</style><div style='height:100px'></div>", None).unwrap();
         assert_eq!(actor.measure_height().unwrap(), 100);
     }
 
@@ -2565,7 +2602,7 @@ mod tests {
             ("<body bgcolor='#203040' text='#fafafa'><p>Authored legacy attributes</p></body>", [32, 48, 64], "rgb(250, 250, 250)"),
         ] {
             let document = appearance.prepare_document(source, &fonts);
-            actor.load(&document.html, appearance.dark).unwrap();
+            actor.load(&document.html, appearance.dark_paper()).unwrap();
             let (png, _, _) = actor.frame().unwrap();
             let pixels = image::load_from_memory(&png).unwrap().into_rgb8();
             assert_eq!(pixels.get_pixel(400, 50).0, paper, "{source}");
@@ -2575,30 +2612,55 @@ mod tests {
 
     #[test]
     #[ignore = "runs real sandboxed Chromium"]
-    fn chromium_email_paper_can_follow_the_dark_shell_and_switch_back() {
+    fn chromium_email_paper_matches_the_theme_across_message_sections() {
         let fonts = overlook_core::FontPrefs::default();
         let mut actor = Actor::start(Arc::new(AtomicBool::new(false)), false).unwrap();
-        for theme in [overlook_core::ResolvedTheme::Light, overlook_core::ResolvedTheme::Dark, overlook_core::ResolvedTheme::Pink] {
-            let palette = crate::theme::Palette::for_theme(theme);
+        let mut other_dark = crate::theme::Palette::dark();
+        other_dark.surface = gpui_kit::rgb(0x292238).into();
+        for palette in [crate::theme::Palette::light(), crate::theme::Palette::dark(), other_dark] {
             for follow in [false, true, false] {
                 let appearance = palette.email_body_appearance(follow);
                 let document = appearance.prepare_document(
-                    "<style>@media(prefers-color-scheme:dark){#card{border-top:1px solid white}}</style><div id='card' style='height:100px;width:600px;background:white;color:black'>Fictional message</div>",
+                    r##"
+                    <style>
+                        #card { background: #fafafa !important; color: black; height: 100px; width: 600px; }
+                        @media(prefers-color-scheme: dark) {
+                            #card { border-top: 1px solid white; }
+                            #footer { background: #121212; color: white; }
+                        }
+                        @media(max-width: 650px) { #card { background: #284563 !important; } }
+                    </style>
+                    <div id="card">Fictional message</div>
+                    <table cellpadding="0" cellspacing="0" width="600"><tr>
+                        <td bgcolor="#ffffff" height="80">Fictional signature</td>
+                        <td bgcolor="#e86714" width="150">Brand accent</td>
+                    </tr></table>
+                    <div id="footer" style="height:80px">Fictional disclaimer</div>
+                    "##,
                     &fonts,
                 );
-                actor.load(&document.html, appearance.dark).unwrap();
+                actor.load(&document.html, appearance.dark_paper()).unwrap();
                 let (png, _, _) = actor.frame().unwrap();
                 let pixels = image::load_from_memory(&png).unwrap().into_rgb8();
                 let paper = appearance.paper.to_be_bytes();
-                assert_eq!(pixels.get_pixel(700, 50).0, [paper[1], paper[2], paper[3]], "{theme:?}, follow: {follow}");
-                let card = pixels.get_pixel(400, 50).0;
+                let paper = [paper[1], paper[2], paper[3]];
+                assert_eq!(pixels.get_pixel(700, 50).0, paper);
+                assert_eq!(pixels.get_pixel(400, 220).0, paper);
                 if appearance.dark {
-                    assert!(card.iter().all(|&channel| channel < 64), "the authored white card was painted {card:?}");
+                    assert_eq!(pixels.get_pixel(400, 50).0, paper);
+                    assert_eq!(pixels.get_pixel(400, 140).0, paper);
+                    assert_ne!(pixels.get_pixel(570, 140).0, paper, "keep the signature accent distinct");
                     assert!((1..28).any(|y| (0..160).any(|x| {
                         pixels.get_pixel(x, y).0.iter().all(|&channel| channel > 192)
                     })), "the authored black text should be readable on the dark card");
+                    actor.input(Input::Resize(640, 900, 1.0), &|_| {}).unwrap();
+                    assert_eq!(actor.cdp.eval("getComputedStyle(document.querySelector('#card')).backgroundColor".into()).unwrap(), "rgb(40, 69, 99)");
+                    actor.input(Input::Resize(800, 900, 1.0), &|_| {}).unwrap();
+                    let (png, _, _) = actor.frame().unwrap();
+                    assert_eq!(image::load_from_memory(&png).unwrap().into_rgb8().get_pixel(400, 50).0, paper);
                 } else {
-                    assert_eq!(card, [255, 255, 255]);
+                    assert_eq!(pixels.get_pixel(400, 50).0, [250, 250, 250]);
+                    assert_eq!(pixels.get_pixel(400, 140).0, [255, 255, 255]);
                 }
                 assert_eq!(actor.cdp.eval("getComputedStyle(document.querySelector('#card')).borderTopWidth".into()).unwrap(), if appearance.dark { "1px" } else { "0px" });
             }
@@ -2610,7 +2672,7 @@ mod tests {
     fn chromium_nested_scroll_edges() {
         let mut actor = Actor::start(Arc::new(AtomicBool::new(false)), false).unwrap();
         let doc = overlook_core::browser::prepare_document("<div style='height:60px;overflow:auto'><div style='height:200px'>Synthetic nested panel</div></div>");
-        actor.load(&doc.html, false).unwrap();
+        actor.load(&doc.html, None).unwrap();
         actor.input(Input::Resize(320, 300, 1.0), &|_| {}).unwrap();
         actor.frame().unwrap();
         let events = Mutex::new(Vec::new());
@@ -2647,7 +2709,7 @@ mod tests {
             include_str!("../../overlook-core/tests/fixtures/formatting/browser-card.html");
         let document = overlook_core::browser::prepare_document(source);
         let mut actor = Actor::start(Arc::new(AtomicBool::new(false)), false).unwrap();
-        actor.load(&document.html, false).unwrap();
+        actor.load(&document.html, None).unwrap();
         actor.input(Input::Resize(760, 600, 1.25), &|_| {}).unwrap();
         let styles = actor.cdp.eval(r#"JSON.stringify((()=>{
             const card=document.querySelector('.card'), button=document.querySelector('.button'), panel=document.querySelector('.panel'), title=document.querySelector('h1');
@@ -2718,7 +2780,7 @@ mod tests {
         let folded = overlook_core::thread_history::prepare(&messages, || true).remove(&overlook_core::MessageId::from("reply")).unwrap();
         let document = overlook_core::browser::prepare_document(&folded);
         let mut actor = Actor::start(Arc::new(AtomicBool::new(false)), false).unwrap();
-        actor.load(&document.html, false).unwrap();
+        actor.load(&document.html, None).unwrap();
         actor.refresh_layout(&|_| {}).unwrap();
         let closed = actor.document_height;
         assert!(closed < 300);
@@ -2742,7 +2804,7 @@ mod tests {
     #[test]
     #[ignore = "runs real sandboxed /usr/bin/chromium"]
     fn chromium_handle_last_clone_lifetime() {
-        let handle = BrowserHandle::new("<p>Synthetic API selection</p>".into(), false, false);
+        let handle = BrowserHandle::new("<p>Synthetic API selection</p>".into(), false, None);
         let clone = handle.clone();
         let stop = handle.0.stop.clone();
         let deadline = Instant::now() + Duration::from_secs(15);
