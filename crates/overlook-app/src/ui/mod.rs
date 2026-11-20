@@ -593,6 +593,8 @@ pub struct MailWindow {
 
     view: MailboxView,
     filter: ListFilter,
+    /// The selected conversation that was automatically marked read in the Unread list.
+    unread_selection: Option<ConversationId>,
     search_input: Entity<InputState>,
     search_query: String,
     search_coverage: String,
@@ -980,6 +982,7 @@ impl MailWindow {
             outgoing_dir,
             view: MailboxView::Kind(LabelKind::Inbox),
             filter: ListFilter::All,
+            unread_selection: None,
             search_input,
             search_query: String::new(),
             search_coverage: String::new(),
@@ -1210,7 +1213,7 @@ impl MailWindow {
         this.reload(cx);
         if this.selected.is_none() {
             if let Some(first) = this.conversations.first().map(|c| c.id.clone()) {
-                this.selected = Some(first);
+                this.set_selected(Some(first));
                 this.load_thread(cx);
             }
         }
@@ -1472,7 +1475,7 @@ impl MailWindow {
         }
         self.view = MailboxView::Kind(LabelKind::Inbox);
         self.filter = ListFilter::All;
-        self.selected = None;
+        self.set_selected(None);
         self.marked.clear();
         self.outbox_selected = None;
         self.thread.clear();
@@ -1484,7 +1487,7 @@ impl MailWindow {
         }
         self.reload(cx);
         self.refresh_other_contacts(cx);
-        self.selected = self.conversations.first().map(|c| c.id.clone());
+        self.set_selected(self.conversations.first().map(|c| c.id.clone()));
         self.marked.clear();
         self.load_thread(cx);
         self.focus_current_module(window, cx);
@@ -1642,7 +1645,7 @@ impl MailWindow {
         self.account = no_account();
         self.view = MailboxView::Kind(LabelKind::Inbox);
         self.filter = ListFilter::All;
-        self.selected = None;
+        self.set_selected(None);
         self.marked.clear();
         self.outbox_selected = None;
         self.thread.clear();
@@ -1976,14 +1979,15 @@ impl MailWindow {
         let owner = self.account.email.clone();
         self.labels = self.mail_index.labels().to_vec();
         let focus = self.inbox_focus();
-        self.conversations = if self.search_query.trim().is_empty() {
-            self.mail_index.conversations(&owner, &self.view, self.filter, focus)
-        } else {
+        let searching = !self.search_query.trim().is_empty();
+        self.conversations = if searching {
             self.search_results()
+        } else {
+            self.mail_index.conversations_including(&owner, &self.view, self.filter, focus, self.unread_selection.as_ref())
         };
         self.list_data_generation += 1;
         // Search coverage counts cached bodies, a full scan: only worth it while searching.
-        self.search_coverage = if self.search_query.trim().is_empty() { String::new() } else { self.search_coverage_line(&acct) };
+        self.search_coverage = if searching { self.search_coverage_line(&acct) } else { String::new() };
         self.counts = sidebar_counts(&self.mail_index, &owner, self.focused_enabled);
         self.other_unread = if self.focused_enabled {
             self.mail_index.view_count(&owner, &MailboxView::Kind(LabelKind::Inbox), Some(FocusTab::Other))
@@ -1996,7 +2000,11 @@ impl MailWindow {
             self.marked.retain(|id| shown.contains(id));
         }
         if let Some(sel) = &self.selected {
-            if !self.conversations.iter().any(|c| &c.id == sel) && self.search_query.is_empty() {
+            let row = self.conversations.iter().find(|c| &c.id == sel);
+            if row.is_none_or(ConversationSummary::is_unread) {
+                self.unread_selection = None;
+            }
+            if row.is_none() && !searching {
                 let remaining = self.mail_index.message_ids_in(sel);
                 if email_modal::keep_modal_selection_after_refresh(self.is_message_window(), remaining.len()) {
                     // Stay on the open conversation in a standalone message window after
@@ -2007,7 +2015,7 @@ impl MailWindow {
                 } else {
                     // The selected conversation left this view (archived, trashed, filtered)
                     // or was permanently deleted while open in a message window.
-                    self.selected = None;
+                    self.set_selected(None);
                     self.marked.clear();
                     self.thread.clear();
                 }
@@ -2173,7 +2181,7 @@ impl MailWindow {
     fn search_results(&self) -> Vec<ConversationSummary> {
         let hits = self.store.search(&self.account.id, &self.search_query).unwrap_or_default();
         let hit_set: BTreeSet<MessageId> = hits.into_iter().collect();
-        self.mail_index.conversations_matching(&hit_set, &self.account.email, self.filter)
+        self.mail_index.conversations_matching_including(&hit_set, &self.account.email, self.filter, self.unread_selection.as_ref())
     }
 
     /// The Focused/Other split applies only to the Inbox when the feature is on.
@@ -2182,10 +2190,13 @@ impl MailWindow {
     }
 
     pub(crate) fn set_inbox_tab(&mut self, tab: FocusTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.inbox_tab != tab {
+            self.unread_selection = None;
+        }
         self.inbox_tab = tab;
         self.reload(cx);
         if !self.conversations.iter().any(|c| Some(&c.id) == self.selected.as_ref()) {
-            self.selected = self.conversations.first().map(|c| c.id.clone());
+            self.set_selected(self.conversations.first().map(|c| c.id.clone()));
             self.marked.clear();
             self.expanded.clear();
             self.load_thread(cx);
@@ -2195,6 +2206,7 @@ impl MailWindow {
     }
 
     pub(crate) fn toggle_focused_inbox(&mut self, cx: &mut Context<Self>) {
+        self.unread_selection = None;
         self.focused_enabled = !self.focused_enabled;
         self.save_setting("focused_inbox", &self.focused_enabled);
         self.inbox_tab = FocusTab::Focused;
@@ -2597,6 +2609,9 @@ impl MailWindow {
     // ------------------------------------------------------------ navigation
 
     fn select_view(&mut self, view: MailboxView, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view != view || !self.search_query.trim().is_empty() {
+            self.unread_selection = None;
+        }
         if !self.search_query.is_empty() {
             self.search_query.clear();
             let input = self.search_input.clone();
@@ -2609,7 +2624,7 @@ impl MailWindow {
         self.outbox_selected = None;
         self.reload(cx);
         if self.selected.is_none() || !self.conversations.iter().any(|c| Some(&c.id) == self.selected.as_ref()) {
-            self.selected = self.conversations.first().map(|c| c.id.clone());
+            self.set_selected(self.conversations.first().map(|c| c.id.clone()));
             self.marked.clear();
             self.expanded.clear();
             self.load_thread(cx);
@@ -2620,18 +2635,24 @@ impl MailWindow {
     }
 
     fn set_filter(&mut self, filter: ListFilter, window: &mut Window, cx: &mut Context<Self>) {
+        if self.filter != filter {
+            self.unread_selection = None;
+        }
         self.filter = filter;
         self.reload(cx);
         self.list_focus.focus(window, cx);
     }
 
     fn set_search(&mut self, query: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_query.trim() != query.trim() {
+            self.unread_selection = None;
+        }
         self.search_query = query;
         self.search_generation += 1;
         self.online_search = OnlineSearch::Idle;
         self.reload(cx);
         if !self.search_query.is_empty() && self.selected_summary().is_none() {
-            self.selected = self.conversations.first().map(|c| c.id.clone());
+            self.set_selected(self.conversations.first().map(|c| c.id.clone()));
             self.marked.clear();
             self.load_thread(cx);
             self.fetch_conversation_extras(window, cx);
@@ -2722,6 +2743,21 @@ impl MailWindow {
         .detach();
     }
 
+    fn set_selected(&mut self, id: Option<ConversationId>) {
+        if self.selected == id {
+            return;
+        }
+        self.mark_read_generation += 1;
+        if let Some(previous) = self.unread_selection.take() {
+            if let Some(index) = self.position_of(&previous) {
+                self.conversations.remove(index);
+                self.marked.remove(&previous);
+                self.list_data_generation += 1;
+            }
+        }
+        self.selected = id;
+    }
+
     fn select_conversation(&mut self, id: Option<ConversationId>, window: &mut Window, cx: &mut Context<Self>) {
         crate::watchdog::mark("open conversation");
         if self.composer.is_some() {
@@ -2730,7 +2766,7 @@ impl MailWindow {
         self.outbox_selected = None;
         self.expanded.clear();
         self.reader_scroll.set_offset(point(px(0.), px(0.)));
-        self.selected = id;
+        self.set_selected(id);
         self.marked.clear();
         self.load_thread(cx);
         self.fetch_conversation_extras(window, cx);
@@ -2738,7 +2774,7 @@ impl MailWindow {
         let unread: Vec<MessageId> = self.thread.iter().filter(|m| !m.is_read).map(|m| m.id.clone()).collect();
         if !unread.is_empty() {
             match self.prefs.mark_as_read {
-                MarkAsRead::WhenSelected => self.apply_local(overlook_store::LocalChange::SetRead { message_ids: unread, read: true }, window, cx),
+                MarkAsRead::WhenSelected => self.mark_open_conversation_read(unread, window, cx),
                 MarkAsRead::AfterDelay => {
                     self.mark_read_generation += 1;
                     let generation = self.mark_read_generation;
@@ -2748,7 +2784,7 @@ impl MailWindow {
                         cx.background_executor().timer(Duration::from_secs(delay)).await;
                         let _ = this.update_in(cx, |this, window, cx| {
                             if this.mark_read_generation == generation && this.selected == selected {
-                                this.apply_local(overlook_store::LocalChange::SetRead { message_ids: unread.clone(), read: true }, window, cx);
+                                this.mark_open_conversation_read(unread, window, cx);
                             }
                         });
                     })
@@ -2764,6 +2800,13 @@ impl MailWindow {
             self.schedule_prerender(cx);
         }
         cx.notify();
+    }
+
+    fn mark_open_conversation_read(&mut self, unread: Vec<MessageId>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.filter == ListFilter::Unread && self.selected_summary().is_some_and(ConversationSummary::is_unread) {
+            self.unread_selection = self.selected.clone();
+        }
+        self.set_read(unread, true, window, cx);
     }
 
     /// Renders the latest message of the conversations above and below the open one
@@ -2819,19 +2862,19 @@ impl MailWindow {
             None => 0,
         };
         let id = self.conversations[next].id.clone();
-        if Some(&id) != self.selected.as_ref() {
-            self.select_conversation(Some(id.clone()), window, cx);
-        }
-        // Keep the selected row in view in the virtual list.
+        // Reveal the target before opening it, while the old row positions still apply.
         let ix = self.shown_rows.borrow().iter().position(|r| matches!(r, ListRow::Conversation(c) if c.id == id));
         if let Some(ix) = ix {
             self.list_state.scroll_to_reveal_item(ix);
+        }
+        if Some(&id) != self.selected.as_ref() {
+            self.select_conversation(Some(id), window, cx);
         }
     }
 
     fn select_outbox_item(&mut self, id: DraftId, window: &mut Window, cx: &mut Context<Self>) {
         self.close_composer(window, cx);
-        self.selected = None;
+        self.set_selected(None);
         self.marked.clear();
         self.thread.clear();
         self.outbox_selected = Some(id);
@@ -3065,7 +3108,7 @@ impl MailWindow {
         self.outbox_selected = None;
         self.expanded.clear();
         self.reader_scroll.set_offset(point(px(0.), px(0.)));
-        self.selected = id;
+        self.set_selected(id);
         if !keep_marked {
             self.marked.clear();
         }
@@ -3495,7 +3538,7 @@ impl MailWindow {
             if let Some(conv) = draft.conversation_id.clone() {
                 // Show the conversation being replied to, if it is in this view.
                 if self.conversations.iter().any(|c| c.id == conv) {
-                    self.selected = Some(conv);
+                    self.set_selected(Some(conv));
                     self.marked.clear();
                     self.load_thread(cx);
                 }

@@ -2531,6 +2531,39 @@ mod tests {
     }
 
     #[test]
+    fn unread_list_can_keep_the_open_conversation_after_it_is_read() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let account = account();
+        let owner = &account.email;
+        let inbox = MailboxView::Kind(LabelKind::Inbox);
+        let open = ConversationId::from("conv-m1");
+        let message = MessageId::from("m1");
+        let mut index = store.mail_index(&account.id).unwrap();
+        let before = index.conversations(owner, &inbox, ListFilter::Unread, None);
+        assert_eq!(before.len(), 2);
+        index.apply(&LocalChange::SetRead { message_ids: vec![message.clone()], read: true });
+
+        let with_open = index.conversations_including(owner, &inbox, ListFilter::Unread, None, Some(&open));
+        assert!(with_open.iter().map(|c| &c.id).eq(before.iter().map(|c| &c.id)));
+        assert!(!with_open.iter().find(|c| c.id == open).unwrap().is_unread());
+        assert_eq!(index.view_count(owner, &inbox, None), 1);
+        let without_open = index.conversations(owner, &inbox, ListFilter::Unread, None);
+        assert_eq!(without_open.len(), 1);
+        assert_ne!(without_open[0].id, open);
+
+        let hits = BTreeSet::from([message.clone()]);
+        assert!(index.conversations_matching(&hits, owner, ListFilter::Unread).is_empty());
+        let search = index.conversations_matching_including(&hits, owner, ListFilter::Unread, Some(&open));
+        assert_eq!(search.len(), 1);
+        assert!(!search[0].is_unread());
+        assert!(index.conversations_matching_including(&BTreeSet::new(), owner, ListFilter::Unread, Some(&open)).is_empty());
+
+        index.apply(&LocalChange::Archive { message_ids: vec![message] });
+        assert_eq!(index.conversations_including(owner, &inbox, ListFilter::Unread, None, Some(&open)), without_open);
+    }
+
+    #[test]
     fn in_memory_index_matches_the_store_after_each_change() {
         let store = Store::open_in_memory().unwrap();
         seeded(&store);

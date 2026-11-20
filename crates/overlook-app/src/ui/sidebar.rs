@@ -323,7 +323,7 @@ impl MailWindow {
                     this.delete_folders_in_trash(&account, window, cx);
                 }
                 if this.selected.as_ref().is_some_and(|s| !this.conversations.iter().any(|c| &c.id == s)) {
-                    this.selected = this.conversations.first().map(|c| c.id.clone());
+                    this.set_selected(this.conversations.first().map(|c| c.id.clone()));
                     this.expanded.clear();
                     this.load_thread(cx);
                 }
