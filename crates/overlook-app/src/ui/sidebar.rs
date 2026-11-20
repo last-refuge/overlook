@@ -31,7 +31,7 @@ const DEPTH_STEP: f32 = 16.;
 const ICON_INSET: f32 = 18.;
 const ROW_ICON_SIZE: f32 = 16.;
 const ROW_ICON_GAP: f32 = 9.;
-const ACCOUNT_MARK_SIZE: f32 = 20.;
+const ACCOUNT_MARK_SIZE: f32 = 18.;
 
 const LABEL_SIZE: f32 = 13.;
 const LABEL_LINE_HEIGHT: f32 = 18.;
