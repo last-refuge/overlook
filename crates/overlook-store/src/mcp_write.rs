@@ -1,5 +1,9 @@
 //! The MCP receipt and outbound operations commit with the local mutation.
 
+mod delivery;
+mod drafts;
+mod organization;
+
 use super::*;
 use serde_json::Value;
 

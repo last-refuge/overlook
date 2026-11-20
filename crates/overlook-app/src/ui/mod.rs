@@ -2331,6 +2331,7 @@ impl MailWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        tracing::debug!(accounts = changes.len(), "reloading mail after MCP writes");
         self.mark_counts_stale(changes.keys().cloned());
         self.reload_account_labels();
         if changes.contains_key(&self.account.id) {

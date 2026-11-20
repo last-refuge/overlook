@@ -160,6 +160,7 @@ fn message(ctx: &ReadContext<'_>, args: &Map<String, Value>) -> Result<Value, Fa
     });
     result["body_truncated"] = json!(text.as_ref().is_some_and(|s| s.len() > 4_096));
     result["body_text"] = json!(text.as_deref().map(|s| display(s, 4_096)));
+    result["focus_override"] = json!(message.focus_override);
     if let Some(invitation) = &message.invitation {
         result["invitation"] = json!({
             "invitation_id":ctx.id("mail_invitation", &invitation.uid),

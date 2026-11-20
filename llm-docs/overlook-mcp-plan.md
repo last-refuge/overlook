@@ -22,7 +22,7 @@ Configure the harness to launch the absolute path to `target/debug/overlook` wit
 
 Run `target/debug/overlook mcp revoke --client my-harness` to deny subsequent calls, including on open connections. Run `target/debug/overlook --quit` with the same profile path to stop the sample owner. Calls without an owner return `profile_unavailable`. Calls with a missing, mismatched, or revoked grant return `access_denied` when an owner is running.
 
-The sample owner keeps its records in memory and starts without a background sync worker. Try finding the Trail walk invitation in the primary mailbox, then looking up its date and the sender's contact in the secondary account. For a desktop profile, eligible IMAP and POP3 accounts use `imap:<address>` and `pop3:<address>` as their CLI grant IDs. Gmail accounts and connections to recognized Google endpoints stay outside the MCP catalog while Google data flows are reviewed. Use one credential per harness. A harness running under your OS login has that login's local filesystem permissions.
+The sample owner keeps its records in an isolated profile database and uses a fictional provider. Try finding the Trail walk invitation in the primary mailbox, then looking up its date and the sender's contact in the secondary account. For a desktop profile, eligible IMAP and POP3 accounts use `imap:<address>` and `pop3:<address>` as their CLI grant IDs. Gmail accounts and connections to recognized Google endpoints stay outside the MCP catalog while Google data flows are reviewed. Use one credential per harness. A harness running under your OS login has that login's local filesystem permissions.
 
 Run `cargo test --locked -p overlook --test mcp_milestone` to exercise both stdio protocol versions and the cross-account workflow against one sample owner. On macOS, the official TypeScript SDK clients `@modelcontextprotocol/client` 2.4.0 and `@modelcontextprotocol/sdk` 1.32.2 passed tool discovery, the Trail walk workflow, and live revocation.
 
@@ -41,6 +41,21 @@ Run `cargo test --locked -p overlook --test mcp_milestone` to exercise both stdi
 `mail_search`, `calendar_events_list`, and `contacts_search` accept an explicit `account_ids` array of up to four granted accounts. Batch results report a separate result or error for each account. Continue individual pages with `account_id` and the corresponding cursor. Cursors are tied to the tool, account and filters, and pages reflect the current cache.
 
 `cache.freshness` reports `recent`, `stale`, or `unknown` independently of coverage. The cutoff for a recent successful fetch is 24 hours. Check `coverage` for unmatched remote results, missing bodies, or uncovered calendar time before interpreting an empty result. User and provider content is marked as untrusted in the tool payloads.
+
+### Mail writes
+
+Grants start with read access. Repeat `--allow` with `modify`, `send`, or `permanent-delete` when issuing a grant to add those independent permissions. For example, `overlook mcp grant --client editor --account-id sample --allow modify` permits organizing mail and editing drafts. A replacement grant rotates its credential. Check `account_capabilities` for its write permissions.
+
+| Permission | Tools |
+| --- | --- |
+| `modify` | `mail_messages_organize` updates read and starred flags, moves messages, and applies supported mailbox labels. `mail_focus_set` sets a Focused Inbox override and can teach the sender rule. `mail_history_undo` reverses supported organization entries. `mail_folder_create` and `mail_folder_rename` manage top-level local POP3 folders. |
+| `modify` | `mail_draft_create`, `mail_draft_update`, `mail_draft_reply`, `mail_draft_reply_all`, `mail_draft_forward`, and `mail_draft_discard` use the existing draft store. `mail_draft_attachment_add` accepts up to 8 KiB as base64, and `mail_draft_attachment_remove` uses an opaque attachment ID. Forwards copy eligible cached attachments and report omissions. |
+| `send` | `mail_send` puts a saved draft in the Outbox with `confirmed: true`. `mail_send_cancel` returns a queued draft to editing before submission starts. |
+| `permanent-delete` | `mail_messages_delete_permanently` requires `confirm: true` and exact message IDs already in Trash. This tool is available to Sample accounts. |
+
+Choose one `account_id` and a new `idempotency_key` for each write. Reuse that key with the same inputs after a timeout or restart to recover the original receipt. Reusing it with different inputs returns `conflict`. Draft edits, attachments, sends, and cancellations also require `if_revision` from the latest draft read or write. Overlook rejects edits to a draft open in a composer.
+
+Use `mail_operation_get` with the returned operation ID to distinguish queued, cancelled, uncertain, failed, and provider-confirmed delivery. A committed write receipt and provider acceptance are separate events. `mail_write_activity_list` shows the client, tool name, and commit time for local writes. The desktop uses its normal sync and Outbox recovery paths. To try offline replay safely, start the sample owner with `overlook mcp sample --offline`, queue a fictional send, stop it, then start `overlook mcp sample` again with the same profile.
 
 ## Architecture
 

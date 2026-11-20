@@ -381,6 +381,264 @@ fn mail_read_pagination_and_refresh_keep_message_flags_and_outbox() {
     quit_owner(&profile, &mut owner);
 }
 
+#[test]
+fn mail_writes_preserve_permission_boundaries_and_replay_after_restart() {
+    let root = fixture();
+    let profile = root.path().join("profile");
+    let mut owner = start_sample_owner(&profile, true);
+    let reader_token = grant(&profile, "reader", &[SECONDARY]);
+    let editor_token = grant_scopes(&profile, "editor", &[SECONDARY], &["modify"]);
+    let writer_token = grant_scopes(&profile, "writer", &[SECONDARY], &["modify", "send"]);
+    let mut reader = Mcp::start(&profile, "reader", &reader_token, LEGACY);
+    let mut editor = Mcp::start(&profile, "editor", &editor_token, MODERN);
+    let mut writer = Mcp::start(&profile, "writer", &writer_token, MODERN);
+    let account = account_id(
+        &writer.accounts(),
+        "Sample Secondary",
+        "secondary@example.com",
+    )
+    .to_owned();
+    let create = json!({
+        "account_id":account,"idempotency_key":"create-rehearsal",
+        "subject":"Offline MCP rehearsal","body_text":"Fictional delivery verification",
+        "to":[{"email":"alex@studio.example","name":"Alex Rivera"}]
+    });
+    assert_failure(
+        &reader.tool("mail_draft_create", create.clone()),
+        "access_denied",
+    );
+    let draft = writer.read("mail_draft_create", create.clone());
+    assert_eq!(draft["status"], "saved");
+    assert_eq!(writer.read("mail_draft_create", create.clone()), draft);
+    let mut conflicting = create;
+    conflicting["subject"] = json!("A different subject");
+    assert_failure(&writer.tool("mail_draft_create", conflicting), "conflict");
+    let draft_id = &draft["draft_id"];
+
+    let attachment = writer.read("mail_draft_attachment_add", json!({
+        "account_id":account,"idempotency_key":"attach-notes","draft_id":draft_id,
+        "if_revision":draft["revision"],"filename":"notes.txt","mime_type":"text/plain","content_base64":"Tm90ZXM="
+    }));
+    let detail = reader.read(
+        "mail_draft_get",
+        json!({"account_id":account,"draft_id":draft_id}),
+    );
+    assert_eq!(
+        detail["draft"]["attachments"][0]["attachment_id"],
+        attachment["attachment_id"]
+    );
+    assert_eq!(detail["draft"]["revision"], attachment["revision"]);
+    assert_failure(
+        &writer.tool(
+            "mail_draft_update",
+            json!({
+                "account_id":account,"idempotency_key":"stale-edit","draft_id":draft_id,
+                "if_revision":draft["revision"],"subject":"A stale change"
+            }),
+        ),
+        "conflict",
+    );
+
+    let send = json!({
+        "account_id":account,"idempotency_key":"send-rehearsal","draft_id":draft_id,
+        "if_revision":attachment["revision"],"confirmed":true
+    });
+    assert_failure(&editor.tool("mail_send", send.clone()), "access_denied");
+    let mut unconfirmed = send.clone();
+    unconfirmed["confirmed"] = json!(false);
+    assert_failure(&writer.tool("mail_send", unconfirmed), "invalid_request");
+    let receipt = writer.read("mail_send", send.clone());
+    assert_eq!(receipt["status"], "queued");
+    assert_eq!(writer.read("mail_send", send.clone()), receipt);
+    let lookup = json!({"account_id":account,"operation_id":receipt["operation_id"]});
+    assert_eq!(
+        reader.read("mail_operation_get", lookup.clone())["status"],
+        "queued"
+    );
+
+    let cancel_draft = writer.read(
+        "mail_draft_create",
+        json!({
+            "account_id":account,"idempotency_key":"create-cancellation",
+            "subject":"Cancelled MCP rehearsal","to":[{"email":"sophie@example.com"}]
+        }),
+    );
+    let queued_cancel = writer.read("mail_send", json!({
+        "account_id":account,"idempotency_key":"queue-cancellation","draft_id":cancel_draft["draft_id"],
+        "if_revision":cancel_draft["revision"],"confirmed":true
+    }));
+    let cancelled = writer.read("mail_send_cancel", json!({
+        "account_id":account,"idempotency_key":"cancel-rehearsal","draft_id":cancel_draft["draft_id"],
+        "if_revision":queued_cancel["revision"]
+    }));
+    assert_eq!(cancelled["operation_id"], queued_cancel["operation_id"]);
+    let cancel_lookup = json!({"account_id":account,"operation_id":cancelled["operation_id"]});
+    assert_eq!(
+        reader.read("mail_operation_get", cancel_lookup.clone())["status"],
+        "cancelled"
+    );
+    assert_eq!(
+        reader.read("mail_outbox_list", json!({"account_id":account}))["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    reader.finish();
+    editor.finish();
+    writer.finish();
+    quit_owner(&profile, &mut owner);
+
+    let mut online = start_owner(&profile);
+    let mut client = Mcp::start(&profile, "writer", &writer_token, MODERN);
+    assert_eq!(
+        client.read("mail_operation_get", lookup)["status"],
+        "provider_confirmed"
+    );
+    assert_eq!(
+        client.read("mail_operation_get", cancel_lookup)["status"],
+        "cancelled"
+    );
+    assert_eq!(client.read("mail_send", send), receipt);
+    let hits = client.read(
+        "mail_search",
+        json!({"account_id":account,"query":"Offline MCP rehearsal"}),
+    );
+    assert_eq!(
+        hits["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["subject"] == "Offline MCP rehearsal")
+            .count(),
+        1
+    );
+    let activity = client.read("mail_write_activity_list", json!({"account_id":account}));
+    assert!(activity["items"].as_array().unwrap().iter().any(|item| {
+        item["write_id"] == receipt["write_id"]
+            && item["action"] == "mail_send"
+            && item["client"] == "writer"
+    }));
+    client.finish();
+    quit_owner(&profile, &mut online);
+}
+
+#[test]
+fn mailbox_actions_are_visible_to_reads_and_can_be_undone() {
+    let root = fixture();
+    let profile = root.path().join("profile");
+    let mut owner = start_sample_owner(&profile, true);
+    let token = grant_scopes(&profile, "organizer", &[PRIMARY, SECONDARY], &["modify"]);
+    let delete_token = grant_scopes(&profile, "deleter", &[PRIMARY], &["permanent-delete"]);
+    let mut client = Mcp::start(&profile, "organizer", &token, MODERN);
+    let accounts = client.accounts();
+    let primary = account_id(&accounts, "Jason Alexander", "jason@example.com");
+    let secondary = account_id(&accounts, "Sample Secondary", "secondary@example.com");
+    let target = |client: &mut Mcp, account: &str| {
+        client.read(
+            "mail_search",
+            json!({
+                "account_id":account,"query":"launch day"
+            }),
+        )["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["subject"] == "Invitation: Launch day go/no-go")
+            .unwrap()
+            .clone()
+    };
+    let primary_hit = target(&mut client, primary);
+    let secondary_hit = target(&mut client, secondary);
+    let message = &primary_hit["message_id"];
+    assert_eq!(primary_hit["is_read"], false);
+    let read = client.read(
+        "mail_messages_organize",
+        json!({
+            "account_id":primary,"idempotency_key":"mark-read","action":"read",
+            "message_ids":[message,secondary_hit["message_id"]]
+        }),
+    );
+    assert_eq!(read["items"][0]["status"], "updated");
+    assert_eq!(read["items"][1]["code"], "not_cached");
+    assert_eq!(
+        client.read(
+            "mail_operation_get",
+            json!({
+                "account_id":primary,"operation_id":read["operation_ids"][0]
+            })
+        )["status"],
+        "queued"
+    );
+    let get = json!({"account_id":primary,"message_id":message});
+    assert_eq!(
+        client.read("mail_message_get", get.clone())["is_read"],
+        true
+    );
+    assert_eq!(
+        target(&mut client, secondary)["is_read"],
+        secondary_hit["is_read"]
+    );
+    assert_eq!(
+        client.read(
+            "mail_history_undo",
+            json!({
+                "account_id":primary,"idempotency_key":"undo-read","entry_id":read["entry_id"]
+            })
+        )["status"],
+        "undone"
+    );
+    assert_eq!(
+        client.read("mail_message_get", get.clone())["is_read"],
+        false
+    );
+
+    client.read(
+        "mail_focus_set",
+        json!({
+            "account_id":primary,"idempotency_key":"focus-message","message_ids":[message],
+            "focus":"focused","train_senders":true
+        }),
+    );
+    assert_eq!(
+        client.read("mail_message_get", get.clone())["focus_override"],
+        true
+    );
+    let delete = json!({
+        "account_id":primary,"idempotency_key":"delete-message","message_ids":[message],"confirm":true
+    });
+    assert_failure(
+        &client.tool("mail_messages_delete_permanently", delete.clone()),
+        "access_denied",
+    );
+    client.read("mail_messages_organize", json!({
+        "account_id":primary,"idempotency_key":"trash-message","action":"trash","message_ids":[message]
+    }));
+    let mut deleter = Mcp::start(&profile, "deleter", &delete_token, LEGACY);
+    let expected = deleter.read("mail_messages_delete_permanently", delete.clone());
+    assert!(expected["operation_ids"][0].is_string());
+    assert_eq!(
+        deleter.read("mail_messages_delete_permanently", delete),
+        expected
+    );
+    assert_failure(&client.tool("mail_message_get", get), "not_cached");
+    client.finish();
+    deleter.finish();
+    quit_owner(&profile, &mut owner);
+
+    let mut online = start_owner(&profile);
+    let mut client = Mcp::start(&profile, "organizer", &token, MODERN);
+    let status = client.read(
+        "mail_operation_get",
+        json!({
+            "account_id":primary,"operation_id":expected["operation_ids"][0]
+        }),
+    );
+    assert_eq!(status["status"], "synced");
+    client.finish();
+    quit_owner(&profile, &mut online);
+}
+
 fn assert_tool_catalog(client: &mut Mcp) {
     let catalog = client.request("tools/list", json!({}));
     let tools = catalog["tools"].as_array().expect("tools/list tools array");
@@ -639,7 +897,15 @@ fn command(profile: &Path, args: &[&str]) -> Command {
 }
 
 fn start_owner(profile: &Path) -> Process {
-    let mut process = Process::spawn(command(profile, &["mcp", "sample"]));
+    start_sample_owner(profile, false)
+}
+
+fn start_sample_owner(profile: &Path, offline: bool) -> Process {
+    let mut args = vec!["mcp", "sample"];
+    if offline {
+        args.push("--offline");
+    }
+    let mut process = Process::spawn(command(profile, &args));
     let deadline = Instant::now() + TIMEOUT;
     loop {
         process.assert_running();
@@ -665,9 +931,16 @@ fn quit_owner(profile: &Path, owner: &mut Process) {
 }
 
 fn grant(profile: &Path, client: &str, accounts: &[&str]) -> String {
+    grant_scopes(profile, client, accounts, &[])
+}
+
+fn grant_scopes(profile: &Path, client: &str, accounts: &[&str], scopes: &[&str]) -> String {
     let mut args = vec!["mcp", "grant", "--client", client];
     for account in accounts {
         args.extend(["--account-id", account]);
+    }
+    for scope in scopes {
+        args.extend(["--allow", scope]);
     }
     let output = NamedTempFile::new().unwrap();
     let mut command = command(profile, &args);
