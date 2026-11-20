@@ -414,7 +414,10 @@ pub enum ListRow {
 struct RowsKey {
     /// Bumped whenever the conversations, drafts or Outbox are reloaded.
     data: u64,
+    account: AccountId,
     view: MailboxView,
+    filter: ListFilter,
+    inbox_tab: Option<FocusTab>,
     searching: bool,
     /// Today, because the day groups ("Today", "Yesterday") move at midnight.
     today: i64,

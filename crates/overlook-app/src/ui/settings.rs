@@ -75,7 +75,9 @@ pub struct SettingsState {
     /// HTML source of the signature being edited.
     pub signature: Entity<TextareaState>,
     pub signature_name: Entity<InputState>,
+    pub signature_font: Entity<ComboboxState<SearchableVec<FontChoice>>>,
     pub selected_signature: Option<String>,
+    pub installed_fonts: Vec<String>,
     /// Automatic replies, once loaded from the provider.
     pub vacation: Option<VacationSettings>,
     pub vacation_loading: bool,
@@ -400,9 +402,15 @@ impl MailWindow {
         let sig = id.as_deref().and_then(|i| p.signature_by_id(i)).cloned().unwrap_or_default();
         if let Some(state) = self.settings.as_mut() {
             state.selected_signature = id;
-            let (name, source) = (state.signature_name.clone(), state.signature.clone());
+            let (name, source, sig_font) = (state.signature_name.clone(), state.signature.clone(), state.signature_font.clone());
+            let choices = font_choices(&state.installed_fonts, "Match compose font", true, true, &[], &sig.font_family);
+            let idx = choices.iter().position(|c| c.family == sig.font_family).unwrap_or(0);
             name.update(cx, |s, cx| s.set_value(sig.name.clone(), window, cx));
             source.update(cx, |s, cx| s.set_value(sig.html.clone(), window, cx));
+            sig_font.update(cx, |cb, cx| {
+                cb.set_items(SearchableVec::new(choices), window, cx);
+                cb.set_selected_indices(vec![IndexPath::default().row(idx)], window, cx);
+            });
         }
         cx.notify();
     }
@@ -560,9 +568,9 @@ impl MailWindow {
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("Your name").default_value(acct.display_name.clone()));
         let account_name_input = cx.new(|cx| InputState::new(window, cx).placeholder(acct.email.clone()).default_value(ap.name.clone()));
         let selected_signature = ap.default_new.clone().or_else(|| ap.signatures.first().map(|s| s.id.clone()));
-        let selected = selected_signature.as_deref().and_then(|id| ap.signature_by_id(id)).cloned().unwrap_or_default();
-        let signature = cx.new(|cx| TextareaState::new(window, cx).placeholder("<p><b>Jason Alexander</b><br>Last Refuge</p>").default_value(selected.html.clone()));
-        let signature_name = cx.new(|cx| InputState::new(window, cx).placeholder("Signature name").default_value(selected.name.clone()));
+        let selected_sig = selected_signature.as_deref().and_then(|id| ap.signature_by_id(id)).cloned().unwrap_or_default();
+        let signature = cx.new(|cx| TextareaState::new(window, cx).placeholder("<p><b>Jason Alexander</b><br>Last Refuge</p>").default_value(selected_sig.html.clone()));
+        let signature_name = cx.new(|cx| InputState::new(window, cx).placeholder("Signature name").default_value(selected_sig.name.clone()));
         let vacation_subject = cx.new(|cx| InputState::new(window, cx).placeholder("Out of office"));
         let vacation_body = cx.new(|cx| TextareaState::new(window, cx).placeholder("I’m away until Monday and will reply when I’m back."));
         let vacation_start = cx.new(|cx| InputState::new(window, cx).placeholder("First day, YYYY-MM-DD (optional)"));
@@ -602,6 +610,12 @@ impl MailWindow {
         let compose_font = build_font_combobox(
             font_choices(&installed_fonts, "Follow interface", true, true, &[], &self.prefs.fonts.compose_family),
             &self.prefs.fonts.compose_family,
+            window,
+            cx,
+        );
+        let signature_font = build_font_combobox(
+            font_choices(&installed_fonts, "Match compose font", true, true, &[], &selected_sig.font_family),
+            &selected_sig.font_family,
             window,
             cx,
         );
@@ -662,6 +676,13 @@ impl MailWindow {
                 if let Some(family) = values.first().filter(|f| **f != this.prefs.fonts.compose_family) {
                     this.prefs.fonts.compose_family = family.clone();
                     this.save_prefs(cx);
+                }
+            }
+        }));
+        subs.push(cx.subscribe_in(&signature_font, window, |this, _, event: &ComboboxEvent<SearchableVec<FontChoice>>, _window, cx| {
+            if let ComboboxEvent::Confirm(values) = event {
+                if let Some(family) = values.first() {
+                    this.edit_signature_font(family.clone(), cx);
                 }
             }
         }));
@@ -744,7 +765,9 @@ impl MailWindow {
             account_name_input,
             signature,
             signature_name,
+            signature_font,
             selected_signature,
+            installed_fonts,
             vacation: None,
             vacation_loading: false,
             vacation_note: None,
@@ -1168,7 +1191,37 @@ impl MailWindow {
                     })
             })
             .when(state.selected_signature.is_some(), |d| {
+                let sig = state.selected_signature.as_deref().and_then(|id| ap.signature_by_id(id));
+                let sig_size = sig.and_then(|s| s.font_size);
+                let compose_size = self.prefs.fonts.clamped_compose_size();
                 d.child(setting_row("Name", "How this signature appears in the composer’s picker.", Input::new(&state.signature_name).w(px(280.)).into_any_element()))
+                    .child(setting_row(
+                        "Signature font",
+                        "Typeface for this signature. Leave on Match compose font to inherit your compose setting.",
+                        Combobox::new(&state.signature_font)
+                            .small()
+                            .w(px(260.))
+                            .placeholder("Match compose font")
+                            .menu_width(px(300.))
+                            .menu_max_h(px(280.))
+                            .search_placeholder("Search installed fonts")
+                            .into_any_element(),
+                    ))
+                    .child(setting_row(
+                        "Signature text size",
+                        "Text size for this signature.",
+                        optional_size_stepper_labeled(
+                            "sig-font-size",
+                            sig_size,
+                            compose_size,
+                            FontPrefs::MIN_EMAIL_SIZE,
+                            FontPrefs::MAX_EMAIL_SIZE,
+                            &[11, 12, 13, 14, 15, 16, 18, 20, 22, 24],
+                            "Match compose",
+                            cx,
+                            |this, size, cx| this.edit_signature_font_size(size, cx),
+                        ),
+                    ))
                     .child(self.render_signature_editor(state, &p, cx))
             })
             .child(setting_row("Use for new messages", "", self.signature_picker("default-new", &account.id, false, cx)))
@@ -2129,10 +2182,26 @@ fn optional_size_stepper(
     cx: &mut Context<MailWindow>,
     on_change: impl Fn(&mut MailWindow, Option<u8>, &mut Context<MailWindow>) + 'static,
 ) -> AnyElement {
+    optional_size_stepper_labeled(id, current, inherited, min, max, presets, "Follow interface", cx, on_change)
+}
+
+/// Optional size stepper where `None` displays `follow_label` with the inherited pixel size.
+#[allow(clippy::too_many_arguments)]
+fn optional_size_stepper_labeled(
+    id: &'static str,
+    current: Option<u8>,
+    inherited: u8,
+    min: u8,
+    max: u8,
+    presets: &'static [u8],
+    follow_label: &'static str,
+    cx: &mut Context<MailWindow>,
+    on_change: impl Fn(&mut MailWindow, Option<u8>, &mut Context<MailWindow>) + 'static,
+) -> AnyElement {
     let effective = current.unwrap_or(inherited).clamp(min, max);
     let label = match current {
         Some(size) => format!("{size} px"),
-        None => format!("Follow interface ({effective} px)"),
+        None => format!("{follow_label} ({effective} px)"),
     };
     let on_change = std::rc::Rc::new(on_change);
     let me = cx.entity().downgrade();
@@ -2162,7 +2231,7 @@ fn optional_size_stepper(
                     let cb_auto = menu_cb.clone();
                     menu = menu
                         .item(
-                            PopupMenuItem::new(format!("Follow interface ({inherited} px)"))
+                            PopupMenuItem::new(format!("{follow_label} ({inherited} px)"))
                                 .checked(current.is_none())
                                 .on_click(move |_, _w, cx| {
                                     me_auto.update(cx, |this, cx| cb_auto(this, None, cx)).ok();
@@ -2235,6 +2304,8 @@ pub(crate) static SETTINGS_INDEX: &[SettingEntry] = &[
     entry(AC, "Account", "Status", "Sync state, sign-in and server settings.", "sync now sign in server settings connection password"),
     entry(AC, "Account", "Calendar server", "CalDAV calendars for this account.", "caldav calendar"),
     entry(AC, "Signatures", "Signatures", "Added below your message, above anything you are replying to.", "signature html picture image"),
+    entry(AC, "Signatures", "Signature font", "Typeface for this signature.", "signature font family typeface"),
+    entry(AC, "Signatures", "Signature text size", "Text size for this signature.", "signature font size"),
     entry(AC, "Signatures", "Use for new messages", "Default signature for new messages.", "signature default"),
     entry(AC, "Signatures", "Use for replies and forwards", "Default signature for replies and forwards.", "signature default reply forward"),
     entry(AC, "Automatic replies", "Send automatic replies", "An out-of-office reply sent for you while it is on.", "vacation out of office away autoresponder"),
@@ -2355,6 +2426,8 @@ mod search_tests {
         assert!(hits.iter().any(|e| e.page == SettingsPage::Fonts && e.label == "Reading font"));
         assert!(search_settings("monospace").iter().any(|e| e.page == SettingsPage::Fonts && e.label == "Monospace font"));
         assert!(search_settings("compose size").iter().any(|e| e.page == SettingsPage::Fonts && e.label == "Compose text size"));
+        assert!(search_settings("signature font").iter().any(|e| e.page == SettingsPage::Accounts && e.label == "Signature font"));
+        assert!(search_settings("signature size").iter().any(|e| e.page == SettingsPage::Accounts && e.label == "Signature text size"));
 
         let installed = vec!["Arial".to_owned(), "Georgia".to_owned(), "Menlo".to_owned()];
         let choices = super::font_choices(

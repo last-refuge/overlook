@@ -81,7 +81,7 @@ fn give_signature(draft: &mut Draft, signature: Option<&Signature>, folder: &std
         }
     }
     draft.signature_id = Some(signature.id.clone());
-    draft.signature_html = Some(signature.html.clone());
+    draft.signature_html = Some(signature.styled_html());
 }
 
 /// The images a draft carries inline, to draw HTML that refers to them with `cid:`.
@@ -140,7 +140,17 @@ impl MailWindow {
         }
         let view = c.signature_view.clone()?;
         let id = c.draft.signature_id.clone().unwrap_or_default();
-        let name = self.account_prefs_for(&c.draft.account_id).signature_by_id(&id).map(|s| s.name.clone()).filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "Signature".into());
+        let account_prefs = self.account_prefs_for(&c.draft.account_id);
+        let sig = account_prefs.signature_by_id(&id);
+        let name = sig.map(|s| s.name.clone()).filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "Signature".into());
+        let sig_family = SharedString::from(
+            sig.map(|s| s.effective_font_family(&self.prefs.fonts))
+                .unwrap_or_else(|| self.prefs.fonts.effective_compose_family())
+                .to_owned(),
+        );
+        let sig_size = sig
+            .map(|s| s.effective_font_size(&self.prefs.fonts))
+            .unwrap_or_else(|| self.prefs.fonts.clamped_compose_size());
         let edit_id = id.clone();
         Some(
             v_flex()
@@ -167,8 +177,9 @@ impl MailWindow {
                         .pl(px(12.))
                         .border_l_2()
                         .border_color(p.divider)
-                        .text_size(crate::ui::ui_px(14.))
-                        .line_height(crate::ui::ui_px(22.))
+                        .font_family(sig_family)
+                        .text_size(px(f32::from(sig_size)))
+                        .line_height(px((f32::from(sig_size) * 1.45).round()))
                         .child(TextView::html(SharedString::from(format!("signature-{}-{id}", c.draft.id)), view)),
                 )
                 .into_any_element(),
@@ -203,6 +214,8 @@ impl MailWindow {
             .child(div().w(px(1.)).h(px(18.)).mx(px(4.)).bg(p.divider))
             .child(Button::new("sig-image").ghost().xsmall().icon(icon("image-plus").size(px(15.))).label("Image").tooltip("Insert a picture (PNG, JPEG, GIF or WebP)").on_click(cx.listener(|this, _, window, cx| this.choose_signature_image(window, cx))));
 
+        let preview_family = SharedString::from(signature.effective_font_family(&self.prefs.fonts).to_owned());
+        let preview_size = signature.effective_font_size(&self.prefs.fonts);
         let preview: AnyElement = if signature.html.trim().is_empty() {
             div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child("Nothing to show yet. Type or paste HTML above.").into_any_element()
         } else {
@@ -227,9 +240,50 @@ impl MailWindow {
                     ),
             )
             .child(div().text_size(crate::ui::ui_px(12.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child("Preview"))
-            .child(div().rounded(px(8.)).border_1().border_color(p.divider).px(px(14.)).py(px(10.)).min_h(px(64.)).text_size(crate::ui::ui_px(14.)).line_height(crate::ui::ui_px(22.)).child(preview))
+            .child(
+                div()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(p.divider)
+                    .px(px(14.))
+                    .py(px(10.))
+                    .min_h(px(64.))
+                    .font_family(preview_family)
+                    .text_size(px(f32::from(preview_size)))
+                    .line_height(px((f32::from(preview_size) * 1.45).round()))
+                    .child(preview),
+            )
             .when(has_remote_images(&signature.html), |d| d.child(div().text_size(crate::ui::ui_px(11.)).text_color(p.muted).child("Pictures from the web are not loaded in the preview. They are sent as links, and many mail programs hold them back until the reader allows them.")))
             .into_any_element()
+    }
+
+    pub(super) fn edit_signature_font(&mut self, family: Option<String>, cx: &mut Context<Self>) {
+        let Some((account, id)) = self.settings.as_ref().and_then(|s| Some((s.account.clone(), s.selected_signature.clone()?))) else {
+            return;
+        };
+        let mut prefs = self.account_prefs_for(&account);
+        let Some(signature) = prefs.signatures.iter_mut().find(|s| s.id == id) else { return };
+        if signature.font_family == family {
+            return;
+        }
+        signature.font_family = family;
+        self.save_account_prefs(&account, prefs, cx);
+        cx.notify();
+    }
+
+    pub(super) fn edit_signature_font_size(&mut self, size: Option<u8>, cx: &mut Context<Self>) {
+        let Some((account, id)) = self.settings.as_ref().and_then(|s| Some((s.account.clone(), s.selected_signature.clone()?))) else {
+            return;
+        };
+        let mut prefs = self.account_prefs_for(&account);
+        let Some(signature) = prefs.signatures.iter_mut().find(|s| s.id == id) else { return };
+        let clamped = size.map(|s| s.clamp(FontPrefs::MIN_EMAIL_SIZE, FontPrefs::MAX_EMAIL_SIZE));
+        if signature.font_size == clamped {
+            return;
+        }
+        signature.font_size = clamped;
+        self.save_account_prefs(&account, prefs, cx);
+        cx.notify();
     }
 
     /// Takes new HTML for the signature being edited: pictures pasted in as `data:` URLs become
@@ -481,5 +535,25 @@ mod tests {
         assert!(has_remote_images("<img src=\"https://x.example/a.png\">"));
         assert!(has_remote_images("<IMG SRC='http://x.example/a.png'>"));
         assert!(!has_remote_images("<img src=\"cid:a@overlook\"><a href=\"https://x.example\">x</a>"));
+    }
+
+    #[test]
+    fn signature_font_override_is_baked_into_draft_and_cleans_up_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sig = signature("<p>Jason</p><img src=\"cid:sig-logo@overlook\">", &[("sig-logo", PNG)]);
+        sig.font_family = Some("Georgia".into());
+        sig.font_size = Some(13);
+        let mut draft = draft();
+        give_signature(&mut draft, Some(&sig), dir.path());
+
+        let html = draft.signature_html.as_deref().unwrap();
+        assert!(html.contains("font-family: 'Georgia',"), "{html}");
+        assert!(html.contains("font-size: 13px;"), "{html}");
+        assert_eq!(draft.attachments.len(), 1);
+        let logo_path = draft.attachments[0].local_path.clone();
+
+        take_off_signature(&mut draft);
+        assert!(draft.attachments.is_empty());
+        assert!(!std::path::Path::new(&logo_path).exists());
     }
 }

@@ -331,7 +331,7 @@ impl Default for Prefs {
     }
 }
 
-/// One named signature: HTML, with the images it embeds.
+/// One named signature: HTML, with the images it embeds and optional typography overrides.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Signature {
@@ -343,6 +343,49 @@ pub struct Signature {
     /// The signature as HTML. Its images are `cid:` references to `images`.
     pub html: String,
     pub images: Vec<SignatureImage>,
+    /// Optional font family for this signature (`None` inherits the compose/outgoing font).
+    pub font_family: Option<String>,
+    /// Optional font size in CSS px (`None` inherits the compose/outgoing size).
+    pub font_size: Option<u8>,
+}
+
+impl Signature {
+    /// Effective UI/preview font family for this signature, falling back to the compose font.
+    pub fn effective_font_family<'a>(&'a self, fonts: &'a FontPrefs) -> &'a str {
+        clean_family(self.font_family.as_deref()).unwrap_or_else(|| fonts.effective_compose_family())
+    }
+
+    /// Effective UI/preview font size in px for this signature, falling back to the compose size.
+    pub fn effective_font_size(&self, fonts: &FontPrefs) -> u8 {
+        self.font_size
+            .map(|s| s.clamp(FontPrefs::MIN_EMAIL_SIZE, FontPrefs::MAX_EMAIL_SIZE))
+            .unwrap_or_else(|| fonts.clamped_compose_size())
+    }
+
+    /// Signature HTML wrapped with this signature's explicit font family/size when configured.
+    /// Returns raw `self.html` unchanged when neither override is set, preserving defaults and
+    /// allowing outgoing-font inheritance in [`crate::compose::outgoing_bodies_with_font`].
+    pub fn styled_html(&self) -> String {
+        if self.html.trim().is_empty() {
+            return String::new();
+        }
+        let family = clean_family(self.font_family.as_deref());
+        let size = self
+            .font_size
+            .map(|s| s.clamp(FontPrefs::MIN_EMAIL_SIZE, FontPrefs::MAX_EMAIL_SIZE));
+        let mut decls = Vec::new();
+        if let Some(fam) = family {
+            decls.push(format!("font-family: {};", css_sans_font_stack(Some(fam))));
+        }
+        if let Some(px) = size {
+            decls.push(format!("font-size: {px}px;"));
+        }
+        if decls.is_empty() {
+            self.html.clone()
+        } else {
+            format!("<div style=\"{}\">{}</div>", decls.join(" "), self.html)
+        }
+    }
 }
 
 /// An image a signature embeds. It travels in the message as an inline part whose
@@ -543,5 +586,56 @@ mod tests {
         .expect("default outgoing font enabled");
         assert_eq!(default_outgoing.family.as_deref(), Some(DEFAULT_UI_FONT));
         assert!(default_outgoing.css_family().starts_with("'Inter',"));
+    }
+
+    #[test]
+    fn signature_font_defaults_inheritance_and_styling() {
+        // Older saved signatures without font fields deserialize cleanly.
+        let prefs: AccountPrefs =
+            serde_json::from_str(r#"{"signatures":[{"id":"s1","name":"Work","html":"<p>Jason</p>"}]}"#).unwrap();
+        let sig = &prefs.signatures[0];
+        assert_eq!((sig.font_family.as_deref(), sig.font_size), (None, None));
+        assert_eq!(sig.styled_html(), "<p>Jason</p>");
+
+        let fonts = FontPrefs {
+            compose_family: Some("Georgia".into()),
+            compose_size: 16,
+            ..Default::default()
+        };
+        assert_eq!(sig.effective_font_family(&fonts), "Georgia");
+        assert_eq!(sig.effective_font_size(&fonts), 16);
+
+        let styled = Signature {
+            id: "s2".into(),
+            name: "Personal".into(),
+            html: "<p>Best,<br>Jason</p>".into(),
+            font_family: Some("Palatino".into()),
+            font_size: Some(13),
+            ..Default::default()
+        };
+        assert_eq!(styled.effective_font_family(&fonts), "Palatino");
+        assert_eq!(styled.effective_font_size(&fonts), 13);
+        let wrapped = styled.styled_html();
+        assert!(wrapped.starts_with("<div style=\"font-family: 'Palatino',"));
+        assert!(wrapped.contains("font-size: 13px;\"><p>Best,<br>Jason</p></div>"));
+
+        // Family-only or size-only overrides emit only that declaration.
+        let family_only = Signature {
+            html: "<p>Hi</p>".into(),
+            font_family: Some("Verdana".into()),
+            ..Default::default()
+        };
+        assert!(family_only.styled_html().contains("font-family: 'Verdana',"));
+        assert!(!family_only.styled_html().contains("font-size:"));
+
+        let size_only = Signature {
+            html: "<p>Hi</p>".into(),
+            font_size: Some(99),
+            ..Default::default()
+        };
+        assert_eq!(
+            size_only.styled_html(),
+            format!("<div style=\"font-size: {}px;\"><p>Hi</p></div>", FontPrefs::MAX_EMAIL_SIZE)
+        );
     }
 }

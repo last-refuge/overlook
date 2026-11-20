@@ -28,6 +28,14 @@ fn full_width(row: impl IntoElement) -> AnyElement {
     v_flex().w_full().child(row).into_any_element()
 }
 
+/// Whether the virtual list should reset its scroll position instead of diff-splicing.
+/// Switching account/view/filter/search always starts at the top, and filling a previously
+/// empty list must also reset because GPUI's `ListState::splice(0..0, count)` shifts
+/// `logical_scroll_top` from `0` to `count` (jumping straight to the bottom).
+fn should_reset_list_state(previous_len: usize, next_len: usize, context_changed: bool) -> bool {
+    context_changed || (previous_len == 0 && next_len > 0)
+}
+
 /// The rows that differ between two lists: the range of `old` that was replaced and how many
 /// rows replaced it. Rows that are the same at the start and at the end are left out, so the
 /// list keeps their measured heights and the scroll position. `None` when nothing differs.
@@ -354,16 +362,26 @@ impl MailWindow {
     fn refresh_list_rows(&self, compact: bool) {
         let key = RowsKey {
             data: self.list_data_generation,
+            account: self.account.id.clone(),
             view: self.view.clone(),
+            filter: self.filter,
+            inbox_tab: self.inbox_focus(),
             searching: !self.search_query.is_empty(),
             today: overlook_core::time::local_day(overlook_core::time::now(), &self.time_zone),
             time_zone_revision: self.time_zone_revision,
         };
         if self.rows_key.borrow().as_ref() != Some(&key) {
+            let context_changed = self.rows_key.borrow().as_ref().is_some_and(|prev| {
+                prev.account != key.account
+                    || prev.view != key.view
+                    || prev.filter != key.filter
+                    || prev.inbox_tab != key.inbox_tab
+                    || prev.searching != key.searching
+            });
             let rows = self.list_rows();
             self.rows_total.set(rows.iter().filter(|r| !matches!(r, ListRow::Group(..))).count());
             self.rows_unread.set(rows.iter().filter(|r| matches!(r, ListRow::Conversation(c) if c.is_unread())).count());
-            self.sync_list_state(&rows);
+            self.sync_list_state(&rows, context_changed);
             *self.rows_key.borrow_mut() = Some(key);
         }
         // Density, sender-picture, preview, and typography settings change every row's height,
@@ -382,10 +400,14 @@ impl MailWindow {
     }
 
     /// Tells the virtual list which rows changed since the last frame. Rows that are the
-    /// same at the start and the end keep their measured heights and the scroll position.
-    fn sync_list_state(&self, rows: &[ListRow]) {
+    /// same at the start and the end keep their measured heights and the scroll position,
+    /// except when changing views or refilling an empty list, which resets cleanly to the top.
+    fn sync_list_state(&self, rows: &[ListRow], context_changed: bool) {
         let mut old = self.shown_rows.borrow_mut();
-        if let Some((replaced, count)) = changed_span(&old, rows) {
+        if should_reset_list_state(old.len(), rows.len(), context_changed) {
+            self.list_state.reset(rows.len());
+            *old = rows.to_vec();
+        } else if let Some((replaced, count)) = changed_span(&old, rows) {
             self.list_state.splice(replaced, count);
             *old = rows.to_vec();
         }
@@ -1163,5 +1185,14 @@ mod tests {
         assert_eq!(changed_span(&[1, 2], &[]), Some((0..2, 0)));
         assert_eq!(changed_span::<u8>(&[], &[1, 2]), Some((0..0, 2)));
         assert_eq!(changed_span(&[1, 2], &[3, 4, 5]), Some((0..2, 3)));
+    }
+
+    #[test]
+    fn switching_views_or_leaving_an_empty_list_resets_scroll_to_top() {
+        assert!(super::should_reset_list_state(0, 5, false));
+        assert!(super::should_reset_list_state(10, 5, true));
+        assert!(super::should_reset_list_state(10, 0, true));
+        assert!(!super::should_reset_list_state(10, 11, false));
+        assert!(!super::should_reset_list_state(0, 0, false));
     }
 }

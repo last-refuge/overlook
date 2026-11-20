@@ -136,6 +136,16 @@ impl MailIndex {
         let trash = self.label_of_kind(LabelKind::Trash);
         let spam = self.label_of_kind(LabelKind::Spam);
         let sent = self.label_of_kind(LabelKind::Sent);
+        // IMAP/M365 accounts have a real server-backed Archive folder distinct from custom user
+        // folders, whereas Gmail has no Archive label and POP3's Archive is local-only
+        // (`provider_id: None`). When a real Archive folder exists, Archive shows only messages
+        // in that folder (plus locally-archived messages whose Inbox label was removed while
+        // sync is pending) so unrelated custom folders never bleed into Archive.
+        let archive_folder = self
+            .labels
+            .iter()
+            .find(|l| l.kind == LabelKind::Archive && l.provider_id.is_some())
+            .map(|l| l.id.clone());
         let trash_view = matches!(view, MailboxView::Kind(LabelKind::Trash));
 
         // Every message of a conversation decides whether it belongs to the view. This
@@ -152,10 +162,14 @@ impl MailIndex {
                 MailboxView::Kind(LabelKind::Trash) => in_trash(m),
                 MailboxView::Kind(LabelKind::Spam) => in_spam(m),
                 MailboxView::Kind(LabelKind::Archive) => {
-                    !in_trash(m)
-                        && !in_spam(m)
-                        && !inbox.as_ref().is_some_and(|i| m.has_label(i))
-                        && !sent.as_ref().is_some_and(|s| m.has_label(s))
+                    if let Some(archive) = &archive_folder {
+                        !in_trash(m) && !in_spam(m) && (m.has_label(archive) || m.label_ids.is_empty())
+                    } else {
+                        !in_trash(m)
+                            && !in_spam(m)
+                            && !inbox.as_ref().is_some_and(|i| m.has_label(i))
+                            && !sent.as_ref().is_some_and(|s| m.has_label(s))
+                    }
                 }
                 MailboxView::Kind(LabelKind::Drafts | LabelKind::Outbox | LabelKind::Container) => false,
                 MailboxView::Kind(LabelKind::User) => m.label_ids.iter().any(|l| self.label_kinds.get(l).copied() == Some(LabelKind::User)),
