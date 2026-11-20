@@ -2555,7 +2555,8 @@ mod tests {
     #[test]
     #[ignore = "runs real sandboxed Chromium"]
     fn chromium_email_paper_defaults_preserve_authored_colors() {
-        let palette = crate::theme::Palette::light();
+        let appearance = crate::theme::Palette::light().email_body_appearance(false);
+        let fonts = overlook_core::FontPrefs::default();
         let mut actor = Actor::start(Arc::new(AtomicBool::new(false)), false).unwrap();
         for (source, paper, ink) in [
             ("<p>Synthetic unstyled message</p>", [255, 255, 255], "rgb(32, 36, 43)"),
@@ -2563,8 +2564,8 @@ mod tests {
             ("<body style='background:#203040;color:#fafafa'><p>Authored inline style</p></body>", [32, 48, 64], "rgb(250, 250, 250)"),
             ("<body bgcolor='#203040' text='#fafafa'><p>Authored legacy attributes</p></body>", [32, 48, 64], "rgb(250, 250, 250)"),
         ] {
-            let document = palette.prepare_browser_document(source);
-            actor.load(&document.html, false).unwrap();
+            let document = appearance.prepare_document(source, &fonts);
+            actor.load(&document.html, appearance.dark).unwrap();
             let (png, _, _) = actor.frame().unwrap();
             let pixels = image::load_from_memory(&png).unwrap().into_rgb8();
             assert_eq!(pixels.get_pixel(400, 50).0, paper, "{source}");
@@ -2574,20 +2575,33 @@ mod tests {
 
     #[test]
     #[ignore = "runs real sandboxed Chromium"]
-    fn chromium_email_paper_stays_light_in_dark_shell() {
+    fn chromium_email_paper_can_follow_the_dark_shell_and_switch_back() {
+        let fonts = overlook_core::FontPrefs::default();
         let mut actor = Actor::start(Arc::new(AtomicBool::new(false)), false).unwrap();
         for theme in [overlook_core::ResolvedTheme::Light, overlook_core::ResolvedTheme::Dark, overlook_core::ResolvedTheme::Pink] {
             let palette = crate::theme::Palette::for_theme(theme);
-            let document = palette.prepare_browser_document(
-                "<style>@media(prefers-color-scheme:dark){body{background:black;color:white}}</style><div style='height:100px;background:white;color:black'>Fictional light paper</div>",
-            );
-            actor.load(&document.html, false).unwrap();
-            let (png, _, _) = actor.frame().unwrap();
-            let pixels = image::load_from_memory(&png).unwrap().into_rgb8();
-            assert_eq!(pixels.get_pixel(400, 50).0, [255, 255, 255], "{theme:?}");
-            assert_eq!(actor.cdp.eval("getComputedStyle(document.body).backgroundColor".into()).unwrap(), "rgb(255, 255, 255)");
-            assert_eq!(actor.cdp.eval("getComputedStyle(document.body).color".into()).unwrap(), "rgb(32, 36, 43)");
-            assert_eq!(actor.cdp.eval("matchMedia('(prefers-color-scheme: dark)').matches".into()).unwrap(), false);
+            for follow in [false, true, false] {
+                let appearance = palette.email_body_appearance(follow);
+                let document = appearance.prepare_document(
+                    "<style>@media(prefers-color-scheme:dark){#card{border-top:1px solid white}}</style><div id='card' style='height:100px;width:600px;background:white;color:black'>Fictional message</div>",
+                    &fonts,
+                );
+                actor.load(&document.html, appearance.dark).unwrap();
+                let (png, _, _) = actor.frame().unwrap();
+                let pixels = image::load_from_memory(&png).unwrap().into_rgb8();
+                let paper = appearance.paper.to_be_bytes();
+                assert_eq!(pixels.get_pixel(700, 50).0, [paper[1], paper[2], paper[3]], "{theme:?}, follow: {follow}");
+                let card = pixels.get_pixel(400, 50).0;
+                if appearance.dark {
+                    assert!(card.iter().all(|&channel| channel < 64), "the authored white card was painted {card:?}");
+                    assert!((1..28).any(|y| (0..160).any(|x| {
+                        pixels.get_pixel(x, y).0.iter().all(|&channel| channel > 192)
+                    })), "the authored black text should be readable on the dark card");
+                } else {
+                    assert_eq!(card, [255, 255, 255]);
+                }
+                assert_eq!(actor.cdp.eval("getComputedStyle(document.querySelector('#card')).borderTopWidth".into()).unwrap(), if appearance.dark { "1px" } else { "0px" });
+            }
         }
     }
 

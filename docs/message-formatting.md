@@ -86,13 +86,13 @@ printing projection; it is not yet guaranteed to match the new inline surface.
 - Remote consent remains an explicit per-message choice or the global **Remote
   content** preference. The legacy persisted preference key remains compatible.
 
-Email paper stays white with dark default text in every shell theme. Mail rendering
-uses Chromium's light color scheme, including previews, quoted history and Outbox;
-a Dark app theme does not invert sender content. Sender-authored colors still take
-precedence. A native white surface adds 20px horizontal and 16px vertical gutters
-outside the document, with matching light paper for plain text, loading and fallback
-content. The surrounding app and message controls retain the selected theme. Fonts
-depend on installed system fonts and consent for authored remote fonts.
+Email paper defaults to white with dark text. In a dark theme, the reading pane's
+sun/moon button switches message bodies between light paper and the theme's dark
+colors. The choice is saved across messages and windows. Chromium uses the chosen
+color scheme for message HTML and adapts light sender styles in dark mode. Native
+gutters, plain text, and loading and fallback content use matching colors. Compose
+previews, reply quote previews, and Outbox previews use light paper. Fonts depend
+on installed system fonts and consent for authored remote fonts.
 Animation/transition playback is suppressed. Full DOM accessibility
 bridging is not implemented yet.
 
