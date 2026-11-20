@@ -3,6 +3,7 @@
 mod delivery;
 mod drafts;
 mod organization;
+mod invitations;
 
 use super::*;
 use serde_json::Value;
