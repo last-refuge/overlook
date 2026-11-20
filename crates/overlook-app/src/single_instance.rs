@@ -123,9 +123,22 @@ fn socket_dir() -> PathBuf {
 }
 
 fn socket_path() -> PathBuf {
-    let profile = std::env::var("OVERLOOK_DATA_DIR").unwrap_or_default();
+    let profile = std::env::var_os("OVERLOOK_DATA_DIR").map(|path| {
+        let path = PathBuf::from(path);
+        path.canonicalize().unwrap_or(path)
+    });
+    // Use the same launch channel for aliases, including an explicit path to the default.
+    let default = crate::default_data_dir().canonicalize().ok();
+    let profile = profile
+        .filter(|path| Some(path) != default.as_ref())
+        .unwrap_or_default();
     let mut h = DefaultHasher::new();
-    profile.hash(&mut h);
+    // Preserve the launch channel for the default and for canonical UTF-8 paths.
+    if let Some(profile) = profile.to_str() {
+        profile.hash(&mut h);
+    } else {
+        profile.hash(&mut h);
+    }
     socket_dir().join(format!("overlook-{:08x}.sock", h.finish() as u32))
 }
 

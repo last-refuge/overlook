@@ -291,6 +291,7 @@ pub fn quit(cx: &mut App) {
 fn quit_now(cx: &mut App) {
     tracing::info!("quitting");
     // A launch from now on starts a new Overlook rather than handing itself to this one.
+    crate::mcp::stop_desktop();
     crate::single_instance::release();
     cx.quit();
 }

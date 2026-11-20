@@ -12,6 +12,7 @@ mod graph_contacts_sync;
 mod google_signin;
 mod lifecycle;
 mod loopback;
+mod mcp;
 mod microsoft_signin;
 mod notify;
 mod persist;
@@ -60,9 +61,10 @@ pub fn since_start_ms() -> u128 {
 }
 
 fn data_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("OVERLOOK_DATA_DIR") {
-        return PathBuf::from(dir);
-    }
+    std::env::var_os("OVERLOOK_DATA_DIR").map_or_else(default_data_dir, PathBuf::from)
+}
+
+fn default_data_dir() -> PathBuf {
     directories::ProjectDirs::from("ai", "Last Refuge", "Overlook")
         .map(|d| d.data_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from(".overlook"))
@@ -77,16 +79,21 @@ pub fn seed_sample_account(store: &Store) -> anyhow::Result<Account> {
         email: "jason@example.com".into(),
         created_at: now(),
     };
-    store.upsert_account(&account)?;
-    let snapshot = sample_mailbox(&account, now());
+    seed_sample_mailbox(store, &account)?;
+    info!("seeded sample account");
+    Ok(account)
+}
+
+fn seed_sample_mailbox(store: &Store, account: &Account) -> anyhow::Result<()> {
+    store.upsert_account(account)?;
+    let snapshot = sample_mailbox(account, now());
     for label in &snapshot.labels {
         store.upsert_label(label)?;
     }
     store.upsert_messages(&snapshot.messages)?;
     store.set_checkpoint(&account.id, snapshot.checkpoint.as_deref())?;
     store.set_sync_state(&account.id, &SyncState::Offline, None)?;
-    info!("seeded sample account");
-    Ok(account)
+    Ok(())
 }
 
 /// Opens the profile database. With no accounts yet, the window offers the sample mailbox.
@@ -124,7 +131,6 @@ fn init_logging() {
     use tracing_subscriber::Layer;
     let filter = log_filter;
     let path = data_dir().join("overlook.log");
-    restrict_to_owner(&data_dir());
     if std::fs::metadata(&path).is_ok_and(|m| m.len() > 4 * 1024 * 1024) {
         let _ = std::fs::rename(&path, path.with_extension("log.old"));
     }
@@ -264,6 +270,13 @@ fn main() {
     STARTED.get_or_init(std::time::Instant::now);
     // Plain command-line conveniences; anything else starts the app.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "mcp") {
+        if let Err(error) = mcp::run(&args[1..]) {
+            eprintln!("Overlook MCP: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let mailto = args.iter().find(|a| a.to_ascii_lowercase().starts_with("mailto:")).cloned();
     if let Some(link) = &mailto {
         // A running Overlook takes the link; this launch is done.
@@ -281,7 +294,7 @@ fn main() {
         return;
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("Overlook {} — a clear view of what matters.\n\nUsage: overlook [mailto:…] [--background] [--quit] [--reload-theme] [--version] [--help]\n\n  --background  start without a window when \"Keep running when the window is closed\" is on\n                (otherwise open it); does nothing if Overlook is already running\n  --quit        quit the running Overlook\n\nEnvironment:\n  OVERLOOK_DATA_DIR      profile directory (default ~/.local/share/overlook)\n  OVERLOOK_CONFIG_DIR    directory for an optional google-oauth-client.json or\n                         microsoft-oauth-client.json of your own (default ~/.config/overlook)\n  OVERLOOK_SIGN_IN=gmail start the Google sign-in at launch (microsoft / icloud / yahoo / aol /
+        println!("Overlook {} — a clear view of what matters.\n\nUsage: overlook [mailto:…] [--background] [--quit] [--reload-theme] [--version] [--help]\n       overlook mcp --help\n\n  --background  start without a window when \"Keep running when the window is closed\" is on\n                (otherwise open it); does nothing if Overlook is already running\n  --quit        quit the running Overlook\n\nEnvironment:\n  OVERLOOK_DATA_DIR      profile directory (default ~/.local/share/overlook)\n  OVERLOOK_CONFIG_DIR    directory for an optional google-oauth-client.json or\n                         microsoft-oauth-client.json of your own (default ~/.config/overlook)\n  OVERLOOK_SIGN_IN=gmail start the Google sign-in at launch (microsoft / icloud / yahoo / aol /
                          fastmail / proton / imap / pop3: open that account setup)\n  OVERLOOK_BROWSER_BIN  compatible Chromium executable (default PATH discovery){}", env!("CARGO_PKG_VERSION"), if cfg!(debug_assertions) { "\n  RUST_LOG=overlook=debug tracing output (development builds only)" } else { "" });
         return;
     }
@@ -302,6 +315,8 @@ fn main() {
     if !background && single_instance::send(&single_instance::LaunchEnv::current().show_line()) {
         return;
     }
+    // Resolve aliases to the same launch channel, including on the first launch.
+    restrict_to_owner(&data_dir());
     match single_instance::listen() {
         Ok(true) => {}
         Ok(false) => {
@@ -328,6 +343,7 @@ fn main() {
         }
     };
     tracing::debug!("startup: store open after {} ms", since_start_ms());
+    mcp::start_desktop(&data_dir(), store.clone());
     theme::install_omarchy_hook();
     if let Some(link) = mailto {
         single_instance::push(link);

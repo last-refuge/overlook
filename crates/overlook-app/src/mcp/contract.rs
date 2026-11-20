@@ -54,6 +54,9 @@ pub enum ErrorCode {
 
 impl Failure {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
-        Self { code, message: message.into() }
+        Self {
+            code,
+            message: message.into(),
+        }
     }
 }

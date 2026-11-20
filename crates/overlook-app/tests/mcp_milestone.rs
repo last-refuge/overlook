@@ -1,6 +1,7 @@
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -19,9 +20,11 @@ const POLL: Duration = Duration::from_millis(20);
 fn modern_and_legacy_clients_share_one_owner_with_live_grant_checks() {
     let root = fixture();
     let profile = root.path().join("profile");
-    let mut owner = start_owner(&profile);
     let alpha = grant(&profile, "alpha", &[PRIMARY]);
+    let mut owner = start_owner(&profile);
     let beta = grant(&profile, "beta", &[PRIMARY, SECONDARY]);
+    let alias = root.path().join("alias");
+    symlink(&profile, &alias).unwrap();
 
     let mut modern = Mcp::start(&profile, "alpha", &alpha, MODERN);
     let discover = modern.request("server/discover", json!({}));
@@ -32,7 +35,7 @@ fn modern_and_legacy_clients_share_one_owner_with_live_grant_checks() {
     assert!(discover["capabilities"]["tools"].is_object());
     assert_tool_catalog(&mut modern);
 
-    let mut legacy = Mcp::start(&profile, "alpha", &alpha, LEGACY);
+    let mut legacy = Mcp::start(&alias, "alpha", &alpha, LEGACY);
     assert_tool_catalog(&mut legacy);
     let primary = only_primary(&modern.accounts());
     assert_eq!(only_primary(&legacy.accounts()), primary);
@@ -60,7 +63,7 @@ fn modern_and_legacy_clients_share_one_owner_with_live_grant_checks() {
         "access_denied",
     );
 
-    let mut duplicate = Process::spawn(command(&profile, &["mcp", "sample"]));
+    let mut duplicate = Process::spawn(command(&alias, &["mcp", "sample"]));
     let status = duplicate.wait();
     assert!(
         status.code().is_some_and(|code| code != 0),
@@ -82,7 +85,7 @@ fn modern_and_legacy_clients_share_one_owner_with_live_grant_checks() {
     modern.finish();
     legacy.finish();
     both.finish();
-    quit_owner(&profile, &mut owner);
+    quit_owner(&alias, &mut owner);
 }
 
 #[test]
@@ -101,8 +104,9 @@ fn wrong_profile_and_stopped_profile_have_distinct_tool_errors() {
 
     let mut client_a = Mcp::start(&a, "alpha", &token_a, MODERN);
     let mut client_b = Mcp::start(&b, "alpha", &token_b, MODERN);
-    only_primary(&client_a.accounts());
-    only_primary(&client_b.accounts());
+    let account_a = only_primary(&client_a.accounts());
+    let account_b = only_primary(&client_b.accounts());
+    assert_ne!(account_a, account_b, "account IDs must be profile-local");
 
     let mut wrong_profile = Mcp::start(&b, "alpha", &token_a, MODERN);
     assert_failure(
@@ -124,6 +128,23 @@ fn wrong_profile_and_stopped_profile_have_distinct_tool_errors() {
     client_b.finish();
     stopped.finish();
     quit_owner(&a, &mut owner_a);
+}
+
+#[test]
+fn sample_mode_leaves_existing_desktop_database_alone() {
+    let root = fixture();
+    let profile = root.path().join("profile");
+    fs::create_dir(&profile).unwrap();
+    let database = profile.join("overlook.sqlite");
+    let contents = b"existing profile data";
+    fs::write(&database, contents).unwrap();
+
+    let mut process = Process::spawn(command(&profile, &["mcp", "sample"]));
+    assert!(!process.wait().success());
+    assert!(process
+        .diagnostics()
+        .contains("without an Overlook database"));
+    assert_eq!(fs::read(database).unwrap(), contents);
 }
 
 fn assert_tool_catalog(client: &mut Mcp) {
