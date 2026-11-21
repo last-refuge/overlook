@@ -47,9 +47,17 @@ impl Drop for Endpoint {
 
 #[derive(Deserialize, Serialize)]
 pub(super) struct Grant {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client: Option<String>,
     token_digest: [u8; 32],
     pub account_ids: BTreeSet<String>,
     #[serde(default)]
+    pub permissions: BTreeSet<WritePermission>,
+}
+
+pub(crate) struct ClientGrant {
+    pub client: String,
+    pub account_ids: BTreeSet<String>,
     pub permissions: BTreeSet<WritePermission>,
 }
 
@@ -141,12 +149,42 @@ impl Profile {
     ) -> anyhow::Result<String> {
         let token = URL_SAFE_NO_PAD.encode(random_bytes::<TOKEN_BYTES>()?);
         let grant = Grant {
+            client: Some(client.to_owned()),
             token_digest: self.token_digest(client, &token),
             account_ids: account_ids.iter().cloned().collect(),
             permissions,
         };
         self.write_private(&self.grant_path(client), &serde_json::to_vec(&grant)?)?;
         Ok(token)
+    }
+
+    pub(super) fn list_grants(&self) -> anyhow::Result<Vec<ClientGrant>> {
+        let mut grants = Vec::new();
+        for entry in fs::read_dir(&self.state)? {
+            let path = entry?.path();
+            if !path
+                .file_name()
+                .is_some_and(|name| name.as_encoded_bytes().starts_with(b"grant-"))
+            {
+                continue;
+            }
+            let Some(grant) = read_grant(&path) else {
+                continue;
+            };
+            let Some(client) = grant
+                .client
+                .filter(|client| valid_client(client) && self.grant_path(client) == path)
+            else {
+                continue;
+            };
+            grants.push(ClientGrant {
+                client,
+                account_ids: grant.account_ids,
+                permissions: grant.permissions,
+            });
+        }
+        grants.sort_by(|a, b| a.client.cmp(&b.client));
+        Ok(grants)
     }
 
     pub(super) fn revoke(&self, client: &str) -> anyhow::Result<()> {
@@ -161,15 +199,7 @@ impl Profile {
         if !valid_client(client) || !valid_token(token) {
             return None;
         }
-        let file = private_file(&self.grant_path(client), false).ok()?;
-        let mut bytes = Vec::new();
-        file.take((MAX_GRANT_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .ok()?;
-        if bytes.len() > MAX_GRANT_BYTES {
-            return None;
-        }
-        let grant: Grant = serde_json::from_slice(&bytes).ok()?;
+        let grant = read_grant(&self.grant_path(client))?;
         let presented = self.token_digest(client, token);
         let difference = presented
             .iter()
@@ -206,6 +236,18 @@ impl Profile {
     }
 }
 
+fn read_grant(path: &Path) -> Option<Grant> {
+    let file = private_file(path, false).ok()?;
+    let mut bytes = Vec::new();
+    file.take((MAX_GRANT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_GRANT_BYTES {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
 pub(super) fn existing_socket(profile: &Path) -> anyhow::Result<PathBuf> {
     let profile = canonical_profile(profile)?;
     let dir = runtime_dir();
@@ -232,7 +274,10 @@ pub(super) fn public_id(key: &[u8; KEY_BYTES], account_id: &str) -> String {
 }
 
 pub(super) fn valid_client(client: &str) -> bool {
-    !client.trim().is_empty() && client.len() <= 128 && !client.chars().any(char::is_control)
+    !client.trim().is_empty()
+        && client.len() <= 128
+        && !client.starts_with('-')
+        && !client.chars().any(char::is_control)
 }
 
 pub(super) fn valid_token(token: &str) -> bool {
@@ -314,4 +359,41 @@ fn random_bytes<const N: usize>() -> io::Result<[u8; N]> {
 fn uid() -> u32 {
     // SAFETY: geteuid has no arguments or preconditions.
     unsafe { libc::geteuid() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn named_grants_expose_metadata_and_keep_legacy_credentials_valid() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = Profile::open(temp.path()).unwrap();
+        let accounts = [String::from("sample")];
+        let permissions = BTreeSet::from([WritePermission::Calendar]);
+        let legacy_token = profile
+            .grant("legacy", &accounts, permissions.clone())
+            .unwrap();
+        let path = profile.grant_path("legacy");
+        let mut old = read_grant(&path).unwrap();
+        old.client = None;
+        profile
+            .write_private(&path, &serde_json::to_vec(&old).unwrap())
+            .unwrap();
+        assert!(profile.authorize("legacy", &legacy_token).is_some());
+
+        let token = profile
+            .grant("current", &accounts, permissions.clone())
+            .unwrap();
+        let grants = profile.list_grants().unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].client, "current");
+        assert_eq!(grants[0].account_ids, BTreeSet::from(accounts));
+        assert_eq!(grants[0].permissions, permissions);
+        let persisted = fs::read_to_string(profile.grant_path("current")).unwrap();
+        assert!(!persisted.contains(&token));
+        profile.revoke("current").unwrap();
+        assert!(profile.list_grants().unwrap().is_empty());
+        assert!(profile.authorize("current", &token).is_none());
+    }
 }

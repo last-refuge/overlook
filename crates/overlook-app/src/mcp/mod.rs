@@ -2,6 +2,7 @@
 
 mod contract;
 mod headless;
+mod http;
 mod read;
 mod service;
 mod transport;
@@ -21,9 +22,10 @@ use std::sync::{Arc, Mutex};
 use crate::{
     data_dir, default_data_dir, seed_sample_account, seed_sample_mailbox, single_instance,
 };
-pub(crate) use service::connect_until;
-pub(crate) use write::Domain as WriteDomain;
-use write::WritePermission;
+pub(crate) use service::{
+    client_grants, connect_until, grant as grant_client, revoke as revoke_client, ClientGrant,
+};
+pub(crate) use write::{Domain as WriteDomain, WritePermission};
 
 static DESKTOP_SERVER: Mutex<Option<service::Server>> = Mutex::new(None);
 static CHANGES: Mutex<BTreeMap<(AccountId, WriteDomain), bool>> = Mutex::new(BTreeMap::new());
@@ -50,6 +52,8 @@ const HELP: &str = r#"Usage: overlook mcp <command>
                                         add a write scope (repeat to combine)
   revoke --client NAME                  revoke a grant
   serve --client NAME                  bridge an MCP client over stdio to the running owner
+  serve-http --config PATH [--bind ADDR]
+                                        serve authenticated Streamable HTTP on loopback
 
   OVERLOOK_DATA_DIR    selects the profile. Sample mode requires a separate directory.
   OVERLOOK_MCP_TOKEN   credential supplied by the MCP client to the serve command.
@@ -71,6 +75,18 @@ pub fn stop_desktop() {
     drop(DESKTOP_SERVER.lock().unwrap().take());
 }
 
+pub(crate) fn eligible_accounts(store: &Store) -> Result<Vec<Account>> {
+    let mut eligible = Vec::new();
+    for account in store.accounts()? {
+        if read::eligible_account(store, &account)
+            .map_err(|failure| anyhow::anyhow!(failure.message))?
+        {
+            eligible.push(account);
+        }
+    }
+    Ok(eligible)
+}
+
 pub fn run(args: &[String]) -> Result<()> {
     let Some((command, flags)) = args.split_first() else {
         println!("{HELP}");
@@ -90,6 +106,7 @@ pub fn run(args: &[String]) -> Result<()> {
             let token = std::env::var("OVERLOOK_MCP_TOKEN").unwrap_or_default();
             transport::serve(move |request| service::call(&profile, &client, &token, request))
         }
+        "serve-http" => http::run(&data_dir(), flags),
         "grant" => {
             let (client, accounts, permissions) = client_flags(flags, true)?;
             ensure!(

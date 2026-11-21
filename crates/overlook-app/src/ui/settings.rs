@@ -1,4 +1,4 @@
-//! Settings dialog: Accounts (with signatures), General, Mail, Calendar, About.
+//! Settings dialog for the desktop app and its integrations.
 //!
 //! Rendered as an overlay in the main window. Every control writes its preference
 //! immediately and the window applies it; nothing here is decorative.
@@ -20,6 +20,10 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use overlook_core::*;
 
+#[path = "mcp_setup.rs"]
+mod mcp_setup;
+use mcp_setup::McpSetup;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsPage {
     Accounts,
@@ -27,16 +31,18 @@ pub enum SettingsPage {
     Fonts,
     Mail,
     Calendar,
+    Integrations,
     About,
 }
 
 impl SettingsPage {
-    pub(crate) const ALL: [SettingsPage; 6] = [
+    pub(crate) const ALL: [SettingsPage; 7] = [
         SettingsPage::Accounts,
         SettingsPage::General,
         SettingsPage::Fonts,
         SettingsPage::Mail,
         SettingsPage::Calendar,
+        SettingsPage::Integrations,
         SettingsPage::About,
     ];
 
@@ -47,6 +53,7 @@ impl SettingsPage {
             SettingsPage::Fonts => "Fonts",
             SettingsPage::Mail => "Mail",
             SettingsPage::Calendar => "Calendar",
+            SettingsPage::Integrations => "Integrations",
             SettingsPage::About => "About",
         }
     }
@@ -58,6 +65,7 @@ impl SettingsPage {
             SettingsPage::Fonts => "type",
             SettingsPage::Mail => "mail",
             SettingsPage::Calendar => "calendar",
+            SettingsPage::Integrations => "plug",
             SettingsPage::About => "info",
         }
     }
@@ -96,6 +104,7 @@ pub struct SettingsState {
     pub reading_font: Entity<ComboboxState<SearchableVec<FontChoice>>>,
     pub compose_font: Entity<ComboboxState<SearchableVec<FontChoice>>>,
     pub caldav: Option<super::calendar_setup::CalendarSetup>,
+    mcp: Option<McpSetup>,
     /// Connecting contacts for an IMAP or POP3 account.
     pub contacts: super::contacts_setup::ContactsSetup,
     /// Cached per-account status, server info, contact counts, and contacts connection status
@@ -754,6 +763,7 @@ impl MailWindow {
         }));
 
         let caldav = self.build_calendar_setup(&acct, window, cx);
+        let mcp = (page == SettingsPage::Integrations).then(|| McpSetup::new(&self.store, window, cx));
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         self.settings = Some(SettingsState {
@@ -785,6 +795,7 @@ impl MailWindow {
             reading_font,
             compose_font,
             caldav,
+            mcp,
             contacts: Default::default(),
             account_status: AccountStatus::default(),
             servers: None,
@@ -812,8 +823,11 @@ impl MailWindow {
         cx.notify();
     }
 
-    fn set_settings_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
+    fn set_settings_page(&mut self, page: SettingsPage, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(s) = self.settings.as_mut() {
+            if s.page != page {
+                s.mcp = (page == SettingsPage::Integrations).then(|| McpSetup::new(&self.store, window, cx));
+            }
             s.page = page;
             s.scroll_target = None;
             s.scroll.set_offset(point(px(0.), px(0.)));
@@ -850,7 +864,7 @@ impl MailWindow {
     fn open_settings_result(&mut self, page: SettingsPage, entry: Option<&'static SettingEntry>, window: &mut Window, cx: &mut Context<Self>) {
         self.clear_settings_search(window, cx);
         if let Some(focus) = self.settings.as_ref().map(|s| s.focus.clone()) { focus.focus(window, cx); }
-        self.set_settings_page(page, cx);
+        self.set_settings_page(page, window, cx);
         let (Some(entry), Some(state)) = (entry, self.settings.as_mut()) else { return };
         let target = ScrollTarget {
             key: entry.anchor(),
@@ -951,6 +965,7 @@ impl MailWindow {
             SettingsPage::Fonts => self.render_settings_fonts(state, cx).into_any_element(),
             SettingsPage::Mail => self.render_settings_mail(state, cx).into_any_element(),
             SettingsPage::Calendar => self.render_settings_calendar(state, cx).into_any_element(),
+            SettingsPage::Integrations => state.mcp.as_ref().map(|setup| self.render_mcp_setup(setup, cx)).unwrap_or_else(|| div().into_any_element()),
             SettingsPage::About => self.render_settings_about(state, cx).into_any_element(),
         } };
         RENDER_TARGET.set(None);
@@ -2298,6 +2313,7 @@ const fn entry(page: SettingsPage, section: &'static str, label: &'static str, d
 use SettingsPage::{About as AB, Accounts as AC, Calendar as CA, Fonts as FO, General as GE, Mail as MA};
 
 pub(crate) static SETTINGS_INDEX: &[SettingEntry] = &[
+    entry(SettingsPage::Integrations, "MCP", "MCP clients", "Create and revoke account access for local AI harnesses.", "agent automation localhost model context protocol token grant"),
     entry(AC, "Your accounts", "Add account", "Mail and calendar accounts on this device.", "gmail imap pop3 new"),
     entry(AC, "Account", "Account name", "What the sidebar calls this account.", "label nickname title sidebar"),
     entry(AC, "Account", "Your name", "Shown as the sender on messages you write.", "display name from sender"),

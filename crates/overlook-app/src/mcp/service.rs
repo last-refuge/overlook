@@ -27,6 +27,7 @@ use tokio::runtime::{Builder, Runtime};
 use super::contract::{Account, ErrorCode, Failure, Reply, Request, Response};
 use super::read::{self, ReadContext};
 use super::write::{self, Domain, WriteContext, WritePermission};
+pub(crate) use files::ClientGrant;
 use files::{Endpoint, Profile};
 pub(crate) use wire::connect_until;
 
@@ -153,6 +154,10 @@ pub fn sample_database(profile: &Path) -> anyhow::Result<std::path::PathBuf> {
 pub fn revoke(profile: &Path, client: &str) -> anyhow::Result<()> {
     anyhow::ensure!(files::valid_client(client), "Invalid client name");
     Profile::open(profile)?.revoke(client)
+}
+
+pub(crate) fn client_grants(profile: &Path) -> anyhow::Result<Vec<ClientGrant>> {
+    Profile::open(profile)?.list_grants()
 }
 
 fn serve(

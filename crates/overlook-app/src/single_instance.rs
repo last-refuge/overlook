@@ -7,7 +7,9 @@
 //! the desktop theme.
 
 use sha2::{Digest, Sha256};
+use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::fd::AsRawFd;
@@ -206,6 +208,37 @@ fn socket_path(profile: &Path) -> PathBuf {
     socket_dir().join(format!("{digest:x}.sock"))
 }
 
+fn check_legacy_owner(profile: &Path) -> io::Result<()> {
+    // Before the lifetime lock, Overlook used the launcher's runtime directory.
+    // Recognize a running copy on upgrade before opening the Store again.
+    let default = crate::default_data_dir().canonicalize().ok();
+    let identity = if default.as_deref() == Some(profile) {
+        Path::new("")
+    } else {
+        profile
+    };
+    let mut digest = DefaultHasher::new();
+    match identity.to_str() {
+        Some(path) => path.hash(&mut digest),
+        None => identity.hash(&mut digest),
+    }
+    let name = format!("overlook-{:08x}.sock", digest.finish() as u32);
+    let directories = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .into_iter()
+        .chain([std::env::temp_dir(), PathBuf::from("/tmp")]);
+    for dir in directories {
+        let socket = dir.join(&name);
+        if fs::symlink_metadata(&socket)
+            .is_ok_and(|meta| meta.file_type().is_socket() && meta.uid() == uid())
+            && connect(&socket).is_ok()
+        {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "an earlier version of Overlook is running for this profile. Quit it before starting this version"));
+        }
+    }
+    Ok(())
+}
+
 /// Hands `line` to every running instance, whatever its profile. Stale sockets are skipped.
 pub fn broadcast(line: &str) {
     let dir = socket_dir();
@@ -281,6 +314,7 @@ pub fn desktop_stopping() {
 
 pub fn listen(profile: &Path, role: Role) -> io::Result<Option<Owner>> {
     let profile = profile.canonicalize()?;
+    check_legacy_owner(&profile)?;
     listen_at(&profile, &socket_path(&profile), role)
 }
 
@@ -433,6 +467,7 @@ pub fn headless_stop_requested(line: &str) -> bool {
 
 pub fn launch_desktop(profile: &Path, line: Option<&str>) -> io::Result<Option<Owner>> {
     let profile = profile.canonicalize()?;
+    check_legacy_owner(&profile)?;
     let path = socket_path(&profile);
     launch_at(&profile, &path, line, LAUNCH_TIMEOUT)
 }
