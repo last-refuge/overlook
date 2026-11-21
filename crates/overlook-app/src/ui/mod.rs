@@ -868,6 +868,7 @@ pub struct MailWindow {
     /// Live isolated message documents; released when their reader surface closes.
     pub(crate) browser_bodies: std::cell::RefCell<HashMap<String, (reader::PreparedDocKey, usize, Entity<crate::browser_body::BrowserBody>)>>,
     pub(crate) prepared_docs: std::cell::RefCell<HashMap<String, reader::PreparedDoc>>,
+    pub(crate) prerendered_docs: std::cell::RefCell<VecDeque<reader::PrerenderedDoc>>,
     pub(crate) preparing_docs: std::cell::RefCell<HashMap<String, reader::PreparedDocKey>>,
     composer: Option<Composer>,
     /// Set in a pop-out composer window: the main window it belongs to.
@@ -1249,6 +1250,7 @@ impl MailWindow {
             inline_images_revision: 0,
             browser_bodies: std::cell::RefCell::new(HashMap::new()),
             prepared_docs: std::cell::RefCell::new(HashMap::new()),
+            prerendered_docs: std::cell::RefCell::new(VecDeque::new()),
             preparing_docs: std::cell::RefCell::new(HashMap::new()),
             composer: None,
             composer_owner,
@@ -3570,25 +3572,58 @@ impl MailWindow {
         self.prerender = Some(cx.spawn(async move |this, cx| {
             // Let the open message paint and quick j/k runs settle before starting.
             cx.background_executor().timer(Duration::from_millis(250)).await;
-            let prepared: Vec<String> = cx
+            let pre_fonts = fonts.clone();
+            let prepared: Vec<reader::PrerenderedDoc> = cx
                 .background_spawn(async move {
                     let mut docs = Vec::new();
                     for id in ids {
                         let Some(m) = store.message(&id).ok().flatten() else { continue };
-                        if m.body.html.is_none() {
+                        let Some(html_len) = m.body.html.as_ref().map(String::len) else {
                             continue; // Plain text is drawn natively.
-                        }
+                        };
+                        let inline_count = m
+                            .attachments
+                            .iter()
+                            .filter(|a| a.is_inline_image() && a.local_path.is_some())
+                            .count();
                         let source = Self::message_source(&m);
-                        let doc = appearance.prepare_document(&source, &fonts);
+                        let doc = appearance.prepare_document(&source, &pre_fonts);
                         let html = reader::resolve_inline_images_blocking(&m, doc.html);
-                        docs.push(html);
+                        let placeholder = m
+                            .body
+                            .text
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|t| !t.is_empty())
+                            .map(|t| SharedString::from(t.to_owned()));
+                        docs.push(reader::PrerenderedDoc {
+                            key: reader::PrerenderedDocKey {
+                                message_id: m.id.clone(),
+                                html_len,
+                                inline_count,
+                                appearance,
+                                fonts: pre_fonts.clone(),
+                            },
+                            html,
+                            remote_resources: doc.remote_resources,
+                            placeholder,
+                        });
                     }
                     docs
                 })
                 .await;
-            for html in prepared {
+            for doc in prepared {
+                let html = doc.html.clone();
                 let job = this
-                    .update(cx, |_this, cx| {
+                    .update(cx, |this, cx| {
+                        // Cache prepared HTML so opening this message mounts BrowserBody on frame 0.
+                        let mut cache = this.prerendered_docs.borrow_mut();
+                        cache.retain(|d| d.key != doc.key);
+                        cache.push_back(doc);
+                        while cache.len() > 16 {
+                            cache.pop_front();
+                        }
+                        drop(cache);
                         if crate::browser_body::is_rendered(&html, false, appearance.dark_paper(), size) {
                             return None;
                         }

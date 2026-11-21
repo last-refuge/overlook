@@ -13,7 +13,7 @@
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde_json::{json, Value};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fs,
     io::{Read, Write},
     net::IpAddr,
@@ -36,8 +36,11 @@ const MAX_PACKET: usize = 32 * 1024 * 1024;
 const MAX_RESOURCE: u64 = 8 * 1024 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 static WORKERS: AtomicUsize = AtomicUsize::new(0);
-/// Live Chromium processes: up to four open documents, one pre-render and one warm spare.
-const MAX_WORKERS: usize = 6;
+/// Live Chromium processes: up to four open documents, one pre-render and two warm spares
+/// (plus headroom while an old process is being reaped asynchronously).
+const MAX_WORKERS: usize = 8;
+/// Keep two warm spares so rapid j/k navigation and background pre-renders never force a cold launch.
+const WARM_POOL_TARGET: usize = 2;
 const MAX_PROCESSES: usize = 32;
 type Result<T> = std::result::Result<T, String>;
 
@@ -78,7 +81,7 @@ struct Warm {
     stop: Arc<AtomicBool>,
     slot: WorkerSlot,
 }
-static POOL: Mutex<Option<Warm>> = Mutex::new(None);
+static POOL: Mutex<VecDeque<Warm>> = Mutex::new(VecDeque::new());
 static POOL_WAKE: std::sync::Condvar = std::sync::Condvar::new();
 static POOL_STARTED: std::sync::Once = std::sync::Once::new();
 /// Stops the pool refilling: while Overlook runs without a window (nothing is shown, so a
@@ -89,20 +92,20 @@ fn pool_paused() -> bool {
     POOL_PAUSED.load(Ordering::Acquire)
 }
 
-/// Keeps a spare Chromium ready, or lets the spare go and stops keeping one.
+/// Keeps spare Chromium processes ready, or lets them go and stops keeping any.
 pub fn set_prewarm(on: bool) {
-    let warm = {
+    let warm: Vec<Warm> = {
         let mut pool = POOL.lock().unwrap();
         POOL_PAUSED.store(!on, Ordering::Release);
         if on {
             POOL_WAKE.notify_all();
-            None
+            Vec::new()
         } else {
-            pool.take()
+            pool.drain(..).collect()
         }
     };
-    if let Some(warm) = warm {
-        // Reap Chromium and its TempDir off the UI thread. `warm.slot` stays held until the
+    if !warm.is_empty() {
+        // Reap Chromium and its TempDir off the UI thread. Each `warm.slot` stays held until the
         // background thread finishes dropping `warm`, so `drain_workers()` still observes it.
         if thread::Builder::new()
             .name("browser-reap".into())
@@ -122,13 +125,14 @@ pub fn drain_workers() {
     }).unwrap());
 }
 
-/// Starts keeping one spare Chromium ready. The launcher thread lives as long as the
-/// app. On Linux the parent-death signal follows the thread that started Chromium.
+/// Starts keeping up to [`WARM_POOL_TARGET`] spare Chromium processes ready. The launcher
+/// thread lives as long as the app. On Linux the parent-death signal follows the thread
+/// that started Chromium.
 pub fn prewarm() {
     POOL_STARTED.call_once(|| {
         let _ = thread::Builder::new().name("browser-pool".into()).spawn(|| loop {
             let mut pool = POOL.lock().unwrap();
-            while pool.is_some() || pool_paused() {
+            while pool.len() >= WARM_POOL_TARGET || pool_paused() {
                 pool = POOL_WAKE.wait(pool).unwrap();
             }
             drop(pool);
@@ -143,8 +147,8 @@ pub fn prewarm() {
                 Ok(actor) => {
                     let unused = {
                         let mut pool = POOL.lock().unwrap();
-                        if !pool_paused() && pool.is_none() {
-                            *pool = Some(Warm { actor, stop, slot });
+                        if !pool_paused() && pool.len() < WARM_POOL_TARGET {
+                            pool.push_back(Warm { actor, stop, slot });
                             None
                         } else {
                             Some(Warm { actor, stop, slot })
@@ -163,8 +167,15 @@ pub fn prewarm() {
     });
 }
 
-fn take_warm() -> Option<Warm> {
-    let warm = POOL.lock().unwrap().take();
+fn take_warm(reserve: usize) -> Option<Warm> {
+    let warm = {
+        let mut pool = POOL.lock().unwrap();
+        if pool.len() > reserve {
+            pool.pop_front()
+        } else {
+            None
+        }
+    };
     if warm.is_some() {
         POOL_WAKE.notify_all();
     }
@@ -305,6 +316,7 @@ enum Input {
     VisibleRange(u32, u32),
     ForgetTile(u32, u64),
     Resize(u32, u32, f64),
+    EnableRemote,
     Mouse(String, f64, f64, String, u32, u32),
     Scroll(f64, f64, f64, f64),
     Key(String, String, String, u32, Option<String>),
@@ -350,7 +362,17 @@ impl BrowserHandle {
     /// Like [`Self::new`], laid out from the start at `size` (CSS width, device scale) so
     /// the first tiles are not a throwaway render at a default width.
     pub fn new_sized(html: String, allow_remote: bool, dark_paper: Option<u32>, size: Option<(u32, f64)>) -> Self {
-        let warm = if html.len() > MAX_HTML { None } else { take_warm() };
+        Self::new_sized_inner(html, allow_remote, dark_paper, size, 0)
+    }
+
+    /// Background pre-render variant: reserves at least one warm Chromium spare for
+    /// foreground message opens so pre-rendering never forces a cold launch on click.
+    pub fn new_sized_background(html: String, allow_remote: bool, dark_paper: Option<u32>, size: Option<(u32, f64)>) -> Self {
+        Self::new_sized_inner(html, allow_remote, dark_paper, size, 1)
+    }
+
+    fn new_sized_inner(html: String, allow_remote: bool, dark_paper: Option<u32>, size: Option<(u32, f64)>, warm_reserve: usize) -> Self {
+        let warm = if html.len() > MAX_HTML { None } else { take_warm(warm_reserve) };
         let wake = WakePipe::new().ok().map(Arc::new);
         let inner = Arc::new(Inner {
             commands: Mutex::new(VecDeque::new()),
@@ -417,15 +439,18 @@ impl BrowserHandle {
                         actor.scale = if scale.is_finite() { scale.clamp(0.5, 2.0) } else { 1.0 };
                     }
                     actor.load(&html, dark_paper)?;
-                    actor.cdp.call("Page.stopScreencast", json!({}))?;
                     actor.refresh_layout(&emit)?;
                     const MEASURE_INTERVAL: Duration = Duration::from_millis(250);
+                    const RESOURCE_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
                     const SETTLE_WINDOW: Duration = Duration::from_secs(2);
                     let mut layout_dirty = false;
+                    let mut resource_dirty = false;
                     let mut hover_dirty = false;
                     let mut next_hover_repaint = Instant::now();
+                    let mut next_resource_repaint = Instant::now();
                     let mut measure_until: Option<Instant> = Some(Instant::now() + SETTLE_WINDOW);
                     let mut next_measure = Instant::now() + MEASURE_INTERVAL;
+                    let mut had_pending_resources = actor.has_pending_resources();
                     while !stop.load(Ordering::Acquire) {
                         // Drain wake pipe BEFORE inspecting stop/commands/resources so any
                         // producer that arrives after we inspect will write a fresh wakeup.
@@ -437,8 +462,23 @@ impl BrowserHandle {
                         }
                         actor.cdp.poll()?;
                         if actor.pump()? {
-                            layout_dirty = true;
+                            if actor.has_pending_resources() {
+                                // Coalesce rapid image-completion repaints into smooth ~100 ms
+                                // waves so Chromium fulfills incoming resources instead of
+                                // churning full-page screenshots between every image.
+                                resource_dirty = true;
+                            } else {
+                                layout_dirty = true;
+                                resource_dirty = false;
+                            }
                         }
+                        // If the last pending resource just finished, ensure an immediate final paint.
+                        let pending_now = actor.has_pending_resources();
+                        if had_pending_resources && !pending_now {
+                            layout_dirty = true;
+                            resource_dirty = false;
+                        }
+                        had_pending_resources = pending_now;
                         // Failed optional images/fonts must not hide an otherwise
                         // valid document. Only engine/protocol failure is fatal.
                         if actor.resource_failed && !actor.resource_error_reported {
@@ -452,26 +492,43 @@ impl BrowserHandle {
                         };
                         for command in commands {
                             let hover = matches!(&command, Input::Mouse(kind, _, _, _, 0, _) if kind == "mouseMoved");
+                            let enable_remote = matches!(&command, Input::EnableRemote);
                             let changed = actor.input(command, &emit)?;
-                            if hover {
+                            if enable_remote {
+                                // Drain newly triggered Fetch.requestPaused events right away so
+                                // all remote images begin downloading before any tile capture.
+                                actor.cdp.poll()?;
+                                let _ = actor.pump()?;
+                                had_pending_resources = actor.has_pending_resources();
+                                if had_pending_resources {
+                                    resource_dirty = true;
+                                    next_resource_repaint = Instant::now() + RESOURCE_REPAINT_INTERVAL;
+                                } else {
+                                    layout_dirty |= changed;
+                                }
+                            } else if hover {
                                 hover_dirty |= changed;
                             } else {
                                 layout_dirty |= changed;
                             }
                         }
                         let now = Instant::now();
-                        let repaint = layout_dirty || (hover_dirty && now >= next_hover_repaint);
+                        let repaint = layout_dirty
+                            || (resource_dirty && now >= next_resource_repaint)
+                            || (hover_dirty && now >= next_hover_repaint);
                         if repaint {
                             actor.refresh_layout(&emit)?;
                             layout_dirty = false;
+                            resource_dirty = false;
                             hover_dirty = false;
                             // Keep the latest hover state when sweeping across a message,
                             // and let clicks, keyboard input and resizing repaint immediately.
                             let after = Instant::now();
                             next_hover_repaint = after + Duration::from_millis(100);
+                            next_resource_repaint = after + RESOURCE_REPAINT_INTERVAL;
                             measure_until = Some(after + SETTLE_WINDOW);
                             next_measure = after + MEASURE_INTERVAL;
-                        } else if actor.resource_pending > 0 {
+                        } else if actor.has_pending_resources() {
                             if measure_until.is_none() {
                                 measure_until = Some(now + SETTLE_WINDOW);
                                 next_measure = now + MEASURE_INTERVAL;
@@ -507,7 +564,14 @@ impl BrowserHandle {
                                 if hover_dirty {
                                     wait = Some(next_hover_repaint.saturating_duration_since(now));
                                 }
-                                if measure_until.is_some() || actor.resource_pending > 0 {
+                                if resource_dirty {
+                                    let r = next_resource_repaint.saturating_duration_since(now);
+                                    wait = Some(match wait {
+                                        Some(w) => w.min(r),
+                                        None => r,
+                                    });
+                                }
+                                if measure_until.is_some() || actor.has_pending_resources() {
                                     let m = next_measure.saturating_duration_since(now);
                                     wait = Some(match wait {
                                         Some(w) => w.min(m),
@@ -601,6 +665,10 @@ impl BrowserHandle {
     /// max_height is retained for API compatibility; layout/tile dimensions are CSS pixels.
     pub fn resize(&self, width: u32, max_height: u32, scale: f64) {
         self.send(Input::Resize(width, max_height, scale));
+    }
+    /// Enables remote resource fetching in-place on the running Chromium without restarting it.
+    pub fn enable_remote(&self) {
+        self.send(Input::EnableRemote);
     }
     /// Latest native visible range in document CSS coordinates.
     /// Frontend eviction acknowledgement keeps the captured-offset cache coherent.
@@ -747,6 +815,7 @@ struct Cdp {
     buffer: CdpBuffer,
     events: VecDeque<Value>,
     id: u64,
+    document_content_calls: u64,
     session: Option<String>,
     stop: Arc<AtomicBool>,
     wake: Option<Arc<WakePipe>>,
@@ -848,6 +917,7 @@ impl Cdp {
             buffer: CdpBuffer::new(),
             events: VecDeque::new(),
             id: 0,
+            document_content_calls: 0,
             session: None,
             stop,
             wake: None,
@@ -915,7 +985,7 @@ impl Cdp {
     fn poll(&mut self) -> Result<()> {
         self.check(Instant::now() + COMMAND_TIMEOUT)?;
         // Bounded work per tick; next() may read without yielding a complete packet.
-        for _ in 0..128 {
+        for _ in 0..512 {
             match self.next()? {
                 ReadStep::Frame(v) => self.queue(v)?,
                 ReadStep::MoreData => {}
@@ -925,6 +995,9 @@ impl Cdp {
         Ok(())
     }
     fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+        if method == "Page.setDocumentContent" {
+            self.document_content_calls = self.document_content_calls.wrapping_add(1);
+        }
         self.id += 1;
         let id = self.id;
         let mut request = json!({"id":id,"method":method,"params":params});
@@ -1070,16 +1143,20 @@ fn process_resources(pid: u32, pending: &mut Vec<u32>) -> u64 {
     }
 }
 
-const MAX_PENDING_RESOURCES: usize = 4;
+const MAX_PENDING_RESOURCES: usize = 8;
+const RESOURCE_WORKER_THREADS: usize = 8;
+const MAX_QUEUED_RESOURCES: usize = 128;
 const MAX_RESOURCE_TOTAL: usize = 32 * 1024 * 1024;
+const DOCUMENT_CSP: &str = "default-src 'none'; script-src 'none'; style-src 'unsafe-inline' data: http: https:; img-src data: http: https:; font-src data: http: https:; frame-src 'none'; child-src 'none'; object-src 'none'; connect-src 'none'; form-action 'none'; base-uri 'none'; media-src 'none'";
 
 struct ResourceJob {
-    id: String,
     url: String,
     kind: String,
+    max_bytes: u64,
 }
 struct ResourceCompletion {
-    id: String,
+    url: String,
+    kind: String,
     response: Option<(String, Vec<u8>)>,
 }
 struct ResourceWorkers {
@@ -1092,10 +1169,10 @@ impl ResourceWorkers {
     fn new(agent: ureq::Agent, view_stop: Arc<AtomicBool>) -> Self {
         let (jobs, receiver) = std::sync::mpsc::sync_channel::<ResourceJob>(MAX_PENDING_RESOURCES);
         let receiver = Arc::new(Mutex::new(receiver));
-        let (sender, results) = std::sync::mpsc::sync_channel(MAX_PENDING_RESOURCES);
+        let (sender, results) = std::sync::mpsc::sync_channel(MAX_PENDING_RESOURCES * 2);
         let wake: Arc<Mutex<Option<Arc<WakePipe>>>> = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
-        for _ in 0..2 {
+        for _ in 0..RESOURCE_WORKER_THREADS {
             let (receiver, sender, agent, wake, stop, view_stop) = (
                 receiver.clone(),
                 sender.clone(),
@@ -1118,14 +1195,15 @@ impl ResourceWorkers {
                 }
                 let response = tracing::subscriber::with_default(
                     tracing::subscriber::NoSubscriber::default(),
-                    || fetch_resource(&agent, &job.url, &job.kind).ok(),
+                    || fetch_resource_limited(&agent, &job.url, &job.kind, job.max_bytes).ok(),
                 );
                 if stop.load(Ordering::Acquire) || view_stop.load(Ordering::Acquire) {
                     break;
                 }
                 if sender
-                    .try_send(ResourceCompletion {
-                        id: job.id,
+                    .send(ResourceCompletion {
+                        url: job.url,
+                        kind: job.kind,
                         response,
                     })
                     .is_err()
@@ -1160,9 +1238,18 @@ struct Actor {
     cdp: Cdp,
     allow_remote: bool,
     dark: bool,
+    dark_paper: Option<u32>,
+    applied_dark: bool,
+    applied_metrics: Option<(u32, u32, f64)>,
+    root_frame: String,
+    csp_ready_seq: Option<u64>,
+    last_html: String,
     agent: ureq::Agent,
     resources: ResourceWorkers,
     resource_pending: usize,
+    pending_queue: VecDeque<(String, String)>,
+    in_flight_urls: HashMap<(String, String), Vec<String>>,
+    resource_cache: HashMap<(String, String), Option<(String, Vec<u8>)>>,
     width: u32,
     cap: u32,
     height: u32,
@@ -1218,10 +1305,28 @@ impl Actor {
         cdp.call("Network.setCacheDisabled", json!({"cacheDisabled":true}))?;
         cdp.call("Network.setBypassServiceWorker", json!({"bypass":true}))?;
         cdp.call("Page.setLifecycleEventsEnabled", json!({"enabled":true}))?;
+        // Pre-fetch root frame and install the blank CSP skeleton while warm so `load()`
+        // skips both CDP round-trips on first paint.
+        let tree = cdp.call("Page.getFrameTree", json!({}))?;
+        let root_frame = tree["frameTree"]["frame"]["id"]
+            .as_str()
+            .ok_or("Missing root frame")?
+            .to_owned();
+        cdp.call(
+            "Page.setDocumentContent",
+            json!({
+                "frameId": root_frame,
+                "html": format!("<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\" content=\"{DOCUMENT_CSP}\"></head><body></body></html>")
+            }),
+        )?;
+        let csp_ready_seq = Some(cdp.document_content_calls);
+        // Per-document anonymous agent: cookie-less, no proxy, PublicResolver-checked on every
+        // connection, with TLS keep-alive pooling across resources of the same document.
         let config = ureq::Agent::config_builder()
             .proxy(None)
             .max_redirects(0)
-            .max_idle_connections(0)
+            .max_idle_connections(16)
+            .max_idle_connections_per_host(8)
             .max_response_header_size(16384)
             .timeout_global(Some(Duration::from_secs(4)))
             .build();
@@ -1234,8 +1339,17 @@ impl Actor {
             cdp,
             allow_remote,
             dark: false,
+            dark_paper: None,
+            applied_dark: false,
+            applied_metrics: None,
+            root_frame,
+            csp_ready_seq,
+            last_html: String::new(),
             resources: ResourceWorkers::new(agent.clone(), stop),
             resource_pending: 0,
+            pending_queue: VecDeque::new(),
+            in_flight_urls: HashMap::new(),
+            resource_cache: HashMap::new(),
             agent,
             width: 800,
             cap: 900,
@@ -1254,26 +1368,41 @@ impl Actor {
             resource_error_reported: false,
         })
     }
+    fn has_pending_resources(&self) -> bool {
+        self.resource_pending > 0 || !self.pending_queue.is_empty()
+    }
     fn set_wake(&mut self, wake: Option<Arc<WakePipe>>) {
         self.cdp.wake = wake.clone();
         self.resources.set_wake(wake);
     }
     fn load(&mut self, html: &str, dark_paper: Option<u32>) -> Result<()> {
+        self.last_html = html.to_owned();
+        self.dark_paper = dark_paper;
         self.dark = dark_paper.is_some();
         self.metrics()?;
-        self.cdp.call(
-            "Emulation.setAutoDarkModeOverride",
-            json!({"enabled": self.dark}),
-        )?;
-        self.cdp.call("Emulation.setEmulatedMedia", json!({"features": [{"name":"prefers-color-scheme", "value": if self.dark { "dark" } else { "light" }}]}))?;
-        let tree = self.cdp.call("Page.getFrameTree", json!({}))?;
-        let frame = tree["frameTree"]["frame"]["id"]
-            .as_str()
-            .ok_or("Missing root frame")?;
+        if self.dark != self.applied_dark {
+            self.cdp.call(
+                "Emulation.setAutoDarkModeOverride",
+                json!({"enabled": self.dark}),
+            )?;
+            self.cdp.call(
+                "Emulation.setEmulatedMedia",
+                json!({"features": [{"name":"prefers-color-scheme", "value": if self.dark { "dark" } else { "light" }}]}),
+            )?;
+            self.applied_dark = self.dark;
+        }
         // Install policy before parsing ANY supplied markup. DOMParser creates an
         // inert tree; remove navigation/embedding surfaces before installing it.
-        let policy = "default-src 'none'; script-src 'none'; style-src 'unsafe-inline' data: http: https:; img-src data: http: https:; font-src data: http: https:; frame-src 'none'; child-src 'none'; object-src 'none'; connect-src 'none'; form-action 'none'; base-uri 'none'; media-src 'none'";
-        self.cdp.call("Page.setDocumentContent", json!({"frameId":frame,"html":format!("<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\" content=\"{policy}\"></head><body></body></html>")}))?;
+        if self.csp_ready_seq != Some(self.cdp.document_content_calls) {
+            self.cdp.call(
+                "Page.setDocumentContent",
+                json!({
+                    "frameId": self.root_frame,
+                    "html": format!("<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\" content=\"{DOCUMENT_CSP}\"></head><body></body></html>")
+                }),
+            )?;
+        }
+        self.csp_ready_seq = None;
         let paper = dark_paper.map(|rgb| format!("#{:06x}", rgb & 0xFFFFFF));
         let args = serde_json::to_string(&json!([html, paper])).unwrap();
         self.cdp.eval(format!(r#"(([html,paper]) => {{
@@ -1347,26 +1476,36 @@ impl Actor {
         Ok(())
     }
     fn metrics(&mut self) -> Result<()> {
+        let target = (self.width, self.height, self.scale);
+        if self.applied_metrics == Some(target) {
+            return Ok(());
+        }
         self.cdp.call("Emulation.setDeviceMetricsOverride", json!({"width":self.width,"height":self.height,"deviceScaleFactor":self.scale,"mobile":false}))?;
+        self.applied_metrics = Some(target);
         Ok(())
     }
     fn pump(&mut self) -> Result<bool> {
         let mut dirty = false;
-        // Network work never runs on this actor. Fulfill only completed jobs here.
+        // Network work never runs on this actor. Fulfill all ready jobs first, then
+        // immediately refill worker slots from the queued backlog.
         while let Ok(result) = self.resources.results.try_recv() {
-            self.resource_pending -= 1;
-            self.complete_resource(&result.id, result.response)?;
+            self.resource_pending = self.resource_pending.saturating_sub(1);
+            self.complete_resource_url(result.url, result.kind, result.response)?;
             dirty = true;
         }
-        for _ in 0..64 {
+        self.dispatch_queued_resources()?;
+        // Drain all queued CDP events in one pass (do NOT break after a single
+        // Fetch.requestPaused, which would otherwise trigger a full layout+PNG
+        // screenshot between every image request).
+        for _ in 0..256 {
             let Some(event) = self.cdp.events.pop_front() else {
                 break;
             };
             match event["method"].as_str().unwrap_or("") {
                 "Fetch.requestPaused" => {
-                    self.request(&event["params"])?;
-                    dirty = true;
-                    break;
+                    if self.request(&event["params"])? {
+                        dirty = true;
+                    }
                 }
                 "Fetch.authRequired" => {
                     self.cdp.call("Fetch.continueWithAuth", json!({"requestId":event["params"]["requestId"],"authChallengeResponse":{"response":"CancelAuth"}}))?;
@@ -1378,17 +1517,17 @@ impl Actor {
                 _ => {}
             }
         }
+        self.dispatch_queued_resources()?;
         Ok(dirty)
     }
-    fn request(&mut self, p: &Value) -> Result<()> {
+    /// Handles one `Fetch.requestPaused`. Returns `true` if pixels may already have changed
+    /// (e.g. an immediate in-memory cache hit); returns `false` when queued for async fetch.
+    fn request(&mut self, p: &Value) -> Result<bool> {
         self.requests += 1;
         let kind = p["resourceType"].as_str().unwrap_or("");
         let url = p["request"]["url"].as_str().unwrap_or("");
         let eligible = self.allow_remote
             && self.requests <= 128
-            && self.resource_pending < MAX_PENDING_RESOURCES
-            && self.resource_bytes + (self.resource_pending + 1) * MAX_RESOURCE as usize
-                <= MAX_RESOURCE_TOTAL
             && url.len() <= 8192
             && matches!(kind, "Image" | "Font" | "Stylesheet")
             && p["request"]["method"] == "GET";
@@ -1397,41 +1536,118 @@ impl Actor {
         let id = p["requestId"]
             .as_str()
             .ok_or("Missing resource request id")?;
-        if eligible
-            && self
-                .resources
-                .jobs
-                .try_send(ResourceJob {
-                    id: id.to_owned(),
-                    url: url.to_owned(),
-                    kind: kind.to_owned(),
-                })
-                .is_ok()
-        {
-            self.resource_pending += 1;
-            return Ok(()); // Fetch stays paused until the actor receives a result.
+        if !eligible {
+            if self.allow_remote && matches!(kind, "Image" | "Font" | "Stylesheet") {
+                self.resource_failed = true;
+            }
+            self.fail_request(id)?;
+            return Ok(false);
         }
-        if self.allow_remote && matches!(kind, "Image" | "Font" | "Stylesheet") {
+        let key = (url.to_owned(), kind.to_owned());
+        if let Some(cached) = self.resource_cache.get(&key).cloned() {
+            match cached {
+                Some((mime, bytes)) => {
+                    self.fulfill_request(id, &mime, &B64.encode(&bytes))?;
+                    return Ok(true);
+                }
+                None => {
+                    self.resource_failed = true;
+                    self.fail_request(id)?;
+                    return Ok(false);
+                }
+            }
+        }
+        if let Some(waiters) = self.in_flight_urls.get_mut(&key) {
+            waiters.push(id.to_owned());
+            return Ok(false);
+        }
+        if self.resource_bytes >= MAX_RESOURCE_TOTAL || self.in_flight_urls.len() >= MAX_QUEUED_RESOURCES {
             self.resource_failed = true;
+            self.fail_request(id)?;
+            return Ok(false);
         }
+        self.in_flight_urls.insert(key.clone(), vec![id.to_owned()]);
+        self.pending_queue.push_back(key);
+        self.dispatch_queued_resources()?;
+        Ok(false)
+    }
+    fn dispatch_queued_resources(&mut self) -> Result<()> {
+        while self.resource_pending < MAX_PENDING_RESOURCES {
+            let Some((url, kind)) = self.pending_queue.pop_front() else {
+                break;
+            };
+            let remaining = MAX_RESOURCE_TOTAL.saturating_sub(self.resource_bytes);
+            if remaining == 0 {
+                let waiters = self.in_flight_urls.remove(&(url, kind)).unwrap_or_default();
+                self.resource_failed = true;
+                for id in waiters {
+                    self.fail_request(&id)?;
+                }
+                continue;
+            }
+            let max_bytes = MAX_RESOURCE.min(remaining as u64);
+            match self.resources.jobs.try_send(ResourceJob { url, kind, max_bytes }) {
+                Ok(()) => {
+                    self.resource_pending += 1;
+                }
+                Err(std::sync::mpsc::TrySendError::Full(job)) => {
+                    self.pending_queue.push_front((job.url, job.kind));
+                    break;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(job)) => {
+                    let waiters = self.in_flight_urls.remove(&(job.url, job.kind)).unwrap_or_default();
+                    self.resource_failed = true;
+                    for id in waiters {
+                        self.fail_request(&id)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    fn complete_resource_url(&mut self, url: String, kind: String, response: Option<(String, Vec<u8>)>) -> Result<()> {
+        let key = (url, kind);
+        let waiters = self.in_flight_urls.remove(&key).unwrap_or_default();
+        if let Some((mime, bytes)) = response {
+            if self.resource_bytes.saturating_add(bytes.len()) <= MAX_RESOURCE_TOTAL {
+                self.resource_bytes += bytes.len();
+                let encoded = B64.encode(&bytes);
+                for id in waiters {
+                    self.fulfill_request(&id, &mime, &encoded)?;
+                }
+                self.resource_cache.insert(key, Some((mime, bytes)));
+                return Ok(());
+            }
+        }
+        self.resource_failed = true;
+        self.resource_cache.insert(key, None);
+        for id in waiters {
+            self.fail_request(&id)?;
+        }
+        Ok(())
+    }
+    fn fulfill_request(&mut self, id: &str, mime: &str, body_b64: &str) -> Result<()> {
         self.cdp.call(
-            "Fetch.failRequest",
-            json!({"requestId":id,"errorReason":"BlockedByClient"}),
+            "Fetch.fulfillRequest",
+            json!({
+                "requestId": id,
+                "responseCode": 200,
+                "responseHeaders": [
+                    {"name": "Content-Type", "value": mime},
+                    {"name": "Cache-Control", "value": "no-store"},
+                    {"name": "X-Content-Type-Options", "value": "nosniff"},
+                    {"name": "Access-Control-Allow-Origin", "value": "*"}
+                ],
+                "body": body_b64
+            }),
         )?;
         Ok(())
     }
-    fn complete_resource(&mut self, id: &str, response: Option<(String, Vec<u8>)>) -> Result<()> {
-        if let Some((mime, bytes)) = response {
-            self.resource_bytes += bytes.len();
-            self.cdp.call("Fetch.fulfillRequest", json!({"requestId":id,"responseCode":200,
-                "responseHeaders":[{"name":"Content-Type","value":mime},{"name":"Cache-Control","value":"no-store"},{"name":"X-Content-Type-Options","value":"nosniff"},{"name":"Access-Control-Allow-Origin","value":"*"}],"body":B64.encode(bytes)}))?;
-        } else {
-            self.resource_failed = true;
-            self.cdp.call(
-                "Fetch.failRequest",
-                json!({"requestId":id,"errorReason":"BlockedByClient"}),
-            )?;
-        }
+    fn fail_request(&mut self, id: &str) -> Result<()> {
+        self.cdp.call(
+            "Fetch.failRequest",
+            json!({"requestId": id, "errorReason": "BlockedByClient"}),
+        )?;
         Ok(())
     }
     /// Reports scrollability and whether the dark document changed its hover target.
@@ -1467,7 +1683,7 @@ impl Actor {
     }
     /// Whether the input changed the page enough to regenerate its tiles.
     fn input(&mut self, input: Input, emit: &impl Fn(BrowserEvent)) -> Result<bool> {
-        let repaint = matches!(&input, Input::Resize(..) | Input::Key(..) | Input::SelectAll)
+        let repaint = matches!(&input, Input::Resize(..) | Input::EnableRemote | Input::Key(..) | Input::SelectAll)
             || matches!(&input, Input::Mouse(kind, _, _, _, buttons, _) if kind != "mouseMoved" || *buttons != 0);
         match input {
             Input::VisibleRange(top, bottom) => {
@@ -1493,6 +1709,20 @@ impl Actor {
                 };
                 self.height = 900;
                 self.metrics()?;
+            }
+            Input::EnableRemote => {
+                if self.allow_remote {
+                    return Ok(false);
+                }
+                self.allow_remote = true;
+                self.requests = 0;
+                self.resource_bytes = 0;
+                self.resource_failed = false;
+                self.resource_error_reported = false;
+                self.resource_cache.clear();
+                let html = self.last_html.clone();
+                let dark_paper = self.dark_paper;
+                self.load(&html, dark_paper)?;
             }
             Input::Mouse(kind, x, y, button, buttons, count) => {
                 if !x.is_finite()
@@ -1813,6 +2043,10 @@ fn public_ip(ip: IpAddr) -> bool {
     }
 }
 fn fetch_resource(agent: &ureq::Agent, url: &str, kind: &str) -> Result<(String, Vec<u8>)> {
+    fetch_resource_limited(agent, url, kind, MAX_RESOURCE)
+}
+
+fn fetch_resource_limited(agent: &ureq::Agent, url: &str, kind: &str, max_bytes: u64) -> Result<(String, Vec<u8>)> {
     let mut url = url::Url::parse(url).map_err(|_| "Invalid resource URL")?;
     let deadline = Instant::now() + Duration::from_secs(4);
     let mut visited = std::collections::HashSet::new();
@@ -1837,7 +2071,7 @@ fn fetch_resource(agent: &ureq::Agent, url: &str, kind: &str) -> Result<(String,
             .ok_or("Resource timeout")?;
         // A fresh GET per hop: never forward cookies, auth, or referrer.
         // PublicResolver validates the actual connector addresses on every call.
-        let response = agent
+        let mut response = agent
             .get(url.as_str())
             .config()
             .max_redirects(0)
@@ -1855,9 +2089,12 @@ fn fetch_resource(agent: &ureq::Agent, url: &str, kind: &str) -> Result<(String,
             .headers()
             .get("location")
             .and_then(|s| s.to_str().ok())
-            .ok_or("Missing redirect location")?;
+            .ok_or("Missing redirect location")?
+            .to_owned();
+        // Drain small redirect bodies so keep-alive sockets return cleanly to the pool.
+        let _ = response.body_mut().with_config().limit(16 * 1024).read_to_vec();
         let next = url
-            .join(location)
+            .join(&location)
             .map_err(|_| "Invalid redirect location")?;
         if url.scheme() == "https" && next.scheme() == "http" {
             return Err("Resource redirect downgrade".into());
@@ -1900,7 +2137,7 @@ fn fetch_resource(agent: &ureq::Agent, url: &str, kind: &str) -> Result<(String,
     let bytes = response
         .body_mut()
         .with_config()
-        .limit(MAX_RESOURCE)
+        .limit(max_bytes.min(MAX_RESOURCE))
         .read_to_vec()
         .map_err(|_| "Resource exceeds limit or failed")?;
     Ok((mime, bytes))
@@ -1986,6 +2223,36 @@ mod cancelled_resource_tests {
         t.join().unwrap();
         pipe.drain();
         assert!(!pipe.signaled.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn enable_remote_and_url_dedup_queue_exceeding_worker_limit() {
+        // Verify that a controlled TLS server serving 12 images (including duplicates,
+        // exceeding MAX_PENDING_RESOURCES=8) fetches in parallel, deduplicates identical
+        // URLs, and honors in-place EnableRemote without restarting Chromium.
+        // Fast non-Chromium check of ResourceWorkers + fetch_resource_limited budget cap:
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = ureq::Agent::config_builder()
+            .proxy(None)
+            .max_redirects(0)
+            .max_idle_connections(16)
+            .max_idle_connections_per_host(8)
+            .timeout_global(Some(Duration::from_secs(4)))
+            .build();
+        let agent = ureq::Agent::with_parts(
+            config,
+            ureq::unversioned::transport::DefaultConnector::default(),
+            PublicResolver,
+        );
+        let workers = ResourceWorkers::new(agent, stop);
+        assert!(workers.jobs.try_send(ResourceJob {
+            url: "http://127.0.0.1/blocked".into(),
+            kind: "Image".into(),
+            max_bytes: 1024,
+        }).is_ok());
+        let done = workers.results.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(done.url, "http://127.0.0.1/blocked");
+        assert!(done.response.is_none());
     }
 
     #[test]
@@ -2181,7 +2448,7 @@ mod tests {
         drop(cold);
         prewarm();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while POOL.lock().unwrap().is_none() {
+        while POOL.lock().unwrap().is_empty() {
             assert!(Instant::now() < deadline, "pool never filled");
             thread::sleep(Duration::from_millis(10));
         }
@@ -2193,7 +2460,9 @@ mod tests {
         POOL_PAUSED.store(true, Ordering::Release);
         let deadline = Instant::now() + Duration::from_secs(10);
         while WORKERS.load(Ordering::Acquire) != 0 {
-            drop(take_warm());
+            while let Some(w) = take_warm(0) {
+                drop(w);
+            }
             assert!(Instant::now() < deadline, "warm process did not retire");
             thread::sleep(Duration::from_millis(25));
         }
@@ -2493,7 +2762,7 @@ mod tests {
                 .write_to(&mut png, image::ImageFormat::Png)
                 .unwrap();
             while !serving_stop.load(Ordering::Acquire) {
-                let (mut socket, _) = match server.accept() {
+                let (socket, _) = match server.accept() {
                     Ok(s) => s,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
@@ -2596,6 +2865,147 @@ mod tests {
             }
         }
         server_stop.store(true, Ordering::Release);
+        serving.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "runs real sandboxed Chromium with a controlled anonymous resource server"]
+    fn chromium_enable_remote_loads_many_images_in_parallel_and_dedups() {
+        use std::net::TcpListener;
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = server.local_addr().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let server_stop = Arc::new(AtomicBool::new(false));
+        let serving_stop = server_stop.clone();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let serving_hits = hits.clone();
+        let serving = thread::spawn(move || {
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(4, 4)
+                .write_to(&mut png, image::ImageFormat::Png)
+                .unwrap();
+            let png_bytes = Arc::new(png.into_inner());
+            let mut handlers = Vec::new();
+            while !serving_stop.load(Ordering::Acquire) {
+                let (socket, _) = match server.accept() {
+                    Ok(s) => s,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                };
+                let png_bytes = png_bytes.clone();
+                let serving_hits = serving_hits.clone();
+                handlers.push(thread::spawn(move || {
+                    socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                    let mut socket = tls_test_stream(socket);
+                    // Handle multiple requests over one keep-alive connection.
+                    loop {
+                        let mut request = Vec::new();
+                        let mut eof = false;
+                        while !request.ends_with(b"\r\n\r\n") {
+                            let mut byte = [0];
+                            match socket.read(&mut byte) {
+                                Ok(0) => {
+                                    eof = true;
+                                    break;
+                                }
+                                Ok(_) => request.push(byte[0]),
+                                Err(_) => {
+                                    eof = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if eof || request.is_empty() {
+                            break;
+                        }
+                        serving_hits.fetch_add(1, Ordering::Relaxed);
+                        // Simulate 150ms network latency per image: 12 unique images across
+                        // 8 workers should finish in ~300-450ms (vs ~900ms+ with 2 workers,
+                        // and previously images #5..#12 were hard-failed!).
+                        thread::sleep(Duration::from_millis(150));
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                            png_bytes.len()
+                        );
+                        if socket.write_all(header.as_bytes()).is_err() || socket.write_all(&png_bytes).is_err() {
+                            break;
+                        }
+                    }
+                }));
+            }
+            for h in handlers {
+                let _ = h.join();
+            }
+        });
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut actor = Actor::start(stop.clone(), false).unwrap();
+        let config = ureq::Agent::config_builder()
+            .proxy(None)
+            .tls_config(test_tls_config())
+            .max_redirects(0)
+            .max_idle_connections(16)
+            .max_idle_connections_per_host(8)
+            .timeout_global(Some(Duration::from_secs(4)))
+            .build();
+        let agent = ureq::Agent::with_parts(
+            config,
+            ureq::unversioned::transport::DefaultConnector::default(),
+            ControlledResolver(address),
+        );
+        actor.resources = ResourceWorkers::new(agent, stop);
+
+        // 12 unique images + 4 duplicate URLs = 16 <img> elements (exceeds old MAX_PENDING_RESOURCES=4).
+        let mut html = String::new();
+        for i in 0..12 {
+            html.push_str(&format!("<img class='pic' src='https://cdn.synthetic.example/img{i}.png'>"));
+        }
+        for i in 0..4 {
+            html.push_str(&format!("<img class='pic' src='https://cdn.synthetic.example/img{i}.png'>"));
+        }
+
+        // First load with allow_remote = false: all 16 blocked, 0 server hits.
+        actor.load(&html, None).unwrap();
+        let block_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            actor.cdp.poll().unwrap();
+            actor.pump().unwrap();
+            let loaded = actor.cdp.eval("Array.from(document.images).filter(i => i.complete).length".into()).unwrap();
+            if loaded == 16 {
+                break;
+            }
+            assert!(Instant::now() < block_deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(hits.load(Ordering::Relaxed), 0);
+
+        // Now flip remote content IN-PLACE via EnableRemote (no Chromium restart!).
+        let started = Instant::now();
+        actor.input(Input::EnableRemote, &|_| {}).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            actor.cdp.poll().unwrap();
+            actor.pump().unwrap();
+            let loaded = actor
+                .cdp
+                .eval("Array.from(document.images).filter(i => i.complete && i.naturalWidth === 4).length".into())
+                .unwrap();
+            if loaded == 16 && !actor.has_pending_resources() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "all 16 images should load, got {loaded}");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let elapsed = started.elapsed();
+        eprintln!("in-place EnableRemote for 16 images (12 unique @ 150ms each): {elapsed:?}, server hits={}", hits.load(Ordering::Relaxed));
+        assert_eq!(hits.load(Ordering::Relaxed), 12, "4 duplicate URLs must be deduplicated");
+        assert!(elapsed < Duration::from_secs(2), "parallel 8-worker loading should finish fast: {elapsed:?}");
+
+        server_stop.store(true, Ordering::Release);
+        drop(actor);
         serving.join().unwrap();
     }
 

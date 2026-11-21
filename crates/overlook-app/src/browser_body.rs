@@ -210,7 +210,7 @@ struct FinishedRender {
 }
 
 /// How many finished renders to keep. Each holds a few decoded tiles of one message.
-const FINISHED_LIMIT: usize = 8;
+const FINISHED_LIMIT: usize = 24;
 
 thread_local! {
     static FINISHED: std::cell::RefCell<std::collections::VecDeque<FinishedRender>> = Default::default();
@@ -259,7 +259,7 @@ pub fn is_rendered(document: &str, allow_remote: bool, dark_paper: Option<u32>, 
 /// it later shows it at once. The Chromium process is released when done.
 pub fn prerender(document: String, allow_remote: bool, dark_paper: Option<u32>, size: (u32, f64), cx: &mut App) -> Task<()> {
     let key = render_key(document_hash(&document, allow_remote, dark_paper), size);
-    let browser = BrowserHandle::new_sized(document, allow_remote, dark_paper, Some(size));
+    let browser = BrowserHandle::new_sized_background(document, allow_remote, dark_paper, Some(size));
     browser.visible_range(0, VIEWPORT_HEIGHT);
     let (waker, notified, mut rx) = EventWaker::new();
     let event_waker = waker.clone();
@@ -423,8 +423,8 @@ impl RetryDocument {
         Self { html: Arc::from(html), allow_remote, dark_paper }
     }
 
-    fn start(&self) -> BrowserHandle {
-        BrowserHandle::new(self.html.to_string(), self.allow_remote, self.dark_paper)
+    fn start(&self, size: Option<(u32, f64)>) -> BrowserHandle {
+        BrowserHandle::new_sized(self.html.to_string(), self.allow_remote, self.dark_paper, size)
     }
 }
 
@@ -565,6 +565,34 @@ impl BrowserBody {
         self.browser.on_event(move || waker.wake());
     }
 
+    /// Flips remote-content consent on the already-running Chromium without restarting it,
+    /// keeping the painted text visible while remote images stream in parallel.
+    pub fn set_allow_remote(&mut self, allow_remote: bool, cx: &mut Context<Self>) {
+        if self.prepared.allow_remote == allow_remote {
+            return;
+        }
+        let html = self.prepared.html.to_string();
+        let dark_paper = self.prepared.dark_paper;
+        self.document_hash = document_hash(&html, allow_remote, dark_paper);
+        self.prepared.allow_remote = allow_remote;
+        self.cache_initial_layout = true;
+        if allow_remote && self.error.is_none() {
+            // Keep existing painted text tiles visible (zero blank flash) while Chromium
+            // reloads the document in-place and fetches remote resources in parallel.
+            // Floor revision at >= 1 so an initial allow_remote=false tile from a
+            // newly started worker can never overwrite or cache under the remote hash.
+            self.tiles.revision = Some(self.tiles.revision.unwrap_or(1));
+            self.tiles.freeze();
+            self.tiles.awaiting_revision = true;
+            self.requested.set(None);
+            self.browser.enable_remote();
+            self.waker.wake();
+            cx.notify();
+        } else {
+            self.retry(cx);
+        }
+    }
+
     pub fn set_document(
         &mut self,
         document: String,
@@ -576,10 +604,22 @@ impl BrowserBody {
         if hash == self.document_hash {
             return;
         }
+        // Fast path: enabling remote content on the exact same HTML & theme reloads
+        // in-place on the running Chromium without spawning a new process or flashing blank.
+        if !self.prepared.allow_remote
+            && allow_remote
+            && dark_paper == self.prepared.dark_paper
+            && self.error.is_none()
+            && *self.prepared.html == document
+        {
+            self.set_allow_remote(true, cx);
+            return;
+        }
         self.document_hash = hash;
         self.layout_ready = false;
         self.cache_initial_layout = true;
         let retain_paint = allow_remote == self.prepared.allow_remote && dark_paper == self.prepared.dark_paper;
+        let size = self.last_resize.or_else(reader_size);
         self.prepared = RetryDocument::new(document, allow_remote, dark_paper);
         if retain_paint {
             // CID completion/preview edits replace the same entity's document.
@@ -588,12 +628,12 @@ impl BrowserBody {
             self.tiles.revision = None;
             self.tiles.awaiting_revision = false;
             self.requested.set(None);
-            self.browser = self.prepared.start();
+            self.browser = self.prepared.start(size);
             self.attach_browser_waker();
             self.error = None;
             self.buttons = 0;
             self.auto_scroll.stop();
-            self.last_resize = None;
+            self.last_resize = size;
             self.pending_context_menu = None;
             self.context_link = None;
             self.waker.wake();
@@ -604,9 +644,10 @@ impl BrowserBody {
     }
 
     fn retry(&mut self, cx: &mut Context<Self>) {
+        let size = self.last_resize.or_else(reader_size);
         self.tiles.reset();
         self.requested.set(None);
-        self.browser = self.prepared.start();
+        self.browser = self.prepared.start(size);
         self.attach_browser_waker();
         self.height = 300;
         self.error = None;
@@ -615,7 +656,7 @@ impl BrowserBody {
         self.cache_initial_layout = true;
         self.buttons = 0;
         self.auto_scroll.stop();
-        self.last_resize = None;
+        self.last_resize = size;
         self.pending_context_menu = None;
         self.context_link = None;
         self.waker.wake();
