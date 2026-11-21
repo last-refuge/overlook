@@ -43,15 +43,21 @@ struct IssuedGrant {
 impl McpSetup {
     pub(super) fn new(store: &Store, window: &mut Window, cx: &mut Context<MailWindow>) -> Self {
         let client = cx.new(|cx| InputState::new(window, cx).placeholder("my-harness"));
-        let accounts = mcp::eligible_accounts(store);
+        let (accounts, note) = match mcp::eligible_accounts(store) {
+            Ok(accounts) => (accounts, None),
+            Err(_) => (
+                Vec::new(),
+                Some("Could not read accounts for this profile.".into()),
+            ),
+        };
         let mut setup = Self {
             client,
-            accounts: accounts.unwrap_or_default(),
+            accounts,
             selected: BTreeSet::new(),
             permissions: BTreeSet::new(),
             grants: Vec::new(),
             issued: None,
-            note: None,
+            note,
         };
         setup.refresh_grants();
         setup
@@ -161,8 +167,9 @@ impl MailWindow {
         });
 
         v_flex().gap(px(12.))
-            .child(section("MCP", Some("Choose which accounts a local AI harness can access. New grants have read access until you add permissions.")))
-            .child(setting_row("Client name", "Use the same name in the harness. Issuing a token again replaces its access.", Input::new(&setup.client).small().into_any_element()))
+            .child(section("MCP", Some("Choose which accounts a local AI harness can access. Select any write permissions this client needs.")))
+            .child(setting_row("Client name", "Use the same name in the harness. Issuing a token again replaces its access.",
+                div().w(px(220.)).child(Input::new(&setup.client).small()).into_any_element()))
             .child(label("Accounts"))
             .when(setup.accounts.is_empty(), |d| d.child(detail("Add an eligible account before issuing a grant.")))
             .children(setup.accounts.iter().map(|account| {
