@@ -167,6 +167,7 @@ impl OAuth {
         json!({
             "resource": self.resource,
             "authorization_servers": [self.issuer],
+            // MCP discovery advertises basic access. The write challenge requests step-up.
             "scopes_supported": [ACCESS_SCOPE],
             "bearer_methods_supported": ["header"],
         })

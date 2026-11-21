@@ -56,10 +56,11 @@ pub(super) fn call(stream: &mut UnixStream, client: &str, token: &str, request: 
     }
     write_frame(stream, &request, deadline).map_err(|_| unavailable())?;
     let reply = read_frame(stream, MAX_REPLY, deadline).map_err(|_| unavailable())?;
-    let reply: ReplyFrame = serde_json::from_slice(&reply).map_err(|_| invalid())?;
-    if reply.version != VERSION {
+    let reply: serde_json::Value = serde_json::from_slice(&reply).map_err(|_| invalid())?;
+    if reply["version"].as_u64() != Some(u64::from(VERSION)) {
         return Err(unsupported());
     }
+    let reply: ReplyFrame = serde_json::from_value(reply).map_err(|_| invalid())?;
     reply.reply
 }
 

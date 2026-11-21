@@ -450,6 +450,12 @@ fn mail_writes_preserve_permission_boundaries_and_replay_after_restart() {
     let receipt = writer.read("mail_send", send.clone());
     assert_eq!(receipt["status"], "queued");
     assert_eq!(writer.read("mail_send", send.clone()), receipt);
+    for client in [&mut reader, &mut writer] {
+        let status = client.read("account_status", json!({"account_id":account}));
+        assert_eq!(status["pending_operations"], 1);
+        assert_eq!(status["outbox_items"], 1);
+        assert!(status["details"]["mail"]["cache"].is_object());
+    }
     let lookup = json!({"account_id":account,"operation_id":receipt["operation_id"]});
     assert_eq!(
         reader.read("mail_operation_get", lookup.clone())["status"],

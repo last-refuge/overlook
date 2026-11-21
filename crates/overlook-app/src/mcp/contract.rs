@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
@@ -26,11 +26,21 @@ pub enum Request {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(untagged)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Response {
     Accounts { accounts: Vec<Account> },
     Capabilities(Capabilities),
     Read(serde_json::Value),
+}
+
+impl Response {
+    pub fn into_tool_payload(self) -> serde_json::Result<serde_json::Value> {
+        match self {
+            Self::Accounts { accounts } => Ok(serde_json::json!({"accounts": accounts})),
+            Self::Capabilities(capabilities) => serde_json::to_value(capabilities),
+            Self::Read(data) => Ok(data),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]

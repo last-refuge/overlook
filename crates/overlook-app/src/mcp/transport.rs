@@ -462,7 +462,7 @@ fn tool_request(mut params: JsonObject) -> Result<Result<Request, Failure>, Erro
 
 fn tool_result(reply: Reply) -> Result<CallToolResult, ErrorData> {
     match reply {
-        Ok(response) => serde_json::to_value(response).map(CallToolResult::structured),
+        Ok(response) => response.into_tool_payload().map(CallToolResult::structured),
         Err(failure) => serde_json::to_value(failure).map(CallToolResult::structured_error),
     }
     .map_err(|_| ErrorData::internal_error("Could not serialize tool result", None))

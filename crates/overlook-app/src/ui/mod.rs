@@ -2365,9 +2365,11 @@ impl MailWindow {
             }
             self.sync_account(account.clone(), window, cx);
             if domain == WriteDomain::Mail && undo_delay > 0 {
-                cx.spawn_in(window, async move |this, cx| {
+                cx.spawn(async move |_, cx| {
                     cx.background_executor().timer(Duration::from_millis(u64::from(undo_delay) * 1000 + 300)).await;
-                    this.update_in(cx, |this, window, cx| this.sync_account(account, window, cx)).ok();
+                    cx.update(|cx| crate::lifecycle::with_sync_owner(cx, |this, window, cx| {
+                        this.sync_account(account, window, cx);
+                    }));
                 }).detach();
             }
         }
@@ -4513,7 +4515,7 @@ impl MailWindow {
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let outcome: Option<SyncOutcome> = spawn_blocking_async(run_sync(store, bundle.mail, bundle.calendar, account.clone(), verify)).await;
-            let _ = this.update_in(cx, |this, window, cx| {
+            let finished = this.update_in(cx, |this, window, cx| {
                 crate::watchdog::mark("sync finished");
                 if this.syncing.get(&account.id) == Some(&generation) {
                     this.syncing.remove(&account.id);
@@ -4616,6 +4618,24 @@ impl MailWindow {
                     this.sync_account(account.id.clone(), window, cx);
                 }
             });
+            if finished.is_err() {
+                // The sync ran on the Store even if its originating window closed.
+                // Clear the retained view's state and let a surviving window pick up
+                // any request that arrived during that pass.
+                this.update(cx, |this, cx| {
+                    if this.syncing.get(&account.id) == Some(&generation) {
+                        this.syncing.remove(&account.id);
+                        if verify {
+                            this.verify_pending.insert(account.id.clone());
+                        }
+                        if this.sync_requested.remove(&account.id) {
+                            cx.defer(move |cx| crate::lifecycle::with_sync_owner(cx, |this, window, cx| {
+                                this.sync_account(account.id, window, cx);
+                            }));
+                        }
+                    }
+                }).ok();
+            }
         })
         .detach();
     }

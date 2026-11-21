@@ -236,6 +236,7 @@ fn http_oauth_introspects_over_tls_and_enforces_scopes_before_owner_ipc() {
     let metadata: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(metadata["authorization_servers"], json!([ISSUER]));
     assert_eq!(metadata["resource"], RESOURCE);
+    assert_eq!(metadata["scopes_supported"], json!([ACCESS_SCOPE]));
 
     let missing = post(None, "accounts_list");
     assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
@@ -254,7 +255,8 @@ fn http_oauth_introspects_over_tls_and_enforces_scopes_before_owner_ipc() {
     let read_only = post(Some("read-only"), "mail_refresh");
     assert_eq!(read_only.status(), StatusCode::FORBIDDEN);
     let challenge = read_only.headers()["www-authenticate"].to_str().unwrap();
-    assert!(challenge.contains("insufficient_scope") && challenge.contains(WRITE_SCOPE));
+    assert!(challenge.contains("insufficient_scope"));
+    assert!(challenge.contains(&format!("scope=\"{ACCESS_SCOPE} {WRITE_SCOPE}\"")));
     assert_eq!(
         post(Some("read-only"), "accounts_list").status(),
         StatusCode::OK
