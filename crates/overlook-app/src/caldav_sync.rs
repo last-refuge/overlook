@@ -10,6 +10,23 @@ pub fn queue_change(
     account: &Account,
     mut edit: CalDavEdit,
 ) -> Result<EventId, String> {
+    let creating = edit.before.is_none();
+    let event = initialize_edit(account, &mut edit)?;
+    let id = event.id.clone();
+    let token = store
+        .caldav_change_for_event(event, creating)
+        .map_err(|e| e.to_string())?;
+    let desired = prepare_change(account, &token, &edit).map_err(|e| e.to_string())?;
+    store
+        .queue_caldav_change(&token, desired, edit)
+        .map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+pub(crate) fn initialize_edit<'a>(
+    account: &Account,
+    edit: &'a mut CalDavEdit,
+) -> Result<&'a Event, &'static str> {
     if edit.before.is_none() {
         if let Some(event) = edit.after.as_mut() {
             event.ical_uid = Some(format!("{}@overlook.local", new_provider_event_id()));
@@ -24,27 +41,22 @@ pub fn queue_change(
         .or(edit.before.as_ref())
         .ok_or("Missing calendar event")?;
     if event.account_id != account.id {
-        return Err("Calendar account changed. Reopen the event.".into());
+        return Err("Calendar account changed. Reopen the event.");
     }
-    let id = event.id.clone();
-    let token = store
-        .caldav_change_for_event(event, edit.before.is_none())
-        .map_err(|e| e.to_string())?;
+    Ok(event)
+}
+
+pub(crate) fn prepare_change(
+    account: &Account,
+    token: &CalDavChange,
+    edit: &CalDavEdit,
+) -> Result<Option<String>, CalDavError> {
     let base = if token.revision == 0 {
         token.base.as_ref().map(|r| r.icalendar.as_str())
     } else {
         token.desired.as_deref()
     };
-    let desired = overlook_provider::caldav::prepare_resource(
-        base,
-        std::slice::from_ref(&edit),
-        &account.email,
-    )
-    .map_err(|e| e.to_string())?;
-    store
-        .queue_caldav_change(&token, desired, edit)
-        .map_err(|e| e.to_string())?;
-    Ok(id)
+    overlook_provider::caldav::prepare_resource(base, std::slice::from_ref(edit), &account.email)
 }
 
 pub fn resolve_change(
@@ -57,23 +69,7 @@ pub fn resolve_change(
         return Err("Calendar account changed. Reopen the changes panel.".into());
     }
     if keep_local {
-        if change.timezone != tz::cache_key() {
-            return Err(
-                "Return to the time zone in which this edit was saved before keeping your changes."
-                    .into(),
-            );
-        }
-        let desired = if let Some(remote) = &change.remote {
-            overlook_provider::caldav::prepare_conflict_resource(
-                change.base.as_ref().map(|r| r.icalendar.as_str()),
-                &remote.icalendar,
-                &change.edits,
-                &account.email,
-            )
-            .map_err(|e| e.to_string())?
-        } else {
-            change.desired.clone()
-        };
+        let desired = prepare_rebase(account, change).map_err(|e| e.to_string())?;
         store
             .rebase_caldav_change(change, desired)
             .map_err(|e| e.to_string())
@@ -81,6 +77,27 @@ pub fn resolve_change(
         store
             .complete_caldav_change(change, change.remote.as_ref(), true)
             .map_err(|e| e.to_string())
+    }
+}
+
+pub(crate) fn prepare_rebase(
+    account: &Account,
+    change: &CalDavChange,
+) -> Result<Option<String>, CalDavError> {
+    if change.timezone != tz::cache_key() {
+        return Err(CalDavError::InvalidConfiguration(
+            "Return to the time zone in which this edit was saved before keeping your changes.",
+        ));
+    }
+    if let Some(remote) = &change.remote {
+        overlook_provider::caldav::prepare_conflict_resource(
+            change.base.as_ref().map(|r| r.icalendar.as_str()),
+            &remote.icalendar,
+            &change.edits,
+            &account.email,
+        )
+    } else {
+        Ok(change.desired.clone())
     }
 }
 

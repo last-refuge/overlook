@@ -12,6 +12,8 @@
 //! the primary copy. For POP3 accounts the local store *is* the primary copy: nothing may
 //! evict their messages. Any eviction routine must check [`Store::is_local_primary`] first.
 
+mod mcp_mail_read;
+mod mcp_write;
 mod index;
 mod calendar_connections;
 mod contact_cards;
@@ -25,6 +27,8 @@ pub use history::{reversal_for, HistoryEntry, Reversal, HISTORY_MAX_ENTRIES};
 pub use draft_sync::{DraftEditGuard, DraftSyncEntry, DraftUpload, same_draft_content};
 
 pub use index::{apply_to_message, MailIndex};
+pub use mcp_mail_read::McpMailSelection;
+pub use mcp_write::{McpCalDavResolution, McpCalendar, McpWriteKey, McpWriteOutcome, McpWriteTxn};
 
 use overlook_core::focus::{FocusRule, FocusTab};
 use overlook_core::sanitize::html_to_text;
@@ -775,29 +779,7 @@ impl Store {
         focused: Option<bool>,
         sender: Option<&str>,
     ) -> Result<()> {
-        self.with_tx(|tx| {
-            ensure_owned(tx, Owned::Message, account, ids.iter().map(|i| i.0.as_str()))?;
-            if !ids.is_empty() {
-                let mut stmt = tx.prepare_cached("UPDATE messages SET focus_override=?2 WHERE id=?1")?;
-                for id in ids {
-                    stmt.execute(params![id.0, focused])?;
-                }
-            }
-            if let Some(email) = sender.map(str::to_ascii_lowercase) {
-                match focused {
-                    Some(f) => {
-                        tx.execute(
-                            "INSERT INTO focus_rules(account_id, email, focused) VALUES(?1,?2,?3) ON CONFLICT(account_id, email) DO UPDATE SET focused=excluded.focused",
-                            params![account.0, email, f],
-                        )?;
-                    }
-                    None => {
-                        tx.execute("DELETE FROM focus_rules WHERE account_id=?1 AND email=?2", params![account.0, email])?;
-                    }
-                }
-            }
-            Ok(())
-        })
+        self.with_tx(|tx| set_focus_override_and_rule_tx(tx, account, ids, focused, sender))
     }
 
     /// Lowercase addresses the account owner has sent mail to.
@@ -952,15 +934,17 @@ impl Store {
 
     /// Writes a local event change and its pending operation atomically.
     pub fn apply_event_change(&self, account: &AccountId, event: &Event, kind: OperationKind) -> Result<PendingOperation> {
+        self.with_tx(|tx| Self::apply_event_change_tx(tx, account, event, kind))
+    }
+
+    fn apply_event_change_tx(tx: &Connection, account: &AccountId, event: &Event, kind: OperationKind) -> Result<PendingOperation> {
         let ts = now();
         ensure_same_account(&event.account_id, account, "event")?;
-        self.with_tx(|tx| {
-            ensure_owned(tx, Owned::Calendar, account, [event.calendar_id.0.as_str()])?;
-            ensure_owned(tx, Owned::Event, account, [event.id.0.as_str()])?;
-            caldav::reject_caldav_write(tx, &event.calendar_id)?;
-            upsert_event_tx(tx, event)?;
-            insert_operation_tx(tx, account, kind, ts)
-        })
+        ensure_owned(tx, Owned::Calendar, account, [event.calendar_id.0.as_str()])?;
+        ensure_owned(tx, Owned::Event, account, [event.id.0.as_str()])?;
+        caldav::reject_caldav_write(tx, &event.calendar_id)?;
+        upsert_event_tx(tx, event)?;
+        insert_operation_tx(tx, account, kind, ts)
     }
 
     /// Removes an event locally and queues its deletion.
@@ -971,7 +955,7 @@ impl Store {
     /// The local occurrences of `event`'s series that `scope` covers, `event` included.
     fn series_members_tx(tx: &Connection, account: &AccountId, event: &Event, scope: RecurrenceScope) -> Result<Vec<Event>> {
         let Some(master) = event.recurring_event_id.as_deref().filter(|_| scope != RecurrenceScope::This) else { return Ok(vec![event.clone()]) };
-        let mut members = load_events(tx, "WHERE e.account_id=?1 AND e.recurring_event_id=?2 ORDER BY e.start", params![account.0, master])?;
+        let mut members = load_events(tx, "WHERE e.account_id=?1 AND e.calendar_id=?2 AND e.recurring_event_id=?3 ORDER BY e.start", params![account.0, event.calendar_id.0, master])?;
         if scope == RecurrenceScope::Following {
             let split = event.split_point();
             members.retain(|m| m.id == event.id || m.split_point() >= split);
@@ -984,65 +968,69 @@ impl Store {
 
     /// Removes an event, or the part of its series `scope` names, and queues one deletion.
     pub fn delete_event_locally_scoped(&self, account: &AccountId, event: &Event, scope: RecurrenceScope) -> Result<PendingOperation> {
+        self.with_tx(|tx| Self::delete_event_locally_scoped_tx(tx, account, event, scope))
+    }
+
+    fn delete_event_locally_scoped_tx(tx: &Connection, account: &AccountId, event: &Event, scope: RecurrenceScope) -> Result<PendingOperation> {
         let ts = now();
-        self.with_tx(|tx| {
-            ensure_owned(tx, Owned::Calendar, account, [event.calendar_id.0.as_str()])?;
-            ensure_owned(tx, Owned::Event, account, [event.id.0.as_str()])?;
-            caldav::reject_caldav_write(tx, &event.calendar_id)?;
-            for member in Self::series_members_tx(tx, account, event, scope)? {
-                tx.execute("DELETE FROM events WHERE id=?1", [&member.id.0])?;
-            }
-            insert_operation_tx(
-                tx,
-                account,
-                OperationKind::DeleteEvent {
-                    event_id: event.id.clone(),
-                    calendar_id: event.calendar_id.clone(),
-                    provider_id: event.provider_id.clone(),
-                    scope,
-                    recurring_event_id: event.recurring_event_id.clone(),
-                    original_start: Some(event.split_point()),
-                },
-                ts,
-            )
-        })
+        ensure_owned(tx, Owned::Calendar, account, [event.calendar_id.0.as_str()])?;
+        ensure_owned(tx, Owned::Event, account, [event.id.0.as_str()])?;
+        caldav::reject_caldav_write(tx, &event.calendar_id)?;
+        for member in Self::series_members_tx(tx, account, event, scope)? {
+            tx.execute("DELETE FROM events WHERE id=?1", [&member.id.0])?;
+        }
+        insert_operation_tx(
+            tx,
+            account,
+            OperationKind::DeleteEvent {
+                event_id: event.id.clone(),
+                calendar_id: event.calendar_id.clone(),
+                provider_id: event.provider_id.clone(),
+                scope,
+                recurring_event_id: event.recurring_event_id.clone(),
+                original_start: Some(event.split_point()),
+            },
+            ts,
+        )
     }
 
     /// Saves an edited occurrence and, for a wider scope, applies the same edit to the other
     /// local occurrences the scope covers: texts and settings as given, times shifted by the
     /// same amount, with the duration of the edited one. One operation carries the scope.
     pub fn apply_series_change(&self, account: &AccountId, event: &Event, scope: RecurrenceScope) -> Result<PendingOperation> {
+        self.with_tx(|tx| Self::apply_series_change_tx(tx, account, event, scope))
+    }
+
+    fn apply_series_change_tx(tx: &Connection, account: &AccountId, event: &Event, scope: RecurrenceScope) -> Result<PendingOperation> {
         let ts = now();
         ensure_same_account(&event.account_id, account, "event")?;
         let duration = event.end - event.start;
-        self.with_tx(|tx| {
-            ensure_owned(tx, Owned::Calendar, account, [event.calendar_id.0.as_str()])?;
-            ensure_owned(tx, Owned::Event, account, [event.id.0.as_str()])?;
-            caldav::reject_caldav_write(tx, &event.calendar_id)?;
-            let before = load_events(tx, "WHERE e.id=?1", params![event.id.0])?.pop();
-            let delta = before.as_ref().map(|b| event.start - b.start).unwrap_or(0);
-            let members = before.as_ref().map(|b| Self::series_members_tx(tx, account, b, scope)).transpose()?.unwrap_or_default();
-            for member in members {
-                if member.id == event.id {
-                    continue;
-                }
-                let mut m = member;
-                m.summary = event.summary.clone();
-                m.description = event.description.clone();
-                m.location = event.location.clone();
-                m.color = event.color.clone();
-                m.reminders = event.reminders.clone();
-                m.attendees = event.attendees.clone();
-                m.wants_conference = event.wants_conference;
-                m.start += delta;
-                m.end = m.start + duration;
-                m.all_day = event.all_day;
-                m.updated = ts;
-                upsert_event_tx(tx, &m)?;
+        ensure_owned(tx, Owned::Calendar, account, [event.calendar_id.0.as_str()])?;
+        ensure_owned(tx, Owned::Event, account, [event.id.0.as_str()])?;
+        caldav::reject_caldav_write(tx, &event.calendar_id)?;
+        let before = load_events(tx, "WHERE e.id=?1", params![event.id.0])?.pop();
+        let delta = before.as_ref().map(|b| event.start - b.start).unwrap_or(0);
+        let members = before.as_ref().map(|b| Self::series_members_tx(tx, account, b, scope)).transpose()?.unwrap_or_default();
+        for member in members {
+            if member.id == event.id {
+                continue;
             }
-            upsert_event_tx(tx, event)?;
-            insert_operation_tx(tx, account, OperationKind::UpdateEvent { event_id: event.id.clone(), scope }, ts)
-        })
+            let mut m = member;
+            m.summary = event.summary.clone();
+            m.description = event.description.clone();
+            m.location = event.location.clone();
+            m.color = event.color.clone();
+            m.reminders = event.reminders.clone();
+            m.attendees = event.attendees.clone();
+            m.wants_conference = event.wants_conference;
+            m.start += delta;
+            m.end = m.start + duration;
+            m.all_day = event.all_day;
+            m.updated = ts;
+            upsert_event_tx(tx, &m)?;
+        }
+        upsert_event_tx(tx, event)?;
+        insert_operation_tx(tx, account, OperationKind::UpdateEvent { event_id: event.id.clone(), scope }, ts)
     }
 
     /// Provider ids of messages that carry a calendar attachment but no parsed invitation
@@ -1089,28 +1077,7 @@ impl Store {
     /// Applies a local change and records its pending operation atomically.
     pub fn apply_change(&self, account: &AccountId, change: LocalChange) -> Result<PendingOperation> {
         let ts = now();
-        self.with_tx(|tx| {
-            // A permanent delete removes the rows, so read their provider ids first.
-            let provider_ids = match &change {
-                LocalChange::DeleteForever { message_ids, .. } => {
-                    ensure_owned(tx, Owned::Message, account, message_ids.iter().map(|i| i.0.as_str()))?;
-                    let mut out = Vec::new();
-                    for id in message_ids {
-                        let pid: Option<String> = tx.query_row("SELECT provider_id FROM messages WHERE id=?1", [&id.0], |r| r.get(0)).optional()?.flatten();
-                        out.extend(pid.map(ProviderId));
-                    }
-                    Some(out)
-                }
-                _ => None,
-            };
-            apply_change_tx(tx, account, &change)?;
-            let mut kind = change.into_operation();
-            if let (OperationKind::DeleteForever { provider_ids: slot, .. }, Some(ids)) = (&mut kind, provider_ids) {
-                *slot = ids;
-            }
-            let op = insert_operation_tx(tx, account, kind, ts)?;
-            Ok(op)
-        })
+        self.with_tx(|tx| apply_queued_change_tx(tx, account, change, ts))
     }
 
     pub fn pending_operations(&self, account: &AccountId) -> Result<Vec<PendingOperation>> {
@@ -1178,65 +1145,106 @@ impl Store {
 
     /// Drafts of an account. `outbox` selects Outbox states instead of editing drafts.
     pub fn drafts(&self, account: &AccountId, outbox: bool) -> Result<Vec<Draft>> {
+        let mut drafts = self.drafts_for_account(account)?;
+        drafts.retain(|d| d.state.is_outbox() == outbox);
+        Ok(drafts)
+    }
+
+    /// Drafts and Outbox items from one account snapshot, newest first.
+    pub fn drafts_for_account(&self, account: &AccountId) -> Result<Vec<Draft>> {
         self.with_read_tx(|tx| {
             let mut all = load_drafts(tx, "WHERE d.account_id=?1", params![account.0])?;
-            all.retain(|d| d.state.is_outbox() == outbox);
             all.sort_by_key(|d| std::cmp::Reverse(d.updated_at));
             Ok(all)
         })
     }
 
     pub fn delete_draft(&self, account: &AccountId, id: &DraftId) -> Result<()> {
-        self.with_tx(|tx| {
-            ensure_owned(tx, Owned::Draft, account, [id.0.as_str()])?;
-            tx.execute("DELETE FROM drafts WHERE id=?1", [&id.0])?;
-            // Any unsent / failed / uncertain send for this draft is cancelled with it.
-            tx.execute(
-                "DELETE FROM pending_operations
-                 WHERE account_id=?1 AND state IN ('pending','failed','uncertain')
-                   AND json_valid(kind_json)
-                   AND json_extract(kind_json,'$.op')='send-draft'
-                   AND json_extract(kind_json,'$.draft_id')=?2",
-                params![account.0, id.0],
-            )?;
-            Ok(())
-        })
+        self.with_tx(|tx| delete_draft_tx(tx, account, id))
     }
 
     /// Moves a draft to the Outbox and queues its send in the same transaction.
     pub fn queue_send(&self, draft: &Draft) -> Result<PendingOperation> {
-        draft.validate_for_send().map_err(|e| StoreError::Invalid(e.to_string()))?;
-        let ts = now();
-        let mut queued = draft.clone();
-        queued.state = DraftState::Queued;
-        queued.updated_at = ts;
-        self.with_tx(|tx| {
-            save_draft_tx(tx, &queued)?;
-            insert_operation_tx(tx, &draft.account_id, OperationKind::SendDraft { draft_id: draft.id.clone() }, ts)
-        })
+        self.with_tx(|tx| queue_send_tx(tx, draft).map(|(_, operation)| operation))
     }
 
-    /// Returns a queued (not yet in-flight) draft to editing and removes its send operation.
+    /// Returns a cancellable Outbox item to editing and removes its send operation.
     pub fn cancel_send(&self, account: &AccountId, id: &DraftId) -> Result<Draft> {
         self.with_tx(|tx| {
             ensure_owned(tx, Owned::Draft, account, [id.0.as_str()])?;
-            let mut found = load_drafts(tx, "WHERE d.id=?1", params![id.0])?;
-            let mut draft = found.pop().ok_or_else(|| StoreError::NotFound(id.0.clone()))?;
-            if !matches!(draft.state, DraftState::Queued | DraftState::Failed(_)) {
-                return Err(StoreError::Invalid("This message is already being sent.".into()));
+            let draft = load_drafts(tx, "WHERE d.id=?1", params![id.0])?
+                .pop()
+                .ok_or_else(|| StoreError::NotFound(id.0.clone()))?;
+            cancel_send_tx(tx, draft, true).map(|(draft, _)| draft)
+        })
+    }
+
+    /// Claims a send under the account's mail sync lease. The replay plan can be stale:
+    /// cancellation, resend, or another claim may have changed it since it was read.
+    /// The returned flag means an earlier submission may have reached the provider.
+    pub fn claim_send(&self, op: &PendingOperation, undo_ms: i64) -> Result<Option<(Draft, bool)>> {
+        let OperationKind::SendDraft { draft_id } = &op.kind else {
+            return Err(StoreError::Invalid("Expected a send operation.".into()));
+        };
+        self.with_tx(|tx| {
+            let current = tx.query_row(
+                "SELECT id, account_id, seq, kind_json, state, attempts, last_error, created_at, updated_at
+                 FROM pending_operations WHERE id=?1 AND account_id=?2",
+                params![op.id.0, op.account_id.0],
+                row_to_operation,
+            ).optional()?;
+            if current.as_ref() != Some(op) || op.state == OperationState::Applied {
+                return Ok(None);
             }
-            draft.state = DraftState::Editing;
-            draft.updated_at = now();
-            save_draft_tx(tx, &draft)?;
+
+            let Some(mut draft) = load_drafts(tx, "WHERE d.id=?1 AND d.account_id=?2", params![draft_id.0, op.account_id.0])?.pop() else {
+                // An orphaned intent has no message to submit. It has no delivery receipt.
+                tx.execute("DELETE FROM pending_operations WHERE id=?1", [&op.id.0])?;
+                return Ok(None);
+            };
+            let reconcile = match (&draft.state, op.state) {
+                (DraftState::Sending | DraftState::Uncertain, _)
+                | (DraftState::Queued | DraftState::Failed(_), OperationState::InFlight | OperationState::Uncertain) => true,
+                (DraftState::Queued, OperationState::Pending) => false,
+                _ => return Ok(None),
+            };
+            let ts = now();
+            if !reconcile && ts - op.created_at < undo_ms {
+                return Ok(None);
+            }
             tx.execute(
-                "DELETE FROM pending_operations
-                 WHERE account_id=?1 AND state IN ('pending','failed')
-                   AND json_valid(kind_json)
-                   AND json_extract(kind_json,'$.op')='send-draft'
-                   AND json_extract(kind_json,'$.draft_id')=?2",
-                params![account.0, id.0],
+                "UPDATE pending_operations SET state='in-flight', attempts=attempts+1, last_error=NULL, updated_at=?2 WHERE id=?1",
+                params![op.id.0, ts],
             )?;
-            Ok(draft)
+            draft.state = DraftState::Sending;
+            draft.updated_at = ts;
+            set_draft_state_tx(tx, draft_id, &draft.state, ts)?;
+            Ok(Some((draft, reconcile)))
+        })
+    }
+
+    /// Records the outcome of a claimed attempt atomically with the Outbox state.
+    pub fn finish_send_attempt(&self, op: &PendingOperation, draft_state: &DraftState, error: &str) -> Result<()> {
+        let OperationKind::SendDraft { draft_id } = &op.kind else {
+            return Err(StoreError::Invalid("Expected a send operation.".into()));
+        };
+        let state = match draft_state {
+            DraftState::Queued => OperationState::Pending,
+            DraftState::Uncertain => OperationState::Uncertain,
+            DraftState::Failed(_) => OperationState::Failed,
+            _ => return Err(StoreError::Invalid("Invalid send outcome.".into())),
+        };
+        self.with_tx(|tx| {
+            let ts = now();
+            let updated = tx.execute(
+                "UPDATE pending_operations SET state=?3, last_error=?4, updated_at=?5
+                 WHERE id=?1 AND account_id=?2 AND state='in-flight' AND attempts=?6",
+                params![op.id.0, op.account_id.0, state.as_key(), error, ts, i64::from(op.attempts) + 1],
+            )?;
+            if updated != 1 {
+                return Err(StoreError::Invalid("The send claim is no longer current.".into()));
+            }
+            set_draft_state_tx(tx, draft_id, draft_state, ts)
         })
     }
 
@@ -1292,13 +1300,7 @@ impl Store {
     }
 
     pub fn set_draft_state(&self, id: &DraftId, state: &DraftState) -> Result<()> {
-        self.with_conn(|c| {
-            c.execute(
-                "UPDATE drafts SET state_json=?2, updated_at=?3 WHERE id=?1",
-                params![id.0, serde_json::to_string(state)?, now()],
-            )?;
-            Ok(())
-        })
+        self.with_conn(|c| set_draft_state_tx(c, id, state, now()))
     }
 
     /// Records provider acceptance: stores the sent message, removes the draft, and marks
@@ -1841,33 +1843,15 @@ impl Store {
 
     /// Saves a contact changed on this device and queues the push.
     pub fn save_contact_locally(&self, account: &AccountId, contact: &Contact) -> Result<PendingOperation> {
-        ensure_same_account(&contact.account_id, account, "contact")?;
-        let ts = now();
         let mut c = contact.clone();
-        c.pending = true;
-        let kind = if c.id.starts_with("local:") { OperationKind::CreateContact { contact_id: c.id.clone() } } else { OperationKind::UpdateContact { contact_id: c.id.clone() } };
-        self.with_tx(|tx| {
-            let prev_updated: Option<Timestamp> = tx
-                .query_row("SELECT updated FROM people WHERE account_id=?1 AND id=?2", params![account.0, c.id], |r| r.get(0))
-                .optional()?;
-            // Strictly monotonic per-contact timestamp so same-ms edits or backward clock
-            // skew can never collide with an in-flight sync's `sent` marker.
-            c.updated = prev_updated.map_or(ts, |prev| ts.max(prev + 1));
-            upsert_contact_tx(tx, &c)?;
-            tx.prepare_cached("UPDATE people SET edit_revision = edit_revision + 1 WHERE account_id=?1 AND id=?2")?
-                .execute(params![account.0, c.id])?;
-            insert_operation_tx(tx, account, kind, ts)
-        })
+        self.with_tx(|tx| save_contact_edit_tx(tx, account, &mut c, true, None))
+            .map(|op| op.expect("queued contact save"))
     }
 
     /// Removes a contact locally and queues its deletion.
     pub fn delete_contact_locally(&self, account: &AccountId, contact: &Contact) -> Result<PendingOperation> {
-        let ts = now();
-        self.with_tx(|tx| {
-            tx.execute("DELETE FROM people WHERE account_id=?1 AND id=?2", params![account.0, contact.id])?;
-            let resource_name = (!contact.id.starts_with("local:")).then(|| contact.id.clone());
-            insert_operation_tx(tx, account, OperationKind::DeleteContact { contact_id: contact.id.clone(), resource_name }, ts)
-        })
+        self.with_tx(|tx| delete_contact_edit_tx(tx, account, contact, true))
+            .map(|op| op.expect("queued contact deletion"))
     }
 
     /// The provider accepted a local change: the row takes the provider's copy (and id).
@@ -1999,6 +1983,36 @@ fn labels_tx(c: &Connection, account: &AccountId) -> Result<Vec<Label>> {
     let mut stmt = c.prepare_cached("SELECT id, account_id, kind, name, provider_id, color, sort_order FROM labels WHERE account_id=?1 ORDER BY sort_order, name")?;
     let rows = stmt.query_map([&account.0], row_to_label)?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn set_focus_override_and_rule_tx(
+    tx: &Connection,
+    account: &AccountId,
+    ids: &[MessageId],
+    focused: Option<bool>,
+    sender: Option<&str>,
+) -> Result<()> {
+    ensure_owned(tx, Owned::Message, account, ids.iter().map(|i| i.0.as_str()))?;
+    if !ids.is_empty() {
+        let mut stmt = tx.prepare_cached("UPDATE messages SET focus_override=?2 WHERE id=?1")?;
+        for id in ids {
+            stmt.execute(params![id.0, focused])?;
+        }
+    }
+    if let Some(email) = sender.map(str::to_ascii_lowercase) {
+        match focused {
+            Some(f) => {
+                tx.execute(
+                    "INSERT INTO focus_rules(account_id, email, focused) VALUES(?1,?2,?3) ON CONFLICT(account_id, email) DO UPDATE SET focused=excluded.focused",
+                    params![account.0, email, f],
+                )?;
+            }
+            None => {
+                tx.execute("DELETE FROM focus_rules WHERE account_id=?1 AND email=?2", params![account.0, email])?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn focus_rules_tx(c: &Connection, account: &AccountId) -> Result<Vec<FocusRule>> {
@@ -2225,6 +2239,44 @@ fn upsert_message_diff_tx(tx: &Connection, m: &Message, prev: Option<&Message>, 
         }
     }
     Ok(())
+}
+
+fn save_contact_edit_tx(tx: &Connection, account: &AccountId, contact: &mut Contact, queue: bool, target_book: Option<&str>) -> Result<Option<PendingOperation>> {
+    ensure_same_account(&contact.account_id, account, "contact")?;
+    let ts = now();
+    let prev_updated: Option<Timestamp> = tx
+        .query_row("SELECT updated FROM people WHERE account_id=?1 AND id=?2", params![account.0, contact.id], |r| r.get(0))
+        .optional()?;
+    // An edit must advance even if the clock hasn't moved past an in-flight sync's sent marker.
+    contact.updated = prev_updated.map_or(ts, |prev| ts.max(prev + 1));
+    contact.pending = queue;
+    upsert_contact_tx(tx, contact)?;
+    tx.prepare_cached("UPDATE people SET edit_revision = edit_revision + 1 WHERE account_id=?1 AND id=?2")?
+        .execute(params![account.0, contact.id])?;
+    if !queue {
+        return Ok(None);
+    }
+    let contact_id = contact.id.clone();
+    let kind = if contact_id.starts_with("local:") {
+        let target_book = contact_cards::contact_create_target(tx, account, &contact_id)?
+            .or_else(|| target_book.map(str::to_owned));
+        OperationKind::CreateContact { contact_id, target_book }
+    } else {
+        OperationKind::UpdateContact { contact_id }
+    };
+    Ok(Some(insert_operation_tx(tx, account, kind, ts)?))
+}
+
+fn delete_contact_edit_tx(tx: &Connection, account: &AccountId, contact: &Contact, queue: bool) -> Result<Option<PendingOperation>> {
+    ensure_same_account(&contact.account_id, account, "contact")?;
+    tx.execute("DELETE FROM people WHERE account_id=?1 AND id=?2", params![account.0, contact.id])?;
+    if !queue {
+        return Ok(None);
+    }
+    let contact_id = contact.id.clone();
+    let resource_name = (!contact_id.starts_with("local:")).then(|| contact_id.clone());
+    let kind = OperationKind::DeleteContact { contact_id, resource_name };
+    Ok(Some(insert_operation_tx(tx, account, kind, now())?))
 }
 
 fn upsert_contact_tx(tx: &Connection, c: &Contact) -> Result<()> {
@@ -2549,6 +2601,28 @@ impl RawMessage {
     }
 }
 
+fn apply_queued_change_tx(tx: &Connection, account: &AccountId, change: LocalChange, ts: Timestamp) -> Result<PendingOperation> {
+    // A permanent delete removes the rows, so read their provider ids first.
+    let provider_ids = match &change {
+        LocalChange::DeleteForever { message_ids, .. } => {
+            ensure_owned(tx, Owned::Message, account, message_ids.iter().map(|i| i.0.as_str()))?;
+            let mut out = Vec::new();
+            for id in message_ids {
+                let pid: Option<String> = tx.query_row("SELECT provider_id FROM messages WHERE id=?1", [&id.0], |r| r.get(0)).optional()?.flatten();
+                out.extend(pid.map(ProviderId));
+            }
+            Some(out)
+        }
+        _ => None,
+    };
+    apply_change_tx(tx, account, &change)?;
+    let mut kind = change.into_operation();
+    if let (OperationKind::DeleteForever { provider_ids: slot, .. }, Some(ids)) = (&mut kind, provider_ids) {
+        *slot = ids;
+    }
+    insert_operation_tx(tx, account, kind, ts)
+}
+
 fn apply_change_tx(tx: &Connection, account: &AccountId, change: &LocalChange) -> Result<()> {
     // Object-level authorization: every message and label the change names must be this
     // account's, before anything is written.
@@ -2644,6 +2718,80 @@ fn insert_operation_tx(tx: &Connection, account: &AccountId, kind: OperationKind
         params![op.id.0, op.account_id.0, op.seq, serde_json::to_string(&op.kind)?, op.state.as_key(), ts],
     )?;
     Ok(op)
+}
+
+fn delete_draft_tx(tx: &Connection, account: &AccountId, id: &DraftId) -> Result<()> {
+    ensure_owned(tx, Owned::Draft, account, [id.0.as_str()])?;
+    // Retain the draft_sync row so reconciliation can remove a provider copy.
+    tx.execute("DELETE FROM drafts WHERE id=?1", [&id.0])?;
+    // Any unsent / failed / uncertain send for this draft is cancelled with it.
+    tx.execute(
+        "DELETE FROM pending_operations
+         WHERE account_id=?1 AND state IN ('pending','failed','uncertain')
+           AND json_valid(kind_json)
+           AND json_extract(kind_json,'$.op')='send-draft'
+           AND json_extract(kind_json,'$.draft_id')=?2",
+        params![account.0, id.0],
+    )?;
+    Ok(())
+}
+
+fn active_send_operations_tx(tx: &Connection, account: &AccountId, draft_id: &DraftId) -> Result<Vec<(OperationId, String)>> {
+    let mut stmt = tx.prepare_cached(
+        "SELECT id, state FROM pending_operations
+         WHERE account_id=?1 AND state!='applied' AND json_valid(kind_json)
+           AND json_extract(kind_json,'$.op')='send-draft'
+           AND json_extract(kind_json,'$.draft_id')=?2 ORDER BY seq",
+    )?;
+    let rows = stmt.query_map(params![account.0, draft_id.0], |r| Ok((OperationId(r.get(0)?), r.get(1)?)))?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn queue_send_tx(tx: &Connection, draft: &Draft) -> Result<(Draft, PendingOperation)> {
+    draft.validate_for_send().map_err(|e| StoreError::Invalid(e.to_string()))?;
+    ensure_owned(tx, Owned::Draft, &draft.account_id, [draft.id.as_str()])?;
+    let current = load_drafts(tx, "WHERE d.id=?1", params![draft.id.0])?.pop();
+    if draft.state != DraftState::Editing
+        || current.is_some_and(|saved| saved.state != DraftState::Editing)
+        || !active_send_operations_tx(tx, &draft.account_id, &draft.id)?.is_empty()
+    {
+        return Err(StoreError::Invalid("Only an editing draft can be queued for sending.".into()));
+    }
+
+    let ts = now();
+    let mut queued = draft.clone();
+    queued.state = DraftState::Queued;
+    queued.updated_at = ts;
+    save_draft_tx(tx, &queued)?;
+    let operation = insert_operation_tx(tx, &draft.account_id, OperationKind::SendDraft { draft_id: draft.id.clone() }, ts)?;
+    Ok((queued, operation))
+}
+
+fn cancel_send_tx(tx: &Connection, mut draft: Draft, allow_failed: bool) -> Result<(Draft, Option<OperationId>)> {
+    let cancellable_state = draft.state == DraftState::Queued || (allow_failed && matches!(draft.state, DraftState::Failed(_)));
+    let operations = active_send_operations_tx(tx, &draft.account_id, &draft.id)?;
+    if !cancellable_state
+        || (!allow_failed && operations.is_empty())
+        || operations.iter().any(|(_, state)| state != "pending" && !(allow_failed && state == "failed"))
+    {
+        return Err(StoreError::Invalid("This message is no longer queued for cancellation.".into()));
+    }
+
+    draft.state = DraftState::Editing;
+    draft.updated_at = now();
+    set_draft_state_tx(tx, &draft.id, &draft.state, draft.updated_at)?;
+    for (id, _) in &operations {
+        tx.execute("DELETE FROM pending_operations WHERE id=?1", [&id.0])?;
+    }
+    Ok((draft, operations.into_iter().next().map(|(id, _)| id)))
+}
+
+fn set_draft_state_tx(tx: &Connection, id: &DraftId, state: &DraftState, at: Timestamp) -> Result<()> {
+    tx.execute(
+        "UPDATE drafts SET state_json=?2, updated_at=?3 WHERE id=?1",
+        params![id.0, serde_json::to_string(state)?, at],
+    )?;
+    Ok(())
 }
 
 fn save_draft_tx(tx: &Connection, d: &Draft) -> Result<()> {
@@ -3451,6 +3599,35 @@ mod tests {
         bad.to.clear();
         assert!(store.queue_send(&bad).is_err());
         assert_eq!(store.pending_count(&acct).unwrap(), 0);
+    }
+
+    #[test]
+    fn send_claim_and_cancellation_use_the_current_queue_entry() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let account = AccountId::from("acct-1");
+        let mut draft = Draft::new(account.clone(), DraftKind::New, 10);
+        draft.to = vec![Address::named("Maya Chen", "maya@northstar.example")];
+
+        let cancelled = store.queue_send(&draft).unwrap();
+        assert!(store.queue_send(&draft).is_err());
+        assert_eq!(store.pending_operations(&account).unwrap(), vec![cancelled.clone()]);
+        assert!(store.claim_send(&cancelled, 60_000).unwrap().is_none());
+
+        let restored = store.cancel_send(&account, &draft.id).unwrap();
+        let queued = store.queue_send(&restored).unwrap();
+        assert!(store.claim_send(&cancelled, 0).unwrap().is_none());
+        assert_eq!(store.draft(&draft.id).unwrap().unwrap().state, DraftState::Queued);
+
+        let (claimed, reconcile) = store.claim_send(&queued, 0).unwrap().unwrap();
+        assert!(!reconcile);
+        assert_eq!(claimed.state, DraftState::Sending);
+        assert_eq!(store.pending_operations(&account).unwrap()[0].state, OperationState::InFlight);
+        assert!(store.claim_send(&queued, 0).unwrap().is_none());
+        assert!(store.cancel_send(&account, &draft.id).is_err());
+        store.finish_send_attempt(&queued, &DraftState::Uncertain, "unknown").unwrap();
+        assert_eq!(store.draft(&draft.id).unwrap().unwrap().state, DraftState::Uncertain);
+        assert_eq!(store.pending_operations(&account).unwrap()[0].state, OperationState::Uncertain);
     }
 
     #[test]

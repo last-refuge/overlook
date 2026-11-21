@@ -264,18 +264,43 @@ fn undoable_since_tx(conn: &Connection, account: &AccountId, id: i64) -> Result<
     Ok(out)
 }
 
+pub(crate) fn record_history_tx(
+    tx: &Connection,
+    account: &AccountId,
+    at: Timestamp,
+    title: &str,
+    detail: &str,
+    reversal: &Reversal,
+) -> Result<i64> {
+    let json = serde_json::to_string(reversal)?;
+    tx.execute(
+        "INSERT INTO change_history(account_id, at, title, detail, reversal_json) VALUES(?1,?2,?3,?4,?5)",
+        params![account.0, at, title, detail, json],
+    )?;
+    Ok(tx.last_insert_rowid())
+}
+
+pub(crate) fn find_history_tx(
+    tx: &Connection,
+    account: &AccountId,
+    mut matches: impl FnMut(i64) -> bool,
+) -> Result<Option<HistoryEntry>> {
+    let mut stmt = tx.prepare_cached(&format!("SELECT {ENTRY_COLUMNS} FROM change_history WHERE account_id=?1 ORDER BY at DESC, id DESC LIMIT ?2"))?;
+    let mut rows = stmt.query_map(params![account.0, HISTORY_MAX_ENTRIES as i64], row_to_entry)?;
+    for row in &mut rows {
+        let row = row?;
+        if matches(row.0.id) {
+            return Ok(Some(with_reversal(row)));
+        }
+    }
+    Ok(None)
+}
+
 impl Store {
     /// Records an action taken at `at` and returns its id. Entries are ordered by `at`, so
     /// the caller stamps it when the action happens: writes may land in another order.
     pub fn record_history(&self, account: &AccountId, at: Timestamp, title: &str, detail: &str, reversal: &Reversal) -> Result<i64> {
-        let json = serde_json::to_string(reversal)?;
-        self.with_tx(|tx| {
-            tx.execute(
-                "INSERT INTO change_history(account_id, at, title, detail, reversal_json) VALUES(?1,?2,?3,?4,?5)",
-                params![account.0, at, title, detail, json],
-            )?;
-            Ok(tx.last_insert_rowid())
-        })
+        self.with_tx(|tx| record_history_tx(tx, account, at, title, detail, reversal))
     }
 
     /// The account's recorded actions, newest first.

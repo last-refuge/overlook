@@ -1,0 +1,114 @@
+# Overlook MCP implementation plan
+
+## Target experience
+
+Connect an MCP-capable harness to one Overlook profile. The harness can discover the accounts it has access to, see what each one supports, and use those accounts for mail, calendars, and contacts. For example, it can find a conversation in work mail, check work and personal calendars together, look up the attendees in a shared address book, and send a meeting invitation from the explicitly selected work calendar. Changes appear in Overlook and use its normal sync and recovery paths.
+
+The first release targets harnesses that launch a local subprocess on macOS or Linux. In **Settings → Integrations**, create a client grant, choose its accounts and permissions, and copy the command and arguments for `overlook mcp serve --client <name>`. The bridge uses the selected profile even when a different account is selected in the app. The [harness setup guide](../docs/overlook-mcp.md) covers desktop and headless ownership, installed entry points, and optional Streamable HTTP.
+
+## Try the read tools with fictional accounts
+
+Build with `cargo build --locked -p overlook`. Start an isolated profile in one terminal.
+
+```sh
+export OVERLOOK_DATA_DIR="$(mktemp -d)"
+printf '%s\n' "$OVERLOOK_DATA_DIR"
+target/debug/overlook mcp sample
+```
+
+In a second terminal, set `OVERLOOK_DATA_DIR` to the printed path. Run `target/debug/overlook mcp grant --client my-harness --account-id sample`. Repeat `--account-id` on the same command to grant `sample-secondary` as well. The command returns the client credential once. Running it again for the same client replaces its grant and credential.
+
+Configure the harness to launch the absolute path to `target/debug/overlook` with arguments `mcp serve --client my-harness`. Supply the same `OVERLOOK_DATA_DIR` and the issued `OVERLOOK_MCP_TOKEN` through the harness's environment and secret storage. Use `accounts_list` to find the granted accounts and `account_capabilities` to check what each supports. Use the returned opaque account IDs in tools.
+
+Run `target/debug/overlook mcp revoke --client my-harness` to deny subsequent calls, including on open connections. Run `target/debug/overlook --quit` with the same profile path to stop the sample owner. Calls without an owner return `profile_unavailable`. Calls with a missing, mismatched, or revoked grant return `access_denied` when an owner is running.
+
+The sample owner keeps its records in an isolated profile database and uses a fictional provider. Try finding the Trail walk invitation in the primary mailbox, then looking up its date and the sender's contact in the secondary account. For a desktop profile, eligible IMAP and POP3 accounts use `imap:<address>` and `pop3:<address>` as their CLI grant IDs. Gmail accounts and connections to recognized Google endpoints stay outside the MCP catalog while Google data flows are reviewed. Use one credential per harness. A harness running under your OS login has that login's local filesystem permissions.
+
+Run `cargo test --locked -p overlook --test mcp_milestone` to exercise both stdio protocol versions and the cross-account workflow against one sample owner. On macOS, the official TypeScript SDK clients `@modelcontextprotocol/client` 2.4.0 and `@modelcontextprotocol/sdk` 1.32.2 passed tool discovery, the Trail walk workflow, and live revocation.
+
+### Read tools
+
+| Area | Tools and coverage |
+| --- | --- |
+| Account | `accounts_list`, `account_capabilities`, and `account_status` show the granted accounts, supported reads, cache status, and pending counts. |
+| Mail | `mail_folders_list`, `mail_messages_list`, `mail_search`, `mail_conversation_get`, and `mail_message_get` read cached folders, headers, plain text, and meeting invitations without changing flags. Listing and search accept an opaque folder ID and optional UTC millisecond bounds. Explicit `source: "provider"` searches the Sample or IMAP provider and reports matches whose headers are absent from the cache. IMAP search bounds its folder and UID scope. |
+| Attachments | `mail_message_get` includes paginated attachment metadata. `mail_attachment_get` returns eligible cached content up to 24 KiB as base64. |
+| Drafts and history | `mail_drafts_list`, `mail_outbox_list`, `mail_draft_get`, and `mail_history_list` inspect local records, including up to 500 recent history entries. |
+| Calendar | `calendar_calendars_list`, `calendar_events_list`, `calendar_event_get`, and `calendar_availability` read cached calendars and events. Range reads take RFC 3339 timestamps with offsets and an exclusive end. Availability reports busy, free within verified cache coverage, and unknown intervals. |
+| Contacts | `contacts_address_books_list`, `contacts_search`, and `contacts_get` read cached contact records and identify their sources, including inferred contacts. |
+| Refresh | `mail_refresh` downloads changes for one Sample or IMAP account using the existing account sync lease. It does not replay drafts, the Outbox, or other pending operations. |
+
+`mail_search`, `calendar_events_list`, and `contacts_search` accept an explicit `account_ids` array of up to four granted accounts. Batch results report a separate result or error for each account. Continue individual pages with `account_id` and the corresponding cursor. Cursors are tied to the tool, account and filters, and pages reflect the current cache.
+
+`cache.freshness` reports `recent`, `stale`, or `unknown` independently of coverage. The cutoff for a recent successful fetch is 24 hours. Check `coverage` for unmatched remote results, missing bodies, or uncovered calendar time before interpreting an empty result. User and provider content is marked as untrusted in the tool payloads.
+
+### Mail writes
+
+Grants start with read access. Repeat `--allow` with `modify`, `send`, or `permanent-delete` when issuing a grant to add those independent permissions. For example, `overlook mcp grant --client editor --account-id sample --allow modify` permits organizing mail and editing drafts. A replacement grant rotates its credential. Check `account_capabilities` for its write permissions.
+
+| Permission | Tools |
+| --- | --- |
+| `modify` | `mail_messages_organize` updates read and starred flags, moves messages, and applies supported mailbox labels. `mail_focus_set` sets a Focused Inbox override and can teach the sender rule. `mail_history_undo` reverses supported organization entries. `mail_folder_create` and `mail_folder_rename` manage top-level local POP3 folders. |
+| `modify` | `mail_draft_create`, `mail_draft_update`, `mail_draft_reply`, `mail_draft_reply_all`, `mail_draft_forward`, and `mail_draft_discard` use the existing draft store. `mail_draft_attachment_add` accepts up to 8 KiB as base64, and `mail_draft_attachment_remove` uses an opaque attachment ID. Forwards copy eligible cached attachments and report omissions. |
+| `send` | `mail_send` puts a saved draft in the Outbox with `confirmed: true`. `mail_send_cancel` returns a queued draft to editing before submission starts. |
+| `permanent-delete` | `mail_messages_delete_permanently` requires `confirm: true` and exact message IDs already in Trash. This tool is available to Sample accounts. |
+
+Choose one `account_id` and a new `idempotency_key` for each write. Reuse that key with the same inputs after a timeout or restart to recover the original receipt. Reusing it with different inputs returns `conflict`. Draft edits, attachments, sends, and cancellations also require `if_revision` from the latest draft read or write. Overlook rejects edits to a draft open in a composer.
+
+Use `mail_operation_get` with the returned operation ID to distinguish queued, cancelled, uncertain, failed, and provider-confirmed delivery. A committed write receipt and provider acceptance are separate events. `mail_write_activity_list` shows the client, tool name, and commit time for local writes. The desktop uses its normal sync and Outbox recovery paths. To try offline replay safely, start the sample owner with `overlook mcp sample --offline`, queue a fictional send, stop it, then start `overlook mcp sample` again with the same profile.
+
+### Calendar and contact writes
+
+Grant `--allow calendar`, `--allow invite`, and `--allow contacts` independently. Each write takes an explicit `account_id` and an `idempotency_key`. Use IDs from the chosen account and pass the latest `revision` as `if_revision` when editing or deleting an existing record. `account_capabilities` lists the granted scopes by domain.
+
+| Permission | Tools | Supported paths |
+| --- | --- | --- |
+| `calendar` | `calendar_event_create`, `calendar_event_update`, `calendar_event_delete` | Personal events on writable Sample and connected CalDAV calendars. CalDAV supports individual occurrence edits and deletions, and whole-series deletion. |
+| `calendar` | `calendar_conflict_resolve` | CalDAV conflicts. Find the operation in `calendar_changes_list`, inspect both versions with `calendar_conflict_get`, and use its revision with `resolution: "keep-local"` or `"take-remote"`. |
+| `invite` | `calendar_invitation_respond`, `calendar_event_guests_set` | Simulated Sample scheduling. The account must be the verified attendee or organizer, respectively. Both take `confirmed: true`. Guest replacement takes `guest_emails`, with an empty list clearing the guests. |
+| `contacts` | `contacts_create`, `contacts_update`, `contacts_delete` | Sample and app-managed contacts, the connected CardDAV default book, and the Microsoft Graph default Contacts folder. Inferred contacts and other provider books have no MCP write path. |
+
+For a timed event use `start` and `end` in RFC 3339 with offsets. For an all-day event use `start_date`, `end_date`, and an IANA `time_zone`. Both forms use an exclusive end. A CalDAV event can receive a new ID after the provider confirms it. Set a contact's `address_book_id` when creating it. Contact updates may set a field to `null` to clear it. After a provider contact create syncs, search the book for the new provider-linked contact ID.
+
+Use `operation_get` to follow queued work and `write_activity_list` to audit local commits. Sample scheduling simulates changes without sending invitations. CalDAV supports personal edits, with meeting scheduling and conferencing unavailable through MCP. Gmail and recognized Google endpoints remain ineligible pending the Google data release review.
+
+## Architecture
+
+1. **MCP adapter.** The stdio adapter uses the official `rmcp` protocol types and bounds each input frame to 64 KiB. Its stdout carries JSON-RPC in both the 2026-07-28 discovery protocol and the 2025-11-25 initialization protocol. The transport and tool schemas are separate from the service operations so a future Streamable HTTP adapter can use the same service. [MCP transports](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports) · [stdio binding](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio) · [Official Rust SDK](https://github.com/modelcontextprotocol/rust-sdk)
+2. **One service owner per profile.** Both MCP adapters send typed requests to the active Overlook process over a private Unix socket. The desktop and foreground headless command share a profile lock. A foreground desktop launch can take over when the headless owner drains and releases the profile. The next tool call uses the new owner and the same account IDs and grants. [Single-instance lifecycle](../crates/overlook-app/src/single_instance.rs) · [App lifecycle](../crates/overlook-app/src/lifecycle.rs)
+3. **Shared operations.** Extract typed operations currently tied to window state, beginning with those MCP exposes first. Both callers use the same account checks, validation, history, write queues, provider sessions, retries, and conflict handling. A committed change emits account- and module-specific invalidation so the relevant windows refresh. Keep SQLite migrations, credentials, provider construction, and sync in the profile owner. [Store](../crates/overlook-store/src/lib.rs) · [Provider construction](../crates/overlook-app/src/providers.rs) · [Sync engine](../crates/overlook-app/src/sync.rs) · [Operation model](../crates/overlook-core/src/ops.rs)
+4. **Capability discovery.** Expose `accounts_list` and `account_capabilities`. Compute support from the account's actual connections, provider, calendar or address book, and access rights. Report supported operations, cached coverage, and connection status independently. A Microsoft mail connection, a connected Graph address book, and a CalDAV calendar are separate capabilities. A POP account can have local organization actions even when the server cannot mirror them. [Provider capabilities](mail-protocol-capabilities.md) · [CalDAV sync](../crates/overlook-app/src/caldav_sync.rs) · [CardDAV sync](../crates/overlook-app/src/carddav_sync.rs) · [Graph contacts sync](../crates/overlook-app/src/graph_contacts_sync.rs)
+
+## Operation coverage
+
+The tool names below are illustrative. Start with a small, discoverable catalog. Track parity against user-facing operations in Overlook and qualify each provider and collection separately.
+
+| Area | Read and discover | Write and manage |
+| --- | --- | --- |
+| Mail | List folders and labels, search across explicitly allowed accounts, list/read conversations and individual messages, discover attachments, inspect drafts, Outbox, history, and sync state | Create and edit drafts, reply/reply-all/forward, attach files, send and cancel queued sends, mark read/unread, star, archive, trash and restore, move, label, mark junk, teach Focused Inbox, manage folders and offline folders, permanently delete and empty supported folders, undo where Overlook supports it |
+| Calendar | List calendars, retrieve events and recurrence instances, search a date range, look up invitations, and derive availability with coverage attached | Create, update, move, and delete events, RSVP, manage guests, reminders and conferencing, and act on the occurrence or series scope supported by the provider. Support calendar management and conflict resolution where Overlook exposes them |
+| Contacts | List address books, search across allowed accounts, retrieve contact cards and their source, and distinguish editable contacts from directory or inferred suggestions | Create, update, and delete contacts. Cover address book choice, bulk actions, and import/export where Overlook currently supports them |
+| Operations | Inspect account status, queued work, outcomes, and conflicts | Request a refresh and use Overlook's existing retry, reconcile, and conflict-resolution actions |
+
+Include a capability and a test for every row in the parity inventory. Provider gaps should surface as structured unsupported or read-only results. Account sign-in, credential changes, and account removal stay in Overlook's account setup.
+
+## Contracts for agents
+
+- **Account and record identity.** Return opaque account, folder, calendar, address-book, and item IDs. Require an explicit account and destination for writes, including the sending identity or organizer. Scope every lookup and mutation by the client's grant and the record's ownership. Aggregated reads identify the originating account per result. Clone or import content across accounts only through named operations with grants on both sides.
+- **Read results.** Paginate lists with opaque cursors, support scoped filters, and return stable structured results. Search reports the covered accounts and folders, date range, cache freshness, and incomplete bodies separately from zero matches. Reading a message has no effect on its read flag. Return plain text by default. Attachments use size-bounded content transfers or a user-selected local file handoff through Overlook's existing attachment checks. Treat message, calendar, and contact text as untrusted data in tool output. [MCP tool schemas and results](https://modelcontextprotocol.io/specification/2026-07-28/server/tools)
+- **Writes.** Carry a durable idempotency key on operations that create or send something. Bind it to the client, account, action, and request content and persist it with the mutation. Carry a revision or equivalent precondition for stale-sensitive changes such as editing a draft or recurring event. Make invitation delivery intent and time zones explicit. Return entity IDs plus a durable operation ID and state. Distinguish local success, queued, provider-confirmed, partial, conflict, failed, and uncertain outcomes. Use the existing send reconciliation path after a lost response before another attempt. For bulk changes, return itemized results so callers can retry only the appropriate items.
+- **Permissions.** Default to disabled. Give each authorized harness an account allowlist and separately grant reads, ordinary writes, sending and invitations, and permanent deletion. Keep client credentials in the OS vault or a supported harness secret store. Check grants at execution and make revocation effective for future calls across open connections. Record the client, account, action, and outcome in a local activity view with redacted logs. Offer user-configurable confirmations for consequential actions and use an Overlook approval surface when a policy or configuration requires it regardless of the harness's features. [MCP tool interaction guidance](https://modelcontextprotocol.io/specification/2026-07-28/server/tools) · [Overlook credential storage](../docs/secrets-policy.md)
+
+## Implementation milestones
+
+1. **Protocol and profile ownership.** Establish a versioned in-process service contract, the private IPC bridge, client grants, status/error schemas, and a sample-profile mode. Prove a current and an older MCP client can discover and call the first tools. Exit when two clients can use the same profile without starting duplicate sync workers and a profile mismatch or revoked grant yields a clear denial.
+2. **Read across accounts.** Ship capability discovery and paginated mail, calendar, and contact reads against cached data, followed by explicit refresh and provider-backed search where supported. Include attachments and time-zone semantics. Exit when a harness can answer a question using mail, calendar, and contacts from different sample accounts and can tell when the result is partial or stale.
+3. **Mail actions and delivery.** Extract message, folder, Focused Inbox, attachment, draft, and Outbox actions in small slices. Start with reversible organization and draft edits, then qualify send, cancellation, history, and permanent deletion. Exit when the UI reflects MCP changes, an offline action replays after restart, and retrying a send request returns the original operation without delivering a duplicate.
+4. **Calendar and contacts parity.** Reuse the existing Google, CalDAV, CardDAV, and Graph paths for writes. Cover recurring-event scopes, RSVP and invitations, provider conflicts, read-only collections, and app-managed contacts. Exit when each supported provider/collection row has protocol, store, and sync evidence, and domain tests verify the intended account receives each change.
+5. **Headless and distribution.** Finish single-owner startup and shutdown with the GUI open or closed. Package the stdio entry point for Linux and macOS. Run end-to-end tests with isolated sample profiles, fake providers, and dedicated live test accounts. Document harness setup and show supported operation coverage. For HTTP-only or remote harnesses, add an opt-in Streamable HTTP adapter after stdio qualifies. Validate MCP OAuth authorization, token audience, origin, and network binding. Enable remote access only through an explicitly configured authenticated deployment. [MCP authorization](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization) · [Transport specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports)
+
+## Release checks
+
+- Verify permission checks with multiple accounts sharing the same email address, disabled or revoked connections, read-only collections, and record IDs presented under the wrong account. Include an integration test in which an email contains instructions that try to trigger a tool call. Verify that the normal grant and confirmation requirements still apply.
+- Cover two harnesses plus the native app writing concurrently, offline restart, expired sessions, provider refusal, lost replies, partial cross-account results, and simultaneous app and headless startup. Verify both durable local state and observed provider state. Keep synthetic and live-provider evidence separate.
+- Review Google-derived data flows before enabling Gmail or other Google Workspace data for real harnesses. Google's policy discusses MCP and user consent, limits third-party transfer, and restricts model training. Confirm the supported harness processing and retention model, disclosure and consent design, and any implications for Overlook's OAuth verification or security assessment. Review tenant constraints for managed Microsoft accounts. Qualify the sample profile and eligible provider paths independently of this review. [Google Workspace user data and developer policy](https://developers.google.com/workspace/workspace-api-user-data-developer-policy) · [Google restricted-scope verification](https://developers.google.com/identity/protocols/oauth2/production-readiness/restricted-scope-verification) · [Overlook's current Google data flow](google-data-flow-review.md)

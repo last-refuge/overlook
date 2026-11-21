@@ -476,11 +476,12 @@ mod tests {
 
     #[test]
     fn a_pin_on_a_server_that_isnt_named_as_this_computer_is_ignored() {
-        // 127.0.0.2 is a loopback address, but not one of the names a pin is honoured for:
-        // the connection is verified against the public roots, which refuse the certificate.
+        // The expanded loopback address is outside the allowed host spellings. It works
+        // on hosts with a single IPv4 loopback address configured, including macOS.
+        let host = "0:0:0:0:0:0:0:1";
         for (speaks, security) in [(Speaks::Imap, Security::StartTls), (Speaks::Smtp, Security::StartTls)] {
-            let (port, seen) = serve_on("127.0.0.2", speaks, security, LOOPBACK_CERT, LOOPBACK_KEY);
-            let elsewhere = ServerEndpoint { host: "127.0.0.2".into(), ..endpoint(port, security, Some(LOOPBACK_CERT)) };
+            let (port, seen) = serve_on(host, speaks, security, LOOPBACK_CERT, LOOPBACK_KEY);
+            let elsewhere = ServerEndpoint { host: host.into(), ..endpoint(port, security, Some(LOOPBACK_CERT)) };
             let result = match speaks {
                 Speaks::Smtp => crate::smtp::Transport::new(elsewhere, "bridge-password").with_timeout(WAIT).probe(),
                 _ => crate::imap::connection::connect(&elsewhere, &"bridge-password".into(), WAIT).map(|_| ()),

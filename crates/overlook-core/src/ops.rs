@@ -59,7 +59,11 @@ pub enum OperationKind {
         original_start: Option<Timestamp>,
     },
     /// Push a contact created on this device.
-    CreateContact { contact_id: String },
+    CreateContact {
+        contact_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_book: Option<String>,
+    },
     /// Push local edits of a contact.
     UpdateContact { contact_id: String },
     /// Delete a contact at the provider.
@@ -102,7 +106,7 @@ impl OperationKind {
 
     pub fn contact_id(&self) -> Option<&str> {
         match self {
-            OperationKind::CreateContact { contact_id } | OperationKind::UpdateContact { contact_id } | OperationKind::DeleteContact { contact_id, .. } => Some(contact_id),
+            OperationKind::CreateContact { contact_id, .. } | OperationKind::UpdateContact { contact_id } | OperationKind::DeleteContact { contact_id, .. } => Some(contact_id),
             _ => None,
         }
     }

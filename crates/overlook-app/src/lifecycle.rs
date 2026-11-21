@@ -44,6 +44,8 @@ struct Lifecycle {
     sample: SampleProvider,
     /// The main window, shown or (while `hidden`) headless.
     main: Option<Main>,
+    /// Keep the latest sync state while a detached editor keeps the app open.
+    sync_view: Option<Entity<MailWindow>>,
     hidden: bool,
     /// A switch between headless and windowed is under way; windows closing meanwhile are ours.
     switching: bool,
@@ -66,6 +68,7 @@ pub fn start(store: Arc<Store>, sample: SampleProvider, hidden: bool, cx: &mut A
         store,
         sample,
         main: None,
+        sync_view: None,
         hidden,
         switching: false,
         show_after: None,
@@ -76,6 +79,8 @@ pub fn start(store: Arc<Store>, sample: SampleProvider, hidden: bool, cx: &mut A
     });
     cx.on_window_closed(window_closed).detach();
     cx.on_app_quit(|cx| {
+        crate::single_instance::desktop_stopping();
+        crate::mcp::stop_desktop();
         if cx.has_global::<Lifecycle>() {
             cx.global_mut::<Lifecycle>().tray.shutdown();
         }
@@ -135,7 +140,10 @@ fn open_main(hidden: bool, cx: &mut App) -> anyhow::Result<()> {
     let (window, view) = gpui_kit::open_window(options, cx, move |window, cx| {
         cx.new(|cx| MailWindow::new(store, sample, accounts, active, WindowSetup::Mail(preference), window, cx))
     })?;
-    cx.global_mut::<Lifecycle>().main = Some(Main { window, view: view.downgrade() });
+    let lifecycle = cx.global_mut::<Lifecycle>();
+    lifecycle.sync_view = Some(view.clone());
+    lifecycle.main = Some(Main { window, view: view.downgrade() });
+    crate::single_instance::wake();
     Ok(())
 }
 
@@ -149,7 +157,11 @@ fn window_closed(cx: &mut App, closed: WindowId) {
     if l.main.as_ref().is_some_and(|m| m.window.window_id() == closed) {
         l.main = None;
     }
+    if none_left {
+        l.sync_view = None;
+    }
     if l.switching || !none_left {
+        crate::single_instance::wake();
         return;
     }
     if l.hidden || !keep_running() {
@@ -290,8 +302,8 @@ pub fn quit(cx: &mut App) {
 
 fn quit_now(cx: &mut App) {
     tracing::info!("quitting");
-    // A launch from now on starts a new Overlook rather than handing itself to this one.
-    crate::single_instance::release();
+    crate::single_instance::desktop_stopping();
+    crate::mcp::stop_desktop();
     cx.quit();
 }
 
@@ -309,11 +321,40 @@ fn serve_launches(cx: &mut App) {
                 None => tracing::warn!("ignored a request from another launch"),
             }
         }
+        cx.update(|cx| {
+            with_sync_owner(cx, |this, window, cx| {
+                let changes = crate::mcp::take_changes();
+                if !changes.is_empty() {
+                    this.mcp_data_changed(changes, window, cx);
+                }
+            });
+        });
         if wakeups.recv().await.is_none() {
             break;
         }
     })
     .detach();
+}
+
+/// Use a live window for the main view's sync work, including while only a
+/// detached editor remains open.
+pub(crate) fn with_sync_owner(
+    cx: &mut App,
+    update: impl FnOnce(&mut MailWindow, &mut Window, &mut Context<MailWindow>),
+) {
+    let Some(lifecycle) = cx.try_global::<Lifecycle>() else { return };
+    let Some(view) = lifecycle.sync_view.clone() else { return };
+    let windows: Vec<_> = lifecycle.main.as_ref().map(|main| main.window).into_iter()
+        .chain(lifecycle.editors.iter().map(|(window, _)| *window))
+        .collect();
+    let mut update = Some(update);
+    for window in windows {
+        if window.update(cx, |_, window, cx| {
+            view.update(cx, |this, cx| update.take().unwrap()(this, window, cx));
+        }).is_ok() {
+            break;
+        }
+    }
 }
 
 fn serve(request: Request, cx: &mut App) {

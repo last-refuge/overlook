@@ -12,7 +12,7 @@ jobs:
     steps:
       - name: Install toolchain and libraries
         run: |
-          pacman -Syu --noconfirm git rustup vulkan-icd-loader libxkbcommon libxkbcommon-x11 libxcb wayland fontconfig freetype2 openssl pkgconf xdg-desktop-portal chromium sudo
+          pacman -Syu --noconfirm git rustup vulkan-icd-loader libxkbcommon libxkbcommon-x11 libxcb wayland fontconfig freetype2 openssl pkgconf xdg-desktop-portal chromium sudo python
           rustup default stable
       - uses: actions/checkout@v4
         with:
@@ -78,6 +78,8 @@ jobs:
           bash scripts/check-release-binary.sh "$extracted"
           tar -xOf "dist/overlook-$VERSION-x86_64-linux.tar.gz" "overlook-$VERSION-x86_64-linux/overlook" > "$extracted"
           bash scripts/check-release-binary.sh "$extracted"
+      - name: Smoke-test MCP in the installed Linux release
+        run: python3 scripts/check-mcp-package.py "dist/overlook-$VERSION-x86_64-linux.tar.gz"
       - name: Include the installer
         run: cp install.sh dist/
       - uses: actions/upload-artifact@v4
@@ -118,6 +120,8 @@ jobs:
           trap 'rm -rf "$extracted"' EXIT
           ditto -x -k "dist/overlook-$version-${{ matrix.arch }}-macos.zip" "$extracted"
           bash scripts/check-release-binary.sh "$extracted/Overlook.app/Contents/MacOS/overlook"
+      - name: Smoke-test MCP in the installed Mac release
+        run: python3 scripts/check-mcp-package.py "dist/overlook-${GITHUB_REF_NAME#v}-${{ matrix.arch }}-macos.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: overlook-release-macos-${{ matrix.arch }}

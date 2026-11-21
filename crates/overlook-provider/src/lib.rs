@@ -345,6 +345,12 @@ pub trait MailProvider: Send + Sync {
         Box::pin(async { Ok(Vec::new()) })
     }
 
+    fn mcp_mail_search_folder(&self, _folder: &str, _query: &str, _limit: usize, _deadline: std::time::Instant)
+        -> BoxFuture<'_, Result<(Vec<ProviderId>, bool), ProviderError>>
+    {
+        Box::pin(async { Err(ProviderError::Rejected("Scoped provider search is unavailable".into())) })
+    }
+
     fn fetch_attachment(&self, _account: &Account, _message: &Message, _attachment: &Attachment) -> BoxFuture<'_, Result<Vec<u8>, ProviderError>> {
         Box::pin(async { Err(ProviderError::Rejected("this account cannot download attachments".into())) })
     }

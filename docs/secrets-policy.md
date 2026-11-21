@@ -139,6 +139,12 @@ Overlook account. Both remove every secret kind for that account, including CalD
 | Logs | Release builds use the fixed filter `overlook=info` and ignore `RUST_LOG` (`crates/overlook-app/src/main.rs:138-146`). Library targets that can carry wire bytes or secrets (`ureq`, `rustls`, `lettre`, `imap`, `oo7`, `zbus`, `zvariant`) are dropped in every build (`main.rs:166-168`). Keyring library errors go only to `overlook::diag` at debug level, which release builds do not record, and users see constant messages (`credentials.rs:77-85`). The log file is mode 0600 in a 0700 data folder (`main.rs:118-132`). |
 | Crash output | Release builds replace the panic output with the fixed line `PANIC_NOTICE` on stderr and send the location and message only to the private log (`main.rs:150-162`). |
 
+## MCP client credentials
+
+MCP grants are separate from the provider credentials above. A profile keeps each grant’s client name, account IDs, write permissions, and token digest in its private `.mcp` directory. Overlook returns the grant token when issuing it. The desktop offers a single clipboard copy of the issued token and omits it from the copied harness configuration. The harness supplies the token in its child process environment. Replacing or revoking a grant takes effect on the next tool call.
+
+An HTTP bridge reads an operator-provided configuration file with owner-only permissions. This file holds an Overlook grant token and a separate HTTP bearer or OAuth introspection credential. The bridge uses the grant token only on the private profile socket. OAuth introspection sends the presented access token and introspection credential to the configured HTTPS authorization server. Mail, calendar, and contacts provider credentials stay in the operating system vault. [MCP setup](overlook-mcp.md)
+
 ## Access logging
 
 Every keyring read, write and delete writes one line under the `overlook::vault_audit` target at info

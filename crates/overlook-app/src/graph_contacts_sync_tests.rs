@@ -212,6 +212,45 @@ fn a_contact_added_here_is_made_once_even_after_a_lost_reply() {
 }
 
 #[test]
+fn an_mcp_contact_write_survives_graph_retry_in_its_account() {
+    use overlook_store::{McpWriteKey, StoreError};
+
+    let (store, account, conn) = setup();
+    let server = Server::default();
+    let other = Account { id: AccountId::from("imap:other"), ..account.clone() };
+    store.upsert_account(&other).unwrap();
+    let mut contact = Contact::new_local(account.id.clone(), now());
+    contact.given_name = Some("Casey".into());
+    contact.email = "casey@example.test".into();
+    let mut operation = None;
+    store.mcp_write::<StoreError>(
+        McpWriteKey {
+            account: &account.id,
+            client: "fixture",
+            key_digest: &[1; 32],
+            request_digest: &[2; 32],
+            action: "contacts_create",
+        },
+        |tx, _| {
+            operation = tx.save_mcp_contact(&mut contact, true, None)?;
+            Ok(json!({"status":"queued"}))
+        },
+    ).unwrap();
+    let operation = operation.unwrap();
+    let status = |id| store.mcp_operation_status(id, |raw| raw == operation.as_str()).unwrap();
+    *server.lose_reply.borrow_mut() = true;
+    assert_eq!(sync(&store, &account, &conn, &server, false).unwrap_err(), GraphError::Network);
+    assert_eq!(status(&account.id).unwrap().state, "pending");
+    assert!(sync(&store, &account, &conn, &server, true).unwrap().is_empty());
+    assert_eq!(status(&account.id).unwrap().state, "applied");
+    assert!(status(&other.id).is_none());
+    assert!(store.contacts(&other.id).unwrap().is_empty());
+    let remote = server.contacts.borrow();
+    assert_eq!(remote.len(), 1);
+    assert!(remote.keys().all(|url| url.starts_with(DEFAULT)));
+}
+
+#[test]
 fn a_new_contact_deleted_after_a_lost_reply_is_deleted_at_microsoft_too() {
     let (store, account, conn) = setup();
     let server = Server::default();

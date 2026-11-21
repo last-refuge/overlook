@@ -261,7 +261,7 @@ fn send_edits(store: &Store, account: &Account, connection: &ContactsConnection,
         let label = op.kind.contact_id().map(|id| edit_label(store, &account.id, id)).unwrap_or_default();
         let _ = store.set_operation_state(&op.id, OperationState::InFlight, None);
         let sent = match &op.kind {
-            OperationKind::CreateContact { contact_id } => create(store, account, connection, server, contact_id),
+            OperationKind::CreateContact { contact_id, target_book } => create(store, account, connection, server, contact_id, target_book.as_deref()),
             OperationKind::UpdateContact { contact_id } => update(store, account, connection, server, contact_id),
             OperationKind::DeleteContact { contact_id, .. } => delete(store, account, server, contact_id),
             _ => Sent::Done,
@@ -366,7 +366,7 @@ fn new_card_uid(contact_id: &str) -> String {
     }
 }
 
-fn create(store: &Store, account: &Account, connection: &ContactsConnection, server: &dyn ContactsServer, contact_id: &str) -> Sent {
+fn create(store: &Store, account: &Account, connection: &ContactsConnection, server: &dyn ContactsServer, contact_id: &str, target_book: Option<&str>) -> Sent {
     // Sent already (the contact then has the server's id), or deleted before it was sent.
     let Ok(Some(contact)) = store.contact_by_id(&account.id, contact_id) else { return Sent::Done };
     // A try whose reply never arrived left its record: where it went, and what it sent.
@@ -374,9 +374,12 @@ fn create(store: &Store, account: &Account, connection: &ContactsConnection, ser
     let (book, url) = match &earlier {
         Some(card) => (card.address_book.clone(), card.url.clone()),
         None => {
-            let book = match default_book(store, connection, server) {
-                Ok(book) => book,
-                Err(sent) => return sent,
+            let book = match target_book {
+                Some(book) => book.to_owned(),
+                None => match default_book(store, connection, server) {
+                    Ok(book) => book,
+                    Err(sent) => return sent,
+                },
             };
             let url = card_url(&book, &new_card_uid(contact_id));
             let record = ContactCard { contact_id: contact_id.to_owned(), address_book: book.clone(), url: url.clone(), etag: String::new(), base: contact.clone() };
@@ -402,8 +405,11 @@ fn create(store: &Store, account: &Account, connection: &ContactsConnection, ser
             }
         }
         Ok(WriteOutcome::Missing) => {
-            // The address book is gone: find another next time.
             let _ = store.delete_contact_card(&account.id, contact_id);
+            if target_book.is_some() {
+                return Sent::Failed("The selected address book is no longer available.".into());
+            }
+            // Desktop creates without an explicit destination can discover a new default.
             let _ = store.set_contacts_default_book(connection, None);
             Sent::Retry(CardDavError::UnexpectedStatus(404))
         }
@@ -435,12 +441,12 @@ fn catch_up(server: &dyn ContactsServer, url: &str, sent_then: &Contact, contact
 fn update(store: &Store, account: &Account, connection: &ContactsConnection, server: &dyn ContactsServer, contact_id: &str) -> Sent {
     // Never confirmed by the server: still a new contact.
     if contact_id.starts_with("local:") {
-        return create(store, account, connection, server, contact_id);
+        return create(store, account, connection, server, contact_id, None);
     }
     let Ok(Some(desired)) = store.contact_by_id(&account.id, contact_id) else { return Sent::Done };
     let Ok(Some(card)) = store.contact_card(&account.id, contact_id) else {
         // Never sent: a contact added here, so it goes as a new one.
-        return if contact_id.starts_with("local:") { create(store, account, connection, server, contact_id) } else { Sent::Done };
+        return if contact_id.starts_with("local:") { create(store, account, connection, server, contact_id, None) } else { Sent::Done };
     };
     // A copy that changes between reading and writing is read again; three tries are plenty.
     for _ in 0..3 {

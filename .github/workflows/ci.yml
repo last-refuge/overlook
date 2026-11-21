@@ -11,7 +11,7 @@ jobs:
     steps:
       - name: Install toolchain and libraries
         run: |
-          pacman -Syu --noconfirm git rustup vulkan-icd-loader libxkbcommon libxkbcommon-x11 libxcb wayland fontconfig freetype2 openssl pkgconf
+          pacman -Syu --noconfirm git rustup vulkan-icd-loader libxkbcommon libxkbcommon-x11 libxcb wayland fontconfig freetype2 openssl pkgconf python
           rustup default stable
       - uses: actions/checkout@v4
       - name: Trust the checkout
@@ -21,6 +21,10 @@ jobs:
         run: cargo test --workspace --locked
       - name: Shell syntax
         run: bash -n install.sh && bash -n packaging/PKGBUILD && bash -n scripts/make-release-tarball.sh
+      - name: Smoke-test MCP in an installed Linux tarball
+        run: |
+          scripts/make-release-tarball.sh ci dist target/debug/overlook
+          python3 scripts/check-mcp-package.py dist/overlook-ci-x86_64-linux.tar.gz
   audit:
     name: Dependency audit (RustSec)
     runs-on: ubuntu-latest

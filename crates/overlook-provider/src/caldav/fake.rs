@@ -61,6 +61,8 @@ impl CalendarServer {
                     }
                     Err(e) => panic!("calendar fixture accept failed: {e}"),
                 };
+                // Accepted sockets can inherit the listener's nonblocking mode.
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(3)))
                     .unwrap();
@@ -177,6 +179,8 @@ pub fn reference_client(address: SocketAddr) -> CalDavClient {
         .max_redirects(0)
         .http_status_as_error(false)
         .proxy(None)
+        // The loopback fixtures close their sockets server-side after each request.
+        .max_idle_connections(0)
         .timeout_global(Some(Duration::from_secs(3)))
         .tls_config(tls)
         .build();

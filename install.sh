@@ -14,7 +14,25 @@
 #   --dry-run       show what would happen and change nothing
 #   --uninstall     remove Overlook
 #   --help          this text
-set -Eeuo pipefail
+# Shared by the verified release install and the offline package smoke test.
+install_tarball() {
+  bash -euo pipefail -c '
+    archive=$1
+    prefix=$2
+    stage=$(mktemp -d)
+    trap "rm -rf -- \"\$stage\"" EXIT
+    tar -xzf "$archive" -C "$stage"
+    roots=("$stage"/*)
+    [[ ${#roots[@]} == 1 && -d ${roots[0]} ]] || { echo "Expected one top-level directory in the release tarball" >&2; exit 1; }
+    source_dir=${roots[0]}
+    install -Dm755 "$source_dir/overlook" "$prefix/bin/overlook"
+    install -Dm644 "$source_dir/packaging/ai.lastrefuge.Overlook.desktop" "$prefix/share/applications/ai.lastrefuge.Overlook.desktop"
+    install -Dm644 "$source_dir/packaging/ai.lastrefuge.Overlook.metainfo.xml" "$prefix/share/metainfo/ai.lastrefuge.Overlook.metainfo.xml"
+    install -Dm644 "$source_dir/icons/overlook-app-icon.svg" "$prefix/share/icons/hicolor/scalable/apps/ai.lastrefuge.Overlook.svg"
+    for s in 16 24 32 48 64 128 256 512; do install -Dm644 "$source_dir/icons/overlook-icon-$s.png" "$prefix/share/icons/hicolor/${s}x${s}/apps/ai.lastrefuge.Overlook.png"; done
+    command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$prefix/share/applications" || true
+  ' bash "$@"
+}
 
 main() {
 
@@ -260,17 +278,7 @@ if (( IS_ARCH )) && [[ -n "$ASSET_URL" ]]; then
   BIN=/usr/bin/overlook
 elif [[ -n "$ASSET_URL" ]]; then
   P=${PREFIX:-$HOME/.local}
-  step "Install into $P" bash -c '
-    set -e; TAR=$0; P=$1; X=$(mktemp -d)
-    tar -xzf "$TAR" -C "$X"; D=$(find "$X" -mindepth 1 -maxdepth 1 -type d | head -n1)
-    install -Dm755 "$D/overlook" "$P/bin/overlook"
-    install -Dm644 "$D/packaging/ai.lastrefuge.Overlook.desktop" "$P/share/applications/ai.lastrefuge.Overlook.desktop"
-    install -Dm644 "$D/packaging/ai.lastrefuge.Overlook.metainfo.xml" "$P/share/metainfo/ai.lastrefuge.Overlook.metainfo.xml"
-    install -Dm644 "$D/icons/overlook-app-icon.svg" "$P/share/icons/hicolor/scalable/apps/ai.lastrefuge.Overlook.svg"
-    for s in 16 24 32 48 64 128 256 512; do install -Dm644 "$D/icons/overlook-icon-$s.png" "$P/share/icons/hicolor/${s}x${s}/apps/ai.lastrefuge.Overlook.png"; done
-    command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$P/share/applications" || true
-    rm -rf "$X"
-  ' "$WORK/$ASSET_NAME" "$P"
+  step "Install into $P" install_tarball "$WORK/$ASSET_NAME" "$P"
   BIN="$P/bin/overlook"
   case ":$PATH:" in *":$P/bin:"*) ;; *) warn "$P/bin is not on your PATH. Add it to your shell profile to run \`overlook\` from a terminal." ;; esac
 elif (( IS_ARCH )); then
@@ -330,4 +338,8 @@ printf '\n'
 
 }
 
-main "$@"
+# Also handle the documented curl | bash invocation, which has no BASH_SOURCE.
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
+  set -Eeuo pipefail
+  main "$@"
+fi

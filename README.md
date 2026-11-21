@@ -204,6 +204,18 @@ On first launch, Overlook opens on its welcome page. Choose a mail provider or s
 in the status bar. Flip it to watch offline changes sync. To add another account later,
 choose **Add account** in Settings → Accounts or in the account menu.
 
+### Connect an MCP harness
+
+Set the harness's stdio command to the absolute path of the installed `overlook` executable.
+For a Linux tarball install, this is usually `~/.local/bin/overlook`. On Arch it is
+`/usr/bin/overlook`. On macOS, use `~/Applications/Overlook.app/Contents/MacOS/overlook`
+or the equivalent path inside your installed app. Pass `mcp`, `serve`, `--client`,
+and your client name as separate arguments. Set `OVERLOOK_DATA_DIR` to the owner's
+profile path. Provide the grant credential as `OVERLOOK_MCP_TOKEN` through the
+harness's secret storage.
+
+See the [MCP setup guide](docs/overlook-mcp.md) for grants and a headless sample profile.
+
 ### Updates
 
 Overlook checks GitHub for a new release once a day and shows a banner when one is available.

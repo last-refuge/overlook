@@ -207,7 +207,8 @@ fn send_edits(store: &Store, account: &Account, connection: &ContactsConnection,
         let label = op.kind.contact_id().map(|id| carddav_sync::edit_label(store, &account.id, id)).unwrap_or_default();
         let _ = store.set_operation_state(&op.id, OperationState::InFlight, None);
         let sent = match &op.kind {
-            OperationKind::CreateContact { contact_id } => create(store, account, connection, server, contact_id),
+            OperationKind::CreateContact { contact_id, target_book: None } => create(store, account, connection, server, contact_id),
+            OperationKind::CreateContact { .. } => Sent::Failed("The selected CardDAV address book is no longer connected.".into()),
             OperationKind::UpdateContact { contact_id } => update(store, account, connection, server, contact_id),
             OperationKind::DeleteContact { contact_id, .. } => delete(store, account, server, contact_id),
             _ => Sent::Done,

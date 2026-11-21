@@ -2327,6 +2327,55 @@ impl MailWindow {
         cx.notify();
     }
 
+    pub(crate) fn mcp_data_changed(
+        &mut self,
+        changes: std::collections::BTreeMap<(AccountId, crate::mcp::WriteDomain), bool>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::mcp::WriteDomain;
+        tracing::debug!(changes = changes.len(), "reloading views after MCP writes");
+        let mail = changes.keys().filter_map(|(account, domain)| (*domain == WriteDomain::Mail).then_some(account));
+        let mail: Vec<_> = mail.cloned().collect();
+        if !mail.is_empty() {
+            self.mark_counts_stale(mail.iter().cloned());
+            self.reload_account_labels();
+            if mail.contains(&self.account.id) {
+                self.reload_mail(cx);
+            }
+            self.reload_folder_windows(mail, cx);
+        }
+        let undo_delay = self.prefs.undo_send_secs;
+        for ((account, domain), queued) in changes {
+            if account == self.account.id {
+                match domain {
+                    WriteDomain::Calendar => self.reload_calendar(),
+                    WriteDomain::Contacts => self.reload_contacts(),
+                    WriteDomain::Mail => {}
+                }
+            }
+            if domain == WriteDomain::Calendar && queued
+                && self.store.calendar_connection(&account).ok().flatten().is_some_and(|connection| connection.enabled)
+            {
+                self.sync_caldav_account(account, true, cx);
+                continue;
+            }
+            if !queued || !self.connected(&account) {
+                continue;
+            }
+            self.sync_account(account.clone(), window, cx);
+            if domain == WriteDomain::Mail && undo_delay > 0 {
+                cx.spawn(async move |_, cx| {
+                    cx.background_executor().timer(Duration::from_millis(u64::from(undo_delay) * 1000 + 300)).await;
+                    cx.update(|cx| crate::lifecycle::with_sync_owner(cx, |this, window, cx| {
+                        this.sync_account(account, window, cx);
+                    }));
+                }).detach();
+            }
+        }
+        cx.notify();
+    }
+
     fn reload_mail_inner(&mut self, reload_all_labels: bool, cx: &mut Context<Self>) {
         let acct = self.account.id.clone();
         if self.mail_index_account.as_ref() != Some(&acct) {
@@ -4275,7 +4324,11 @@ impl MailWindow {
 
     pub(crate) fn open_draft(&mut self, id: DraftId, window: &mut Window, cx: &mut Context<Self>) {
         if self.activate_detached_draft(&id, cx) { return; }
+        // Protect the stored row before reading it, through the handoff to the
+        // permanent composer guard. Otherwise a concurrent discard can reopen it.
+        let _opening = self.store.edit_draft(&id);
         if let Ok(Some(draft)) = self.store.draft(&id) {
+            if draft.state != DraftState::Editing { return; }
             if let Some(conv) = draft.conversation_id.clone() {
                 // Show the conversation being replied to, if it is in this view.
                 if self.conversations.iter().any(|c| c.id == conv) {
@@ -4292,6 +4345,7 @@ impl MailWindow {
     }
 
     pub(crate) fn cancel_send(&mut self, id: DraftId, window: &mut Window, cx: &mut Context<Self>) {
+        let _opening = self.store.edit_draft(&id);
         match self.store.cancel_send(&self.account.id, &id) {
             Ok(draft) => {
                 self.outbox_selected = None;
@@ -4461,7 +4515,7 @@ impl MailWindow {
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let outcome: Option<SyncOutcome> = spawn_blocking_async(run_sync(store, bundle.mail, bundle.calendar, account.clone(), verify)).await;
-            let _ = this.update_in(cx, |this, window, cx| {
+            let finished = this.update_in(cx, |this, window, cx| {
                 crate::watchdog::mark("sync finished");
                 if this.syncing.get(&account.id) == Some(&generation) {
                     this.syncing.remove(&account.id);
@@ -4564,6 +4618,24 @@ impl MailWindow {
                     this.sync_account(account.id.clone(), window, cx);
                 }
             });
+            if finished.is_err() {
+                // The sync ran on the Store even if its originating window closed.
+                // Clear the retained view's state and let a surviving window pick up
+                // any request that arrived during that pass.
+                this.update(cx, |this, cx| {
+                    if this.syncing.get(&account.id) == Some(&generation) {
+                        this.syncing.remove(&account.id);
+                        if verify {
+                            this.verify_pending.insert(account.id.clone());
+                        }
+                        if this.sync_requested.remove(&account.id) {
+                            cx.defer(move |cx| crate::lifecycle::with_sync_owner(cx, |this, window, cx| {
+                                this.sync_account(account.id, window, cx);
+                            }));
+                        }
+                    }
+                }).ok();
+            }
         })
         .detach();
     }

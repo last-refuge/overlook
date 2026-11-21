@@ -45,6 +45,7 @@
 //! `NotDelivered` only when this process saw the failure happen before `DATA`, and
 //! [`SendOutcome::Unknown`] otherwise.
 
+mod mcp_mail_search;
 pub mod connection;
 pub mod folders;
 pub mod idle;
@@ -2327,6 +2328,13 @@ impl MailProvider for ImapProvider {
         let message = message.clone();
         let attachment = attachment.clone();
         Box::pin(async move { self.attachment(&message, &attachment) })
+    }
+
+    fn mcp_mail_search_folder(&self, folder: &str, query: &str, limit: usize, deadline: std::time::Instant)
+        -> BoxFuture<'_, Result<(Vec<ProviderId>, bool), ProviderError>>
+    {
+        let (folder, query) = (folder.to_owned(), query.to_owned());
+        Box::pin(async move { self.mcp_mail_search_in_folder(&folder, &query, limit, deadline) })
     }
 
     fn search(&self, _account: &Account, query: &str, limit: usize) -> BoxFuture<'_, Result<Vec<ProviderId>, ProviderError>> {

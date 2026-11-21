@@ -232,6 +232,44 @@ fn a_contact_added_here_is_created_in_the_default_book() {
 }
 
 #[test]
+fn an_explicit_contact_destination_survives_default_book_changes_and_retry() {
+    use overlook_store::{McpWriteKey, StoreError};
+    use serde_json::json;
+
+    let (store, account, conn) = setup();
+    let server = Server::default();
+    let mut contact = Contact::new_local(account.id.clone(), now());
+    contact.given_name = Some("Sophie".into());
+    contact.email = "sophie@example.test".into();
+    let mut operation = None;
+    store.mcp_write::<StoreError>(
+        McpWriteKey {
+            account: &account.id,
+            client: "fixture",
+            key_digest: &[1; 32],
+            request_digest: &[2; 32],
+            action: "contacts_create",
+        },
+        |tx, _| {
+            operation = tx.save_mcp_contact(&mut contact, true, Some(BOOK))?;
+            Ok(json!({"status":"queued"}))
+        },
+    ).unwrap();
+    let operation = operation.unwrap();
+    let other = "https://contacts.example.test/dav/addressbooks/user/me/Other/";
+    store.set_contacts_default_book(&conn, Some(other)).unwrap();
+    let replacement_default = connection(&store, &account);
+    *server.lose_reply.borrow_mut() = true;
+    assert!(matches!(sync(&store, &account, &replacement_default, &server, false), Err(CardDavError::Network)));
+    assert!(sync(&store, &account, &replacement_default, &server, false).unwrap().is_empty());
+    let cards = server.cards.borrow();
+    assert_eq!(cards.len(), 1);
+    assert!(cards.keys().all(|url| url.starts_with(BOOK)));
+    assert_eq!(*server.writes.borrow(), 1);
+    assert_eq!(store.mcp_operation_status(&account.id, |id| id == operation.as_str()).unwrap().unwrap().state, "applied");
+}
+
+#[test]
 fn a_contact_deleted_here_is_deleted_there_and_stays_deleted() {
     let (store, account, conn) = setup();
     let server = Server::default();
