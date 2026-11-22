@@ -154,7 +154,7 @@ The installer verifies the x86-64 package against the release checksum and insta
 ### Linux tarball
 
 On compatible x86-64 Linux distributions, install the verified release tarball to `~/.local`.
-The 2.0.0 tarball requires glibc 2.44 or newer. Run `getconf GNU_LIBC_VERSION` to check your version.
+The 2.1.0 tarball requires glibc 2.44 or newer. Run `getconf GNU_LIBC_VERSION` to check your version.
 
 ### Ubuntu and other Linux source builds
 

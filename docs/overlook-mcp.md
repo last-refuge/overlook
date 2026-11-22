@@ -25,8 +25,8 @@ OVERLOOK_BIN="/absolute/path/to/overlook"
 "$OVERLOOK_BIN" mcp --help
 ```
 
-The output should start with `Usage: overlook mcp <command>` and list `serve`. MCP landed after
-Overlook 2.0.0. If you see the general Overlook help, install a newer build or build from current
+The output should start with `Usage: overlook mcp <command>` and list `serve`. MCP is available in
+Overlook 2.1.0 and later. If you see the general Overlook help, update Overlook or build from current
 `main` using the [Linux](../README.md#ubuntu-and-other-linux-source-builds) or
 [macOS](../README.md#build-from-source) instructions.
 
