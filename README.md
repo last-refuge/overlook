@@ -37,7 +37,7 @@ curl -fsSL https://raw.githubusercontent.com/last-refuge/overlook/main/install.s
 curl -fsSL https://raw.githubusercontent.com/last-refuge/overlook/main/install.sh | bash -s -- --source
 ```
 
-[Latest downloads](https://github.com/last-refuge/overlook/releases/latest) · [Installation details](#installation-details) · [Updates](#updates)
+[Latest downloads](https://github.com/last-refuge/overlook/releases/latest) · [Installation details](#installation-details) · [Updates](#updates) · [MCP setup](docs/overlook-mcp.md)
 
 ---
 
@@ -204,17 +204,12 @@ On first launch, Overlook opens on its welcome page. Choose a mail provider or s
 in the status bar. Flip it to watch offline changes sync. To add another account later,
 choose **Add account** in Settings → Accounts or in the account menu.
 
-### Connect an MCP harness
+### Connect an MCP client
 
-Set the harness's stdio command to the absolute path of the installed `overlook` executable.
-For a Linux tarball install, this is usually `~/.local/bin/overlook`. On Arch it is
-`/usr/bin/overlook`. On macOS, use `~/Applications/Overlook.app/Contents/MacOS/overlook`
-or the equivalent path inside your installed app. Pass `mcp`, `serve`, `--client`,
-and your client name as separate arguments. Set `OVERLOOK_DATA_DIR` to the owner's
-profile path. Provide the grant credential as `OVERLOOK_MCP_TOKEN` through the
-harness's secret storage.
-
-See the [MCP setup guide](docs/overlook-mcp.md) for grants and a headless sample profile.
+Overlook's Model Context Protocol (MCP) server gives clients such as Codex CLI and Claude Code
+access to the accounts and actions you select in **Settings → Integrations**. You can connect
+while the desktop is running, run Overlook headlessly, or try fictional data in a separate profile.
+Follow the [MCP setup guide](docs/overlook-mcp.md) for installation, client configuration, and a first test.
 
 ### Updates
 
