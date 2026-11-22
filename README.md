@@ -117,7 +117,7 @@ and you can read, search, write, and file mail with no connection at all.
 <p align="center">
   <img src="docs/screenshots/calendar-week-light.png" alt="Overlook calendar week view" width="920">
 </p>
-<p align="center"><sub>Week view with overlapping meetings, an all-day row, working hours, and today's marker.</sub></p>
+<p align="center"><sub>Week view with meetings, working locations, and an all-day event.</sub></p>
 
 <table>
   <tr>
