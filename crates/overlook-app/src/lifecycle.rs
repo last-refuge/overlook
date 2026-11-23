@@ -639,20 +639,33 @@ fn refresh_reminder_panel(cx: &mut App) {
 }
 
 pub(crate) fn snooze_reminder(id: EventId, minutes: i64, cx: &mut App) {
-    change_reminders(cx, |inbox| inbox.snooze(&id, overlook_core::time::now(), minutes));
+    if change_reminders(cx, |inbox| inbox.snooze(&id, overlook_core::time::now(), minutes)) {
+        refresh_reminder_panel(cx);
+    }
 }
 
 pub(crate) fn dismiss_reminders(id: Option<EventId>, cx: &mut App) {
-    change_reminders(cx, |inbox| inbox.dismiss(id.as_ref()));
-}
-
-fn change_reminders(cx: &mut App, change: impl FnOnce(&mut Inbox) -> bool) {
-    let lifecycle = cx.global_mut::<Lifecycle>();
-    if change(&mut lifecycle.reminders) {
-        lifecycle.reminders.save(lifecycle.store.clone());
-        lifecycle.reminder_wake.notify_one();
+    if !change_reminders(cx, |inbox| inbox.dismiss(id.as_ref())) {
+        return;
+    }
+    let lifecycle = cx.global::<Lifecycle>();
+    if lifecycle.reminders.due().is_empty() {
+        if let Some(panel) = &lifecycle.reminder_panel {
+            let _ = panel.window.update(cx, |_, window, _| window.remove_window());
+        }
+    } else {
         refresh_reminder_panel(cx);
     }
+}
+
+fn change_reminders(cx: &mut App, change: impl FnOnce(&mut Inbox) -> bool) -> bool {
+    let lifecycle = cx.global_mut::<Lifecycle>();
+    if !change(&mut lifecycle.reminders) {
+        return false;
+    }
+    lifecycle.reminders.save(lifecycle.store.clone());
+    lifecycle.reminder_wake.notify_one();
+    true
 }
 
 pub(crate) fn open_reminder_event(id: EventId, cx: &mut App) {
