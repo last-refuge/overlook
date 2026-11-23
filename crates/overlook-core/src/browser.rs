@@ -27,7 +27,7 @@ pub struct BrowserDocument {
 /// Maximum authored HTML size accepted for browser preparation (in bytes).
 /// The original stored message is never modified by preparation.
 pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_TAG_STARTS: usize = 50_000;
+pub(super) const MAX_TAG_STARTS: usize = 50_000;
 pub(crate) const MAX_DOM_DEPTH: usize = 128;
 const MAX_DOM_NODES: usize = 100_000;
 const MAX_CSS_DEPTH: usize = 32;

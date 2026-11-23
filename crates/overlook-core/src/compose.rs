@@ -223,7 +223,7 @@ pub fn outgoing_bodies_with_font(
     // is configured, apply it on the outer signature wrapper too so signatures without their
     // own font inherit it while explicit per-signature styles inside still take precedence.
     if let Some(signature) = draft.signature_html.as_deref().filter(|s| !s.trim().is_empty()) {
-        let signature = clean_only(signature, RemoteContent::Allowed);
+        let signature = crate::signature::render_html(signature, RemoteContent::Allowed);
         text = format!("{}\n\n-- \n{}", text.trim_end(), html_to_text(&signature));
         if let Some(font) = font {
             html = format!(
@@ -326,7 +326,7 @@ pub fn outgoing_preview(draft: &Draft, source: Option<&Message>, policy: RemoteC
         },
     );
     if let Some(signature) = draft.signature_html.as_deref().filter(|s| !s.trim().is_empty()) {
-        let signature = clean_only(signature, policy);
+        let signature = crate::signature::render_html(signature, policy);
         html = format!("{html}<br><div>{signature}</div>");
     }
     if let Some(source) = source.filter(|_| draft.include_quote) {
@@ -532,6 +532,34 @@ mod tests {
         draft.signature_html = Some("<p onclick=\"x()\">Jason</p><script>alert(1)</script><img src=\"data:image/png;base64,AAAA\">".into());
         let out = outgoing_bodies(&draft, None);
         assert!(out.html.contains("Jason") && !out.html.contains("onclick") && !out.html.contains("script") && !out.html.contains("data:"), "{}", out.html);
+    }
+
+    #[test]
+    fn typed_signature_lines_survive_preview_and_sending_with_a_selected_font() {
+        let mut draft = Draft::new(AccountId::from("a"), DraftKind::New, 0);
+        draft.body_text = "Hello".into();
+        let signature = crate::prefs::Signature {
+            html: "Example Person\nExample Company\nExample Title".into(),
+            font_family: Some("Verdana".into()),
+            font_size: Some(15),
+            ..Default::default()
+        };
+        draft.signature_html = Some(signature.styled_html());
+
+        let preview = outgoing_preview(&draft, None, RemoteContent::Blocked);
+        let out = outgoing_bodies(&draft, None);
+        for html in [preview, out.html] {
+            assert!(html.contains("font-family:'verdana',"), "{html}");
+            assert!(html.contains("font-size:15px"), "{html}");
+            assert!(
+                html.contains("Example Person<br>Example Company<br>Example Title"),
+                "{html}"
+            );
+        }
+        assert_eq!(
+            out.text,
+            "Hello\n\n-- \nExample Person\nExample Company\nExample Title"
+        );
     }
 
     #[test]

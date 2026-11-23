@@ -162,7 +162,7 @@ fn is_named(node: &Handle, names: &[&str]) -> bool {
     matches!(&node.data, NodeData::Element { name, .. } if names.contains(&&*name.local))
 }
 
-fn element(name: &str, attrs: Vec<Attribute>) -> Handle {
+pub(super) fn element(name: &str, attrs: Vec<Attribute>) -> Handle {
     Node::new(NodeData::Element {
         name: QualName::new(None, ns!(html), LocalName::from(name)),
         attrs: RefCell::new(attrs),
@@ -171,13 +171,13 @@ fn element(name: &str, attrs: Vec<Attribute>) -> Handle {
     })
 }
 
-fn text_node(text: &str) -> Handle {
+pub(super) fn text_node(text: &str) -> Handle {
     Node::new(NodeData::Text {
         contents: RefCell::new(text.into()),
     })
 }
 
-fn set_children(parent: &Handle, children: Vec<Handle>) {
+pub(super) fn set_children(parent: &Handle, children: Vec<Handle>) {
     for child in &children {
         child.parent.set(Some(Rc::downgrade(parent)));
     }

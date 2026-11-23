@@ -7,11 +7,15 @@
 //! edit as a [`Replacement`], so the field can apply it without losing its undo history.
 
 use crate::prefs::SignatureImage;
+use crate::prepass::{element, set_children, text_node};
+use crate::sanitize::presentation::{serialize_body, walk};
+use crate::sanitize::{clean_document, RemoteContent};
 use base64::{
     alphabet,
     engine::{general_purpose::GeneralPurposeConfig, DecodePaddingMode, GeneralPurpose},
     Engine as _,
 };
+use markup5ever_rcdom::{Handle, NodeData};
 use std::ops::Range;
 
 /// The largest image a signature may embed.
@@ -25,6 +29,117 @@ const LENIENT: GeneralPurpose = GeneralPurpose::new(
     &alphabet::STANDARD,
     GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
 );
+
+/// Cleans a signature for preview or sending. In plain or inline signatures, newlines
+/// entered in the editor become HTML breaks. Structured HTML keeps its own layout.
+pub fn render_html(source: &str, policy: RemoteContent) -> String {
+    let dom = clean_document(source, policy);
+    if source.contains(['\r', '\n']) {
+        let mut body = None;
+        // Budget one tag per new break, including newlines decoded from entities.
+        let mut tags_left = crate::browser::MAX_TAG_STARTS;
+        walk(&dom.document, &mut |node| match &node.data {
+            NodeData::Element { name, .. } => {
+                tags_left = tags_left.saturating_sub(2);
+                if &*name.local == "body" {
+                    body = Some(node.clone());
+                }
+            }
+            NodeData::Text { contents } => {
+                tags_left -= contents
+                    .borrow()
+                    .bytes()
+                    .filter(|&byte| byte == b'\n')
+                    .take(tags_left)
+                    .count();
+            }
+            _ => {}
+        });
+        if let Some(body) = body.filter(|_| tags_left > 0) {
+            // Draft snapshots can wrap the signature in a div for its selected font.
+            let root = match body.children.borrow().as_slice() {
+                [child] if font_wrapper(child) => child.clone(),
+                _ => body.clone(),
+            };
+            if root.children.borrow().iter().all(is_inline) {
+                let mut after_break = false;
+                insert_line_breaks(&root, &mut after_break);
+            }
+        }
+    }
+    serialize_body(&dom)
+}
+
+fn font_wrapper(node: &Handle) -> bool {
+    let NodeData::Element { name, attrs, .. } = &node.data else {
+        return false;
+    };
+    &*name.local == "div"
+        && matches!(
+            attrs.borrow().as_slice(),
+            [style] if &*style.name.local == "style"
+                && style.value.split_terminator(';').all(|decl| {
+                    decl.starts_with("font-family:") || decl.starts_with("font-size:")
+                })
+        )
+}
+
+fn is_inline(node: &Handle) -> bool {
+    match &node.data {
+        NodeData::Text { .. } | NodeData::Comment { .. } => true,
+        NodeData::Element { name, attrs, .. } => {
+            let inline = matches!(
+                &*name.local,
+                "a" | "abbr" | "b" | "br" | "code" | "del" | "em" | "font" | "i" | "img" | "ins"
+                    | "kbd" | "q" | "s" | "small" | "span" | "strike" | "strong" | "sub" | "sup" | "u"
+            );
+            let has_whitespace_style = attrs.borrow().iter().any(|attr| {
+                &*attr.name.local == "style" && attr.value.contains("white-space:")
+            });
+            inline && !has_whitespace_style && node.children.borrow().iter().all(is_inline)
+        }
+        _ => false,
+    }
+}
+
+fn insert_line_breaks(root: &Handle, after_break: &mut bool) {
+    let mut children = Vec::with_capacity(root.children.borrow().len());
+    for child in root.children.borrow().iter() {
+        match &child.data {
+            NodeData::Text { contents } => {
+                let contents = contents.borrow();
+                // The Line break toolbar button inserts `<br>\n`. Skip that source newline.
+                let text = if *after_break {
+                    contents
+                        .trim_start_matches([' ', '\t'])
+                        .strip_prefix('\n')
+                        .unwrap_or(&contents)
+                } else {
+                    &contents
+                };
+                *after_break = false;
+                for (index, line) in text.split('\n').enumerate() {
+                    if index > 0 {
+                        children.push(element("br", Vec::new()));
+                    }
+                    if !line.is_empty() {
+                        children.push(text_node(line));
+                    }
+                }
+            }
+            NodeData::Element { name, .. } => {
+                match &*name.local {
+                    "br" => *after_break = true,
+                    "img" => *after_break = false,
+                    _ => insert_line_breaks(child, after_break),
+                }
+                children.push(child.clone());
+            }
+            _ => children.push(child.clone()),
+        }
+    }
+    set_children(root, children);
+}
 
 /// A change to the source text: replace `range` of the old text with `text`, then select
 /// `selection`, which is in the new text.
@@ -269,6 +384,33 @@ pub fn with_data_urls(html: &str, images: &[SignatureImage]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_lines_render_with_inline_formatting_and_existing_breaks() {
+        let source = "<b>Café</b>\r\n\r\n<i title='Design >\nStudio'>Design\rStudio</i><br>\n2 &lt; 3 &amp; 東京";
+        let html = render_html(source, RemoteContent::Blocked);
+        assert_eq!(
+            html,
+            "<b>Café</b><br><br><i title=\"Design >\nStudio\">Design<br>Studio</i><br>2 &lt; 3 &amp; 東京"
+        );
+        assert_eq!(
+            crate::sanitize::html_to_text(&html),
+            "Café\n\nDesign\nStudio\n2 < 3 & 東京"
+        );
+    }
+
+    #[test]
+    fn signature_html_layout_keeps_its_own_spacing() {
+        for source in [
+            "<table>\n<tr><td>First\nLast</td><td><img src='cid:logo'\n width='120'></td></tr>\n</table>",
+            "<span style='white-space:pre-wrap'>First\n  Last</span>",
+        ] {
+            assert_eq!(
+                render_html(source, RemoteContent::Blocked),
+                crate::sanitize::clean_only(source, RemoteContent::Blocked)
+            );
+        }
+    }
 
     const PNG: &[u8] = b"\x89PNG\r\n\x1a\nrest-of-png";
 

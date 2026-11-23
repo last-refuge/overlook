@@ -19,7 +19,7 @@ use gpui_kit::component::text::TextView;
 use gpui_kit::component::Sizable;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-use overlook_core::sanitize::{clean_only, escape_html, RemoteContent};
+use overlook_core::sanitize::{escape_html, RemoteContent};
 use overlook_core::signature as sig;
 use overlook_core::*;
 
@@ -109,7 +109,7 @@ pub(super) fn resolve_draft_images(html: &str, attachments: &[DraftAttachment]) 
 /// its own images drawn.
 pub(super) fn signature_view(draft: &Draft) -> Option<SharedString> {
     let html = draft.signature_html.as_deref().filter(|h| !h.trim().is_empty())?;
-    Some(resolve_draft_images(&clean_only(html, RemoteContent::Blocked), &draft.attachments).into())
+    Some(resolve_draft_images(&sig::render_html(html, RemoteContent::Blocked), &draft.attachments).into())
 }
 
 /// Whether `html` shows a picture from the web, which the preview holds back.
@@ -219,7 +219,7 @@ impl MailWindow {
         let preview: AnyElement = if signature.html.trim().is_empty() {
             div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child("Nothing to show yet. Type or paste HTML above.").into_any_element()
         } else {
-            let html = sig::with_data_urls(&clean_only(&signature.html, RemoteContent::Blocked), &signature.images);
+            let html = sig::with_data_urls(&sig::render_html(&signature.html, RemoteContent::Blocked), &signature.images);
             TextView::html(SharedString::from(format!("signature-preview-{}", signature.id)), html).into_any_element()
         };
         v_flex()
