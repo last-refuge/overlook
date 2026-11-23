@@ -5360,31 +5360,36 @@ impl MailWindow {
     }
 
     fn render_body(&self, cx: &mut Context<Self>) -> AnyElement {
+        let gutter = cx.palette().navigation_palette().sidebar;
+        let main_panel = || resizable_panel().bg(gutter).pt(px(8.));
+        // Keep the resize hit areas and cursors, with no painted pane dividers.
+        let handles: gpui_kit::base::ResizeHandleRenderer = std::rc::Rc::new(|_, _, _| Some(Empty.into_any_element()));
         if matches!(self.module, Module::Contacts | Module::Calendar) {
             self.browser_bodies.borrow_mut().clear();
             self.prepared_docs.borrow_mut().clear();
             self.preparing_docs.borrow_mut().clear();
         }
         if self.module == Module::Contacts {
+            let contacts = rounded_pane(self.render_contacts_main(cx), gutter, px(0.));
             return h_resizable("main-contacts")
                 .with_state(&self.panes)
+                .with_handle_appearance(handles)
                 .child(resizable_panel().size(px(self.sidebar_width)).size_range(px(180.)..px(360.)).child(self.render_contacts_sidebar(cx).into_any_element()))
-                .child(resizable_panel().child(self.render_contacts_main(cx).into_any_element()))
+                .child(main_panel().child(contacts.into_any_element()))
                 .into_any_element();
         }
         if self.module == Module::Calendar {
+            let calendar = rounded_pane(self.render_calendar_main(cx), gutter, px(0.));
             return h_resizable("main-calendar")
                 .with_state(&self.panes)
+                .with_handle_appearance(handles)
                 .child(resizable_panel().size(px(self.sidebar_width)).size_range(px(180.)..px(360.)).child(self.render_calendar_sidebar(cx).into_any_element()))
-                .child(resizable_panel().child(self.render_calendar_main(cx).into_any_element()))
+                .child(main_panel().child(calendar.into_any_element()))
                 .into_any_element();
         }
         let sidebar = self.render_sidebar(cx).into_any_element();
-        let gutter = cx.palette().navigation_palette().sidebar;
-        // Keep the resize hit areas and cursors, with no painted pane dividers.
-        let handles: gpui_kit::base::ResizeHandleRenderer = std::rc::Rc::new(|_, _, _| Some(Empty.into_any_element()));
-        let list = mail_pane(self.render_list(cx), gutter, px(8.)).into_any_element();
-        let reader = mail_pane(self.render_reader(cx), gutter, px(0.)).into_any_element();
+        let list = rounded_pane(self.render_list(cx), gutter, px(8.)).into_any_element();
+        let reader = rounded_pane(self.render_reader(cx), gutter, px(0.)).into_any_element();
 
         let content = match self.reading_pane {
             ReadingPane::Right => h_resizable("content-h")
@@ -5421,7 +5426,7 @@ impl MailWindow {
             .with_state(&self.panes)
             .with_handle_appearance(handles)
             .child(resizable_panel().size(px(self.sidebar_width)).size_range(px(180.)..px(360.)).child(sidebar))
-            .child(resizable_panel().bg(gutter).pt(px(8.)).child(content))
+            .child(main_panel().child(content))
             .on_resize(cx.listener(|this, state: &Entity<ResizableState>, _window, cx| {
                 if let Some(w) = state.read(cx).sizes().first() {
                     let next = f32::from(*w);

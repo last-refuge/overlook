@@ -1,4 +1,4 @@
-//! Small presentational helpers shared by the mail views.
+//! Small presentational helpers shared by the workspace views.
 
 use crate::theme::Palette;
 use gpui_kit::base::h_flex;
@@ -7,7 +7,7 @@ use gpui_kit::*;
 use overlook_core::Address;
 
 /// GPUI clips children to a rectangle; cover the top notches after the pane paints.
-pub fn mail_pane(body: impl IntoElement, backdrop: Hsla, top_right_radius: Pixels) -> Div {
+pub fn rounded_pane(body: impl IntoElement, backdrop: Hsla, top_right_radius: Pixels) -> Div {
     div().relative().size_full().overflow_hidden()
         .child(body)
         .child(gpui_kit::base::RoundedFrameCover::top(px(8.), top_right_radius).backdrop(backdrop))
