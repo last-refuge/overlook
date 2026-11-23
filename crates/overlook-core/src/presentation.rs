@@ -10,7 +10,7 @@ pub(super) fn document(html: &str) -> RcDom {
     crate::browser::parse_bounded_document(html).unwrap_or_default()
 }
 
-pub(super) fn walk(node: &Handle, f: &mut impl FnMut(&Handle)) {
+pub(crate) fn walk(node: &Handle, f: &mut impl FnMut(&Handle)) {
     let mut stack = vec![(node.clone(), 0usize)];
     while let Some((n, depth)) = stack.pop() {
         if depth > crate::browser::MAX_DOM_DEPTH {
@@ -24,7 +24,7 @@ pub(super) fn walk(node: &Handle, f: &mut impl FnMut(&Handle)) {
     }
 }
 
-pub(super) fn serialize_body(dom: &RcDom) -> String {
+pub(crate) fn serialize_body(dom: &RcDom) -> String {
     let mut body = None;
     let mut roots = Vec::new();
     walk(&dom.document, &mut |n| {

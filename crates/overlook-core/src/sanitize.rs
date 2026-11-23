@@ -184,12 +184,16 @@ fn build_cleaner(policy: RemoteContent) -> ammonia::Builder<'static> {
 /// original message is quoted in a reply or forward, where the recipient should get the whole
 /// thing.
 pub fn clean_only(html: &str, policy: RemoteContent) -> String {
+    presentation::serialize_body(&clean_document(html, policy))
+}
+
+pub(super) fn clean_document(html: &str, policy: RemoteContent) -> RcDom {
     let dom = presentation::visible_document(html);
     let clean = builder(policy)
         .clean(&presentation::serialize_body(&dom))
         .to_string();
     // Canonical serialization keeps equivalent entity spellings stable across passes.
-    presentation::serialize_body(&presentation::document(&clean))
+    presentation::document(&clean)
 }
 
 pub fn sanitize_html(html: &str, policy: RemoteContent) -> Sanitized {
