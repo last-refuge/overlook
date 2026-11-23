@@ -5,7 +5,7 @@ use super::{MailWindow, Nav};
 use super::ui_px;
 use std::collections::HashMap;
 use crate::assets::icon;
-use crate::theme::ActivePalette;
+use crate::theme::{ActivePalette, Palette};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement;
@@ -29,7 +29,7 @@ const DEPTH_STEP: f32 = 16.;
 /// Where a row's icon starts, past the column for the disclosure arrow. Section titles start
 /// here too, so arrows, icons and titles each keep one left edge.
 const ICON_INSET: f32 = 18.;
-const ROW_ICON_SIZE: f32 = 16.;
+pub(super) const ROW_ICON_SIZE: f32 = 16.;
 const ROW_ICON_GAP: f32 = 9.;
 const ACCOUNT_MARK_SIZE: f32 = 18.;
 
@@ -63,7 +63,7 @@ fn favorite_for(account: &AccountId, view: &MailboxView) -> Favorite {
 
 /// Sidebar spacing for the Comfortable/Compact setting.
 #[derive(Clone, Copy)]
-struct Metrics {
+pub(super) struct SidebarMetrics {
     row_height: f32,
     row_gap: f32,
     header_top: f32,
@@ -76,13 +76,62 @@ struct Metrics {
     bottom: f32,
 }
 
-impl Metrics {
-    fn for_density(density: Density) -> Self {
+impl SidebarMetrics {
+    pub(super) fn for_density(density: Density) -> Self {
         match density {
             Density::Comfortable => Self { row_height: 32., row_gap: 2., header_top: 14., folders_top: 8., header_bottom: 4., header_padding: 4., divider_gap: 12., footer_top: 16., bottom: 14. },
             Density::Compact => Self { row_height: 26., row_gap: 1., header_top: 8., folders_top: 5., header_bottom: 2., header_padding: 2., divider_gap: 8., footer_top: 10., bottom: 8. },
         }
     }
+
+    pub(super) fn pane(self, palette: &Palette) -> Div {
+        // Align the first heading with the top of the main content pane.
+        v_flex().size_full().bg(palette.sidebar).text_color(palette.foreground)
+            .pt(px(8.)).px(px(6.)).pb(px(self.bottom))
+    }
+
+    pub(super) fn heading(self, palette: &Palette) -> Div {
+        h_flex().items_center().pl(px(ICON_INSET)).pr(px(10.))
+            .py(px(self.header_padding)).mb(px(self.header_bottom))
+            .text_size(ui_px(DETAIL_SIZE)).line_height(ui_px(DETAIL_LINE_HEIGHT))
+            .font_weight(FontWeight::SEMIBOLD).text_color(palette.muted)
+    }
+
+    pub(super) fn rows(self) -> Div {
+        v_flex().gap(px(self.row_gap))
+    }
+
+    pub(super) fn row(self, id: impl Into<ElementId>) -> Stateful<Div> {
+        h_flex().id(id).items_center().gap(px(ROW_ICON_GAP)).min_h(px(self.row_height))
+            .pl(px(ICON_INSET)).pr(px(10.)).rounded(px(7.)).cursor_pointer()
+            .text_size(ui_px(LABEL_SIZE)).line_height(ui_px(LABEL_LINE_HEIGHT))
+    }
+
+    pub(super) fn footer(self) -> Div {
+        // Center the avatar over the rows' icons.
+        h_flex().items_center().gap(px(ROW_ICON_GAP))
+            .px(px(ICON_INSET + ROW_ICON_SIZE / 2. - 15.)).pt(px(self.footer_top))
+    }
+}
+
+pub(super) fn sidebar_count() -> Div {
+    static TABULAR: std::sync::LazyLock<FontFeatures> =
+        std::sync::LazyLock::new(|| FontFeatures(std::sync::Arc::new(vec![("tnum".into(), 1)])));
+    div().flex_none().text_size(ui_px(DETAIL_SIZE)).line_height(ui_px(DETAIL_LINE_HEIGHT))
+        .font_features(TABULAR.clone()).font_weight(FontWeight::MEDIUM)
+}
+
+pub(super) fn sidebar_owner_details(name: String, status: String, dot: Hsla, palette: &Palette) -> Div {
+    v_flex()
+        .flex_1()
+        .min_w_0()
+        .child(div().text_size(ui_px(LABEL_SIZE)).line_height(ui_px(LABEL_LINE_HEIGHT)).font_weight(FontWeight::SEMIBOLD).truncate().child(name))
+        .child(
+            h_flex().items_center().gap(px(5.))
+                .text_size(ui_px(DETAIL_SIZE)).line_height(ui_px(DETAIL_LINE_HEIGHT)).text_color(palette.muted)
+                .child(div().flex_none().size(px(6.)).rounded_full().bg(dot))
+                .child(div().min_w_0().truncate().child(status)),
+        )
 }
 
 impl MailWindow {
@@ -461,14 +510,13 @@ impl MailWindow {
 
     pub(super) fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().navigation_palette();
-        let m = Metrics::for_density(self.density);
+        let m = SidebarMetrics::for_density(self.density);
         let status = self.status.clone();
         let outbox = status.outbox_items;
         let drafts = self.drafts.len();
         // Read once per render, not per row: every row consults the pinned list.
         let pinned_list: std::rc::Rc<Vec<Favorite>> = std::rc::Rc::new(self.favorites());
         let ordered_accounts = self.sidebar_accounts();
-        let count_features = FontFeatures(std::sync::Arc::new(vec![("tnum".into(), 1)]));
 
         // `section` and `account` keep element ids unique: a folder can be in Favorites and
         // in its account's list, and every account has an Inbox.
@@ -548,8 +596,7 @@ impl MailWindow {
             let expander = nav.expander.clone().filter(|_| !in_favorites);
             // A container opens nothing: clicking it folds or unfolds the folders inside.
             let fold_key = expander.as_ref().filter(|_| container).map(|(key, _)| key.clone());
-            div()
-                .id(SharedString::from(format!("nav-{section}-{}-{:?}", account.0, nav.view)))
+            m.row(SharedString::from(format!("nav-{section}-{}-{:?}", account.0, nav.view)))
                 .relative()
                 .when(droppable, |d| {
                     d.drag_over::<super::ConversationDrag>(move |style, _, _, _| style.bg(p.selection).border_1().border_color(p.accent))
@@ -569,7 +616,8 @@ impl MailWindow {
                     // A transparent 2px band above and below takes the insert line, so showing
                     // it moves nothing; the row is 4px shorter to stay the same height.
                     let over = favorite.clone();
-                    d.border_t(px(2.))
+                    d.min_h(px(m.row_height - 4.))
+                        .border_t(px(2.))
                         .border_b(px(2.))
                         .border_color(gpui_kit::transparent_black())
                         .on_drag(fav_drag, |d: &super::FavoriteDrag, _pos, _window, cx| cx.new(|_| super::DragPreview { label: d.name.clone() }))
@@ -584,13 +632,8 @@ impl MailWindow {
                         })
                         .on_drop(cx.listener(move |this, drag: &super::FavoriteDrag, _window, cx| this.move_favorite_to(&drag.favorite, &drop_target, cx)))
                 })
-                .h_flex()
-                .items_center()
-                .gap(px(ROW_ICON_GAP))
-                .min_h(px(if in_favorites { m.row_height - 4. } else { m.row_height }))
                 .when(subtitle.is_some(), |d| d.py(px(m.header_padding)))
                 .pl(px(ICON_INSET + DEPTH_STEP * nav.depth as f32))
-                .pr(px(10.))
                 .when_some(expander, |d, (key, collapsed)| {
                     // In the row's left padding, so the icons stay in line with the other rows.
                     d.child(
@@ -611,10 +654,6 @@ impl MailWindow {
                             })),
                     )
                 })
-                .rounded(px(7.))
-                .cursor_pointer()
-                .text_size(ui_px(LABEL_SIZE))
-                .line_height(ui_px(LABEL_LINE_HEIGHT))
                 .text_color(if current { p.selection_text } else if container { p.muted } else { p.foreground })
                 .when(container, |d| d.tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Holds folders only. Mail cannot be stored here. Right-click to learn more.").build(window, cx)))
                 .when_some(tooltip, |d, text| d.tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(text.clone()).build(window, cx)))
@@ -642,12 +681,8 @@ impl MailWindow {
                     let unread = matches!(nav.view, MailboxView::Kind(LabelKind::Inbox) | MailboxView::Label(_)) && !container;
                     let inbox = nav.view == MailboxView::Kind(LabelKind::Inbox);
                     d.child(
-                        div()
-                            .flex_none()
-                            .text_size(ui_px(DETAIL_SIZE))
-                            .line_height(ui_px(DETAIL_LINE_HEIGHT))
-                            .font_features(count_features.clone())
-                            .font_weight(if unread { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
+                        sidebar_count()
+                            .when(unread, |d| d.font_weight(FontWeight::SEMIBOLD))
                             .text_color(if current { p.selection_text } else if unread { p.foreground } else { p.muted })
                             .when(inbox, |d| {
                                 let (fill, ink) = count_pill(&p);
@@ -799,22 +834,15 @@ impl MailWindow {
                 (DETAIL_SIZE, DETAIL_LINE_HEIGHT)
             };
             let label = div().flex_1().min_w_0().truncate().child(text);
-            div()
+            m.heading(&p)
                 .id(SharedString::from(format!("section-{key}")))
-                .h_flex()
-                .items_center()
                 .gap(px(ICON_INSET - HEADER_ARROW_INSET - 12.))
                 .mt(px(top))
-                .mb(px(m.header_bottom))
                 .pl(px(HEADER_ARROW_INSET))
-                .pr(px(10.))
-                .py(px(m.header_padding))
                 .rounded(px(6.))
                 .cursor_pointer()
                 .text_size(ui_px(size))
                 .line_height(ui_px(line_height))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(p.muted)
                 .hover(|d| d.bg(p.hover))
                 .child(icon(if collapsed { "chevron-right" } else { "chevron-down" }).flex_none().size(px(12.)).text_color(p.muted))
                 // The service mark is wider than a folder icon. Reduce its gap so the
@@ -902,7 +930,7 @@ impl MailWindow {
             let header = top_level_target(header, &a.id, cx);
             let folders = (!collapsed).then(|| {
                 let (mailboxes, folders) = self.account_folders(&a.id, &p);
-                let mailboxes = v_flex().gap(px(m.row_gap)).children(mailboxes.into_iter().map(|nav| nav_button("account", &a.id, nav, None, cx)));
+                let mailboxes = m.rows().children(mailboxes.into_iter().map(|nav| nav_button("account", &a.id, nav, None, cx)));
                 let mut column = v_flex().child(mailboxes);
                 if !folders.is_empty() {
                     let key = format!("folders:{}", a.id.0);
@@ -910,7 +938,7 @@ impl MailWindow {
                     let title = section_header(key, "Folders".into(), folded, m.folders_top, None, cx);
                     column = column.child(top_level_target(title, &a.id, cx));
                     if !folded {
-                        column = column.child(v_flex().gap(px(m.row_gap)).children(folders.into_iter().map(|nav| nav_button("account", &a.id, nav, None, cx))));
+                        column = column.child(m.rows().children(folders.into_iter().map(|nav| nav_button("account", &a.id, nav, None, cx))));
                     }
                 }
                 column
@@ -961,18 +989,7 @@ impl MailWindow {
                 let (_, folders) = self.account_folders(&offline, &p);
                 if folders.is_empty() {
                     let action = |id: &'static str, glyph: &'static str, text: &'static str| {
-                        div()
-                            .id(id)
-                            .h_flex()
-                            .items_center()
-                            .gap(px(ROW_ICON_GAP))
-                            .min_h(px(m.row_height))
-                            .pl(px(ICON_INSET))
-                            .pr(px(10.))
-                            .rounded(px(7.))
-                            .cursor_pointer()
-                            .text_size(ui_px(LABEL_SIZE))
-                            .line_height(ui_px(LABEL_LINE_HEIGHT))
+                        m.row(id)
                             .text_color(p.muted)
                             .hover(|d| d.bg(p.hover).text_color(p.foreground))
                             .child(icon(glyph).flex_none().size(px(ROW_ICON_SIZE)).text_color(p.muted))
@@ -985,7 +1002,7 @@ impl MailWindow {
                         })))
                         .child(action("offline-open-folder", "folder-open", "Open Offline Folder…").on_click(cx.listener(|this, _, window, cx| this.open_offline_folder(window, cx))));
                 } else {
-                    column = column.child(v_flex().gap(px(m.row_gap)).children(folders.into_iter().map(|mut nav| {
+                    column = column.child(m.rows().children(folders.into_iter().map(|mut nav| {
                         nav.icon = OFFLINE_FOLDER_ICON;
                         nav.tooltip = match &nav.view {
                             MailboxView::Label(id) => self.offline_folder(id).and_then(|l| self.offline_tooltip(&offline, &l)),
@@ -1004,7 +1021,7 @@ impl MailWindow {
             .min_h_0()
             // First thing in the sidebar: no gap above, the panel padding is enough.
             .child(section_header("favorites".into(), "Favorites".into(), favorites_collapsed, 0., None, cx))
-            .when(!favorites_collapsed, |d| d.child(v_flex().gap(px(m.row_gap)).children(favorites)))
+            .when(!favorites_collapsed, |d| d.child(m.rows().children(favorites)))
             // Favorites span every account; the line separates them from the account tree,
             // with the same gap above and below.
             .child(div().flex_none().h(px(1.)).my(px(m.divider_gap)).mx(px(8.)).bg(p.divider))
@@ -1013,42 +1030,19 @@ impl MailWindow {
             .child(div().h(px(m.bottom)))
             .overflow_y_scrollbar();
 
-        v_flex()
-            .size_full()
-            .bg(p.sidebar)
-            .text_color(p.foreground)
-            // Same top inset as the list and reader panes (`main` layout in mod.rs), so the first
-            // header lines up with their top edge.
-            .pt(px(8.))
-            .px(px(6.))
-            .pb(px(m.bottom))
+        m.pane(&p)
             .child(nav)
             // The account switcher at the bottom is for one-at-a-time mode; with every
             // account in the tree, a click on another account's folder switches instead.
             .when(!all_accounts, |d| d.child(
-                h_flex()
-                    .items_center()
-                    .gap(px(9.))
-                    // The avatar is centered over the rows' icons.
-                    .px(px(ICON_INSET + 8. - 15.))
-                    .pt(px(m.footer_top))
+                m.footer()
                     .child(owner_avatar(&owner, 30., &p))
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .child(div().text_size(ui_px(LABEL_SIZE)).line_height(ui_px(LABEL_LINE_HEIGHT)).font_weight(FontWeight::SEMIBOLD).truncate().child(owner.display_name()))
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap(px(5.))
-                                    .text_size(ui_px(DETAIL_SIZE))
-                                    .line_height(ui_px(DETAIL_LINE_HEIGHT))
-                                    .text_color(p.muted)
-                                    .child(div().flex_none().size(px(6.)).rounded_full().bg(state_color))
-                                    .child(div().min_w_0().truncate().child(format!("{} · {}", self.account.provider.label(), status.state.label()))),
-                            ),
-                    )
+                    .child(sidebar_owner_details(
+                        owner.display_name(),
+                        format!("{} · {}", self.account.provider.label(), status.state.label()),
+                        state_color,
+                        &p,
+                    ))
                     .child(
                         Button::new("account-menu")
                             .ghost()
