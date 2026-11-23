@@ -277,7 +277,7 @@ impl MailWindow {
         let reading_pane = self.reading_pane;
         let density = self.density;
         let focused_enabled = self.focused_enabled;
-        let reminders_enabled = self.reminders_enabled;
+        let reminders_enabled = self.prefs.event_reminders;
         let this2 = cx.entity().downgrade();
         button.dropdown_menu(move |menu, _window, _cx| {
             let a = this2.clone();
@@ -327,14 +327,16 @@ impl MailWindow {
                 )
                 .separator()
                 .label("Calendar")
+                .item(PopupMenuItem::new("Open reminders").on_click(|_, _, cx| {
+                    cx.defer(|cx| crate::lifecycle::show_reminders(crate::single_instance::LaunchEnv::default(), cx));
+                }))
                 .item(
                     PopupMenuItem::new("Event reminders")
                         .checked(reminders_enabled)
                         .on_click(move |_, _w, cx| {
                             let _ = r.update(cx, |this, cx| {
-                                this.reminders_enabled = !this.reminders_enabled;
-                                this.save_setting("reminders", &this.reminders_enabled);
-                                cx.notify();
+                                this.prefs.event_reminders = !this.prefs.event_reminders;
+                                this.save_prefs(cx);
                             });
                         }),
                 )

@@ -336,7 +336,7 @@ impl MailWindow {
         if crate::theme::current_fonts(cx) != self.prefs.fonts {
             crate::theme::apply_fonts(&self.prefs.fonts, cx);
         }
-        self.reminders_enabled = self.prefs.event_reminders;
+        crate::lifecycle::set_reminder_preferences(&self.prefs, cx);
         self.prepare_outbox_preview(cx);
         self.prepare_composer_preview(cx);
         self.reload(cx);
@@ -1369,7 +1369,7 @@ impl MailWindow {
             .child(section("Running in the background", None))
             .child(setting_row(
                 "Keep running when the window is closed",
-                "Overlook keeps checking mail and calendars, with notifications and reminders, after you close its window, and shows an icon in the system tray. Open it again from the tray, the app launcher or a notification; Ctrl+Q quits.",
+                "Keep checking mail and calendars after you close Overlook’s windows. Use the tray or app launcher to reopen it. Ctrl+Q quits.",
                 Switch::new("pref-keep-running").checked(prefs.keep_running).on_click(cx.listener(|this, checked: &bool, _w, cx| {
                     this.prefs.keep_running = *checked;
                     this.save_prefs(cx);
@@ -1411,7 +1411,7 @@ impl MailWindow {
             ))
             .child(setting_row(
                 "Event reminders",
-                "Desktop notification before events start.",
+                "Show the calendar reminders window and a desktop notification when reminders are due.",
                 Switch::new("pref-reminders").checked(prefs.event_reminders).on_click(cx.listener(|this, checked: &bool, _w, cx| {
                     this.prefs.event_reminders = *checked;
                     this.save_prefs(cx);
@@ -1851,7 +1851,7 @@ impl MailWindow {
             ))
             .child(setting_row(
                 "Event reminders",
-                "Desktop notification before events start.",
+                "Show the calendar reminders window and a desktop notification when reminders are due.",
                 Switch::new("pref-reminders-cal").checked(prefs.event_reminders).on_click(cx.listener(|this, checked: &bool, _w, cx| {
                     this.prefs.event_reminders = *checked;
                     this.save_prefs(cx);
@@ -2350,11 +2350,11 @@ pub(crate) static SETTINGS_INDEX: &[SettingEntry] = &[
     entry(GE, "Start-up and time", "Open Overlook in", "Mail, Calendar, or the last used module.", "startup launch start"),
     entry(GE, "Start-up and time", "Time format", "12-hour or 24-hour clock.", "clock 24h 12h am pm"),
     entry(GE, "Start-up and time", "Week starts on", "Monday or Sunday.", "first day week"),
-    entry(GE, "Running in the background", "Keep running when the window is closed", "Keep checking mail and calendars, with notifications, reminders and a tray icon, after the window closes.", "background tray icon system tray minimize close daemon quit"),
+    entry(GE, "Running in the background", "Keep running when the window is closed", "Keep checking mail and calendars after you close Overlook’s windows.", "background tray icon system tray minimize close daemon quit"),
     entry(GE, "Running in the background", "Start Overlook when you log in", "Start at login, without a window when Overlook keeps running.", "autostart startup login boot launch"),
     entry(GE, "Notifications", "Show in Omarchy notifications", "Messages also appear in Omarchy’s notification center.", "omarchy notification center"),
     entry(GE, "Notifications", "New mail", "Desktop notification when new mail arrives.", "notifications alert focused"),
-    entry(GE, "Notifications", "Event reminders", "Desktop notification before events start.", "notifications alert reminder"),
+    entry(GE, "Notifications", "Event reminders", "Show the calendar reminders window and a desktop notification when reminders are due.", "notifications alert reminder"),
     entry(GE, "Synchronization", "Check for changes every", "How often Overlook looks for new mail and events.", "sync interval refresh poll frequency"),
     entry(MA, "Layout", "Sidebar accounts", "Show every account’s folders, or only the account you are in.", "sidebar all accounts one at a time folders tree"),
     entry(MA, "Layout", "Focused Inbox", "Sort the Inbox into Focused and Other.", "other inbox sort"),
@@ -2371,7 +2371,7 @@ pub(crate) static SETTINGS_INDEX: &[SettingEntry] = &[
     entry(CA, "Events", "Default event length", "", "duration meeting minutes"),
     entry(CA, "Events", "Default reminder", "Used when an event or calendar sets no reminder of its own.", "alert notification alarm"),
     entry(CA, "Events", "Show declined events", "", "declined rsvp hide"),
-    entry(CA, "Events", "Event reminders", "Desktop notification before events start.", "notifications alert"),
+    entry(CA, "Events", "Event reminders", "Show the calendar reminders window and a desktop notification when reminders are due.", "notifications alert"),
     entry(AB, "Updates", "Check for updates", "From the project’s GitHub releases.", "update version upgrade automatic"),
     entry(AB, "Links", "Source", "github.com/last-refuge/overlook", "github repository code website"),
     entry(AB, "On this device", "Mail, events, drafts, and attachments", "Open the data folder.", "data folder storage location"),

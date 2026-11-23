@@ -18,6 +18,7 @@ pub(crate) enum MessageTarget {
 }
 
 pub(crate) enum WindowSetup {
+    ReminderService(AppearancePreference),
     Mail(AppearancePreference),
     Composer {
         appearance: AppearancePreference,

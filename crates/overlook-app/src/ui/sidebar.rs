@@ -9,7 +9,7 @@ use crate::theme::{ActivePalette, Palette};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement;
-use gpui_kit::component::{Sizable, StyledExt};
+use gpui_kit::component::Sizable;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use gpui_kit::base::{h_flex, v_flex};

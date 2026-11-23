@@ -3,20 +3,21 @@
 //! The app quits only when asked (`QuitMode::Explicit`); this module decides when. Closing the
 //! last window quits, unless "Keep running when the window is closed" is on: then GPUI switches
 //! to headless mode (no display connection at all) and the main window opens again there. It
-//! draws nothing, but its sync, IDLE, reminders, new-mail notifications and update checks carry
-//! on, since they all live in the main window. A later launch, or a click on one of its
+//! draws nothing, but sync, IDLE, reminders, new-mail notifications and update checks carry
+//! on. A later launch, or a click on one of its
 //! notifications, switches back to the launch's desktop and opens the window again. Quit (Ctrl+Q,
 //! the command palette, `overlook --quit`) ends the process.
 //!
 //! Every request from a later launch arrives here too (`serve_launches`), so one is served even
 //! while the window is hidden, or when only a composer window is open. So do the tray icon's,
-//! which this module shows while keep-running is on (`tray.rs`).
+//! which this module shows for the life of the app (`tray.rs`).
 
+use crate::reminders::{self, Inbox, Reminder};
 use crate::single_instance::{LaunchEnv, Request};
-use crate::ui::{MailWindow, WindowSetup};
+use crate::ui::{MailWindow, ReminderWindow, WindowSetup};
 use gpui_kit::component::TitleBar;
 use gpui_kit::*;
-use overlook_core::{AccountId, AppearancePreference};
+use overlook_core::{Account, AccountId, AppearancePreference, EventId, Prefs};
 use overlook_provider::sample::SampleProvider;
 use overlook_store::Store;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,6 +40,11 @@ struct Main {
     view: WeakEntity<MailWindow>,
 }
 
+struct ReminderPanel {
+    window: AnyWindowHandle,
+    view: WeakEntity<ReminderWindow>,
+}
+
 struct Lifecycle {
     store: Arc<Store>,
     sample: SampleProvider,
@@ -51,6 +57,12 @@ struct Lifecycle {
     switching: bool,
     /// A show request that arrived during a switch.
     show_after: Option<LaunchEnv>,
+    reminders_after: Option<LaunchEnv>,
+    // A reminder can be the only visible window. Keep the last usable display to open it.
+    desktop: Option<GraphicalEnvironment>,
+    reminder_panel: Option<ReminderPanel>,
+    reminders: Inbox,
+    reminder_prefs: reminders::Preferences,
     /// Requests waiting for the window to be shown: a mailto link while hidden.
     after_show: Vec<Request>,
     /// Every mail window can own a draft that must be saved before Quit.
@@ -64,6 +76,8 @@ impl Global for Lifecycle {}
 /// Opens the main window (or, when `hidden`, starts headless with it) and starts serving
 /// later launches. GPUI must already be in the matching mode.
 pub fn start(store: Arc<Store>, sample: SampleProvider, hidden: bool, cx: &mut App) {
+    let saved = store.setting::<Prefs>("prefs").ok().flatten().unwrap_or_default();
+    let reminders = Inbox::load(&store);
     cx.set_global(Lifecycle {
         store,
         sample,
@@ -72,6 +86,11 @@ pub fn start(store: Arc<Store>, sample: SampleProvider, hidden: bool, cx: &mut A
         hidden,
         switching: false,
         show_after: None,
+        reminders_after: None,
+        desktop: cx.graphical_environment(),
+        reminder_panel: None,
+        reminders,
+        reminder_prefs: reminder_preferences(&saved),
         after_show: Vec::new(),
         editors: Vec::new(),
         replaced_noticed: false,
@@ -104,6 +123,7 @@ pub fn start(store: Arc<Store>, sample: SampleProvider, hidden: bool, cx: &mut A
     serve_launches(cx);
     watch_for_upgrades(cx);
     keep_tray(cx);
+    watch_reminders(cx);
 }
 
 /// Registers a mail window so its draft gets a chance to save before Quit.
@@ -113,7 +133,15 @@ pub fn add_editor(window: AnyWindowHandle, editor: WeakEntity<MailWindow>, cx: &
     }
 }
 
-fn open_main(hidden: bool, cx: &mut App) -> anyhow::Result<()> {
+struct MailStartup {
+    store: Arc<Store>,
+    sample: SampleProvider,
+    accounts: Vec<Account>,
+    active: Option<AccountId>,
+    preference: AppearancePreference,
+}
+
+fn mail_startup(cx: &App) -> anyhow::Result<MailStartup> {
     let (store, sample) = {
         let l = cx.global::<Lifecycle>();
         (l.store.clone(), l.sample.clone())
@@ -125,7 +153,19 @@ fn open_main(hidden: bool, cx: &mut App) -> anyhow::Result<()> {
         .flatten()
         .filter(|id| accounts.iter().any(|a| &a.id == id))
         .or_else(|| accounts.first().map(|a| a.id.clone()));
-    let preference: AppearancePreference = store.setting(crate::SETTING_APPEARANCE).ok().flatten().unwrap_or_default();
+    let preference = store.setting(crate::SETTING_APPEARANCE).ok().flatten().unwrap_or_default();
+    Ok(MailStartup { store, sample, accounts, active, preference })
+}
+
+impl MailStartup {
+    fn build(self, setup: WindowSetup, window: &mut Window, cx: &mut App) -> Entity<MailWindow> {
+        cx.new(|cx| MailWindow::new(self.store, self.sample, self.accounts, self.active, setup, window, cx))
+    }
+}
+
+fn open_main(hidden: bool, cx: &mut App) -> anyhow::Result<()> {
+    let startup = mail_startup(cx)?;
+    let preference = startup.preference;
     if !hidden {
         // The desktop's light or dark setting may have changed while the window was away.
         crate::theme::apply_preference(preference, crate::theme::system_appearance(cx.window_appearance()), cx);
@@ -138,7 +178,7 @@ fn open_main(hidden: bool, cx: &mut App) -> anyhow::Result<()> {
         ..TitleBar::window_options()
     };
     let (window, view) = gpui_kit::open_window(options, cx, move |window, cx| {
-        cx.new(|cx| MailWindow::new(store, sample, accounts, active, WindowSetup::Mail(preference), window, cx))
+        startup.build(WindowSetup::Mail(preference), window, cx)
     })?;
     let lifecycle = cx.global_mut::<Lifecycle>();
     lifecycle.sync_view = Some(view.clone());
@@ -154,13 +194,22 @@ fn window_closed(cx: &mut App, closed: WindowId) {
     }
     let l = cx.global_mut::<Lifecycle>();
     l.editors.retain(|(w, _)| w.window_id() != closed);
-    if l.main.as_ref().is_some_and(|m| m.window.window_id() == closed) {
+    let closed_main = l.main.as_ref().is_some_and(|m| m.window.window_id() == closed);
+    if closed_main {
         l.main = None;
+    }
+    if l.reminder_panel.as_ref().is_some_and(|panel| panel.window.window_id() == closed) {
+        l.reminder_panel = None;
     }
     if none_left {
         l.sync_view = None;
     }
     if l.switching || !none_left {
+        if !l.switching && closed_main && l.reminder_panel.is_some() {
+            if let Err(error) = start_reminder_sync_owner(cx) {
+                tracing::warn!(%error, "could not continue background sync in the reminders window");
+            }
+        }
         crate::single_instance::wake();
         return;
     }
@@ -191,9 +240,7 @@ fn go_hidden(cx: &mut App) {
             let l = cx.global_mut::<Lifecycle>();
             l.hidden = true;
             l.switching = false;
-            if let Some(env) = l.show_after.take() {
-                show(env, cx);
-            }
+            serve_window_requests(cx);
         });
     })
     .detach();
@@ -218,30 +265,43 @@ pub(crate) fn show_settings(page: crate::ui::SettingsPage, cx: &mut App) {
 /// Brings Overlook forward on the launch's desktop: the main window, opened again if it was
 /// hidden or closed.
 pub fn show(env: LaunchEnv, cx: &mut App) {
+    show_window(WindowTarget::Main, env, cx);
+}
+
+pub(crate) fn show_reminders(env: LaunchEnv, cx: &mut App) {
+    show_window(WindowTarget::Reminders, env, cx);
+}
+
+#[derive(Clone, Copy)]
+enum WindowTarget {
+    Main,
+    Reminders,
+}
+
+fn show_window(target: WindowTarget, env: LaunchEnv, cx: &mut App) {
+    if !cx.has_global::<Lifecycle>() {
+        return;
+    }
     let l = cx.global_mut::<Lifecycle>();
     if l.switching {
-        l.show_after = Some(env);
+        match target {
+            WindowTarget::Main => l.show_after = Some(env),
+            WindowTarget::Reminders => l.reminders_after = Some(env),
+        }
         return;
     }
     if !l.hidden {
-        let main = l.main.as_ref().map(|m| m.window);
-        // Only a composer is open: the main window comes back beside it.
-        let window = match main {
-            Some(window) => Some(window),
-            None => open_main(false, cx).map_err(|e| tracing::error!("could not open the window: {e:#}")).ok().and_then(|()| cx.global::<Lifecycle>().main.as_ref().map(|m| m.window)),
-        };
-        if let Some(window) = window {
-            let _ = window.update(cx, |_, window, _| window.activate_window());
+        if let Err(error) = present(target, cx) {
+            tracing::warn!(%error, "could not open the Overlook window");
         }
-        serve_after_show(cx);
         return;
     }
     l.switching = true;
+    let desktop = l.desktop.clone().unwrap_or_else(GraphicalEnvironment::detect);
     // The headless window goes; its replacement on the desktop starts afresh from the store.
     if let Some(main) = l.main.take() {
         let _ = main.window.update(cx, |_, window, _| window.remove_window());
     }
-    let desktop = GraphicalEnvironment::detect();
     #[cfg(target_os = "linux")]
     let desktop = {
         let mut desktop = desktop;
@@ -257,31 +317,91 @@ pub fn show(env: LaunchEnv, cx: &mut App) {
         let switched = cx.update(|cx| cx.request_windowing(WindowingRequest::Windowed(desktop))).await;
         cx.update(|cx| {
             let opened = switched.and_then(|()| {
-                crate::browser_engine::set_prewarm(true);
-                open_main(false, cx)
+                let desktop = cx.graphical_environment();
+                let l = cx.global_mut::<Lifecycle>();
+                l.desktop = desktop;
+                l.hidden = false;
+                if matches!(target, WindowTarget::Reminders) {
+                    let preference = l.store.setting(crate::SETTING_APPEARANCE).ok().flatten().unwrap_or_default();
+                    crate::theme::apply_preference(preference, crate::theme::system_appearance(cx.window_appearance()), cx);
+                }
+                present(target, cx)
             });
-            let l = cx.global_mut::<Lifecycle>();
-            l.switching = false;
-            match opened {
-                Ok(()) => {
-                    l.hidden = false;
-                    tracing::info!("window shown");
-                    cx.activate(true);
-                    serve_after_show(cx);
-                }
-                Err(e) => {
-                    // Still headless: carry on there.
-                    tracing::error!("could not show the window: {e:#}");
-                    crate::browser_engine::set_prewarm(false);
-                    if let Err(e) = open_main(true, cx) {
-                        tracing::error!("could not keep running without a window, so quitting: {e:#}");
-                        quit_now(cx);
-                    }
-                }
+            cx.global_mut::<Lifecycle>().switching = false;
+            if let Err(error) = opened {
+                tracing::warn!(%error, "could not show the Overlook window");
+                go_hidden(cx);
+            } else {
+                serve_window_requests(cx);
             }
         });
     })
     .detach();
+}
+
+fn serve_window_requests(cx: &mut App) {
+    let l = cx.global_mut::<Lifecycle>();
+    let (main, reminders) = (l.show_after.take(), l.reminders_after.take());
+    if let Some(env) = main {
+        show(env, cx);
+    }
+    if let Some(env) = reminders {
+        show_reminders(env, cx);
+    }
+}
+
+fn present(target: WindowTarget, cx: &mut App) -> anyhow::Result<()> {
+    let window = match target {
+        WindowTarget::Main => {
+            let lifecycle = cx.global::<Lifecycle>();
+            if lifecycle.main.is_none() {
+                crate::browser_engine::set_prewarm(true);
+                open_main(false, cx)?;
+            }
+            cx.global::<Lifecycle>().main.as_ref().map(|m| m.window)
+        }
+        WindowTarget::Reminders => Some(open_reminder_panel(cx)?),
+    };
+    if let Some(window) = window {
+        let _ = window.update(cx, |_, window, _| window.activate_window());
+        cx.activate(true);
+    }
+    if matches!(target, WindowTarget::Main) {
+        serve_after_show(cx);
+    }
+    Ok(())
+}
+
+fn open_reminder_panel(cx: &mut App) -> anyhow::Result<AnyWindowHandle> {
+    let lifecycle = cx.global::<Lifecycle>();
+    if let Some(panel) = &lifecycle.reminder_panel {
+        return Ok(panel.window);
+    }
+    let due = lifecycle.reminders.due().to_vec();
+    let (window, view) = ReminderWindow::open(due, cx)?;
+    let lifecycle = cx.global_mut::<Lifecycle>();
+    lifecycle.reminder_panel = Some(ReminderPanel { window, view: view.downgrade() });
+    if lifecycle.main.is_none() {
+        if let Err(error) = start_reminder_sync_owner(cx) {
+            tracing::warn!(%error, "could not continue background sync in the reminders window");
+        }
+    }
+    Ok(window)
+}
+
+/// While only reminders are visible, use this window for the existing mail sync tasks.
+fn start_reminder_sync_owner(cx: &mut App) -> anyhow::Result<()> {
+    let panel = cx.global::<Lifecycle>().reminder_panel.as_ref().expect("reminders window exists");
+    let (window, view) = (panel.window, panel.view.clone());
+    let startup = mail_startup(cx)?;
+    let preference = startup.preference;
+    let mail = window.update(cx, |_, window, cx| {
+        let mail = startup.build(WindowSetup::ReminderService(preference), window, cx);
+        let _ = view.update(cx, |view, cx| view.focus(window, cx));
+        mail
+    })?;
+    cx.global_mut::<Lifecycle>().sync_view = Some(mail);
+    Ok(())
 }
 
 /// Quit: each open composer saves its draft as closing its window would, and one that can't
@@ -345,6 +465,7 @@ pub(crate) fn with_sync_owner(
     let Some(lifecycle) = cx.try_global::<Lifecycle>() else { return };
     let Some(view) = lifecycle.sync_view.clone() else { return };
     let windows: Vec<_> = lifecycle.main.as_ref().map(|main| main.window).into_iter()
+        .chain(lifecycle.reminder_panel.as_ref().map(|panel| panel.window))
         .chain(lifecycle.editors.iter().map(|(window, _)| *window))
         .collect();
     let mut update = Some(update);
@@ -361,10 +482,14 @@ fn serve(request: Request, cx: &mut App) {
     let l = cx.global_mut::<Lifecycle>();
     match request {
         Request::Show(env) => show(env, cx),
+        Request::Reminders(env) => show_reminders(env, cx),
         Request::Quit => quit(cx),
         // While hidden there's nothing to repaint; the window reads the theme when it opens.
         Request::ReloadTheme if l.hidden || l.switching => {}
         Request::SyncNow if l.switching => {}
+        request @ (Request::SyncNow | Request::ReloadTheme) if l.main.is_none() => {
+            with_sync_owner(cx, |this, window, cx| this.serve_launch(request, window, cx));
+        }
         Request::Mailto(_) if l.hidden || l.switching || l.main.is_none() => {
             l.after_show.push(request);
             show(LaunchEnv::default(), cx);
@@ -413,22 +538,104 @@ fn serve_in_main_with(cx: &mut App, f: impl FnOnce(&mut MailWindow, &mut Context
     }
 }
 
-/// Shows the tray icon while keep-running is on, with the unread count, and takes it away
-/// when it's switched off. Checked every two seconds: cheap, and the count needs no hook into
-/// every change that moves it. D-Bus work runs on the dedicated tray worker thread.
+/// Shows the tray icon for the life of the process. D-Bus work runs off the UI thread.
 fn keep_tray(cx: &mut App) {
     cx.spawn(async move |cx| loop {
         cx.update(|cx| {
             let unread = cx
                 .global::<Lifecycle>()
-                .main
+                .sync_view
                 .as_ref()
-                .and_then(|m| m.view.upgrade())
                 .map(|view| view.read(cx).unread_inbox_total());
-            let enabled = keep_running();
-            cx.global_mut::<Lifecycle>().tray.sync(enabled, unread);
+            cx.global_mut::<Lifecycle>().tray.sync(true, unread);
         });
         cx.background_executor().timer(Duration::from_secs(2)).await;
     })
     .detach();
+}
+
+fn reminder_preferences(prefs: &Prefs) -> reminders::Preferences {
+    reminders::Preferences { enabled: prefs.event_reminders, default_minutes: prefs.default_reminder_minutes }
+}
+
+pub(crate) fn set_reminder_preferences(prefs: &Prefs, cx: &mut App) {
+    if cx.has_global::<Lifecycle>() {
+        cx.global_mut::<Lifecycle>().reminder_prefs = reminder_preferences(prefs);
+    }
+}
+
+fn watch_reminders(cx: &mut App) {
+    cx.spawn(async move |cx| loop {
+        let (store, tracked, prefs) = cx.update(|cx| {
+            let l = cx.global::<Lifecycle>();
+            (l.store.clone(), l.reminders.tracked(), l.reminder_prefs)
+        });
+        let now = overlook_core::time::now();
+        let result = cx.background_executor().spawn(async move {
+            reminders::candidates(&store, tracked, now, prefs)
+        }).await;
+        cx.update(|cx| match result {
+            Ok(candidates) => {
+                let l = cx.global_mut::<Lifecycle>();
+                if l.reminder_prefs != prefs {
+                    return;
+                }
+                let (changed, due) = l.reminders.refresh(candidates, overlook_core::time::now(), prefs.enabled);
+                if changed {
+                    l.reminders.save(l.store.clone());
+                }
+                refresh_reminder_panel(cx);
+                if !due.is_empty() {
+                    notify_reminders(&due);
+                    show_reminders(LaunchEnv::default(), cx);
+                }
+            }
+            Err(error) => tracing::warn!(%error, "could not check calendar reminders"),
+        });
+        cx.background_executor().timer(Duration::from_secs(15)).await;
+    }).detach();
+}
+
+fn notify_reminders(due: &[Reminder]) {
+    let (headline, body) = if let [reminder] = due {
+        let event = &reminder.event;
+        let schedule = format!("{} · {}", overlook_core::tz::format_day(event.start), overlook_core::tz::format_clock(event.start));
+        let body = event.location.as_deref().filter(|text| !text.trim().is_empty())
+            .map_or_else(|| schedule.clone(), |location| format!("{schedule}\n{location}"));
+        (event.display_title(), body)
+    } else {
+        (format!("{} calendar reminders", due.len()), "Open Calendar reminders in Overlook to review them.".into())
+    };
+    crate::notify::desktop(crate::notify::Level::Reminder, headline, body);
+}
+
+fn refresh_reminder_panel(cx: &mut App) {
+    let l = cx.global::<Lifecycle>();
+    if let Some(panel) = &l.reminder_panel {
+        let view = panel.view.clone();
+        let due = l.reminders.due().to_vec();
+        let _ = view.update(cx, |view, cx| view.update_due(due, cx));
+    }
+}
+
+pub(crate) fn snooze_reminder(id: EventId, minutes: i64, cx: &mut App) {
+    change_reminders(cx, |inbox| inbox.snooze(&id, overlook_core::time::now() + minutes * reminders::MINUTE));
+}
+
+pub(crate) fn dismiss_reminders(id: Option<EventId>, cx: &mut App) {
+    change_reminders(cx, |inbox| inbox.dismiss(id.as_ref()));
+}
+
+fn change_reminders(cx: &mut App, change: impl FnOnce(&mut Inbox) -> bool) {
+    let lifecycle = cx.global_mut::<Lifecycle>();
+    if change(&mut lifecycle.reminders) {
+        lifecycle.reminders.save(lifecycle.store.clone());
+        refresh_reminder_panel(cx);
+    }
+}
+
+pub(crate) fn open_reminder_event(id: EventId, cx: &mut App) {
+    show(LaunchEnv::default(), cx);
+    let Some((window, view)) = cx.global::<Lifecycle>().main.as_ref().map(|m| (m.window, m.view.clone())) else { return };
+    let _ = window.update(cx, |_, window, cx| view.update(cx, |this, cx| this.show_event_in_calendar(id, window, cx)));
 }
