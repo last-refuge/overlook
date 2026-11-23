@@ -1071,8 +1071,6 @@ impl MailWindow {
             .size_full()
             .bg(p.sidebar)
             .text_color(p.foreground)
-            .border_r_1()
-            .border_color(p.divider)
             .pt(px(18.))
             .px(px(11.))
             .pb(px(14.))
