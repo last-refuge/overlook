@@ -95,7 +95,7 @@ fn send(level: Level, headline: String, body: String) {
                 // Each value is one argument, never parsed by a shell; --exec comes last.
                 let status = Command::new(sender)
                     .args(["--app-name", "Overlook", "-g", glyph(level), "-u", urgency])
-                    .args(omarchy_args(&headline, &body))
+                    .args(omarchy_args(level, &headline, &body))
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
@@ -121,13 +121,17 @@ fn send(level: Level, headline: String, body: String) {
 }
 
 /// Headline, description, and a click that focuses Overlook (or starts it).
-fn omarchy_args(headline: &str, body: &str) -> Vec<String> {
+fn omarchy_args(level: Level, headline: &str, body: &str) -> Vec<String> {
     let mut args = vec![headline.to_owned()];
     if !body.is_empty() {
         args.push(body.to_owned());
     }
-    // The window class, not "Overlook": a terminal titled "…omarchy-overlook" matches that.
-    args.extend(["--exec", "omarchy-launch-or-focus", "ai.lastrefuge.Overlook", "overlook"].map(str::to_owned));
+    if level == Level::Reminder {
+        args.extend(["--exec", "overlook", "--reminders"].map(str::to_owned));
+    } else {
+        // Match the app's window class so a terminal titled "…omarchy-overlook" can't match it.
+        args.extend(["--exec", "omarchy-launch-or-focus", "ai.lastrefuge.Overlook", "overlook"].map(str::to_owned));
+    }
     args
 }
 
@@ -143,8 +147,10 @@ mod tests {
 
     #[test]
     fn the_click_command_comes_last_as_separate_words() {
-        let args = super::omarchy_args("New mail", "From Maya");
+        let args = super::omarchy_args(super::Level::Mail, "New mail", "From Maya");
         assert_eq!(args, vec!["New mail", "From Maya", "--exec", "omarchy-launch-or-focus", "ai.lastrefuge.Overlook", "overlook"]);
-        assert_eq!(super::omarchy_args("Hi", "")[1], "--exec");
+        assert_eq!(super::omarchy_args(super::Level::Info, "Hi", "")[1], "--exec");
+        assert_eq!(super::omarchy_args(super::Level::Reminder, "Meeting", "Starts at 3:00 PM"),
+            vec!["Meeting", "Starts at 3:00 PM", "--exec", "overlook", "--reminders"]);
     }
 }

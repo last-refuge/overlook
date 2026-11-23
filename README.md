@@ -83,8 +83,9 @@ and you can read, search, write, and file mail with no connection at all.
 - **A calendar, not an afterthought.** Day, Week, Month, and Agenda. Invitations with Accept, Tentative, and
   Decline, from the calendar or from the email itself. Drag across empty time to create an event, right-click one to edit, duplicate, or delete
   it, drag events to move or resize them, edit one occurrence of a repeating event or the whole series, invite guests and check whether they
-  are free, add a Google Meet link. Reminders as desktop notifications. Working hours shaded. Google's event
-  colors.
+  are free, add a Google Meet link. Due reminders open in a separate window and also appear as desktop
+  notifications. Open the event, join its meeting, snooze, dismiss one reminder, or dismiss all. Working hours
+  are shaded, and Google's event colors are supported.
 - **Offline, properly.** Archive, star, move, reply, and send while disconnected; everything is queued in order
   and replayed when you are back. A visible Outbox says *Waiting for connection*; *Sent* appears only after
   Gmail accepts the message, and a dropped connection mid-send is reconciled before any retry so nothing is
@@ -106,11 +107,11 @@ and you can read, search, write, and file mail with no connection at all.
   control takes effect immediately.
   Mail and calendar use date-aware daylight-saving rules. Overlook checks for system time-zone changes
   every minute and asks before switching; keeping the current zone saves an override.
-- **Runs in the background if you want it to.** Settings → General → *Keep running when the window is
-  closed* keeps mail and calendars syncing, with new-mail notifications and event reminders, after you close
-  the window, and puts the Overlook mark in the system tray (with a dot while the Inbox has unread mail).
-  Open it again from the tray, the app launcher or a notification; <kbd>Ctrl</kbd>+<kbd>Q</kbd>, the tray
-  menu or `overlook --quit` quits. *Start Overlook when you log in* adds an autostart entry, which starts it
+- **System tray and background sync.** The Overlook mark appears in compatible system trays while the app
+  runs, with a dot when the Inbox has unread mail. Open **Calendar reminders** from the tray menu or run
+  `overlook --reminders`. Settings → General → *Keep running when the window is closed* keeps mail and calendars
+  syncing and reminders active after you close the windows. <kbd>Ctrl</kbd>+<kbd>Q</kbd>, the tray menu or
+  `overlook --quit` quits. *Start Overlook when you log in* adds an autostart entry, which starts it
   without a window when it keeps running in the background. Launching Overlook again always brings the
   running one forward rather than starting a second copy.
 

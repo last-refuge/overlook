@@ -26,6 +26,7 @@ mod macos_menu;
 mod settings;
 mod signature;
 mod reader;
+mod reminders;
 mod sidebar;
 mod shell;
 mod toolbar;
@@ -45,6 +46,7 @@ pub use account_setup::{AccountSetup, SetupMode};
 pub use calendar::{CalView, Module, NewEvent};
 pub use composer::Composer;
 pub(crate) use composer_window::WindowSetup;
+pub(crate) use reminders::ReminderWindow;
 pub use settings::{SettingsPage, SettingsState};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -671,15 +673,9 @@ fn prune_temp_cache_dirs() {
 const MAX_OTHER_INDEXES: usize = 4;
 const MAX_PDF_THUMBS: usize = 128;
 const MAX_REMOTE_ALLOWED: usize = 512;
-const MAX_NOTIFIED_REMINDERS: usize = 1024;
-const MAX_SNOOZED_REMINDERS: usize = 256;
-const REMINDER_RETENTION_MS: i64 = 24 * 3_600_000;
 
 /// Set once the first main window has opened; a later one is the window coming back.
 static MAIN_WINDOW_OPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Reminder state handed from a closing main window to the next one.
-type ReminderMemory = (HashMap<(EventId, i32), i64>, HashMap<EventId, i64>);
-static REMINDER_MEMORY: std::sync::Mutex<Option<ReminderMemory>> = std::sync::Mutex::new(None);
 
 pub struct MailWindow {
     focus_handle: FocusHandle,
@@ -960,12 +956,6 @@ pub struct MailWindow {
     pub(crate) cal_range_drag: Option<calendar::CalRangeDrag>,
     /// The left button just went down on an event, for the column underneath to see.
     pub(crate) cal_press_on_event: bool,
-    pub(crate) reminders_enabled: bool,
-    pub(crate) checking_reminders: bool,
-    /// Reminders already shown this session: (event, minutes before) → event start timestamp.
-    pub(crate) notified: HashMap<(EventId, i32), i64>,
-    /// Reminders put off from the toast: event → when to show it again.
-    pub(crate) snoozed_reminders: HashMap<EventId, i64>,
     /// Memoized sanitized event description for the currently viewed calendar event.
     pub(crate) cal_desc_cache: std::cell::RefCell<Option<(EventId, String, String)>>,
     pub(crate) prefs: Prefs,
@@ -1003,18 +993,6 @@ pub struct MailWindow {
     _subscriptions: Vec<Subscription>,
 }
 
-impl Drop for MailWindow {
-    fn drop(&mut self) {
-        // Only the main window checks reminders; its state outlives it (see `new`).
-        if self.composer_owner.is_none() && self.folder_owner.is_none() && self.message_owner.is_none() {
-            self.prune_reminder_memory(now());
-            let memory = (std::mem::take(&mut self.notified), std::mem::take(&mut self.snoozed_reminders));
-            *REMINDER_MEMORY.lock().unwrap_or_else(|e| e.into_inner()) = Some(memory);
-            tracing::info!("main window state released");
-        }
-    }
-}
-
 impl MailWindow {
     pub fn new(
         store: Arc<Store>,
@@ -1027,22 +1005,25 @@ impl MailWindow {
     ) -> Self {
         tracing::debug!("startup: window opening after {} ms", crate::since_start_ms());
         let account = accounts.iter().find(|a| Some(&a.id) == active.as_ref()).or_else(|| accounts.first()).cloned().unwrap_or_else(no_account);
+        let reminder_service = matches!(setup, WindowSetup::ReminderService(_));
         let (appearance, composer_owner, folder_owner, message_owner, shared_providers, folder, message_view) = match setup {
-            WindowSetup::Mail(appearance) => (appearance, None, None, None, None, None, None),
+            WindowSetup::Mail(appearance) | WindowSetup::ReminderService(appearance) => (appearance, None, None, None, None, None, None),
             WindowSetup::Composer { appearance, owner, providers } => (appearance, Some(owner), None, None, Some(providers), None, None),
             WindowSetup::Folder { appearance, owner, providers, account, view } => (appearance, None, Some(owner), None, Some(providers), Some((account, view)), None),
             WindowSetup::Message { appearance, owner, providers, account, view } => (appearance, None, None, Some(owner), Some(providers), None, Some((account, view))),
         };
         #[cfg(target_os = "macos")]
-        window.set_window_title(if composer_owner.is_some() {
-            "Compose"
-        } else if folder_owner.is_some() {
-            "Mail Folder"
-        } else if message_owner.is_some() {
-            "Message"
-        } else {
-            "Overlook"
-        });
+        if !reminder_service {
+            window.set_window_title(if composer_owner.is_some() {
+                "Compose"
+            } else if folder_owner.is_some() {
+                "Mail Folder"
+            } else if message_owner.is_some() {
+                "Message"
+            } else {
+                "Overlook"
+            });
+        }
         let detached = composer_owner.is_some() || folder_owner.is_some() || message_owner.is_some();
         let offline = store.offline_account().unwrap_or_else(|e| {
             tracing::warn!("could not set up offline folders: {e}");
@@ -1110,7 +1091,6 @@ impl MailWindow {
         let focused_enabled = store.setting::<bool>("focused_inbox").ok().flatten().unwrap_or(true);
         let prefs: Prefs = store.setting::<Prefs>("prefs").ok().flatten().unwrap_or_default();
         if !detached { crate::notify::set_mirror(prefs.omarchy_notifications); }
-        let reminders_enabled = prefs.event_reminders;
         if !detached {
             overlook_core::tz::set_clock_24h(prefs.clock_24h);
             overlook_core::tz::set_override(prefs.time_zone.as_ref()).ok();
@@ -1311,10 +1291,6 @@ impl MailWindow {
             cal_drag: None,
             cal_range_drag: None,
             cal_press_on_event: false,
-            reminders_enabled,
-            checking_reminders: false,
-            notified: HashMap::new(),
-            snoozed_reminders: HashMap::new(),
             cal_desc_cache: std::cell::RefCell::new(None),
             update: UpdateState {
                 install: InstallKind::detect(),
@@ -1352,16 +1328,18 @@ impl MailWindow {
         this.count_kept_offline_mail();
         // Main and folder windows can own composers too. Native close and explicit Quit
         // must both finish their saves before the editor and its debounce timer go away.
-        let editor = cx.weak_entity();
-        crate::lifecycle::add_editor(window.window_handle(), editor.clone(), cx);
-        window.on_window_should_close(cx, move |window, cx| {
-            editor.update(cx, |this, cx| this.prepare_composer_window_close(window, cx)).unwrap_or(true)
-        });
+        if !reminder_service {
+            let editor = cx.weak_entity();
+            crate::lifecycle::add_editor(window.window_handle(), editor.clone(), cx);
+            window.on_window_should_close(cx, move |window, cx| {
+                editor.update(cx, |this, cx| this.prepare_composer_window_close(window, cx)).unwrap_or(true)
+            });
+        }
         // Every window starts with every other account's badges to count: the first
         // `reload` recounts them, in the main window and in a folder window alike.
         this.mark_all_counts_stale();
         // A composer shares providers and the store, but never starts a second
-        // synchronization loop, IDLE watcher, reminder service or update checker.
+        // synchronization loop, IDLE watcher or update checker.
         if let Some((_, view)) = folder {
             this.module = Module::Mail;
             this.select_view(view, window, cx);
@@ -1390,13 +1368,7 @@ impl MailWindow {
         // The main window opens again after running in the background (`lifecycle`); what
         // follows only a process start happens once.
         let first_start = !MAIN_WINDOW_OPENED.swap(true, std::sync::atomic::Ordering::Relaxed);
-        let hidden = cx.graphical_environment().is_none();
-        // Reminders already shown stay shown, and snoozes run on, across a reopened window.
-        if let Some((notified, snoozed)) = REMINDER_MEMORY.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            this.notified = notified;
-            this.snoozed_reminders = snoozed;
-            this.prune_reminder_memory(now());
-        }
+        let hidden = reminder_service || cx.graphical_environment().is_none();
         // The watchdog reports any stall of this thread (see `watchdog.rs`).
         crate::watchdog::start();
         cx.spawn(async move |this, cx| loop {
@@ -1428,7 +1400,9 @@ impl MailWindow {
                 this.load_thread(cx);
             }
         }
-        this.focus_current_module(window, cx);
+        if !reminder_service {
+            this.focus_current_module(window, cx);
+        }
         // Synchronize on startup for every reachable account; queued work from a previous
         // session is replayed before anything else happens.
         // A fresh start checks every account's folders and messages against the server once.
@@ -1522,12 +1496,10 @@ impl MailWindow {
         })
         .detach();
 
-        // Periodic synchronization while accounts are reachable, and reminder checks.
+        // Periodic synchronization while accounts are reachable.
         cx.spawn_in(window, async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_secs(15)).await;
             let alive = this.update_in(cx, |this, window, cx| {
-                // Reminders are checked every tick; mail/calendar sync follows the preference.
-                this.check_reminders(window, cx);
                 if this.prefs.check_for_updates && now() - this.update.last_check > 24 * 3_600_000 {
                     this.check_for_updates(false, window, cx);
                 }
@@ -1552,7 +1524,7 @@ impl MailWindow {
         use crate::single_instance::Request;
         match request {
             Request::Show(_) => window.activate_window(),
-            Request::Quit => {}
+            Request::Quit | Request::Reminders(_) => {}
             Request::SyncNow => self.sync_now(window, cx),
             // Omarchy's theme-set hook asks for the desktop theme to be read again.
             Request::ReloadTheme => {
@@ -1670,29 +1642,6 @@ impl MailWindow {
                 self.other_indexes.remove(&evicted);
             } else {
                 break;
-            }
-        }
-    }
-
-    pub(crate) fn prune_reminder_memory(&mut self, now_ms: i64) {
-        let cutoff = now_ms - REMINDER_RETENTION_MS;
-        self.notified.retain(|_, ts| *ts > cutoff);
-        if self.notified.len() > MAX_NOTIFIED_REMINDERS {
-            let mut entries: Vec<((EventId, i32), i64)> = self.notified.iter().map(|(k, &v)| (k.clone(), v)).collect();
-            entries.sort_by_key(|(_, ts)| *ts);
-            let drop_count = entries.len() - MAX_NOTIFIED_REMINDERS;
-            for (k, _) in entries.into_iter().take(drop_count) {
-                self.notified.remove(&k);
-            }
-        }
-        let snooze_cutoff = now_ms - 3_600_000;
-        self.snoozed_reminders.retain(|_, until| *until > snooze_cutoff);
-        if self.snoozed_reminders.len() > MAX_SNOOZED_REMINDERS {
-            let mut entries: Vec<(EventId, i64)> = self.snoozed_reminders.iter().map(|(k, &v)| (k.clone(), v)).collect();
-            entries.sort_by_key(|(_, ts)| *ts);
-            let drop_count = entries.len() - MAX_SNOOZED_REMINDERS;
-            for (k, _) in entries.into_iter().take(drop_count) {
-                self.snoozed_reminders.remove(&k);
             }
         }
     }

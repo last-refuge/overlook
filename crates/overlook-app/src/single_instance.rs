@@ -77,6 +77,7 @@ pub const RELOAD_THEME: &str = "overlook:reload-theme";
 /// The line a plain launch sends: show the running Overlook instead of starting another.
 /// Tab-separated `NAME=value` pairs from `LaunchEnv` may follow.
 pub const SHOW: &str = "overlook:show";
+pub const REMINDERS: &str = "overlook:reminders";
 /// The line `overlook --quit` sends.
 pub const QUIT: &str = "overlook:quit";
 /// Check for new mail now (the tray icon's menu).
@@ -120,7 +121,15 @@ impl LaunchEnv {
 
     /// The show line carrying this environment.
     pub fn show_line(&self) -> String {
-        let mut line = SHOW.to_owned();
+        self.window_line(SHOW)
+    }
+
+    pub fn reminders_line(&self) -> String {
+        self.window_line(REMINDERS)
+    }
+
+    fn window_line(&self, command: &str) -> String {
+        let mut line = command.to_owned();
         for (name, value) in &self.0 {
             // A value with a tab or line break would split the line; it can't name a display.
             if !value.contains(['\t', '\n', '\r']) {
@@ -147,6 +156,7 @@ impl LaunchEnv {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Request {
     Show(LaunchEnv),
+    Reminders(LaunchEnv),
     Quit,
     SyncNow,
     ReloadTheme,
@@ -160,6 +170,7 @@ impl Request {
         let (head, fields) = line.split_once('\t').unwrap_or((line, ""));
         match head.trim() {
             SHOW => Some(Self::Show(LaunchEnv::parse(fields))),
+            REMINDERS => Some(Self::Reminders(LaunchEnv::parse(fields))),
             QUIT => Some(Self::Quit),
             SYNC => Some(Self::SyncNow),
             RELOAD_THEME => Some(Self::ReloadTheme),
@@ -174,6 +185,7 @@ impl Request {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Show(_) => "show",
+            Self::Reminders(_) => "show reminders",
             Self::Quit => "quit",
             Self::SyncNow => "check for new mail",
             Self::ReloadTheme => "reload theme",

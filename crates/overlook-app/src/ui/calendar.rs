@@ -11,11 +11,10 @@ use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
-use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::text::TextView;
-use gpui_kit::component::{Sizable, WindowExt};
+use gpui_kit::component::Sizable;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use overlook_core::sanitize::{sanitize_html, text_to_html, RemoteContent};
@@ -408,6 +407,9 @@ impl MailWindow {
     /// Switches to the calendar, moves to the event's day, and selects it.
     pub(crate) fn show_event_in_calendar(&mut self, id: EventId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(event) = self.store.event(&id).ok().flatten() else { return };
+        if self.account.id != event.account_id {
+            self.switch_account(event.account_id, window, cx);
+        }
         self.set_module(Module::Calendar, window, cx);
         self.cal_anchor = tz::day_start(event.start);
         if self.cal_view == CalView::Agenda {
@@ -420,114 +422,6 @@ impl MailWindow {
         self.reset_detail_scroll();
         self.cal_selected = Some(id);
         cx.notify();
-    }
-
-    /// Fires due reminders: a desktop notification plus an in-app toast, once per event
-    /// and offset per session. SQLite reads run off the UI thread.
-    pub(crate) fn check_reminders(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.reminders_enabled || self.checking_reminders {
-            return;
-        }
-        self.checking_reminders = true;
-        let now_ms = now();
-        let horizon = now_ms + 2 * 3_600_000;
-        let accounts: Vec<AccountId> = self.accounts.iter().map(|a| a.id.clone()).collect();
-        let store = self.store.clone();
-        let tz_key = tz::cache_key();
-        let fallback = self.prefs.default_reminder_minutes as i32;
-        cx.spawn_in(window, async move |this, cx| {
-            let candidates: Vec<(Event, Vec<i32>)> = cx
-                .background_spawn(async move {
-                    let mut out = Vec::new();
-                    for account_id in accounts {
-                        if store
-                            .calendar_connection(&account_id)
-                            .ok()
-                            .flatten()
-                            .is_some_and(|c| !store.caldav_timezone_matches(&c.id, &tz_key).unwrap_or(false))
-                        {
-                            continue;
-                        }
-                        let calendars = store.calendars(&account_id).unwrap_or_default();
-                        let Ok(events) = store.events_starting_between(&account_id, now_ms - 60_000, horizon) else {
-                            continue;
-                        };
-                        for event in events {
-                            if event.my_response() == Some(ResponseStatus::Declined) || event.is_working_location() {
-                                continue;
-                            }
-                            let defaults: Vec<i32> = calendars
-                                .iter()
-                                .find(|c| c.id == event.calendar_id)
-                                .map(|c| c.default_reminders.clone())
-                                .filter(|d| !d.is_empty())
-                                .unwrap_or_else(|| if fallback > 0 { vec![fallback] } else { Vec::new() });
-                            let offsets: Vec<i32> = event.effective_reminders(&defaults).to_vec();
-                            out.push((event, offsets));
-                        }
-                    }
-                    out
-                })
-                .await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.checking_reminders = false;
-                if !this.reminders_enabled {
-                    return;
-                }
-                let now_ms = now();
-                this.prune_reminder_memory(now_ms);
-                for (event, offsets) in candidates {
-                    // A snoozed reminder comes back once, when its time is up.
-                    if let Some(until) = this.snoozed_reminders.get(&event.id).copied() {
-                        if now_ms < until {
-                            continue;
-                        }
-                        this.snoozed_reminders.remove(&event.id);
-                        if event.start > now_ms - 60_000 {
-                            this.fire_reminder(&event, now_ms, window, cx);
-                        }
-                        continue;
-                    }
-                    for minutes in offsets {
-                        let fire_at = event.start - i64::from(minutes) * 60_000;
-                        let key = (event.id.clone(), minutes);
-                        if fire_at <= now_ms && event.start > now_ms - 60_000 && !this.notified.contains_key(&key) {
-                            this.notified.insert(key, event.start);
-                            this.fire_reminder(&event, now_ms, window, cx);
-                        }
-                    }
-                }
-            });
-        })
-        .detach();
-    }
-
-    /// Shows one reminder: a desktop notification and an in-app toast with Snooze.
-    fn fire_reminder(&mut self, event: &Event, now_ms: i64, window: &mut Window, cx: &mut Context<Self>) {
-        let remaining = ((event.start - now_ms) / 60_000).max(0);
-        let when = if remaining == 0 { "now".to_owned() } else { format!("in {remaining} min") };
-        let title = event.display_title();
-        let mut body = format!("{} · {} – {}", when, tz::format_clock(event.start), tz::format_clock(event.end));
-        if let Some(l) = &event.location {
-            body.push_str(&format!("\n{l}"));
-        }
-        crate::notify::desktop(crate::notify::Level::Reminder, title.clone(), body);
-        let t = cx.entity().downgrade();
-        let id = event.id.clone();
-        window.push_notification(
-            Notification::info(format!("{title} · {when}")).action(move |_, _window, cx| {
-                let t = t.clone();
-                let id = id.clone();
-                let toast = cx.entity().downgrade();
-                Button::new("snooze-reminder").small().label("Snooze 5 min").on_click(move |_, window, cx| {
-                    let _ = t.update(cx, |this, _cx| {
-                        this.snoozed_reminders.insert(id.clone(), now() + 5 * 60_000);
-                    });
-                    let _ = toast.update(cx, |n, cx| n.dismiss(window, cx));
-                })
-            }),
-            cx,
-        );
     }
 
     pub(crate) fn start_edit_event(&mut self, id: EventId, window: &mut Window, cx: &mut Context<Self>) {
@@ -2287,7 +2181,7 @@ const MODAL_MAX_HEIGHT: f32 = 0.88;
 const PANEL_WAIT: std::time::Duration = std::time::Duration::from_millis(350);
 
 /// A second click in place. Pressing a second time and dragging is a move, not a double click.
-fn is_double_click(click: &ClickEvent) -> bool {
+pub(super) fn is_double_click(click: &ClickEvent) -> bool {
     let in_place = match click {
         ClickEvent::Mouse(m) => {
             let moved = m.up.position - m.down.position;

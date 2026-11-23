@@ -15,6 +15,7 @@ mod loopback;
 mod mcp;
 mod microsoft_signin;
 mod notify;
+mod reminders;
 mod persist;
 mod watchdog;
 mod malware_scan;
@@ -298,7 +299,7 @@ fn main() {
         return;
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("Overlook {} — a clear view of what matters.\n\nUsage: overlook [mailto:…] [--background] [--quit] [--reload-theme] [--version] [--help]\n       overlook mcp --help\n\n  --background  start without a window when \"Keep running when the window is closed\" is on\n                (otherwise open it); does nothing if Overlook is already running\n  --quit        quit the running Overlook\n\nEnvironment:\n  OVERLOOK_DATA_DIR      profile directory (default ~/.local/share/overlook)\n  OVERLOOK_CONFIG_DIR    directory for an optional google-oauth-client.json or\n                         microsoft-oauth-client.json of your own (default ~/.config/overlook)\n  OVERLOOK_SIGN_IN=gmail start the Google sign-in at launch (microsoft / icloud / yahoo / aol /
+        println!("Overlook {} — a clear view of what matters.\n\nUsage: overlook [mailto:…] [--background] [--reminders] [--quit] [--reload-theme] [--version] [--help]\n       overlook mcp --help\n\n  --background  start without a window when \"Keep running when the window is closed\" is on\n                (otherwise open it); does nothing if Overlook is already running\n  --reminders   open the calendar reminders window\n  --quit        quit the running Overlook\n\nEnvironment:\n  OVERLOOK_DATA_DIR      profile directory (default ~/.local/share/overlook)\n  OVERLOOK_CONFIG_DIR    directory for an optional google-oauth-client.json or\n                         microsoft-oauth-client.json of your own (default ~/.config/overlook)\n  OVERLOOK_SIGN_IN=gmail start the Google sign-in at launch (microsoft / icloud / yahoo / aol /
                          fastmail / proton / imap / pop3: open that account setup)\n  OVERLOOK_BROWSER_BIN  compatible Chromium executable (default PATH discovery){}", env!("CARGO_PKG_VERSION"), if cfg!(debug_assertions) { "\n  RUST_LOG=overlook=debug tracing output (development builds only)" } else { "" });
         return;
     }
@@ -309,10 +310,14 @@ fn main() {
         return;
     }
     let background = args.iter().any(|a| a == "--background");
-    let launch = mailto.clone().unwrap_or_else(|| single_instance::LaunchEnv::current().show_line());
+    let reminders = mailto.is_none() && args.iter().any(|a| a == "--reminders");
+    let launch = mailto.clone().unwrap_or_else(|| {
+        let env = single_instance::LaunchEnv::current();
+        if reminders { env.reminders_line() } else { env.show_line() }
+    });
     let profile = data_dir();
     restrict_to_owner(&profile);
-    let mut owner = match single_instance::launch_desktop(&profile, (!background || mailto.is_some()).then_some(launch.as_str())) {
+    let mut owner = match single_instance::launch_desktop(&profile, (!background || reminders || mailto.is_some()).then_some(launch.as_str())) {
         Ok(Some(owner)) => owner,
         Ok(None) => return,
         Err(error) => {
@@ -333,8 +338,8 @@ fn main() {
     };
     tracing::debug!("startup: store open after {} ms", since_start_ms());
     theme::install_omarchy_hook();
-    if let Some(link) = mailto {
-        single_instance::push(link);
+    if reminders || mailto.is_some() {
+        single_instance::push(launch);
     }
     let provider = sample_provider();
     mcp::start_desktop(owner.profile(), store.clone(), provider.clone());
@@ -342,7 +347,7 @@ fn main() {
     let prefs = store.setting::<overlook_core::Prefs>("prefs").ok().flatten();
     lifecycle::set_keep_running(prefs.as_ref().is_some_and(|p| p.keep_running));
     // Started at login with "Keep running when the window is closed" on: no window until asked.
-    let start_hidden = background && prefs.as_ref().is_some_and(|p| p.keep_running);
+    let start_hidden = reminders || (background && prefs.as_ref().is_some_and(|p| p.keep_running));
     // `lifecycle` decides when the app ends; closing the last window may leave it running.
     let mut application = gpui_kit::application().with_assets(assets::Assets).with_quit_mode(QuitMode::Explicit);
     if start_hidden {

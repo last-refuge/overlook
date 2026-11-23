@@ -1,7 +1,7 @@
-//! The tray icon, while "Keep running when the window is closed" is on (`lifecycle` starts and
-//! stops it). A StatusNotifierItem, which Omarchy's bar and most Linux trays show: the
+//! The tray icon for the life of the app. A StatusNotifierItem, which Omarchy's bar and
+//! other compatible Linux trays show: the
 //! Overlook mark, with a dot while the Inbox has unread mail, and the count in its tooltip.
-//! A click opens the window; the menu also has Check for new mail and Quit.
+//! A click opens Overlook; the menu also opens reminders, checks for new mail, and quits.
 //!
 //! Its D-Bus service runs on ksni's own thread. What it's asked to do goes through the same
 //! queue as a later launch's request (`single_instance::push`), so the app serves it the
@@ -239,6 +239,7 @@ impl ksni::Tray for OverlookTray {
         };
         vec![
             item("Open Overlook", crate::single_instance::SHOW),
+            item("Calendar reminders", crate::single_instance::REMINDERS),
             item("Check for new mail", crate::single_instance::SYNC),
             MenuItem::Separator,
             item("Quit Overlook", crate::single_instance::QUIT),
