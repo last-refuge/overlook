@@ -78,6 +78,18 @@ impl Inbox {
         self.records.keys().cloned().collect()
     }
 
+    /// Snoozes that have already expired are handled by the normal refresh, including
+    /// reminders on hidden calendars that can only return once visible again.
+    pub fn next_snooze_after(&self, now: i64) -> Option<i64> {
+        self.records
+            .values()
+            .filter_map(|record| match record.status {
+                Status::SnoozedUntil(until) if until > now => Some(until),
+                _ => None,
+            })
+            .min()
+    }
+
     /// Refresh the inbox from one successful query. Return whether to persist and which
     /// occurrences have newly become due. A moved occurrence gets a fresh schedule.
     pub fn refresh(
@@ -136,7 +148,17 @@ impl Inbox {
         (before != self.records, newly_due)
     }
 
-    pub fn snooze(&mut self, id: &EventId, until: i64) -> bool {
+    pub fn snooze(&mut self, id: &EventId, now: i64, minutes: i64) -> bool {
+        let Some(record) = self.records.get(id) else {
+            return false;
+        };
+        let until = now.saturating_add(minutes.saturating_mul(MINUTE));
+        // For an upcoming event, bring the reminder back by the start time.
+        let until = if now < record.start {
+            until.min(record.start)
+        } else {
+            until
+        };
         self.change_due(Some(id), Status::SnoozedUntil(until))
     }
 
@@ -325,11 +347,12 @@ mod tests {
         let (store, event) = fixture();
         let mut inbox = Inbox::default();
         assert_eq!(refresh(&mut inbox, &store, NOW).len(), 1);
-        assert!(refresh(&mut inbox, &store, NOW + 15 * MINUTE).is_empty());
+        let already_started = event.start + MINUTE;
+        assert!(refresh(&mut inbox, &store, already_started).is_empty());
         assert_eq!(inbox.due().len(), 1);
 
-        let until = NOW + 60 * MINUTE;
-        assert!(inbox.snooze(&event.id, until));
+        let until = already_started + 60 * MINUTE;
+        assert!(inbox.snooze(&event.id, already_started, 60));
         inbox.save(store.clone());
         crate::persist::flush();
         let mut reopened = Inbox::load(&store);
@@ -337,6 +360,26 @@ mod tests {
         assert!(reopened.due().is_empty());
         assert_eq!(refresh(&mut reopened, &store, until)[0].event.id, event.id);
         assert!(refresh(&mut reopened, &store, until + MINUTE).is_empty());
+    }
+
+    #[test]
+    fn snoozing_an_upcoming_event_caps_the_deadline_at_its_start() {
+        for (minutes_before, minutes_to_snooze, minutes_before_return) in [(3, 5, 0), (10, 5, 5)] {
+            let (store, event) = fixture();
+            let mut inbox = Inbox::default();
+            let now = event.start - minutes_before * MINUTE;
+            assert_eq!(refresh(&mut inbox, &store, now).len(), 1);
+            assert!(inbox.snooze(&event.id, now, minutes_to_snooze));
+            inbox.save(store.clone());
+            crate::persist::flush();
+            let mut inbox = Inbox::load(&store);
+
+            let deadline = event.start - minutes_before_return * MINUTE;
+            assert_eq!(inbox.next_snooze_after(now), Some(deadline));
+            assert!(refresh(&mut inbox, &store, deadline - 1).is_empty());
+            assert_eq!(refresh(&mut inbox, &store, deadline)[0].event.id, event.id);
+            assert_eq!(inbox.next_snooze_after(deadline), None);
+        }
     }
 
     #[test]
