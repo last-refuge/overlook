@@ -439,7 +439,7 @@ Which service an account is with, pictured (`account_mark.rs`). It appears besid
 
 ### Command toolbar
 A white (message-surface) strip, 8px radius, `shadow_sm`, one row of 36px commands with two-tone colour icons and sentence-case labels.
-- **Split New:** the module's own New in the solid action fill (Alexander's New message is its own steel blue #3E687E), joined to a 26px menu half behind a 28%-opacity on-action hairline. The menu offers the other two of New message, New event and New contact, with shortcuts.
+- **Split New.** All three modules use New message's width and solid fill, which is steel blue (#3E687E) in Alexander. A 26px menu half sits behind a 28%-opacity on-action hairline and offers the other two New commands with their shortcuts.
 - **Groups:** a 1px × 22px divider-coloured separator with 4px margins between groups; navigation and app commands sit at the far end.
 - **Move to** carries a 13px muted chevron.
 - **Selected state** (such as a starred conversation's Unstar): selection fill and text.
