@@ -63,6 +63,7 @@ struct Lifecycle {
     reminder_panel: Option<ReminderPanel>,
     reminders: Inbox,
     reminder_prefs: reminders::Preferences,
+    reminder_wake: Arc<tokio::sync::Notify>,
     /// Requests waiting for the window to be shown: a mailto link while hidden.
     after_show: Vec<Request>,
     /// Every mail window can own a draft that must be saved before Quit.
@@ -91,6 +92,7 @@ pub fn start(store: Arc<Store>, sample: SampleProvider, hidden: bool, cx: &mut A
         reminder_panel: None,
         reminders,
         reminder_prefs: reminder_preferences(&saved),
+        reminder_wake: Arc::new(tokio::sync::Notify::new()),
         after_show: Vec::new(),
         editors: Vec::new(),
         replaced_noticed: false,
@@ -565,6 +567,7 @@ pub(crate) fn set_reminder_preferences(prefs: &Prefs, cx: &mut App) {
 }
 
 fn watch_reminders(cx: &mut App) {
+    let wake = cx.global::<Lifecycle>().reminder_wake.clone();
     cx.spawn(async move |cx| loop {
         let (store, tracked, prefs) = cx.update(|cx| {
             let l = cx.global::<Lifecycle>();
@@ -574,13 +577,14 @@ fn watch_reminders(cx: &mut App) {
         let result = cx.background_executor().spawn(async move {
             reminders::candidates(&store, tracked, now, prefs)
         }).await;
+        let checked_at = overlook_core::time::now();
         cx.update(|cx| match result {
             Ok(candidates) => {
                 let l = cx.global_mut::<Lifecycle>();
                 if l.reminder_prefs != prefs {
                     return;
                 }
-                let (changed, due) = l.reminders.refresh(candidates, overlook_core::time::now(), prefs.enabled);
+                let (changed, due) = l.reminders.refresh(candidates, checked_at, prefs.enabled);
                 if changed {
                     l.reminders.save(l.store.clone());
                 }
@@ -592,7 +596,23 @@ fn watch_reminders(cx: &mut App) {
             }
             Err(error) => tracing::warn!(%error, "could not check calendar reminders"),
         });
-        cx.background_executor().timer(Duration::from_secs(15)).await;
+        let next_snooze = cx.update(|cx| {
+            let l = cx.global::<Lifecycle>();
+            if l.reminder_prefs.enabled {
+                l.reminders.next_snooze_after(checked_at)
+            } else {
+                None
+            }
+        });
+        let interval = Duration::from_secs(15);
+        let delay = next_snooze.map_or(interval, |deadline| {
+            let remaining = deadline.saturating_sub(overlook_core::time::now()).max(0) as u64;
+            Duration::from_millis(remaining).min(interval)
+        });
+        tokio::select! {
+            _ = cx.background_executor().timer(delay) => {},
+            _ = wake.notified() => {},
+        }
     }).detach();
 }
 
@@ -619,7 +639,7 @@ fn refresh_reminder_panel(cx: &mut App) {
 }
 
 pub(crate) fn snooze_reminder(id: EventId, minutes: i64, cx: &mut App) {
-    change_reminders(cx, |inbox| inbox.snooze(&id, overlook_core::time::now() + minutes * reminders::MINUTE));
+    change_reminders(cx, |inbox| inbox.snooze(&id, overlook_core::time::now(), minutes));
 }
 
 pub(crate) fn dismiss_reminders(id: Option<EventId>, cx: &mut App) {
@@ -630,6 +650,7 @@ fn change_reminders(cx: &mut App, change: impl FnOnce(&mut Inbox) -> bool) {
     let lifecycle = cx.global_mut::<Lifecycle>();
     if change(&mut lifecycle.reminders) {
         lifecycle.reminders.save(lifecycle.store.clone());
+        lifecycle.reminder_wake.notify_one();
         refresh_reminder_panel(cx);
     }
 }
