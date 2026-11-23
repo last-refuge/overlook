@@ -13,6 +13,10 @@ use overlook_core::toolbar::{
 const SEPARATOR_WIDTH: f32 = 13.;
 /// The menu half of the split New button.
 const SPLIT_WIDTH: f32 = 26.;
+const NEW_MESSAGE_LABEL: &str = "New message";
+const COMMAND_PADDING: f32 = 8.;
+const COMMAND_ICON_SIZE: f32 = 20.;
+const COMMAND_LABEL_GAP: f32 = 6.;
 const TOOLBAR_GAP: f32 = 2.;
 const MAC_BRAND_WIDTH: f32 = 132.;
 
@@ -71,9 +75,9 @@ impl Glyph {
     fn render(self, p: &Palette, primary: bool) -> AnyElement {
         match self {
             Self::Color(c) => if primary {
-                color_icon_on_action(c, 20., p)
+                color_icon_on_action(c, COMMAND_ICON_SIZE, p)
             } else {
-                color_icon(c, 20., p)
+                color_icon(c, COMMAND_ICON_SIZE, p)
             }
             .into_any_element(),
             Self::Symbol(name) => icon(name).size(px(18.)).into_any_element(),
@@ -102,7 +106,7 @@ impl MailWindow {
     fn toolbar_command(&self, action: A) -> Command {
         use Glyph::{Color, Symbol};
         let (label, glyph, hint) = match action {
-            A::NewMessage => ("New message", Color(C::Compose), "Ctrl N"),
+            A::NewMessage => (NEW_MESSAGE_LABEL, Color(C::Compose), "Ctrl N"),
             A::Archive => ("Archive", Color(C::Archive), "E"),
             A::DeleteMail => ("Delete", Color(C::Delete), "Del"),
             A::MoveMail => ("Move to", Color(C::Move), "V"),
@@ -127,7 +131,7 @@ impl MailWindow {
             A::EditEvent | A::EditContact => ("Edit", Color(C::Edit), ""),
             A::DeleteEvent | A::DeleteContact => ("Delete", Color(C::Delete), ""),
             A::NewContact => ("New contact", Color(C::ContactAdd), ""),
-            A::ContactMessage => ("New message", Color(C::Compose), ""),
+            A::ContactMessage => (NEW_MESSAGE_LABEL, Color(C::Compose), ""),
             A::ContactMail => ("Mail from", Color(C::Mail), ""),
             A::Sync => ("Sync", Color(C::Sync), "F5"),
             A::Appearance => ("Appearance", Color(C::Appearance), ""),
@@ -337,9 +341,10 @@ impl MailWindow {
         &self,
         action: A,
         compact: bool,
-        in_more: bool,
+        strip_new_width: Option<Pixels>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let in_more = strip_new_width.is_none();
         let p = *cx.palette();
         let command = self.toolbar_command(action);
         let label: SharedString = command.label.clone().into();
@@ -364,7 +369,7 @@ impl MailWindow {
             .ghost()
             .small()
             .h(px(if in_more { 34. } else { HEADER_CONTROL_HEIGHT }))
-            .px(px(8.))
+            .px(px(COMMAND_PADDING))
             .flex_none()
             .accessibility_label(label.clone())
             .tooltip(format!("{tip} · Drag to rearrange"))
@@ -376,13 +381,15 @@ impl MailWindow {
             .when(command.selected, |b| {
                 b.bg(p.selection).text_color(p.selection_text)
             })
-            .when(command.primary && !in_more, |b| primary_fill(b, action, &p, cx))
+            .when_some(strip_new_width.filter(|_| command.primary), |b, width| {
+                primary_fill(b.w(width), &p, cx)
+            })
             .when(in_more, |b| b.w_full().justify_start())
             .child(
                 h_flex()
                     .items_center()
-                    .gap(px(6.))
-                    .when(in_more, |row| row.w_full())
+                    .gap(px(COMMAND_LABEL_GAP))
+                    .when(in_more || command.primary, |row| row.w_full())
                     .child(command.glyph.render(&p, command.primary && !in_more))
                     .when(!only_icon, |row| row.child(label))
                     // Move to opens a list of folders to pick from.
@@ -424,7 +431,7 @@ impl MailWindow {
             _ => vec![NewItem::Event, NewItem::Contact],
         };
         let this = cx.entity().downgrade();
-        let menu = primary_fill(Button::new("toolbar-new-more"), action, &p, cx)
+        let menu = primary_fill(Button::new("toolbar-new-more"), &p, cx)
             .small()
             .h(px(HEADER_CONTROL_HEIGHT))
             .w(px(SPLIT_WIDTH))
@@ -440,7 +447,7 @@ impl MailWindow {
             .dropdown_menu(move |mut menu, _window, _cx| {
                 for item in &items {
                     let (label, glyph, hint) = match item {
-                        NewItem::Message => ("New message", "square-pen", "Ctrl N"),
+                        NewItem::Message => (NEW_MESSAGE_LABEL, "square-pen", "Ctrl N"),
                         NewItem::Event => ("New event", "calendar-plus", "Ctrl Shift A"),
                         NewItem::Contact => ("New contact", "user-plus", ""),
                     };
@@ -592,7 +599,7 @@ impl MailWindow {
         // that fits and overflows only what doesn't.
         let font = window.text_style().font();
         let label_size = window.rem_size() * 0.875;
-        let label_width = |label: &str| {
+        let label_width = |label: &str, font: &Font| {
             let run = TextRun {
                 len: label.len(),
                 font: font.clone(),
@@ -608,22 +615,27 @@ impl MailWindow {
                     .width,
             )
         };
-        // The drop edge, padding, icon and gap around a label, and the strip's gap after it.
-        const LABELLED: f32 = 2. + 16. + 20. + 6. + 2. + 1.;
-        const ICON_ONLY: f32 = 2. + 16. + 20. + 2. - 3.;
+        const LABELLED_BUTTON_EXTRAS: f32 = COMMAND_PADDING * 2. + COMMAND_ICON_SIZE + COMMAND_LABEL_GAP;
+        // Drop edge, gap after the button, and a pixel for rounding.
+        const LABELLED_SLOT_EXTRAS: f32 = 2. + TOOLBAR_GAP + 1.;
+        const ICON_ONLY: f32 = 2. + COMMAND_PADDING * 2. + COMMAND_ICON_SIZE + TOOLBAR_GAP - 3.;
+        // Match Mail's button at the configured interface font and text size.
+        let mut new_label_font = font.clone();
+        new_label_font.family = SharedString::from(self.prefs.fonts.effective_ui_family().to_owned());
+        let new_button_width = label_width(NEW_MESSAGE_LABEL, &new_label_font) + LABELLED_BUTTON_EXTRAS;
         let visible = layout.visible_count(
             f32::from(command_width) - 90.,
             |action| {
                 let command = self.toolbar_command(action);
                 if command.primary {
-                    label_width(&command.label) + LABELLED + SPLIT_WIDTH
+                    new_button_width + LABELLED_SLOT_EXTRAS + SPLIT_WIDTH
                 } else if compact
                     || matches!(command.glyph, Glyph::Symbol(_))
                     || matches!(action, A::Appearance | A::Layout)
                 {
                     ICON_ONLY
                 } else {
-                    label_width(&command.label) + LABELLED
+                    label_width(&command.label, &font) + LABELLED_BUTTON_EXTRAS + LABELLED_SLOT_EXTRAS
                 }
             },
             SEPARATOR_WIDTH,
@@ -650,7 +662,7 @@ impl MailWindow {
                         .into_any_element(),
                 );
             }
-            let button = self.toolbar_button(*action, compact, false, cx);
+            let button = self.toolbar_button(*action, compact, Some(px(new_button_width)), cx);
             items.push(
                 self.draggable_command(*action, Area::Strip, button, cx)
                     .into_any_element(),
@@ -868,7 +880,7 @@ impl MailWindow {
                 );
             }
             for action in actions {
-                let button = self.toolbar_button(action, false, true, cx);
+                let button = self.toolbar_button(action, false, None, cx);
                 let row = h_flex()
                     .w_full()
                     .items_center()
@@ -1091,10 +1103,9 @@ impl MailWindow {
     }
 }
 
-/// The solid fill of a New button. Alexander's New message is its own steel blue; the rest
-/// use the theme's action colour.
-fn primary_fill(button: Button, action: A, p: &Palette, cx: &mut Context<MailWindow>) -> Button {
-    if p.resolved == ResolvedTheme::Alexander && action == A::NewMessage {
+/// Both halves of every New button share the same fill, including Alexander's steel blue.
+fn primary_fill(button: Button, p: &Palette, cx: &mut Context<MailWindow>) -> Button {
+    if p.resolved == ResolvedTheme::Alexander {
         button
             .custom(
                 ButtonCustomVariant::new(cx)
