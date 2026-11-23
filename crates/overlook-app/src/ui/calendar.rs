@@ -2,6 +2,7 @@
 //! simple new-event form. Everything reads from the local store; changes are written with
 //! their pending operation and reach Google through the sync engine.
 
+use super::sidebar::{sidebar_owner_details, SidebarMetrics, ROW_ICON_SIZE};
 use super::widgets::*;
 use super::MailWindow;
 use crate::assets::icon;
@@ -1025,6 +1026,7 @@ impl MailWindow {
 
     pub(crate) fn render_calendar_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().navigation_palette();
+        let m = SidebarMetrics::for_density(self.density);
         let (dot, text) = match &self.cal_status {
             SyncState::UpToDate => (p.success, "Up to date".to_owned()),
             SyncState::Syncing => (p.accent, "Syncing…".to_owned()),
@@ -1033,70 +1035,38 @@ impl MailWindow {
             SyncState::SignInRequired => (p.warning, "Sign-in required".to_owned()),
             SyncState::SyncFailed(r) => (p.warning, format!("Sync failed: {r}")),
         };
-        let mut list = v_flex().gap(px(2.));
+        let mut list = m.rows();
         for c in &self.calendars {
             let id = c.id.clone();
             let color = c.color.as_deref().and_then(hex_to_hsla).unwrap_or(p.accent);
             list = list.child(
-                h_flex()
-                    .id(SharedString::from(format!("cal-{}", c.id)))
-                    .items_center()
-                    .gap(px(10.))
-                    .min_h(px(32.))
-                    .px(px(11.))
-                    .rounded(px(7.))
-                    .cursor_pointer()
-                    .text_size(crate::ui::ui_px(13.))
+                m.row(SharedString::from(format!("cal-{}", c.id)))
                     .text_color(if c.visible { p.foreground } else { p.muted })
                     .hover(|d| d.bg(p.hover))
                     .child(
-                        div()
+                        h_flex()
+                            .w(px(ROW_ICON_SIZE))
                             .flex_none()
-                            .size(px(14.))
-                            .rounded(px(4.))
-                            .border_2()
-                            .border_color(color)
-                            .when(c.visible, |d| d.bg(color))
-                            .flex()
-                            .items_center()
                             .justify_center()
-                            .when(c.visible, |d| d.child(icon("check").size(px(10.)).text_color(gpui_kit::white()))),
+                            .child(
+                                div().size(px(14.)).rounded(px(4.)).border_2().border_color(color)
+                                    .when(c.visible, |d| d.bg(color))
+                                    .flex().items_center().justify_center()
+                                    .when(c.visible, |d| d.child(icon("check").size(px(10.)).text_color(gpui_kit::white()))),
+                            ),
                     )
-                    .child(div().flex_1().truncate().child(c.name.clone()))
+                    .child(div().flex_1().min_w_0().truncate().child(c.name.clone()))
                     .on_click(cx.listener(move |this, _, _w, cx| this.toggle_calendar_visible(id.clone(), cx))),
             );
         }
         let owner = self.owner();
-        v_flex()
-            .size_full()
-            .bg(p.sidebar)
-            .text_color(p.foreground)
-            .pt(px(18.))
-            .px(px(11.))
-            .pb(px(14.))
-            .child(div().mt(px(18.)).mb(px(6.)).px(px(11.)).text_size(crate::ui::ui_px(11.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child("My calendars"))
+        m.pane(&p)
+            .child(m.heading(&p).child("My calendars"))
             .child(v_flex().id("calendar-list").flex_1().min_h_0().child(list).overflow_y_scrollbar())
             .child(
-                h_flex()
-                    .items_center()
-                    .gap(px(9.))
-                    .px(px(6.))
-                    .pt(px(16.))
+                m.footer()
                     .child(owner_avatar(&owner, 30., &p))
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .child(div().text_size(crate::ui::ui_px(13.)).font_weight(FontWeight::MEDIUM).truncate().child(owner.display_name()))
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap(px(5.))
-                                    .text_size(crate::ui::ui_px(11.))
-                                    .text_color(p.muted)
-                                    .child(div().size(px(6.)).rounded_full().bg(dot))
-                                    .child(format!("Calendar · {text}")),
-                            ),
-                    ),
+                    .child(sidebar_owner_details(owner.display_name(), format!("Calendar · {text}"), dot, &p)),
             )
     }
 

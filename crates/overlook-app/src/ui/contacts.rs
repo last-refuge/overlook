@@ -2,6 +2,7 @@
 //! detail pane; address-book entries can be added, edited and deleted, and every change is
 //! saved on this device first and pushed through the operation log like mail and events.
 
+use super::sidebar::{sidebar_count, SidebarMetrics, ROW_ICON_SIZE};
 use super::widgets::*;
 use super::MailWindow;
 use crate::assets::icon;
@@ -527,38 +528,26 @@ impl MailWindow {
 
     pub(crate) fn render_contacts_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().navigation_palette();
+        let m = SidebarMetrics::for_density(self.density);
         let total = self.contacts.len();
         let book = self.contacts_book_count;
         let other = total.saturating_sub(book);
         let writable = self.contacts_writable();
         let item = |label: SharedString, count: usize, filter: ContactFilter, icon_name: &'static str, cx: &mut Context<Self>| {
             let active = self.contact_filter == filter;
-            h_flex()
-                .id(SharedString::from(format!("cfilter-{filter:?}")))
-                .items_center()
-                .gap(px(10.))
-                .min_h(px(32.))
-                .px(px(11.))
-                .rounded(px(7.))
-                .cursor_pointer()
-                .text_size(crate::ui::ui_px(13.))
+            m.row(SharedString::from(format!("cfilter-{filter:?}")))
                 .text_color(if active { p.selection_text } else { p.foreground })
-                .when(active, |d| d.bg(p.selection).font_weight(FontWeight::SEMIBOLD))
+                .when(active, |d| d.bg(p.selection))
                 .when(!active, |d| d.hover(|d| d.bg(p.hover)))
-                .child(icon(icon_name).size(px(15.)).text_color(if active { p.accent } else { p.muted }))
-                .child(div().flex_1().child(label))
-                .child(div().text_size(crate::ui::ui_px(11.)).text_color(if active { p.selection_text } else { p.muted }).child(count.to_string()))
+                .child(icon(icon_name).flex_none().size(px(ROW_ICON_SIZE)).text_color(if active { p.accent } else { p.muted }))
+                .child(div().flex_1().min_w_0().truncate().when(active, |d| d.font_weight(FontWeight::SEMIBOLD)).child(label))
+                .child(sidebar_count().text_color(if active { p.selection_text } else { p.muted }).child(count.to_string()))
                 .on_click(cx.listener(move |this, _, _w, cx| this.set_contact_filter(filter, cx)))
         };
-        v_flex()
-            .size_full()
-            .bg(p.sidebar)
-            .text_color(p.foreground)
-            .p(px(10.))
-            .gap(px(12.))
+        m.pane(&p)
+            .child(m.heading(&p).child("Contact lists"))
             .child(
-                v_flex()
-                    .gap(px(2.))
+                m.rows()
                     .child(item("All".into(), total, ContactFilter::All, "users", cx))
                     .child(item(self.contacts_source.book_name().into(), book, ContactFilter::AddressBook, "book-user", cx))
                     .child(item("Other contacts".into(), other, ContactFilter::Other, "user-round", cx)),
@@ -568,6 +557,7 @@ impl MailWindow {
             .when(self.contacts_source == ContactsSource::Device, |d| {
                 d.child(
                     div()
+                        .mt(px(12.))
                         .p(px(10.))
                         .rounded(px(8.))
                         .bg(p.chip)
@@ -584,6 +574,7 @@ impl MailWindow {
                 let email = self.account.email.clone();
                 d.child(
                     v_flex()
+                        .mt(px(12.))
                         .gap(px(6.))
                         .p(px(10.))
                         .rounded(px(8.))
