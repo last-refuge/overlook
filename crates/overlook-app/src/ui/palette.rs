@@ -13,6 +13,7 @@ pub(crate) enum PaletteCommand {
     Action(Rc<dyn Action>),
     Module(Module),
     View(MailboxView),
+    AllInboxes,
     MoveTo(MailboxView),
     Account(AccountId),
     Settings(SettingsPage),
@@ -70,39 +71,44 @@ pub(crate) fn filter_entries(entries: &[PaletteEntry], query: &str) -> Vec<Palet
 
 impl MailWindow {
     pub(crate) fn palette_entries(&self) -> Vec<PaletteEntry> {
-        let entry = |title: &str, hint: Option<&str>, command: PaletteCommand| PaletteEntry {
+        let hint = |a: ShortcutAction| Some(self.shortcut_hint(a));
+        let entry = |title: &str, hint: Option<String>, command: PaletteCommand| PaletteEntry {
             title: SharedString::from(title.to_owned()),
-            hint: hint.map(|h| SharedString::from(h.to_owned())),
+            hint: hint.map(SharedString::from),
             section: None,
             icon: None,
             command,
         };
         let action = |a: Box<dyn Action>| PaletteCommand::Action(Rc::from(a));
         let mut out = vec![
-            entry("New message", Some("Ctrl+N"), action(Box::new(Compose))),
-            entry("Reply", Some("Ctrl+R"), action(Box::new(Reply))),
-            entry("Reply all", Some("Ctrl+Shift+R"), action(Box::new(ReplyAll))),
-            entry("Forward", Some("Ctrl+F"), action(Box::new(Forward))),
-            entry("Archive", Some("E"), action(Box::new(ArchiveSelected))),
-            entry("Delete", Some("Del"), action(Box::new(TrashSelected))),
-            entry("Mark read or unread", Some("U"), action(Box::new(ToggleRead))),
-            entry("Star or unstar", Some("S"), action(Box::new(ToggleStar))),
-            entry("Undo", Some("Ctrl+Z"), action(Box::new(UndoLast))),
-            entry("Show change history", Some("Ctrl+H"), action(Box::new(ShowHistory))),
-            entry("Search mail", Some("Ctrl+E"), action(Box::new(FocusSearch))),
-            entry("Sync now", Some("F5"), action(Box::new(SyncNow))),
-            entry("New event", Some("Ctrl+Shift+A"), action(Box::new(NewEventAction))),
-            entry("Go to Mail", Some("Ctrl+1"), PaletteCommand::Module(Module::Mail)),
-            entry("Go to Calendar", Some("Ctrl+2"), PaletteCommand::Module(Module::Calendar)),
-            entry("Go to Contacts", Some("Ctrl+3"), PaletteCommand::Module(Module::Contacts)),
-            entry("Quit Overlook", Some("Ctrl+Q"), action(Box::new(QuitOverlook))),
+            entry("New message", hint(ShortcutAction::Compose), action(Box::new(Compose))),
+            entry("Reply", hint(ShortcutAction::Reply), action(Box::new(Reply))),
+            entry("Reply all", hint(ShortcutAction::ReplyAll), action(Box::new(ReplyAll))),
+            entry("Forward", hint(ShortcutAction::Forward), action(Box::new(Forward))),
+            entry("Archive", hint(ShortcutAction::Archive), action(Box::new(ArchiveSelected))),
+            entry("Delete", hint(ShortcutAction::Trash), action(Box::new(TrashSelected))),
+            entry("Mark read or unread", hint(ShortcutAction::ToggleRead), action(Box::new(ToggleRead))),
+            entry("Star or unstar", hint(ShortcutAction::ToggleStar), action(Box::new(ToggleStar))),
+            entry("Undo", hint(ShortcutAction::Undo), action(Box::new(UndoLast))),
+            entry("Show change history", hint(ShortcutAction::ShowHistory), action(Box::new(ShowHistory))),
+            entry("Search mail", hint(ShortcutAction::FocusSearch), action(Box::new(FocusSearch))),
+            entry("Sync now", hint(ShortcutAction::SyncNow), action(Box::new(SyncNow))),
+            entry("New event", hint(ShortcutAction::NewEvent), action(Box::new(NewEventAction))),
+            entry("Go to Mail", hint(ShortcutAction::SwitchToMail), PaletteCommand::Module(Module::Mail)),
+            entry("Go to Calendar", hint(ShortcutAction::SwitchToCalendar), PaletteCommand::Module(Module::Calendar)),
+            entry("Go to Contacts", hint(ShortcutAction::SwitchToContacts), PaletteCommand::Module(Module::Contacts)),
+            entry("Quit Overlook", hint(ShortcutAction::Quit), action(Box::new(QuitOverlook))),
         ];
         if !self.is_message_window() && self.renamable_open_folder().is_some() {
-            out.push(entry("Rename folder", Some("F2"), action(Box::new(RenameFolder))));
+            out.push(entry("Rename folder", hint(ShortcutAction::RenameFolder), action(Box::new(RenameFolder))));
+        }
+        if self.prefs.show_all_inboxes && self.has_account() {
+            out.push(entry("Go to All Inboxes", None, PaletteCommand::AllInboxes));
         }
         for (name, kind) in [
             ("Inbox", LabelKind::Inbox),
             ("Starred", LabelKind::Starred),
+            ("Snoozed", LabelKind::Snoozed),
             ("Drafts", LabelKind::Drafts),
             ("Outbox", LabelKind::Outbox),
             ("Sent", LabelKind::Sent),
@@ -115,19 +121,28 @@ impl MailWindow {
         let mut user: Vec<&Label> = self.labels.iter().filter(|l| l.kind == LabelKind::User).collect();
         user.sort_by_cached_key(|l| overlook_core::sidebar::folder_title(&l.name).to_lowercase());
         for l in &user {
-            out.push(entry(&format!("Go to {}", overlook_core::sidebar::folder_title(&l.name)), Some("label"), PaletteCommand::View(MailboxView::Label(l.id.clone()))));
+            out.push(entry(&format!("Go to {}", overlook_core::sidebar::folder_title(&l.name)), Some("label".to_owned()), PaletteCommand::View(MailboxView::Label(l.id.clone()))));
         }
         if self.multi_selected() || !self.thread.is_empty() {
-            out.push(entry("Move to…", Some("V"), action(Box::new(MoveSelected))));
+            if !self.offline_active() {
+                out.push(entry("Snooze…", None, action(Box::new(SnoozeSelected))));
+                let any_snoozed = self.selection_state().any_snoozed
+                    || self.active_summary().is_some_and(|s| s.snoozed_until.is_some());
+                if any_snoozed {
+                    out.push(entry("Unsnooze", None, action(Box::new(UnsnoozeSelected))));
+                }
+            }
+            out.push(entry("Move to…", hint(ShortcutAction::MoveSelected), action(Box::new(MoveSelected))));
             for l in &user {
-                out.push(entry(&format!("Move to {}", overlook_core::sidebar::folder_title(&l.name)), Some("label"), PaletteCommand::MoveTo(MailboxView::Label(l.id.clone()))));
+                out.push(entry(&format!("Move to {}", overlook_core::sidebar::folder_title(&l.name)), Some("label".to_owned()), PaletteCommand::MoveTo(MailboxView::Label(l.id.clone()))));
             }
         }
         for a in self.accounts.iter().filter(|a| a.id != self.account.id) {
-            out.push(entry(&format!("Switch to {}", a.email), Some("account"), PaletteCommand::Account(a.id.clone())));
+            out.push(entry(&format!("Switch to {}", a.email), Some("account".to_owned()), PaletteCommand::Account(a.id.clone())));
         }
+        let settings_hint = hint(ShortcutAction::OpenSettings);
         for page in SettingsPage::ALL {
-            out.push(entry(&format!("Settings: {}", page.label()), Some("Ctrl+,"), PaletteCommand::Settings(page)));
+            out.push(entry(&format!("Settings: {}", page.label()), settings_hint.clone(), PaletteCommand::Settings(page)));
         }
         out
     }
@@ -240,13 +255,27 @@ impl MailWindow {
                     let view = view.clone();
                     if self.in_main_window(cx, move |this, window, cx| {
                         this.set_module(Module::Mail, window, cx);
+                        this.all_inboxes = false;
                         this.select_view(view, window, cx);
                     }) {
                         return;
                     }
                 }
                 self.set_module(Module::Mail, window, cx);
+                self.all_inboxes = false;
                 self.select_view(view, window, cx);
+            }
+            PaletteCommand::AllInboxes => {
+                if self.is_message_window() {
+                    if self.in_main_window(cx, |this, window, cx| {
+                        this.set_module(Module::Mail, window, cx);
+                        this.open_all_inboxes(window, cx);
+                    }) {
+                        return;
+                    }
+                }
+                self.set_module(Module::Mail, window, cx);
+                self.open_all_inboxes(window, cx);
             }
             PaletteCommand::MoveTo(view) => {
                 let drag = ConversationDrag { mail: DraggedMail::Selection, title: String::new(), count: 0 };

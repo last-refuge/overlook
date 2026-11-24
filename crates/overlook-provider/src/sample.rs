@@ -522,6 +522,7 @@ pub fn sent_message_with_font(
         is_important: false,
         focus_override: None,
         invitation: None,
+        read_receipt: None,
     }
 }
 
@@ -606,6 +607,7 @@ pub fn sample_mailbox(account: &Account, now: Timestamp) -> MailboxSnapshot {
             is_important: false,
             focus_override: None,
             invitation: None,
+            read_receipt: None,
         }
     };
 

@@ -21,6 +21,7 @@ mod caldav;
 mod caldav_outbox;
 mod schema;
 mod draft_sync;
+mod snooze;
 mod time_zone;
 mod history;
 pub use history::{reversal_for, HistoryEntry, Reversal, HISTORY_MAX_ENTRIES};
@@ -589,6 +590,7 @@ impl Store {
             for m in messages {
                 upsert_message_tx(tx, m)?;
             }
+            snooze::wake_snoozes_for_incoming_tx(tx, messages)?;
             Ok(())
         })
     }
@@ -609,6 +611,12 @@ impl Store {
             }
         }
         self.with_tx(|tx| {
+            let track_snoozes = snooze::has_any_snoozes_tx(tx)?;
+            let mut merged_for_snooze: Vec<Message> = if track_snoozes {
+                Vec::with_capacity(messages.len())
+            } else {
+                Vec::new()
+            };
             for incoming in messages {
                 let load_bodies = incoming.body.is_cached();
                 let mut existing = load_messages_with(tx, "WHERE m.id=?1", params![incoming.id.0], load_bodies)?.pop();
@@ -628,6 +636,9 @@ impl Store {
                         }
                         if merged.invitation.is_none() {
                             merged.invitation = local.invitation.clone();
+                        }
+                        if merged.read_receipt.is_none() {
+                            merged.read_receipt = local.read_receipt.clone();
                         }
                         if merged.from == local.from
                             && merged.to == local.to
@@ -674,7 +685,13 @@ impl Store {
                     }
                 }
                 upsert_message_diff_tx(tx, &merged, existing.as_ref(), skip_body_write)?;
+                if track_snoozes {
+                    merged_for_snooze.push(merged);
+                }
                 existing.take();
+            }
+            if track_snoozes {
+                snooze::wake_snoozes_for_incoming_tx(tx, &merged_for_snooze)?;
             }
             Ok(())
         })
@@ -683,10 +700,31 @@ impl Store {
     /// Removes messages deleted at the provider.
     pub fn delete_messages(&self, ids: &[MessageId]) -> Result<usize> {
         self.with_tx(|tx| {
+            let affected: Vec<(AccountId, ConversationId)> = if !ids.is_empty() && snooze::has_any_snoozes_tx(tx)? {
+                let mut lookup = tx.prepare_cached("SELECT account_id, conversation_id FROM messages WHERE id=?1")?;
+                let mut seen = HashSet::new();
+                let mut out = Vec::new();
+                for id in ids {
+                    if let Some(pair) = lookup
+                        .query_row([&id.0], |r| Ok((AccountId(r.get(0)?), ConversationId(r.get(1)?))))
+                        .optional()?
+                    {
+                        if seen.insert(pair.clone()) {
+                            out.push(pair);
+                        }
+                    }
+                }
+                out
+            } else {
+                Vec::new()
+            };
             let mut stmt = tx.prepare_cached("DELETE FROM messages WHERE id=?1")?;
             let mut n = 0;
             for id in ids {
                 n += stmt.execute([&id.0])?;
+            }
+            if !affected.is_empty() {
+                snooze::prune_empty_snoozes_tx(tx, &affected)?;
             }
             Ok(n)
         })
@@ -708,6 +746,53 @@ impl Store {
             let mut msgs = load_messages(tx, "WHERE m.account_id=?1 AND m.conversation_id=?2", params![account.0, conversation.0])?;
             msgs.sort_by_key(|m| m.date);
             Ok(msgs)
+        })
+    }
+
+    /// Incoming RFC 8098 read/disposition receipts within `account` whose
+    /// `Original-Message-ID` matches `original_rfc_message_id`, oldest first.
+    pub fn read_receipts_for_message(
+        &self,
+        account: &AccountId,
+        original_rfc_message_id: &str,
+    ) -> Result<Vec<ConfirmedReadReceipt>> {
+        let normalized = overlook_core::threading::normalize_message_id(original_rfc_message_id);
+        if normalized.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_read(|c| {
+            let mut stmt = c.prepare_cached(
+                "SELECT m.id, m.date, m.from_json, rr.receipt_json
+                 FROM message_read_receipts rr
+                 JOIN messages m ON m.id = rr.message_id
+                 WHERE m.account_id = ?1 AND rr.original_message_id = ?2
+                 ORDER BY m.date ASC, m.id ASC",
+            )?;
+            let rows = stmt.query_map(params![account.0, normalized], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id, received_at, from_json, receipt_json) = row?;
+                let sender: Address = serde_json::from_str(&from_json)?;
+                match serde_json::from_str::<ReadReceipt>(&receipt_json) {
+                    Ok(receipt) => out.push(ConfirmedReadReceipt {
+                        receipt_message_id: MessageId(id),
+                        received_at,
+                        sender,
+                        receipt,
+                    }),
+                    Err(e) => {
+                        tracing::warn!(message_id = %id, error = %e, "corrupt message_read_receipts.receipt_json");
+                    }
+                }
+            }
+            Ok(out)
         })
     }
 
@@ -733,7 +818,8 @@ impl Store {
                 .into_iter()
                 .map(|r| (r.email.to_ascii_lowercase(), r.focused))
                 .collect();
-            Ok(MailIndex::new(labels, messages, pending, rules))
+            let snoozes = snooze::snoozes_map_tx(tx, account)?;
+            Ok(MailIndex::new(labels, messages, pending, rules).with_snoozes(snoozes))
         })
     }
 
@@ -2217,6 +2303,21 @@ fn upsert_message_diff_tx(tx: &Connection, m: &Message, prev: Option<&Message>, 
         }
     }
 
+    if prev.is_none_or(|p| p.read_receipt != m.read_receipt) {
+        tx.prepare_cached("DELETE FROM message_read_receipts WHERE message_id=?1")?
+            .execute([&m.id.0])?;
+        if let Some(receipt) = &m.read_receipt {
+            tx.prepare_cached(
+                "INSERT INTO message_read_receipts(message_id, receipt_json, original_message_id) VALUES(?1,?2,?3)",
+            )?
+            .execute(params![
+                m.id.0,
+                serde_json::to_string(receipt)?,
+                receipt.original_message_id.as_deref(),
+            ])?;
+        }
+    }
+
     if prev.is_none_or(|p| p.attachments != m.attachments) {
         tx.prepare_cached("DELETE FROM attachments WHERE message_id=?1")?
             .execute([&m.id.0])?;
@@ -2445,8 +2546,10 @@ fn load_messages_with(c: &Connection, where_clause: &str, args: &[&dyn rusqlite:
     let sql = format!(
         "SELECT m.id, m.account_id, m.conversation_id, m.provider_id, m.from_json, m.to_json, m.cc_json, m.bcc_json, m.reply_to_json,
                 m.subject, m.snippet, {body_columns}, m.date, m.is_read, m.is_starred, m.is_outgoing, m.rfc_message_id, m.in_reply_to,
-                m.category, m.is_important, m.focus_override, m.invitation_json, m.references_json
-         FROM messages m {body_join} {where_clause} ORDER BY m.date DESC"
+                m.category, m.is_important, m.focus_override, m.invitation_json, m.references_json, rr.receipt_json
+         FROM messages m {body_join}
+         LEFT JOIN message_read_receipts rr ON rr.message_id = m.id
+         {where_clause} ORDER BY m.date DESC"
     );
     let mut stmt = c.prepare(&sql)?;
     let mut messages: Vec<Message> = stmt
@@ -2477,6 +2580,7 @@ fn load_messages_with(c: &Connection, where_clause: &str, args: &[&dyn rusqlite:
                 is_important: r.get(20)?,
                 focus_override: r.get(21)?,
                 invitation_json: r.get(22)?,
+                read_receipt_json: r.get(24)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?
@@ -2549,6 +2653,7 @@ struct RawMessage {
     is_important: bool,
     focus_override: Option<bool>,
     invitation_json: Option<String>,
+    read_receipt_json: Option<String>,
 }
 
 impl RawMessage {
@@ -2568,6 +2673,13 @@ impl RawMessage {
             Ok(v) => Some(v),
             Err(e) => {
                 tracing::warn!(message_id = %self.id, error = %e, "corrupt messages.invitation_json");
+                None
+            }
+        });
+        let read_receipt = self.read_receipt_json.as_deref().and_then(|j| match serde_json::from_str(j) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(message_id = %self.id, error = %e, "corrupt message_read_receipts.receipt_json");
                 None
             }
         });
@@ -2597,6 +2709,7 @@ impl RawMessage {
             is_important: self.is_important,
             focus_override: self.focus_override,
             invitation,
+            read_receipt,
         })
     }
 }
@@ -2666,14 +2779,40 @@ fn apply_change_tx(tx: &Connection, account: &AccountId, change: &LocalChange) -
                 stmt.execute(params![id.0, starred])?;
             }
         }
-        LocalChange::AddLabel { message_ids, label_id } => add_label(message_ids, label_id)?,
-        LocalChange::RemoveLabel { message_ids, label_id } => remove_label(message_ids, label_id)?,
-        LocalChange::Archive { message_ids } => remove_label(message_ids, &label_id_of(LabelKind::Inbox)?)?,
+        LocalChange::AddLabel { message_ids, label_id } => {
+            add_label(message_ids, label_id)?;
+            let kind: Option<String> = tx
+                .prepare_cached("SELECT kind FROM labels WHERE id=?1")?
+                .query_row([&label_id.0], |r| r.get(0))
+                .optional()?;
+            if matches!(
+                kind.as_deref().and_then(LabelKind::from_key),
+                Some(LabelKind::Trash | LabelKind::Spam)
+            ) {
+                snooze::clear_snoozes_for_messages_tx(tx, account, message_ids)?;
+            }
+        }
+        LocalChange::RemoveLabel { message_ids, label_id } => {
+            remove_label(message_ids, label_id)?;
+            let kind: Option<String> = tx
+                .prepare_cached("SELECT kind FROM labels WHERE id=?1")?
+                .query_row([&label_id.0], |r| r.get(0))
+                .optional()?;
+            if kind.as_deref().and_then(LabelKind::from_key) == Some(LabelKind::Inbox) {
+                let convs = snooze::conversation_ids_for_messages_tx(tx, account, message_ids)?;
+                snooze::clear_snoozes_without_inbox_tx(tx, account, &convs)?;
+            }
+        }
+        LocalChange::Archive { message_ids } => {
+            remove_label(message_ids, &label_id_of(LabelKind::Inbox)?)?;
+            snooze::clear_snoozes_for_messages_tx(tx, account, message_ids)?;
+        }
         LocalChange::Trash { message_ids } => {
             let trash = label_id_of(LabelKind::Trash)?;
             let inbox = label_id_of(LabelKind::Inbox)?;
             remove_label(message_ids, &inbox)?;
             add_label(message_ids, &trash)?;
+            snooze::clear_snoozes_for_messages_tx(tx, account, message_ids)?;
         }
         LocalChange::Untrash { message_ids } => {
             let trash = label_id_of(LabelKind::Trash)?;
@@ -2682,6 +2821,7 @@ fn apply_change_tx(tx: &Connection, account: &AccountId, change: &LocalChange) -
             add_label(message_ids, &inbox)?;
         }
         LocalChange::DeleteForever { message_ids, .. } => {
+            snooze::clear_snoozes_for_messages_tx(tx, account, message_ids)?;
             let mut stmt = tx.prepare_cached("DELETE FROM messages WHERE id=?1")?;
             for id in message_ids {
                 stmt.execute([&id.0])?;
@@ -2840,6 +2980,10 @@ fn save_draft_tx(tx: &Connection, d: &Draft) -> Result<()> {
     if let Some(html) = &d.signature_html {
         tx.execute("INSERT INTO draft_signatures(draft_id, signature_id, html) VALUES(?1,?2,?3)", params![d.id.0, d.signature_id, html])?;
     }
+    tx.execute("DELETE FROM draft_read_receipts WHERE draft_id=?1", [&d.id.0])?;
+    if d.request_read_receipt {
+        tx.execute("INSERT INTO draft_read_receipts(draft_id, request_read_receipt) VALUES(?1, 1)", [&d.id.0])?;
+    }
     tx.execute("DELETE FROM draft_attachments WHERE draft_id=?1", [&d.id.0])?;
     for a in &d.attachments {
         tx.execute(
@@ -2853,10 +2997,12 @@ fn save_draft_tx(tx: &Connection, d: &Draft) -> Result<()> {
 fn load_drafts(c: &Connection, where_clause: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<Draft>> {
     let sql = format!(
         "SELECT d.id, d.account_id, d.kind, d.conversation_id, d.in_reply_to, d.to_json, d.cc_json, d.bcc_json, d.subject, d.body_text,
-                d.body_html, d.state_json, d.created_at, d.updated_at, d.provider_id, d.include_quote, i.source_json, s.signature_id, s.html
+                d.body_html, d.state_json, d.created_at, d.updated_at, d.provider_id, d.include_quote, i.source_json, s.signature_id, s.html,
+                COALESCE(rr.request_read_receipt, 0)
          FROM drafts d
          LEFT JOIN draft_imports i ON i.draft_id=d.id
          LEFT JOIN draft_signatures s ON s.draft_id=d.id
+         LEFT JOIN draft_read_receipts rr ON rr.draft_id=d.id
          {where_clause}"
     );
     let mut stmt = c.prepare(&sql)?;
@@ -2879,12 +3025,16 @@ fn load_drafts(c: &Connection, where_clause: &str, args: &[&dyn rusqlite::ToSql]
             r.get::<_, Option<String>>(14)?,
             r.get::<_, i64>(15)? != 0,
             r.get::<_, Option<String>>(16)?,
-            (r.get::<_, Option<String>>(17)?, r.get::<_, Option<String>>(18)?),
+            (
+                r.get::<_, Option<String>>(17)?,
+                r.get::<_, Option<String>>(18)?,
+                r.get::<_, i64>(19)? != 0,
+            ),
         ))
     })?;
     let mut drafts = Vec::new();
     for row in rows {
-        let (id, account_id, kind, conv, reply, to, cc, bcc, subject, body_text, body_html, state, created, updated, provider, include_quote, imported, (signature_id, signature_html)) = row?;
+        let (id, account_id, kind, conv, reply, to, cc, bcc, subject, body_text, body_html, state, created, updated, provider, include_quote, imported, (signature_id, signature_html, request_read_receipt)) = row?;
         drafts.push(Draft {
             id: DraftId(id),
             account_id: AccountId(account_id),
@@ -2899,6 +3049,7 @@ fn load_drafts(c: &Connection, where_clause: &str, args: &[&dyn rusqlite::ToSql]
             body_html,
             imported: imported.as_deref().map(serde_json::from_str).transpose()?,
             include_quote,
+            request_read_receipt,
             signature_id,
             signature_html,
             attachments: Vec::new(),
@@ -2991,6 +3142,7 @@ mod tests {
             is_important: false,
             focus_override: None,
             invitation: None,
+            read_receipt: None,
         }
     }
 
@@ -4498,5 +4650,98 @@ mod tests {
         .join();
         drop(guard);
         assert!(!store.draft_is_open(&draft_id));
+    }
+
+    #[test]
+    fn draft_read_receipt_defaults_false_and_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("read-receipts.sqlite");
+        let acct = account();
+        let draft_id;
+        {
+            let store = Store::open(&path).unwrap();
+            store.upsert_account(&acct).unwrap();
+
+            let mut default_draft = Draft::new(acct.id.clone(), DraftKind::New, 10);
+            default_draft.subject = "No receipt".into();
+            store.save_draft(&default_draft).unwrap();
+            let loaded_default = store.draft(&default_draft.id).unwrap().unwrap();
+            assert!(!loaded_default.request_read_receipt);
+
+            let mut opted_in = Draft::new(acct.id.clone(), DraftKind::New, 20);
+            opted_in.subject = "With receipt".into();
+            opted_in.request_read_receipt = true;
+            draft_id = opted_in.id.clone();
+            store.save_draft(&opted_in).unwrap();
+        }
+        {
+            let store = Store::open(&path).unwrap();
+            let mut loaded = store.draft(&draft_id).unwrap().unwrap();
+            assert!(loaded.request_read_receipt, "opt-in survives database reopen");
+
+            loaded.request_read_receipt = false;
+            store.save_draft(&loaded).unwrap();
+            assert!(!store.draft(&draft_id).unwrap().unwrap().request_read_receipt);
+        }
+    }
+
+    #[test]
+    fn message_read_receipt_persists_survives_header_refresh_and_isolates_accounts() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let acct1 = AccountId::from("acct-1");
+        let acct2 = Account {
+            id: AccountId::from("acct-2"),
+            provider: ProviderKind::Sample,
+            display_name: "Work".into(),
+            email: "work@example.com".into(),
+            created_at: 2,
+        };
+        store.upsert_account(&acct2).unwrap();
+
+        let mut mdn = message("mdn-1", "Read: Contract", "This is a receipt.", &["label-inbox"]);
+        mdn.date = 2_000_000;
+        mdn.read_receipt = Some(
+            overlook_core::read_receipt::parse_mdn(
+                "Reporting-UA: mail.northstar.example; Thunderbird\r\n\
+                 Final-Recipient: rfc822; maya@northstar.example\r\n\
+                 Original-Message-ID: <sent-1@overlook.example>\r\n\
+                 Disposition: manual-action/MDN-sent-manually; displayed\r\n",
+            )
+            .unwrap(),
+        );
+        store.upsert_messages(&[mdn.clone()]).unwrap();
+
+        let reloaded = store.message(&MessageId::from("mdn-1")).unwrap().unwrap();
+        assert_eq!(reloaded.read_receipt, mdn.read_receipt);
+
+        // Header-only remote refresh must preserve the cached MDN metadata.
+        let mut header_only = mdn.clone();
+        header_only.body = Body::default();
+        header_only.snippet.clear();
+        header_only.read_receipt = None;
+        store.merge_remote_messages(&[header_only], &BTreeSet::new()).unwrap();
+        assert_eq!(
+            store.message(&MessageId::from("mdn-1")).unwrap().unwrap().read_receipt,
+            mdn.read_receipt
+        );
+
+        // Lookup by Original-Message-ID matches within acct-1 and never leaks to acct-2.
+        let matched = store
+            .read_receipts_for_message(&acct1, "sent-1@overlook.example")
+            .unwrap();
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].receipt_message_id, MessageId::from("mdn-1"));
+        assert_eq!(
+            matched[0].receipt.summary_banner(),
+            "Read receipt from the recipient's mail client"
+        );
+        assert!(
+            store
+                .read_receipts_for_message(&acct2.id, "<sent-1@overlook.example>")
+                .unwrap()
+                .is_empty(),
+            "receipts must stay isolated per account"
+        );
     }
 }

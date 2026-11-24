@@ -42,18 +42,18 @@ impl MailWindow {
             .child(
                 v_flex().gap(px(4.)).pt(px(8.)).children(
                     [
-                        ("rail-mail", "Mail", "Mail (Ctrl 1)", Module::Mail, C::Mail),
+                        ("rail-mail", "Mail", self.tooltip_with_hint("Mail", ShortcutAction::SwitchToMail), Module::Mail, C::Mail),
                         (
                             "rail-calendar",
                             "Calendar",
-                            "Calendar (Ctrl 2)",
+                            self.tooltip_with_hint("Calendar", ShortcutAction::SwitchToCalendar),
                             Module::Calendar,
                             C::Calendar,
                         ),
                         (
                             "rail-contacts",
                             "Contacts",
-                            "Contacts (Ctrl 3)",
+                            self.tooltip_with_hint("Contacts", ShortcutAction::SwitchToContacts),
                             Module::Contacts,
                             C::Contacts,
                         ),
@@ -110,7 +110,7 @@ impl MailWindow {
                     .toggled(self.history.is_some())
                     .when(self.history.is_some(), |b| b.bg(p.selection))
                     .accessibility_label("Change history")
-                    .tooltip("Change history (Ctrl H)")
+                    .tooltip(self.tooltip_with_hint("Change history", ShortcutAction::ShowHistory))
                     .child(color_icon(C::History, 20., &p))
                     .on_click(cx.listener(|this, _, window, cx| {
                         if this.history.is_some() {
@@ -128,7 +128,7 @@ impl MailWindow {
                     .p(px(4.))
                     .mb(px(10.))
                     .accessibility_label("Settings")
-                    .tooltip("Settings (Ctrl ,)")
+                    .tooltip(self.tooltip_with_hint("Settings", ShortcutAction::OpenSettings))
                     .child(color_icon(C::Settings, 20., &p))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open_settings(SettingsPage::General, window, cx)
@@ -138,17 +138,29 @@ impl MailWindow {
 
     pub(super) fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *cx.palette();
-        let owner = self.owner();
-        let mark = self.has_account().then(|| self.account_mark(&self.account));
+        let active_acct = self.writing_account();
+        let owner = Address::named(&active_acct.display_name, &active_acct.email);
+        let mark = self.has_account().then(|| self.account_mark(&active_acct));
+        let header_accounts: Vec<(AccountId, String)> = self
+            .sidebar_accounts()
+            .into_iter()
+            .map(|a| {
+                let label = self.account_menu_label(&a);
+                (a.id, label)
+            })
+            .collect();
+        let active_account = active_acct.id;
+        let this_header = cx.entity().downgrade();
+        let search_hint = self.shortcut_hint(ShortcutAction::FocusSearch);
         let search: AnyElement = match self.module {
             Module::Mail => Input::new(&self.search_input)
                 .prefix(icon("search").size(px(16.)).text_color(p.muted))
-                .suffix(kbd("Ctrl E", &p))
+                .suffix(kbd(search_hint, &p))
                 .cleanable(true)
                 .into_any_element(),
             Module::Contacts => Input::new(&self.contact_search)
                 .prefix(icon("search").size(px(16.)).text_color(p.muted))
-                .suffix(kbd("Ctrl E", &p))
+                .suffix(kbd(search_hint, &p))
                 .cleanable(true)
                 .into_any_element(),
             Module::Calendar => Button::new("calendar-commands")
@@ -159,7 +171,7 @@ impl MailWindow {
                 .bg(p.message_surface())
                 .icon(icon("search").size(px(16.)))
                 .label("Search commands")
-                .tooltip("Search commands (Ctrl K)")
+                .tooltip(self.tooltip_with_hint("Search commands", ShortcutAction::OpenCommandPalette))
                 .on_click(cx.listener(|this, _, window, cx| this.open_palette(window, cx)))
                 .into_any_element(),
         };
@@ -215,12 +227,36 @@ impl MailWindow {
                                 .size(px(HEADER_CONTROL_HEIGHT))
                                 .p(px(3.))
                                 .rounded_full()
-                                .accessibility_label("Account settings")
+                                .accessibility_label("Accounts")
                                 .tooltip(format!("{} · {}", owner.display_name(), owner.email))
                                 .child(owner_avatar(&owner, 29., &p))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.open_settings(SettingsPage::Accounts, window, cx)
-                                })),
+                                .dropdown_menu(move |mut menu, _window, _cx| {
+                                    if !header_accounts.is_empty() {
+                                        menu = menu.label("Accounts");
+                                        for (id, label) in &header_accounts {
+                                            let target = id.clone();
+                                            let t = this_header.clone();
+                                            menu = menu.item(
+                                                PopupMenuItem::new(label.clone())
+                                                    .checked(*id == active_account)
+                                                    .on_click(move |_, window, cx| {
+                                                        let _ = t.update(cx, |this, cx| {
+                                                            this.switch_account(target.clone(), window, cx)
+                                                        });
+                                                    }),
+                                            );
+                                        }
+                                        menu = menu.separator();
+                                    }
+                                    let t = this_header.clone();
+                                    menu.item(PopupMenuItem::new("Manage accounts").on_click(
+                                        move |_, window, cx| {
+                                            let _ = t.update(cx, |this, cx| {
+                                                this.open_settings(SettingsPage::Accounts, window, cx)
+                                            });
+                                        },
+                                    ))
+                                }),
                         )
                         // Painted over the button's corner; it has no hitbox, so a click
                         // on it still reaches the button.
@@ -277,6 +313,7 @@ impl MailWindow {
         let reading_pane = self.reading_pane;
         let density = self.density;
         let focused_enabled = self.focused_enabled;
+        let show_all_inboxes = self.prefs.show_all_inboxes;
         let reminders_enabled = self.prefs.event_reminders;
         let this2 = cx.entity().downgrade();
         button.dropdown_menu(move |menu, _window, _cx| {
@@ -284,6 +321,7 @@ impl MailWindow {
             let b = this2.clone();
             let c = this2.clone();
             let d = this2.clone();
+            let e = this2.clone();
             let r = this2.clone();
             menu.label("Reading pane")
                 .item(
@@ -323,6 +361,15 @@ impl MailWindow {
                         .checked(focused_enabled)
                         .on_click(move |_, _w, cx| {
                             let _ = d.update(cx, |this, cx| this.toggle_focused_inbox(cx));
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("All Inboxes")
+                        .checked(show_all_inboxes)
+                        .on_click(move |_, window, cx| {
+                            let _ = e.update(cx, |this, cx| {
+                                this.set_show_all_inboxes(!show_all_inboxes, window, cx)
+                            });
                         }),
                 )
                 .separator()

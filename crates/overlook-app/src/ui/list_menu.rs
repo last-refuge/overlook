@@ -12,27 +12,55 @@ pub(crate) struct SelectionState {
     pub any_in_inbox: bool,
     pub all_in_junk: bool,
     pub has_junk_label: bool,
+    pub any_snoozed: bool,
+    pub all_snoozed: bool,
 }
 
-/// Summarises `rows` against the account's labels. Trash and Junk are judged by the
+/// Summarises `rows` against a single account's labels. Trash and Junk are judged by the
 /// labels the summary carries, so a row needs no thread loaded.
 pub(super) fn selection_state<'a>(rows: impl IntoIterator<Item = &'a ConversationSummary>, labels: &[Label]) -> SelectionState {
-    let of_kind = |kind: LabelKind| labels.iter().find(|l| l.kind == kind).map(|l| &l.id);
-    let (trash, inbox, spam) = (of_kind(LabelKind::Trash), of_kind(LabelKind::Inbox), of_kind(LabelKind::Spam));
+    selection_state_for(rows, |_| labels)
+}
+
+fn label_of_kind(labels: &[Label], kind: LabelKind) -> Option<&LabelId> {
+    labels.iter().find(|l| l.kind == kind).map(|l| &l.id)
+}
+
+/// Summarises `rows` against each row's owning account's labels, so multi-account
+/// selections in All Inboxes check each account's own Inbox/Trash/Junk label IDs.
+pub(super) fn selection_state_for<'a, 'b>(
+    rows: impl IntoIterator<Item = &'a ConversationSummary>,
+    labels_of: impl Fn(&AccountId) -> &'b [Label],
+) -> SelectionState {
     let has = |c: &ConversationSummary, id: Option<&LabelId>| id.is_some_and(|id| c.label_ids.contains(id));
-    let mut state = SelectionState { all_starred: true, all_in_trash: true, all_in_junk: true, has_junk_label: spam.is_some(), ..Default::default() };
+    let mut state = SelectionState {
+        all_starred: true,
+        all_in_trash: true,
+        all_in_junk: true,
+        all_snoozed: true,
+        ..Default::default()
+    };
     for c in rows {
+        let labels = labels_of(&c.account_id);
+        let trash = label_of_kind(labels, LabelKind::Trash);
+        let inbox = label_of_kind(labels, LabelKind::Inbox);
+        let spam = label_of_kind(labels, LabelKind::Spam);
         state.count += 1;
         state.any_unread |= c.is_unread();
         state.all_starred &= c.starred;
         state.all_in_trash &= has(c, trash);
         state.any_in_inbox |= has(c, inbox);
         state.all_in_junk &= has(c, spam);
+        state.has_junk_label |= spam.is_some();
+        state.any_snoozed |= c.snoozed_until.is_some();
+        state.all_snoozed &= c.snoozed_until.is_some();
     }
     if state.count == 0 {
         state.all_starred = false;
         state.all_in_trash = false;
         state.all_in_junk = false;
+        state.all_snoozed = false;
+        state.has_junk_label = label_of_kind(labels_of(&AccountId(String::new())), LabelKind::Spam).is_some();
     }
     state
 }
@@ -73,13 +101,14 @@ mod tests {
             latest_message_id: MessageId::from(id),
             label_ids: label_ids.iter().map(|l| LabelId::from(*l)).collect::<BTreeSet<_>>(),
             pending: false,
+            snoozed_until: None,
         }
     }
 
     #[test]
     fn a_single_inbox_row() {
         let s = selection_state([&row("c1", 1, false, &["inbox"])], &labels(true));
-        assert_eq!(s, SelectionState { count: 1, any_unread: true, all_starred: false, all_in_trash: false, any_in_inbox: true, all_in_junk: false, has_junk_label: true });
+        assert_eq!(s, SelectionState { count: 1, any_unread: true, all_starred: false, all_in_trash: false, any_in_inbox: true, all_in_junk: false, has_junk_label: true, any_snoozed: false, all_snoozed: false });
     }
 
     #[test]
@@ -111,5 +140,30 @@ mod tests {
     fn an_empty_selection_claims_nothing() {
         let s = selection_state(std::iter::empty(), &labels(true));
         assert_eq!(s, SelectionState { has_junk_label: true, ..Default::default() });
+    }
+
+    #[test]
+    fn multi_account_selection_checks_each_rows_own_account_labels() {
+        let labels_a = vec![
+            Label { id: LabelId::from("a:INBOX"), account_id: AccountId::from("a"), kind: LabelKind::Inbox, name: "Inbox".into(), provider_id: None, color: None, sort_order: 0 },
+            Label { id: LabelId::from("a:TRASH"), account_id: AccountId::from("a"), kind: LabelKind::Trash, name: "Trash".into(), provider_id: None, color: None, sort_order: 1 },
+        ];
+        let labels_b = vec![
+            Label { id: LabelId::from("b:INBOX"), account_id: AccountId::from("b"), kind: LabelKind::Inbox, name: "Inbox".into(), provider_id: None, color: None, sort_order: 0 },
+            Label { id: LabelId::from("b:TRASH"), account_id: AccountId::from("b"), kind: LabelKind::Trash, name: "Trash".into(), provider_id: None, color: None, sort_order: 1 },
+            Label { id: LabelId::from("b:SPAM"), account_id: AccountId::from("b"), kind: LabelKind::Spam, name: "Spam".into(), provider_id: None, color: None, sort_order: 2 },
+        ];
+        let mut r1 = row("c1", 0, true, &["a:INBOX"]);
+        r1.account_id = AccountId::from("a");
+        let mut r2 = row("c2", 1, true, &["b:INBOX"]);
+        r2.account_id = AccountId::from("b");
+        let rows = [r1, r2];
+        let s = selection_state_for(&rows, |acct| if acct.0 == "a" { &labels_a } else { &labels_b });
+        assert_eq!(s.count, 2);
+        assert!(s.any_unread);
+        assert!(s.all_starred);
+        assert!(s.any_in_inbox);
+        assert!(!s.all_in_trash);
+        assert!(s.has_junk_label);
     }
 }

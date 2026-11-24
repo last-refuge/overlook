@@ -89,6 +89,7 @@ mod tests {
             is_important: false,
             focus_override: None,
             invitation: None,
+            read_receipt: None,
         }
     }
 

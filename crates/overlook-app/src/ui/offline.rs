@@ -67,15 +67,6 @@ impl MailWindow {
             .unwrap_or_else(no_account)
     }
 
-    /// Who mail is written as: the owner of [`Self::writing_account`].
-    pub(crate) fn writing_owner(&self) -> Address {
-        if !self.offline_active() {
-            return self.owner();
-        }
-        let from = self.writing_account();
-        Address::named(&from.display_name, &from.email)
-    }
-
     /// Leaves the offline folders for the mail account shown before them (Calendar and
     /// Contacts belong to a mail account).
     pub(crate) fn leave_offline(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -130,13 +121,23 @@ impl MailWindow {
     /// conversations that the open view shows (a conversation's trashed messages go only
     /// when dragged from Trash).
     pub(crate) fn drop_on_offline(&mut self, drag: ConversationDrag, target: LabelId, window: &mut Window, cx: &mut Context<Self>) {
-        let conversations: Vec<ConversationId> = match &drag.mail {
-            DraggedMail::Conversation(id) => vec![id.clone()],
+        let conversations: Vec<ConversationRef> = match &drag.mail {
+            DraggedMail::Conversation(c) => vec![c.clone()],
             DraggedMail::Selection => self.target_conversations(),
         };
-        let ids: Vec<MessageId> = conversations.iter().flat_map(|c| self.mail_index.visible_message_ids_in(c, &self.view)).collect();
-        if !ids.is_empty() {
-            self.move_offline(ids, target, window, cx);
+        let mut by_account: std::collections::BTreeMap<AccountId, Vec<MessageId>> = std::collections::BTreeMap::new();
+        let view = if self.all_inboxes_active() { MailboxView::Kind(LabelKind::Inbox) } else { self.view.clone() };
+        for c in &conversations {
+            let ids = self
+                .index_for(&c.account_id)
+                .map(|idx| idx.visible_message_ids_in(&c.id, &view))
+                .unwrap_or_default();
+            if !ids.is_empty() {
+                by_account.entry(c.account_id.clone()).or_default().extend(ids);
+            }
+        }
+        for (acct, ids) in by_account {
+            self.move_offline_from(acct, ids, target.clone(), window, cx);
         }
     }
 
@@ -144,16 +145,21 @@ impl MailWindow {
     /// account it is copied here and deleted from the server; within offline folders it
     /// just changes folder.
     pub(crate) fn move_offline(&mut self, ids: Vec<MessageId>, target: LabelId, window: &mut Window, cx: &mut Context<Self>) {
+        let source = self.account.id.clone();
+        self.move_offline_from(source, ids, target, window, cx);
+    }
+
+    fn move_offline_from(&mut self, source_id: AccountId, ids: Vec<MessageId>, target: LabelId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(folder) = self.offline_folder(&target) else { return };
         if !local::dir_of(&folder).is_some_and(|d| d.is_dir()) {
             let place = local::dir_of(&folder).map(|d| shown_path(&d)).unwrap_or_default();
             crate::ui::toast(window, cx, crate::notify::Level::Error, format!("“{}” can’t be found at {place}. Connect its drive, or disconnect the folder.", Self::offline_folder_name(&folder.name)));
             return;
         }
-        if self.offline_active() {
+        if self.is_offline(&source_id) {
             return self.move_within_offline(ids, folder, window, cx);
         }
-        let source = self.account.clone();
+        let Some(source) = self.known_account(&source_id) else { return };
         let ids: Vec<MessageId> = ids.into_iter().filter(|id| !self.offline_moving.contains(id)).collect();
         if ids.is_empty() {
             return;
@@ -200,8 +206,8 @@ impl MailWindow {
                         }
                         // Move on only when the open conversation has gone; the rest of the
                         // selection is settled once the whole drag is done.
-                        let open_gone = this.selected.as_ref().is_some_and(|s| !this.conversations.iter().any(|c| &c.id == s));
-                        if this.account.id == source.id && open_gone && this.marked.len() <= 1 {
+                        let open_gone = this.selected.as_ref().is_some_and(|s| !this.conversations.iter().any(|c| ConversationRef::of(c) == *s));
+                        if (this.account.id == source.id || this.all_inboxes_active()) && open_gone && this.marked.len() <= 1 {
                             this.select_after_removal(next.clone(), window, cx);
                         }
                     }
@@ -220,7 +226,7 @@ impl MailWindow {
                 if moved > 0 {
                     // The folder's manifest learns about the new mail.
                     this.sync_offline_files(cx);
-                    if this.account.id == source.id {
+                    if this.account.id == source.id || this.all_inboxes_active() {
                         this.select_after_removal(next.clone(), window, cx);
                     }
                     let title = format!("Moved {} to offline folder “{name}”", messages_phrase(moved));

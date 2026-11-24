@@ -125,19 +125,41 @@ pub fn message_from_json(account: &Account, v: &Value, labels: &HashMap<String, 
         .and_then(|d| d.as_str())
         .and_then(|d| d.parse::<i64>().ok())
         .unwrap_or(0);
-    let snippet = v.get("snippet").and_then(|s| s.as_str()).map(html_to_text).unwrap_or_default();
+    let mut snippet = v
+        .get("snippet")
+        .and_then(|s| s.as_str())
+        .map(|s| overlook_core::clean_snippet(&html_to_text(s), 160))
+        .unwrap_or_default();
 
     let mut text = None;
     let mut html = None;
     let mut calendar_text = None;
+    let mut mdn_text = None;
     let mut attachments = Vec::new();
     let local_id = local_message_id(&account.id, gmail_id);
     if let Some(p) = payload {
-        collect_parts(p, &mut text, &mut html, &mut calendar_text, &mut attachments, &local_id);
+        collect_parts(p, &mut text, &mut html, &mut calendar_text, &mut mdn_text, &mut attachments, &local_id);
     }
     let invitation = calendar_text.as_deref().and_then(overlook_core::ics::parse_invitation);
-    if text.is_none() && html.is_some() {
-        text = html.as_deref().map(html_to_text);
+    let read_receipt = mdn_text.as_deref().and_then(overlook_core::read_receipt::parse_mdn);
+    let plain_has_visible = text
+        .as_deref()
+        .is_some_and(|t| !overlook_core::clean_snippet(t, 160).is_empty());
+    if (text.is_none() || !plain_has_visible) && html.is_some() {
+        if let Some(rendered) = html.as_deref().map(html_to_text) {
+            if text.is_none() || !overlook_core::clean_snippet(&rendered, 160).is_empty() {
+                text = Some(rendered);
+            }
+        }
+    }
+    if snippet.is_empty() {
+        if let Some(s) = text
+            .as_deref()
+            .map(|t| overlook_core::clean_snippet(t, 160))
+            .filter(|s| !s.is_empty())
+        {
+            snippet = s;
+        }
     }
 
     let state = label_state(&label_ids_raw, labels);
@@ -169,6 +191,7 @@ pub fn message_from_json(account: &Account, v: &Value, labels: &HashMap<String, 
         is_important: state.is_important,
         focus_override: None,
         invitation,
+        read_receipt,
     })
 }
 
@@ -197,10 +220,26 @@ fn part_header(part: &Value, name: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn collect_parts(part: &Value, text: &mut Option<String>, html: &mut Option<String>, calendar: &mut Option<String>, attachments: &mut Vec<Attachment>, message_id: &MessageId) {
+fn collect_parts(
+    part: &Value,
+    text: &mut Option<String>,
+    html: &mut Option<String>,
+    calendar: &mut Option<String>,
+    mdn: &mut Option<String>,
+    attachments: &mut Vec<Attachment>,
+    message_id: &MessageId,
+) {
     let mime = part.get("mimeType").and_then(|m| m.as_str()).unwrap_or("");
     let filename = part.get("filename").and_then(|f| f.as_str()).unwrap_or("");
     let body = part.get("body");
+    if mime.eq_ignore_ascii_case("message/disposition-notification") {
+        if mdn.is_none() {
+            if let Some(data) = body.and_then(|b| b.get("data")).and_then(|d| d.as_str()) {
+                *mdn = Some(String::from_utf8_lossy(&base64url_decode(data)).into_owned());
+            }
+        }
+        return;
+    }
     if mime.starts_with("text/calendar") && calendar.is_none() {
         if let Some(data) = body.and_then(|b| b.get("data")).and_then(|d| d.as_str()) {
             *calendar = Some(String::from_utf8_lossy(&base64url_decode(data)).into_owned());
@@ -236,7 +275,7 @@ fn collect_parts(part: &Value, text: &mut Option<String>, html: &mut Option<Stri
     }
     if let Some(parts) = part.get("parts").and_then(|p| p.as_array()) {
         for child in parts {
-            collect_parts(child, text, html, calendar, attachments, message_id);
+            collect_parts(child, text, html, calendar, mdn, attachments, message_id);
         }
     }
 }
@@ -381,12 +420,44 @@ mod tests {
         let mut text = None;
         let mut html = None;
         let mut cal = None;
+        let mut mdn = None;
         let mut atts = Vec::new();
-        collect_parts(&part, &mut text, &mut html, &mut cal, &mut atts, &MessageId("m1".into()));
+        collect_parts(&part, &mut text, &mut html, &mut cal, &mut mdn, &mut atts, &MessageId("m1".into()));
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0].content_id.as_deref(), Some("logo@x"));
         assert_eq!(atts[0].filename, "inline-1.png");
         assert!(atts[0].is_inline_image());
+    }
+
+    #[test]
+    fn maps_incoming_gmail_mdn_read_receipt() {
+        let mdn = b"Reporting-UA: mail.google.com; Gmail\r\nFinal-Recipient: rfc822; maya@northstar.example\r\nOriginal-Message-ID: <optin-gmail@overlook.example>\r\nDisposition: manual-action/MDN-sent-manually; displayed\r\n";
+        let json = serde_json::json!({
+            "id": "mdn1",
+            "threadId": "t1",
+            "labelIds": ["INBOX", "UNREAD"],
+            "snippet": "This is a receipt for the mail you sent",
+            "internalDate": "1760000100000",
+            "payload": {
+                "mimeType": "multipart/report",
+                "headers": [
+                    {"name": "From", "value": "Maya Chen <maya@northstar.example>"},
+                    {"name": "To", "value": "jason@example.com"},
+                    {"name": "Subject", "value": "Read: Launch brief"}
+                ],
+                "parts": [
+                    {"mimeType": "text/plain", "body": {"data": base64url_encode(b"This is a receipt for the mail you sent.")}},
+                    {"mimeType": "message/disposition-notification", "filename": "MDNPart2.txt", "body": {"data": base64url_encode(mdn)}}
+                ]
+            }
+        });
+        let m = message_from_json(&account(), &json, &HashMap::new()).unwrap();
+        let receipt = m.read_receipt.as_ref().expect("Gmail MDN parsed");
+        assert!(receipt.is_displayed());
+        assert_eq!(receipt.original_message_id.as_deref(), Some("<optin-gmail@overlook.example>"));
+        assert_eq!(receipt.final_recipient.as_deref(), Some("maya@northstar.example"));
+        assert_eq!(receipt.summary_banner(), "Read receipt from the recipient's mail client");
+        assert!(m.attachments.is_empty(), "MDN part is not surfaced as a file attachment");
     }
 
     #[test]

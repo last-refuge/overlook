@@ -137,6 +137,13 @@ impl MailWindow {
         }
     }
 
+    pub(super) fn toggle_read_receipt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(c) = self.composer.as_mut() {
+            c.draft.request_read_receipt = !c.draft.request_read_receipt;
+        }
+        self.composer_changed(window, cx);
+    }
+
     pub(super) fn toggle_message_history(&mut self, cx: &mut Context<Self>) {
         if let Some(c) = self.composer.as_mut().filter(|c| c.source.is_some()) {
             c.quote_shown = !c.quote_shown;
@@ -332,8 +339,14 @@ impl MailWindow {
     }
 
     pub(super) fn composer_is_inline(&self) -> bool {
-        self.composer_owner.is_none() && self.composer.as_ref().is_some_and(|c| c.draft.kind != DraftKind::New
-            && self.selected.is_some() && c.draft.conversation_id.as_ref() == self.selected.as_ref())
+        self.composer_owner.is_none()
+            && self.composer.as_ref().is_some_and(|c| {
+                c.draft.kind != DraftKind::New
+                    && self.selected.as_ref().is_some_and(|sel| {
+                        sel.account_id == c.draft.account_id
+                            && c.draft.conversation_id.as_ref() == Some(&sel.id)
+                    })
+            })
     }
 
     pub(super) fn reuse_reply(&mut self, kind: DraftKind, source: &Message, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -350,7 +363,9 @@ impl MailWindow {
             && (c.draft.kind == kind || (replies(c.draft.kind) && replies(kind)))) else { return false };
         if current.draft.kind != kind {
             self.sync_composer_fields(cx);
-            let targets = Draft::in_response_to_with(self.writing_account().id, kind, source, &self.writing_owner(), now(), self.prefs.quote_on_reply);
+            let reply_acct = self.reply_account_for(source);
+            let reply_owner = Address::named(&reply_acct.display_name, &reply_acct.email);
+            let targets = Draft::in_response_to_with(reply_acct.id, kind, source, &reply_owner, now(), self.prefs.quote_on_reply);
             let join = |list: &[Address]| list.iter().map(Address::to_header).collect::<Vec<_>>().join(", ");
             let c = self.composer.as_mut().expect("the existing draft is being reused");
             c.draft.kind = kind;
@@ -551,12 +566,25 @@ impl MailWindow {
         if query == c.recipient_query { return; }
         let suggestions = if let Some(query) = &query {
             let token = query.text();
-            let writer_email = self.writing_account().email;
+            let draft_account = c.draft.account_id.clone();
+            let writer_email = self.account_email(&draft_account);
             // Address book first, then people written to before, without duplicates.
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             // Both from memory: no database read per keystroke.
-            let contacts = overlook_store::contacts_matching(&self.contacts, token, 5).into_iter().filter(|c| !c.email.is_empty()).map(|c| c.address());
-            let known = self.mail_index.known_recipients(token, 5).into_iter();
+            let contacts_slice = if draft_account == self.account.id {
+                self.contacts.as_slice()
+            } else {
+                self.other_contacts_by_account
+                    .get(&draft_account)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+            };
+            let contacts = overlook_store::contacts_matching(contacts_slice, token, 5).into_iter().filter(|c| !c.email.is_empty()).map(|c| c.address());
+            let known = self
+                .index_for(&draft_account)
+                .map(|idx| idx.known_recipients(token, 5))
+                .unwrap_or_default()
+                .into_iter();
             contacts
                 .chain(known)
                 .filter(|a| !a.email.eq_ignore_ascii_case(&writer_email))
@@ -729,9 +757,17 @@ impl MailWindow {
     /// Wait for a pause in typing before syncing saved drafts. The account's normal
     /// rate-limit/offline backoff and single-flight sync still apply.
     pub(super) fn schedule_draft_sync(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let writer = self.writing_account();
+        let account = self
+            .composer
+            .as_ref()
+            .map(|c| c.draft.account_id.clone())
+            .unwrap_or_else(|| self.writing_account().id);
+        self.schedule_draft_sync_for(account, window, cx);
+    }
+
+    pub(super) fn schedule_draft_sync_for(&self, account: AccountId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(writer) = self.known_account(&account) else { return };
         if !matches!(writer.provider, ProviderKind::Gmail | ProviderKind::Imap) { return; }
-        let account = writer.id;
         if self.sync_through_owner(&account, Duration::from_millis(1500), window, cx) { return; }
         let editor = self.composer.as_ref().map(|c| (c.draft.id.clone(), c.save_generation));
         cx.spawn_in(window, async move |this, cx| {
@@ -744,6 +780,91 @@ impl MailWindow {
                 this.sync_account(account.clone(), window, cx);
             });
         }).detach();
+    }
+
+    /// Switches the From account on a new message draft before sending, moving staged
+    /// attachments and retiring any draft already saved under the previous account.
+    pub(super) fn set_composer_account(&mut self, new_account: AccountId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.accounts.iter().find(|a| a.id == new_account).cloned() else { return };
+        if self.composer.as_ref().is_none_or(|c| c.draft.kind != DraftKind::New || c.draft.account_id == target.id || c.attaching) {
+            return;
+        }
+        self.sync_composer_fields(cx);
+        let (old_account, old_id, had_saved, had_pending, mut draft) = {
+            let c = self.composer.as_ref().expect("checked above");
+            (c.draft.account_id.clone(), c.draft.id.clone(), c.last_saved.is_some(), c.pending_saves > 0, c.draft.clone())
+        };
+        if had_pending {
+            self.unwanted_drafts.insert(old_id.clone());
+        }
+        if had_saved {
+            let _ = self.store.delete_draft(&old_account, &old_id);
+        }
+
+        let new_id = DraftId::generate();
+        let old_dir = self.outgoing_dir.join(old_id.as_str());
+        let new_dir = self.outgoing_dir.join(new_id.as_str());
+        // Move only listed (user-attached) files; signature images belong to the old account's signature.
+        draft.attachments.retain(DraftAttachment::is_listed);
+        if !draft.attachments.is_empty() {
+            let _ = std::fs::create_dir_all(&new_dir);
+            for att in &mut draft.attachments {
+                let src = std::path::PathBuf::from(&att.local_path);
+                let file_name = src.file_name().map(|n| n.to_owned()).unwrap_or_else(|| std::ffi::OsString::from(&att.filename));
+                let dst = new_dir.join(file_name);
+                if src != dst {
+                    if std::fs::rename(&src, &dst).is_err() && std::fs::copy(&src, &dst).is_ok() {
+                        let _ = std::fs::remove_file(&src);
+                    }
+                    att.local_path = dst.to_string_lossy().into_owned();
+                }
+            }
+        }
+        if !had_pending {
+            let _ = std::fs::remove_dir_all(&old_dir);
+        }
+
+        draft.id = new_id.clone();
+        draft.account_id = target.id.clone();
+        draft.provider_id = None;
+        draft.updated_at = now();
+        let default_sig = self.default_signature_id_for(&target.id, false);
+        self.apply_signature(&mut draft, default_sig.as_deref());
+        let signature_view = super::signature::signature_view(&draft);
+        let new_guard = self.store.edit_draft(&new_id);
+        let non_empty = !draft.is_empty();
+
+        if let Some(c) = self.composer.as_mut() {
+            c._edit_guard = new_guard;
+            c.draft = draft;
+            c.signature_view = signature_view;
+            c.content_revision = c.content_revision.wrapping_add(1);
+            c.preview_cache = None;
+            c.last_saved = None;
+            c.pending_saves = 0;
+            c.dirty = non_empty;
+            c.error = None;
+            c.recipient_query = None;
+        }
+        if let Some(owner) = self.composer_owner.clone() {
+            self.account = target.clone();
+            owner.parent.update(cx, |main, _| {
+                if let Some(detached) = main.detached_composers.remove(&old_id) {
+                    main.detached_composers.insert(new_id.clone(), detached);
+                }
+            });
+        }
+        self.reload_drafts(cx);
+        if had_saved {
+            self.schedule_draft_sync_for(old_account, window, cx);
+        }
+        if non_empty {
+            self.save_composer(window, cx);
+        } else {
+            self.prepare_composer_preview(cx);
+        }
+        self.refresh_recipient_suggestions(window, cx);
+        cx.notify();
     }
 
     pub(super) fn send_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -939,7 +1060,52 @@ impl MailWindow {
             }
             (false, None) => "Not saved yet".to_owned(),
         };
-        let owner = self.writing_owner();
+        let owner = self.owner_for(&c.draft.account_id);
+        let from_editable = c.draft.kind == DraftKind::New && self.accounts.len() > 1;
+        let from_element: AnyElement = if from_editable {
+            let current_account = c.draft.account_id.clone();
+            let from_choices: Vec<(AccountId, String)> = self
+                .sidebar_accounts()
+                .into_iter()
+                .map(|a| {
+                    let addr = Address::named(&a.display_name, &a.email);
+                    (a.id, format!("{} <{}>", addr.display_name(), addr.email))
+                })
+                .collect();
+            let mark = self.known_account(&current_account).map(|a| self.account_mark(&a).render(14., &p));
+            let this = cx.entity().downgrade();
+            Button::new("composer-from")
+                .ghost()
+                .small()
+                .px(px(6.))
+                .dropdown_caret(true)
+                .tooltip("Choose which account sends this message")
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .children(mark)
+                        .child(div().text_size(crate::ui::ui_px(13.)).child(format!("{} <{}>", owner.display_name(), owner.email))),
+                )
+                .dropdown_menu(move |mut menu, _window, _cx| {
+                    menu = menu.label("Send from");
+                    for (id, label) in &from_choices {
+                        let target = id.clone();
+                        let t = this.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(label.clone())
+                                .checked(*id == current_account)
+                                .on_click(move |_, window, cx| {
+                                    let _ = t.update(cx, |this, cx| this.set_composer_account(target.clone(), window, cx));
+                                }),
+                        );
+                    }
+                    menu
+                })
+                .into_any_element()
+        } else {
+            div().text_size(crate::ui::ui_px(13.)).child(format!("{} <{}>", owner.display_name(), owner.email)).into_any_element()
+        };
 
         let field_label = |text: &'static str| {
             div().w(px(56.)).flex_none().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(text)
@@ -1048,19 +1214,39 @@ impl MailWindow {
             .child(h_flex().flex_none().flex_wrap().items_center().gap(px(6.)).px(px(12.)).py(px(8.))
                 .border_b_1().border_color(p.divider)
                 .child(Button::new("send").primary().label("Send").icon(icon("send").size(px(15.)))
-                    .tooltip("Send (Ctrl Enter)").on_click(cx.listener(|this, _, window, cx| this.send_composer(window, cx))))
+                    .tooltip(self.tooltip_with_hint("Send", ShortcutAction::SendMessage)).on_click(cx.listener(|this, _, window, cx| this.send_composer(window, cx))))
                 .child(Button::new("attach").ghost().small().icon(icon("paperclip").size(px(16.)))
                     .tooltip("Attach files").accessibility_label("Attach files")
                     .on_click(cx.listener(|this, _, window, cx| this.attach_files(window, cx))))
+                .child({
+                    let requested = c.draft.request_read_receipt;
+                    let label = read_receipt_toggle_label(requested);
+                    Button::new("request-read-receipt")
+                        .ghost()
+                        .small()
+                        .when(requested, |b| b.bg(p.accent.opacity(0.14)).text_color(p.accent))
+                        .icon(
+                            icon("receipt-text")
+                                .size(px(16.))
+                                .when(requested, |i| i.text_color(p.accent)),
+                        )
+                        .tooltip(label)
+                        .accessibility_label(label)
+                        .on_click(cx.listener(|this, _, window, cx| this.toggle_read_receipt(window, cx)))
+                })
                 .child(div().flex_1())
                 .child(h_flex().items_center().gap(px(4.))
                     .when(c.source.is_some(), |d| d.child(Button::new("message-history").ghost().small()
                         .icon(icon("text-quote").size(px(15.))).label(if c.quote_shown { "Hide history" } else { "Show history" })
-                        .tooltip("Show or hide message history (Ctrl Shift H)")
+                        .tooltip(self.tooltip_with_hint("Show or hide message history", ShortcutAction::ToggleMessageHistory))
                         .on_click(cx.listener(|this, _, _, cx| this.toggle_message_history(cx)))))
                     .when(self.composer_owner.is_none(), |d| d.child(Button::new("pop-out-composer").ghost().small()
                         .icon(icon("external-link").size(px(16.))).disabled(c.attaching || c.pending_saves > 0)
-                        .tooltip(if c.attaching || c.pending_saves > 0 { "Wait for the draft and attachments to finish saving" } else { "Open draft in its own window (Ctrl Shift O)" })
+                        .tooltip(if c.attaching || c.pending_saves > 0 {
+                            "Wait for the draft and attachments to finish saving".to_owned()
+                        } else {
+                            self.tooltip_with_hint("Open draft in its own window", ShortcutAction::PopOutComposer)
+                        })
                         .accessibility_label("Pop out draft")
                         .on_click(cx.listener(|this, _, window, cx| this.pop_out_composer(window, cx)))))
                     .children(reply_options)
@@ -1076,10 +1262,7 @@ impl MailWindow {
             .child(v_flex().id("composer-content").min_h_0()
                 .when(!inline, |d| d.flex_1().overflow_y_scroll().track_scroll(&c.scroll))
                 .child(v_flex().flex_none().h_auto().min_h_full()
-            .when(!inline || c.show_headers, |d| d.child(field_row(
-                "From",
-                div().text_size(crate::ui::ui_px(13.)).child(format!("{} <{}>", owner.display_name(), owner.email)).into_any_element(),
-            )))
+            .when(!inline || c.show_headers, |d| d.child(field_row("From", from_element)))
             .child(
                 h_flex()
                     .items_center()
@@ -1200,7 +1383,7 @@ impl MailWindow {
             .child(tool("fmt-quote", "text-quote", "Quote (Ctrl Shift 9)", cx, |t, w, cx| t.format_lines(LinePrefix::Quote, w, cx)))
             .child(div().flex_1())
             .child({
-                let ap = self.account_prefs_for(&self.writing_account().id);
+                let ap = self.account_prefs_for(&c.draft.account_id);
                 let current = c.draft.signature_id.clone();
                 let choices: Vec<(Option<String>, String)> = std::iter::once((None, "None".to_string())).chain(ap.signatures.iter().map(|s| (Some(s.id.clone()), s.name.clone()))).collect();
                 let label = current.as_deref().and_then(|id| ap.signature_by_id(id)).map(|s| s.name.clone()).unwrap_or_else(|| "No signature".into());
@@ -1607,6 +1790,14 @@ pub(super) fn stage_attachment(original: &str, content: &[u8], dir: &std::path::
     Ok(DraftAttachment { id, filename: name, mime_type: mime_type.into(), size_bytes: content.len() as u64, local_path: dest.to_string_lossy().to_string(), content_id })
 }
 
+fn read_receipt_toggle_label(requested: bool) -> &'static str {
+    if requested {
+        overlook_core::read_receipt::REQUEST_READ_RECEIPT_ACTIVE_LABEL
+    } else {
+        overlook_core::read_receipt::REQUEST_READ_RECEIPT_LABEL
+    }
+}
+
 #[cfg(test)]
 mod attachment_tests {
     use super::{prepare_attachments, stage_attachment};
@@ -1655,5 +1846,14 @@ mod attachment_tests {
         let logo = stage_attachment("logo.png", b"\x89PNG\r\n\x1a\n", &root, 0, Some("logo@brand.example".into()), true).unwrap();
         assert_eq!((logo.content_id.as_deref(), logo.is_listed(), ok.is_listed()), (Some("logo@brand.example"), false, true));
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn read_receipt_toggle_label_and_icon_asset() {
+        use gpui_kit::AssetSource;
+        assert_eq!(super::read_receipt_toggle_label(false), "Request read receipt");
+        assert_eq!(super::read_receipt_toggle_label(true), "Read receipt requested");
+        let loaded = crate::assets::Assets.load("icons/receipt-text.svg").unwrap();
+        assert!(loaded.is_some(), "Lucide receipt-text.svg icon should be bundled");
     }
 }

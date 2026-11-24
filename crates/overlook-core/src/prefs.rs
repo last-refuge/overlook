@@ -286,12 +286,16 @@ pub struct Prefs {
     pub check_for_updates: bool,
     // Sidebar
     pub sidebar_mode: crate::SidebarMode,
+    /// Opt-in combined "All Inboxes" view in the Mail sidebar.
+    pub show_all_inboxes: bool,
     /// Account ids in the order the sidebar lists them; see `sidebar::ordered_accounts`.
     pub account_order: Vec<crate::AccountId>,
     /// Pinned folders; `None` until the user changes them, meaning every account's Inbox.
     pub favorites: Option<Vec<crate::Favorite>>,
     // Typography
     pub fonts: FontPrefs,
+    // Keyboard shortcuts
+    pub shortcuts: crate::shortcuts::ShortcutPrefs,
 }
 
 impl Default for Prefs {
@@ -324,9 +328,11 @@ impl Default for Prefs {
             show_declined_events: false,
             check_for_updates: true,
             sidebar_mode: crate::SidebarMode::AllAccounts,
+            show_all_inboxes: false,
             account_order: Vec::new(),
             favorites: None,
             fonts: FontPrefs::default(),
+            shortcuts: crate::shortcuts::ShortcutPrefs::default(),
         }
     }
 }
@@ -416,6 +422,9 @@ pub struct AccountPrefs {
     pub sign_replies: bool,
     /// Provider URL/id survives reconnecting a CalDAV account with a fresh local id.
     pub default_calendar: Option<String>,
+    /// Custom hex color (`#RRGGBB`) for this account's calendars and events; `None` uses a
+    /// distinct default color per account.
+    pub calendar_color: Option<String>,
 }
 
 impl AccountPrefs {
@@ -637,5 +646,23 @@ mod tests {
             size_only.styled_html(),
             format!("<div style=\"font-size: {}px;\"><p>Hi</p></div>", FontPrefs::MAX_EMAIL_SIZE)
         );
+    }
+
+    #[test]
+    fn all_inboxes_preference_defaults_off_and_round_trips() {
+        let older: Prefs = serde_json::from_str("{}").unwrap();
+        assert!(!older.show_all_inboxes);
+
+        let enabled = Prefs { show_all_inboxes: true, ..Default::default() };
+        let encoded = serde_json::to_string(&enabled).unwrap();
+        let decoded: Prefs = serde_json::from_str(&encoded).unwrap();
+        assert!(decoded.show_all_inboxes);
+
+        // AccountPrefs::calendar_color defaults to None on legacy JSON and round-trips cleanly.
+        let legacy_acct: AccountPrefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy_acct.calendar_color, None);
+        let colored = AccountPrefs { calendar_color: Some("#10B981".into()), ..Default::default() };
+        let decoded_acct: AccountPrefs = serde_json::from_str(&serde_json::to_string(&colored).unwrap()).unwrap();
+        assert_eq!(decoded_acct.calendar_color.as_deref(), Some("#10B981"));
     }
 }

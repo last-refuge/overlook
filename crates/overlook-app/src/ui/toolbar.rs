@@ -90,7 +90,7 @@ struct Command {
     enabled: bool,
     selected: bool,
     primary: bool,
-    hint: &'static str,
+    hint: String,
 }
 
 #[derive(Clone, Copy)]
@@ -106,37 +106,37 @@ impl MailWindow {
     fn toolbar_command(&self, action: A) -> Command {
         use Glyph::{Color, Symbol};
         let (label, glyph, hint) = match action {
-            A::NewMessage => (NEW_MESSAGE_LABEL, Color(C::Compose), "Ctrl N"),
-            A::Archive => ("Archive", Color(C::Archive), "E"),
-            A::DeleteMail => ("Delete", Color(C::Delete), "Del"),
-            A::MoveMail => ("Move to", Color(C::Move), "V"),
-            A::ToggleRead => ("Mark unread", Color(C::Mail), "Ctrl U"),
-            A::ToggleStar => ("Star", Color(C::Star), "S"),
-            A::Reply => ("Reply", Color(C::Reply), "Ctrl R"),
-            A::ReplyAll => ("Reply all", Color(C::ReplyAll), "Ctrl Shift R"),
-            A::Forward => ("Forward", Color(C::Forward), "Ctrl F"),
-            A::JumpLatest => ("Latest message", Symbol("arrow-down-to-line"), ""),
-            A::PreviousConversation => ("Previous conversation", Symbol("chevron-left"), "K"),
-            A::NextConversation => ("Next conversation", Symbol("chevron-right"), "J"),
-            A::MoveFocus => ("Move to Other", Color(C::Move), ""),
-            A::AlwaysMoveFocus => ("Always move sender", Color(C::Read), ""),
-            A::NewEvent => ("New event", Color(C::CalendarAdd), "Ctrl Shift A"),
-            A::Today => ("Today", Color(C::Calendar), "T"),
-            A::PreviousPeriod => ("Previous period", Symbol("chevron-left"), "←"),
-            A::NextPeriod => ("Next period", Symbol("chevron-right"), "→"),
-            A::Day => ("Day", Color(C::Day), "D"),
-            A::Week => ("Week", Color(C::Week), "W"),
-            A::Month => ("Month", Color(C::Month), "M"),
-            A::Agenda => ("Agenda", Color(C::Agenda), "A"),
-            A::EditEvent | A::EditContact => ("Edit", Color(C::Edit), ""),
-            A::DeleteEvent | A::DeleteContact => ("Delete", Color(C::Delete), ""),
-            A::NewContact => ("New contact", Color(C::ContactAdd), ""),
-            A::ContactMessage => (NEW_MESSAGE_LABEL, Color(C::Compose), ""),
-            A::ContactMail => ("Mail from", Color(C::Mail), ""),
-            A::Sync => ("Sync", Color(C::Sync), "F5"),
-            A::Appearance => ("Appearance", Color(C::Appearance), ""),
-            A::Layout => ("Layout", Color(C::Layout), ""),
-            A::Unknown => ("Unavailable", Symbol("circle-help"), ""),
+            A::NewMessage => (NEW_MESSAGE_LABEL, Color(C::Compose), self.shortcut_hint(ShortcutAction::Compose)),
+            A::Archive => ("Archive", Color(C::Archive), self.shortcut_hint(ShortcutAction::Archive)),
+            A::DeleteMail => ("Delete", Color(C::Delete), self.shortcut_hint(ShortcutAction::Trash)),
+            A::MoveMail => ("Move to", Color(C::Move), self.shortcut_hint(ShortcutAction::MoveSelected)),
+            A::ToggleRead => ("Mark unread", Color(C::Mail), self.shortcut_hint(ShortcutAction::ToggleRead)),
+            A::ToggleStar => ("Star", Color(C::Star), self.shortcut_hint(ShortcutAction::ToggleStar)),
+            A::Reply => ("Reply", Color(C::Reply), self.shortcut_hint(ShortcutAction::Reply)),
+            A::ReplyAll => ("Reply all", Color(C::ReplyAll), self.shortcut_hint(ShortcutAction::ReplyAll)),
+            A::Forward => ("Forward", Color(C::Forward), self.shortcut_hint(ShortcutAction::Forward)),
+            A::JumpLatest => ("Latest message", Symbol("arrow-down-to-line"), String::new()),
+            A::PreviousConversation => ("Previous conversation", Symbol("chevron-left"), self.shortcut_hint(ShortcutAction::PrevConversation)),
+            A::NextConversation => ("Next conversation", Symbol("chevron-right"), self.shortcut_hint(ShortcutAction::NextConversation)),
+            A::MoveFocus => ("Move to Other", Color(C::Move), String::new()),
+            A::AlwaysMoveFocus => ("Always move sender", Color(C::Read), String::new()),
+            A::NewEvent => ("New event", Color(C::CalendarAdd), self.shortcut_hint(ShortcutAction::NewEvent)),
+            A::Today => ("Today", Color(C::Calendar), self.shortcut_hint(ShortcutAction::CalendarToday)),
+            A::PreviousPeriod => ("Previous period", Symbol("chevron-left"), self.shortcut_hint(ShortcutAction::CalendarPrevious)),
+            A::NextPeriod => ("Next period", Symbol("chevron-right"), self.shortcut_hint(ShortcutAction::CalendarNext)),
+            A::Day => ("Day", Color(C::Day), self.shortcut_hint(ShortcutAction::CalendarDay)),
+            A::Week => ("Week", Color(C::Week), self.shortcut_hint(ShortcutAction::CalendarWeek)),
+            A::Month => ("Month", Color(C::Month), self.shortcut_hint(ShortcutAction::CalendarMonth)),
+            A::Agenda => ("Agenda", Color(C::Agenda), self.shortcut_hint(ShortcutAction::CalendarAgenda)),
+            A::EditEvent | A::EditContact => ("Edit", Color(C::Edit), String::new()),
+            A::DeleteEvent | A::DeleteContact => ("Delete", Color(C::Delete), String::new()),
+            A::NewContact => ("New contact", Color(C::ContactAdd), String::new()),
+            A::ContactMessage => (NEW_MESSAGE_LABEL, Color(C::Compose), String::new()),
+            A::ContactMail => ("Mail from", Color(C::Mail), String::new()),
+            A::Sync => ("Sync", Color(C::Sync), self.shortcut_hint(ShortcutAction::SyncNow)),
+            A::Appearance => ("Appearance", Color(C::Appearance), String::new()),
+            A::Layout => ("Layout", Color(C::Layout), String::new()),
+            A::Unknown => ("Unavailable", Symbol("circle-help"), String::new()),
         };
         let mut command = Command {
             label: label.into(),
@@ -430,6 +430,8 @@ impl MailWindow {
             A::NewContact => vec![NewItem::Message, NewItem::Event],
             _ => vec![NewItem::Event, NewItem::Contact],
         };
+        let compose_hint = self.shortcut_hint(ShortcutAction::Compose);
+        let event_hint = self.shortcut_hint(ShortcutAction::NewEvent);
         let this = cx.entity().downgrade();
         let menu = primary_fill(Button::new("toolbar-new-more"), &p, cx)
             .small()
@@ -447,8 +449,8 @@ impl MailWindow {
             .dropdown_menu(move |mut menu, _window, _cx| {
                 for item in &items {
                     let (label, glyph, hint) = match item {
-                        NewItem::Message => (NEW_MESSAGE_LABEL, "square-pen", "Ctrl N"),
-                        NewItem::Event => ("New event", "calendar-plus", "Ctrl Shift A"),
+                        NewItem::Message => (NEW_MESSAGE_LABEL, "square-pen", compose_hint.as_str()),
+                        NewItem::Event => ("New event", "calendar-plus", event_hint.as_str()),
                         NewItem::Contact => ("New contact", "user-plus", ""),
                     };
                     let (t, item) = (this.clone(), *item);

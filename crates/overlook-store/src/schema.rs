@@ -4,8 +4,44 @@ use rusqlite::Connection;
 
 const MIGRATIONS: &[&str] = &[
     V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17, V18, V19, V20,
-    V21, V22, V23, V24, V25,
+    V21, V22, V23, V24, V25, V26, V27,
 ];
+
+/// Device-local email snoozes: one active snooze per (account_id, conversation_id) with
+/// baseline message fingerprints so reconnects/resyncs never mistake existing or older
+/// messages for a new inbound reply.
+const V26: &str = r#"
+CREATE TABLE conversation_snoozes (
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL,
+    wake_at INTEGER NOT NULL,
+    snoozed_at INTEGER NOT NULL,
+    baseline_latest_inbound INTEGER,
+    baseline_message_ids_json TEXT NOT NULL DEFAULT '[]',
+    baseline_rfc_ids_json TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (account_id, conversation_id)
+);
+CREATE INDEX conversation_snoozes_wake ON conversation_snoozes(wake_at);
+"#;
+
+/// Opt-in per-message RFC 8098 read receipt requests on drafts, and parsed incoming
+/// RFC 8098 MDN receipt metadata on messages. Tables of their own, so nothing that
+/// exists is altered.
+const V27: &str = r#"
+CREATE TABLE draft_read_receipts (
+    draft_id TEXT PRIMARY KEY REFERENCES drafts(id) ON DELETE CASCADE,
+    request_read_receipt INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE message_read_receipts (
+    message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    receipt_json TEXT NOT NULL,
+    original_message_id TEXT
+);
+CREATE INDEX message_read_receipts_original
+    ON message_read_receipts(original_message_id)
+    WHERE original_message_id IS NOT NULL;
+"#;
 
 const V25: &str = r#"
 ALTER TABLE mcp_operation_status ADD COLUMN source TEXT NOT NULL DEFAULT 'queue';
@@ -782,6 +818,7 @@ mod calendar_migration_tests {
             "caldav_outbox_connection",
             "calendars_account",
             "change_history_at",
+            "conversation_snoozes_wake",
         ] {
             assert!(indexes.contains(expected), "missing index {expected}");
         }

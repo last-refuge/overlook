@@ -456,11 +456,11 @@ impl MailWindow {
                                 .items_center()
                                 .text_size(crate::ui::ui_px(12.))
                                 .text_color(p.muted)
-                                .child(kbd("E", &p))
+                                .child(kbd(self.shortcut_hint(ShortcutAction::Archive), &p))
                                 .child("archive")
-                                .child(kbd("Del", &p))
+                                .child(kbd(self.shortcut_hint(ShortcutAction::Trash), &p))
                                 .child("delete")
-                                .child(kbd("U", &p))
+                                .child(kbd(self.shortcut_hint(ShortcutAction::ToggleRead), &p))
                                 .child("mark read")
                                 .child(kbd("Esc", &p))
                                 .child("clear"),
@@ -485,22 +485,23 @@ impl MailWindow {
                                 .items_center()
                                 .text_size(crate::ui::ui_px(12.))
                                 .text_color(p.muted)
-                                .child(kbd("J", &p))
-                                .child(kbd("K", &p))
+                                .child(kbd(self.shortcut_hint(ShortcutAction::NextConversation), &p))
+                                .child(kbd(self.shortcut_hint(ShortcutAction::PrevConversation), &p))
                                 .child("move")
-                                .child(kbd("E", &p))
+                                .child(kbd(self.shortcut_hint(ShortcutAction::Archive), &p))
                                 .child("archive")
-                                .child(kbd("Ctrl N", &p))
+                                .child(kbd(self.shortcut_hint(ShortcutAction::Compose), &p))
                                 .child("new message"),
                         ),
                 )
                 .into_any_element();
         };
 
+        let account_labels = self.labels_for_account(&summary.account_id);
         let labels: Vec<(String, Option<Hsla>)> = summary
             .label_ids
             .iter()
-            .filter_map(|id| self.labels.iter().find(|l| &l.id == id))
+            .filter_map(|id| account_labels.iter().find(|l| &l.id == id))
             .filter(|l| l.kind == LabelKind::User)
             .map(|l| (overlook_core::sidebar::folder_title(&l.name).to_owned(), p.label_color(l.color.as_deref())))
             .collect();
@@ -537,6 +538,31 @@ impl MailWindow {
                                 .accessibility_label(body_theme_label)
                                 .tooltip(body_theme_label)
                                 .on_click(cx.listener(|this, _, _, cx| this.toggle_message_body_appearance(cx))),
+                        )
+                    })
+                    .when(self.can_snooze_account(&summary.account_id), |d| {
+                        let snooze_ref = super::ConversationRef::of(&summary);
+                        let tip = if summary.snoozed_until.is_some() {
+                            "Change snooze time…"
+                        } else {
+                            "Snooze…"
+                        };
+                        d.child(
+                            Button::new("reader-snooze")
+                                .ghost()
+                                .small()
+                                .size(px(32.))
+                                .p(px(0.))
+                                .child(
+                                    icon("clock")
+                                        .size(px(17.))
+                                        .text_color(if summary.snoozed_until.is_some() { p.accent } else { p.muted }),
+                                )
+                                .accessibility_label(tip)
+                                .tooltip(tip)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_snooze_modal(vec![snooze_ref.clone()], window, cx);
+                                })),
                         )
                     })
                     // The conversation as printed: its newest message, with the history it quotes.
@@ -611,6 +637,7 @@ impl MailWindow {
                         )
                     }),
             )
+            .children(self.render_reader_snooze_banner(&summary, cx))
             .child(divider(&p));
 
         let latest_id = summary.latest_message_id.clone();
@@ -737,7 +764,7 @@ impl MailWindow {
                     .hover(|d| d.border_color(p.control_border))
                     .child(icon(if all { "reply-all" } else { "reply" }).size(px(16.)).text_color(p.accent))
                     .child(div().flex_1().min_w_0().truncate().child(text))
-                    .child(kbd("Ctrl R", &p))
+                    .child(kbd(self.shortcut_hint(ShortcutAction::Reply), &p))
                     .on_click(cx.listener(|this, _, window, cx| this.reply_default(window, cx))),
             )
             .into_any_element()
@@ -750,7 +777,7 @@ impl MailWindow {
         let p = *cx.palette();
         let id = m.id.clone();
         let full_date = format_full(m.date, &self.time_zone);
-        let who = if m.is_outgoing { Address::named("You", &self.account.email) } else { m.from.clone() };
+        let who = if m.is_outgoing { Address::named("You", &self.account_email(&m.account_id)) } else { m.from.clone() };
         let owner = self.owner();
         div()
             .id(SharedString::from(format!("collapsed-{}", m.id)))
@@ -793,7 +820,7 @@ impl MailWindow {
         let p = *cx.palette();
         let rich_body = self.live_browser_messages.borrow().contains(&format!("message-{}", m.id));
         let attachments: Vec<&Attachment> = m.attachments.iter().filter(|a| !rich_body || !embedded_in_body(a, &m.body)).collect();
-        let who = if m.is_outgoing { Address::named("You", &self.account.email) } else { m.from.clone() };
+        let who = if m.is_outgoing { Address::named("You", &self.account_email(&m.account_id)) } else { m.from.clone() };
         let owner = self.owner();
         let allow_remote = self.remote_allowed.contains(&m.id) || self.prefs.remote_images == RemoteImages::Allow;
         let (body_view, remote_resources) = if m.body.html.is_none() && m.body.text.as_deref().is_some_and(|t| !t.trim().is_empty()) {
@@ -809,7 +836,7 @@ impl MailWindow {
                 cx,
             )
         };
-        let sender_email = if m.is_outgoing { self.account.email.clone() } else { m.from.email.clone() };
+        let sender_email = if m.is_outgoing { self.account_email(&m.account_id) } else { m.from.email.clone() };
         let mid = m.id.clone();
         let is_latest = self.active_summary().is_some_and(|s| s.latest_message_id == m.id);
         let collapse_id = m.id.clone();
@@ -893,7 +920,7 @@ impl MailWindow {
                                 let menu = menu.separator();
                                 let menu = item(menu, if m.is_read { "Mark as unread" } else { "Mark as read" }, t.clone(), m.clone(), |this, m, w, cx| {
                                     let read = !m.is_read;
-                                    this.set_read(vec![m.id.clone()], read, w, cx)
+                                    this.set_read_for(&m.account_id, vec![m.id.clone()], read, w, cx)
                                 });
                                 let menu = menu.separator();
                                 let menu = item(menu, "Print…", t.clone(), m.clone(), |this, m, w, cx| this.print_message(m, w, cx));
@@ -922,7 +949,14 @@ impl MailWindow {
                         }),
                 )
             })
-            .children(m.invitation.as_ref().map(|inv| self.render_invitation_card(inv, cx)))
+            .children(m.invitation.as_ref().map(|inv| self.render_invitation_card(&m.account_id, inv, cx)))
+            .children(m.read_receipt.as_ref().map(|receipt| self.render_read_receipt_banner(receipt, &m.from, cx)))
+            .children(
+                self.thread_read_receipts
+                    .get(&m.id)
+                    .filter(|receipts| !receipts.is_empty())
+                    .map(|receipts| self.render_sent_receipts_banner(receipts, cx)),
+            )
             .when(!allow_remote && remote_resources > 0, |d| {
                 d.child(
                     h_flex()
@@ -1251,11 +1285,85 @@ impl MailWindow {
             .on_click(cx.listener(move |this, _, window, cx| this.open_attachment(open.clone(), window, cx)))
     }
 
+    /// Banner shown when viewing an incoming RFC 8098 MDN receipt message.
+    /// Explicitly describes the confirmation as a receipt from the recipient's mail client.
+    fn render_read_receipt_banner(&self, receipt: &ReadReceipt, sender: &Address, cx: &Context<Self>) -> impl IntoElement {
+        let p = *cx.palette();
+        let (title, detail) = read_receipt_banner_copy(receipt, Some(sender));
+        let accent = if receipt.is_displayed() { p.success } else { p.muted };
+        v_flex()
+            .gap(px(4.))
+            .px(px(14.))
+            .py(px(10.))
+            .rounded(px(10.))
+            .border_1()
+            .border_color(p.divider)
+            .bg(p.chip)
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(icon("mail-check").size(px(16.)).text_color(accent))
+                    .child(
+                        div()
+                            .text_size(crate::ui::ui_px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.foreground)
+                            .child(title),
+                    ),
+            )
+            .child(
+                div()
+                    .pl(px(24.))
+                    .text_size(crate::ui::ui_px(12.))
+                    .text_color(p.muted)
+                    .child(detail),
+            )
+    }
+
+    /// Banner shown on a sent message when one or more incoming RFC 8098 MDN receipts
+    /// matched its `Message-ID`.
+    fn render_sent_receipts_banner(&self, receipts: &[ConfirmedReadReceipt], cx: &Context<Self>) -> impl IntoElement {
+        let p = *cx.palette();
+        let title = sent_receipts_banner_title(receipts);
+        let any_displayed = receipts.iter().any(|r| r.receipt.is_displayed());
+        let accent = if any_displayed { p.success } else { p.muted };
+        v_flex()
+            .gap(px(4.))
+            .px(px(14.))
+            .py(px(10.))
+            .rounded(px(10.))
+            .border_1()
+            .border_color(p.divider)
+            .bg(p.chip)
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(icon("mail-check").size(px(16.)).text_color(accent))
+                    .child(
+                        div()
+                            .text_size(crate::ui::ui_px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.foreground)
+                            .child(title),
+                    ),
+            )
+            .children(receipts.iter().map(|entry| {
+                let line = format_sent_receipt_row(entry, &self.time_zone);
+                div()
+                    .pl(px(24.))
+                    .text_size(crate::ui::ui_px(12.))
+                    .text_color(p.muted)
+                    .child(line)
+            }))
+    }
+
     /// Invitation card for messages that carry a `text/calendar` part.
     /// Reads the resolved event from `self.invite_events` (populated off `render()`).
-    fn render_invitation_card(&self, inv: &overlook_core::ics::Invitation, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_invitation_card(&self, account: &AccountId, inv: &overlook_core::ics::Invitation, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *cx.palette();
-        let event = self.invite_events.get(&inv.uid).and_then(|e| e.clone());
+        let event = self.invite_events.get(&(account.clone(), inv.uid.clone())).and_then(|e| e.clone());
         let title = event.as_ref().map(|e| e.display_title()).or_else(|| inv.summary.clone()).unwrap_or_else(|| "Invitation".into());
         let when = match &event {
             Some(e) if e.all_day => format!("{} · All day", overlook_core::tz::format_day(e.start)),
@@ -1347,10 +1455,21 @@ impl MailWindow {
             .child(
                 h_flex()
                     .items_center()
+                    .flex_wrap()
                     .gap(px(8.))
                     .text_size(crate::ui::ui_px(12.))
                     .text_color(p.muted)
-                    .child(format!("To {}", d.to.iter().map(Address::to_header).collect::<Vec<_>>().join(", "))),
+                    .child(format!("To {}", d.to.iter().map(Address::to_header).collect::<Vec<_>>().join(", ")))
+                    .when(d.request_read_receipt, |row| {
+                        row.child("·").child(
+                            h_flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .text_color(p.accent)
+                                .child(icon("mail-check").size(px(13.)).text_color(p.accent))
+                                .child("Read receipt requested"),
+                        )
+                    }),
             )
             .child(
                 h_flex()
@@ -1408,6 +1527,26 @@ impl MailWindow {
                     }),
             )
     }
+}
+
+fn read_receipt_banner_copy(receipt: &ReadReceipt, sender: Option<&Address>) -> (&'static str, String) {
+    (receipt.summary_banner(), receipt.detail_summary(sender))
+}
+
+fn sent_receipts_banner_title(receipts: &[ConfirmedReadReceipt]) -> &'static str {
+    if receipts.len() == 1 {
+        receipts[0].receipt.summary_banner()
+    } else if receipts.iter().any(|r| r.receipt.is_displayed()) {
+        overlook_core::read_receipt::CONFIRMED_READ_RECEIPTS_PLURAL_LABEL
+    } else {
+        "Disposition receipts from recipients' mail clients"
+    }
+}
+
+fn format_sent_receipt_row(entry: &ConfirmedReadReceipt, zone: &overlook_core::tz::TimeZone) -> String {
+    let when = format_full(entry.received_at, zone);
+    let detail = entry.receipt.detail_summary(Some(&entry.sender));
+    format!("{detail} Received {when}.")
 }
 
 /// Replaces `cid:` image references with already-encoded `data:` URLs.
@@ -1778,5 +1917,39 @@ mod tests {
     fn placeholder_is_plain_text_and_bounded() {
         assert_eq!(super::placeholder_text("<p>Hello <b>there</b></p>").trim(), "Hello there");
         assert!(super::placeholder_text(&"x".repeat(10_000)).chars().count() <= 4001);
+    }
+
+    #[test]
+    fn read_receipt_banners_describe_confirmation_as_recipient_client_receipt() {
+        let receipt = overlook_core::read_receipt::parse_mdn(
+            "Reporting-UA: mail.northstar.example; Mozilla Thunderbird 128.0\r\n\
+             Final-Recipient: rfc822; maya@northstar.example\r\n\
+             Original-Message-ID: <sent-1@overlook.example>\r\n\
+             Disposition: manual-action/MDN-sent-manually; displayed\r\n",
+        )
+        .unwrap();
+        let sender = overlook_core::Address::named("Maya Chen", "maya@northstar.example");
+        let (title, detail) = super::read_receipt_banner_copy(&receipt, Some(&sender));
+        assert_eq!(title, "Read receipt from the recipient's mail client");
+        assert!(detail.contains("maya@northstar.example"), "{detail}");
+        assert!(detail.contains("Mozilla Thunderbird 128.0"), "{detail}");
+
+        let confirmed = overlook_core::ConfirmedReadReceipt {
+            receipt_message_id: overlook_core::MessageId::from("mdn-1"),
+            received_at: overlook_core::tz::parse_rfc3339("2026-10-14T10:02:00-07:00").unwrap(),
+            sender,
+            receipt: receipt.clone(),
+        };
+        assert_eq!(
+            super::sent_receipts_banner_title(std::slice::from_ref(&confirmed)),
+            "Read receipt from the recipient's mail client"
+        );
+        let row = super::format_sent_receipt_row(&confirmed, &overlook_core::tz::TimeZone::UTC);
+        assert!(row.contains("maya@northstar.example"), "{row}");
+        assert!(row.contains("Received "), "{row}");
+        assert_eq!(
+            super::sent_receipts_banner_title(&[confirmed.clone(), confirmed]),
+            "Read receipts from recipients' mail clients"
+        );
     }
 }
