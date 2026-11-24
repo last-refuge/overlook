@@ -261,12 +261,11 @@ impl MailWindow {
         }) {
             Ok((handle, editor)) => {
                 let parent = owner_entity.downgrade();
-                let closed_id = id.clone();
                 let closed = cx.on_window_closed(move |cx, closed| {
                     if closed == handle.window_id() {
                         parent
                             .update(cx, |this, cx| {
-                                this.detached_composers.remove(&closed_id);
+                                this.detached_composers.retain(|_, d| d.window.window_id() != closed);
                                 this.reload_mail(cx);
                             })
                             .ok();

@@ -386,6 +386,7 @@ mod tests {
             is_important: false,
             focus_override: None,
             invitation: None,
+            read_receipt: None,
         };
         let mut draft = Draft::resend_of(AccountId::from("a"), &source, 0);
         let out = outgoing_bodies(&draft, None);
@@ -453,6 +454,7 @@ mod tests {
             is_important: false,
             focus_override: None,
             invitation: None,
+            read_receipt: None,
         }
     }
 

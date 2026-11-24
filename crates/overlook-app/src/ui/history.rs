@@ -35,14 +35,16 @@ pub(crate) struct HistoryState {
 }
 
 impl MailWindow {
-    /// "Subject" or "Subject and 2 more", for the conversations `ids` belong to.
-    fn describe_messages(&self, ids: &[MessageId]) -> String {
+    /// "Subject" or "Subject and 2 more", for the conversations `ids` belong to in `account`.
+    fn describe_messages_for(&self, account: &AccountId, ids: &[MessageId]) -> String {
         let mut seen: Vec<&ConversationId> = Vec::new();
         let mut first: Option<&str> = None;
-        for m in ids.iter().filter_map(|id| self.mail_index.message(id)) {
-            if !seen.contains(&&m.conversation_id) {
-                seen.push(&m.conversation_id);
-                first.get_or_insert(m.subject.as_str());
+        if let Some(index) = self.index_for(account) {
+            for m in ids.iter().filter_map(|id| index.message(id)) {
+                if !seen.contains(&&m.conversation_id) {
+                    seen.push(&m.conversation_id);
+                    first.get_or_insert(m.subject.as_str());
+                }
             }
         }
         let subject = match first.map(str::trim) {
@@ -59,21 +61,37 @@ impl MailWindow {
     /// Makes `changes` as one undoable action of the open account, and records how to take
     /// it back. With `toast`, an Undo toast says what happened.
     pub(crate) fn perform(&mut self, title: impl Into<String>, changes: Vec<LocalChange>, toast: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.perform_for(self.account.id.clone(), title, changes, toast, window, cx);
+    }
+
+    /// Makes `changes` as one undoable action of `account`, and records how to take it back.
+    pub(crate) fn perform_for(
+        &mut self,
+        account: AccountId,
+        title: impl Into<String>,
+        changes: Vec<LocalChange>,
+        toast: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let changes: Vec<LocalChange> = changes.into_iter().filter(|c| !c.message_ids().is_empty()).collect();
         if changes.is_empty() {
             return;
         }
         let mut ids: Vec<MessageId> = changes.iter().flat_map(|c| c.message_ids().iter().cloned()).collect();
         ids.dedup();
-        let detail = self.describe_messages(&ids);
+        let detail = self.describe_messages_for(&account, &ids);
         // From the index as it is before the change, so only what changes is reversed.
-        let reversal = reversal_for(&changes, &self.mail_index);
+        let reversal = self
+            .index_for(&account)
+            .map(|idx| reversal_for(&changes, idx))
+            .unwrap_or_default();
         for change in changes {
-            self.apply_local(change, window, cx);
+            self.apply_local_for(&account, change, window, cx);
         }
         let title = title.into();
         let toast = toast.then(|| title.clone());
-        self.record(self.account.id.clone(), title, detail, Reversal::Changes { changes: reversal }, toast, window, cx);
+        self.record(account, title, detail, Reversal::Changes { changes: reversal }, toast, window, cx);
     }
 
     /// Records an action in the background. The Undo toast (`toast` is its text) appears
@@ -121,8 +139,20 @@ impl MailWindow {
         if account == &self.account.id {
             self.apply_local(change, window, cx);
         } else {
+            if let Some(index) = self.other_indexes.get_mut(account) {
+                index.apply(&change);
+                self.mail_index_generation += 1;
+            }
+            if self.thread.first().is_some_and(|m| &m.account_id == account) {
+                self.apply_to_thread_for(account, std::slice::from_ref(&change));
+            }
+            self.mark_counts_stale([account.clone()]);
+            if self.all_inboxes_active() {
+                self.refresh_mail();
+            }
             self.queue_local_write(account.clone(), LocalWrite::Change(change));
             self.write_local_changes(window, cx);
+            cx.notify();
         }
     }
 
@@ -317,8 +347,9 @@ impl MailWindow {
                             .child(kbd("Esc", &p)),
                     )
                     .child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(format!(
-                        "{} · Undo one change, or restore to a point to take back everything after it. Ctrl+Z undoes the latest.",
-                        self.account_name(&state.account)
+                        "{} · Undo one change, or restore to a point to take back everything after it. {} undoes the latest.",
+                        self.account_name(&state.account),
+                        self.shortcut_hint(ShortcutAction::Undo),
                     )))
                     .child(div().id("history-list").flex_1().min_h_0().overflow_y_scroll().child(body)),
             )

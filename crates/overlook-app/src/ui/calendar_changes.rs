@@ -20,9 +20,17 @@ impl MailWindow {
         scope: RecurrenceScope,
         cx: &mut Context<Self>,
     ) -> Result<EventId, String> {
+        let account_id = after
+            .as_ref()
+            .or(before.as_ref())
+            .map(|e| e.account_id.clone())
+            .ok_or_else(|| "Missing calendar event".to_owned())?;
+        let account = self
+            .known_account(&account_id)
+            .ok_or_else(|| "Calendar account is no longer connected.".to_owned())?;
         let id = crate::caldav_sync::queue_change(
             &self.store,
-            &self.account,
+            &account,
             CalDavEdit {
                 before,
                 after,
@@ -30,7 +38,7 @@ impl MailWindow {
             },
         )?;
         self.reload_calendar();
-        self.sync_caldav_account(self.account.id.clone(), true, cx);
+        self.sync_caldav_account(account_id, true, cx);
         Ok(id)
     }
 
@@ -41,8 +49,12 @@ impl MailWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(account) = self.known_account(&change.account_id) else {
+            super::toast(window, cx, crate::notify::Level::Error, "Calendar account is no longer connected.");
+            return;
+        };
         let result =
-            crate::caldav_sync::resolve_change(&self.store, &self.account, &change, keep_local);
+            crate::caldav_sync::resolve_change(&self.store, &account, &change, keep_local);
         match result {
             Ok(()) => {
                 self.reload_calendar();
@@ -66,7 +78,11 @@ impl MailWindow {
                 let local=change.edits.last().and_then(|e|e.after.as_ref());
                 let details=local.map(|e|format!("Your version: {} · {} – {}{}",tz::format_day(e.start),tz::format_clock(e.start),tz::format_clock(e.end),e.location.as_ref().map(|l|format!(" · {l}")).unwrap_or_default())).unwrap_or_else(||"Your change: delete this event".into());
                 v_flex().gap(px(6.)).p(px(10.)).border_1().border_color(p.divider).rounded(px(8.))
-                    .child(div().font_weight(FontWeight::MEDIUM).child(change.title()))
+                    .child(div().font_weight(FontWeight::MEDIUM).child(if self.cal_enabled_accounts.len() > 1 {
+                        format!("{} · {}", change.title(), self.account_name(&change.account_id))
+                    } else {
+                        change.title()
+                    }))
                     .child(div().text_size(crate::ui::ui_px(12.)).child(details))
                     .children(local.and_then(|e|e.description.as_ref()).map(|s|div().text_size(crate::ui::ui_px(12.)).child(s.chars().take(500).collect::<String>())))
                     .child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(change.note.clone().unwrap_or_else(||match change.state {CalDavChangeState::Pending=>"Saved on this device. Waiting to upload.".into(),_=>"Checking the provider before retrying this upload. Your changes are saved.".into()})))

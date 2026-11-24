@@ -43,6 +43,7 @@ pub(super) fn system_folder(kind: LabelKind) -> Option<(&'static str, &'static s
     Some(match kind {
         LabelKind::Inbox => ("Inbox", "inbox"),
         LabelKind::Starred => ("Starred", "star"),
+        LabelKind::Snoozed => ("Snoozed", "clock"),
         LabelKind::Drafts => ("Drafts", "square-pen"),
         LabelKind::Outbox => ("Outbox", "clock"),
         LabelKind::Sent => ("Sent", "send"),
@@ -257,6 +258,7 @@ impl MailWindow {
                 return;
             }
         }
+        self.all_inboxes = false;
         self.select_view(view, window, cx);
     }
 
@@ -381,8 +383,8 @@ impl MailWindow {
                 if kind == LabelKind::Trash {
                     this.delete_folders_in_trash(&account, window, cx);
                 }
-                if this.selected.as_ref().is_some_and(|s| !this.conversations.iter().any(|c| &c.id == s)) {
-                    this.set_selected(this.conversations.first().map(|c| c.id.clone()));
+                if this.selected.as_ref().is_some_and(|s| !this.conversations.iter().any(|c| super::ConversationRef::of(c) == *s)) {
+                    this.set_selected(this.conversations.first().map(super::ConversationRef::of));
                     this.expanded.clear();
                     this.load_thread(cx);
                 }
@@ -456,7 +458,7 @@ impl MailWindow {
             rows
         };
         let mut out = Vec::new();
-        for k in [LabelKind::Inbox, LabelKind::Starred, LabelKind::Drafts, LabelKind::Outbox, LabelKind::Sent, LabelKind::Archive, LabelKind::Spam, LabelKind::Trash] {
+        for k in [LabelKind::Inbox, LabelKind::Starred, LabelKind::Snoozed, LabelKind::Drafts, LabelKind::Outbox, LabelKind::Sent, LabelKind::Archive, LabelKind::Spam, LabelKind::Trash] {
             if k == LabelKind::Outbox && !show_outbox {
                 continue;
             }
@@ -524,9 +526,9 @@ impl MailWindow {
             let this = self;
             let favorites = &pinned_list;
             let in_active = account == &this.account.id;
-            let current = in_active && this.view == nav.view && this.search_query.is_empty();
+            let current = !this.all_inboxes_active() && in_active && this.view == nav.view && this.search_query.is_empty();
             // The active account counts from its live index; the others from their last
-            // recount. Drops go to the active account only.
+            // recount. Drops go to the active account (or any account while in All Inboxes).
             let count = if !in_active {
                 this.account_counts.get(account).and_then(|c| c.get(&nav.view)).copied().unwrap_or(0)
             } else {
@@ -538,9 +540,12 @@ impl MailWindow {
             };
             let view = nav.view.clone();
             let drop_view = nav.view.clone();
+            let drop_account = account.clone();
             let container = nav.container;
             // The same set `drop_on_view` accepts.
-            let droppable = in_active && !container && matches!(nav.view, MailboxView::Kind(LabelKind::Inbox | LabelKind::Archive | LabelKind::Trash | LabelKind::Starred | LabelKind::Spam) | MailboxView::Label(_));
+            let droppable = (in_active || (this.all_inboxes_active() && !this.is_offline(account)))
+                && !container
+                && matches!(nav.view, MailboxView::Kind(LabelKind::Inbox | LabelKind::Archive | LabelKind::Trash | LabelKind::Starred | LabelKind::Spam) | MailboxView::Label(_));
             // Mail of the open account dropped on an offline folder leaves the server for this
             // computer.
             let offline_target = match &nav.view {
@@ -600,7 +605,9 @@ impl MailWindow {
                 .relative()
                 .when(droppable, |d| {
                     d.drag_over::<super::ConversationDrag>(move |style, _, _, _| style.bg(p.selection).border_1().border_color(p.accent))
-                        .on_drop(cx.listener(move |this, drag: &super::ConversationDrag, window, cx| this.drop_on_view(drag.clone(), drop_view.clone(), window, cx)))
+                        .on_drop(cx.listener(move |this, drag: &super::ConversationDrag, window, cx| {
+                            this.drop_on_account_view(drag.clone(), Some(drop_account.clone()), drop_view.clone(), window, cx)
+                        }))
                 })
                 .when_some(offline_target, |d, target| {
                     d.drag_over::<super::ConversationDrag>(move |style, _, _, _| style.bg(p.selection).border_1().border_color(p.accent))
@@ -810,7 +817,7 @@ impl MailWindow {
         };
 
         let owner = self.owner();
-        let accounts: Vec<(Account, String, &'static str)> = ordered_accounts.iter().map(|a| (a.clone(), self.account_name(&a.id), self.account_kind_label(a))).collect();
+        let accounts: Vec<(Account, String)> = ordered_accounts.iter().map(|a| (a.clone(), self.account_menu_label(a))).collect();
         let sidebar_mode = self.prefs.sidebar_mode;
         let active_id = self.account.id.clone();
         let active_email = self.account.email.clone();
@@ -1015,10 +1022,56 @@ impl MailWindow {
             div().id("offline-block").flex().flex_col().my(px(INSERT_LINE)).child(column).into_any_element()
         });
 
+        let all_inboxes_row: Option<AnyElement> = (self.prefs.show_all_inboxes && self.has_account()).then(|| {
+            let current = self.all_inboxes_active() && self.search_query.is_empty();
+            let count = self.all_inboxes_unread_count();
+            let me = cx.entity().downgrade();
+            m.row("nav-all-inboxes")
+                .mb(px(m.header_bottom + 2.))
+                .text_color(if current { p.selection_text } else { p.foreground })
+                .when(current, |d| d.bg(p.selection))
+                .when(!current, |d| d.hover(|d| d.bg(p.hover)))
+                .child(icon("inbox").flex_none().size(px(ROW_ICON_SIZE)).text_color(if current { p.accent } else { p.muted }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .font_weight(if current { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
+                        .child("All Inboxes"),
+                )
+                .when(count > 0, |d| {
+                    let (fill, ink) = count_pill(&p);
+                    d.child(
+                        sidebar_count()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .min_w(px(20.))
+                            .min_h(ui_px(18.))
+                            .px(px(6.))
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(fill)
+                            .text_color(ink)
+                            .child(count.to_string()),
+                    )
+                })
+                .on_click(cx.listener(|this, _, window, cx| this.open_all_inboxes(window, cx)))
+                .context_menu(move |menu, _window, _cx| {
+                    let t = me.clone();
+                    menu.item(PopupMenuItem::new("Hide All Inboxes").on_click(move |_, window, cx| {
+                        let _ = t.update(cx, |this, cx| this.set_show_all_inboxes(false, window, cx));
+                    }))
+                })
+                .into_any_element()
+        });
+
         let nav = v_flex()
             .id("sidebar-nav")
             .flex_1()
             .min_h_0()
+            .children(all_inboxes_row)
             // First thing in the sidebar: no gap above, the panel padding is enough.
             .child(section_header("favorites".into(), "Favorites".into(), favorites_collapsed, 0., None, cx))
             .when(!favorites_collapsed, |d| d.child(m.rows().children(favorites)))
@@ -1051,11 +1104,10 @@ impl MailWindow {
                             .tooltip("Accounts")
                             .dropdown_menu(move |mut menu, _window, _cx| {
                                 menu = menu.label("Accounts");
-                                for (a, name, kind) in &accounts {
+                                for (a, text) in &accounts {
                                     let id = a.id.clone();
                                     let t = this.clone();
-                                    let text = if name == &a.email { format!("{} · {kind}", a.email) } else { format!("{name} · {}", a.email) };
-                                    menu = menu.item(PopupMenuItem::new(text).checked(a.id == active_id).on_click(
+                                    menu = menu.item(PopupMenuItem::new(text.clone()).checked(a.id == active_id).on_click(
                                         move |_, window, cx| {
                                             let _ = t.update(cx, |this, cx| this.switch_account(id.clone(), window, cx));
                                         },

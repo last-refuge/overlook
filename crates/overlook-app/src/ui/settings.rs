@@ -31,17 +31,19 @@ pub enum SettingsPage {
     Fonts,
     Mail,
     Calendar,
+    Keyboard,
     Integrations,
     About,
 }
 
 impl SettingsPage {
-    pub(crate) const ALL: [SettingsPage; 7] = [
+    pub(crate) const ALL: [SettingsPage; 8] = [
         SettingsPage::Accounts,
         SettingsPage::General,
         SettingsPage::Fonts,
         SettingsPage::Mail,
         SettingsPage::Calendar,
+        SettingsPage::Keyboard,
         SettingsPage::Integrations,
         SettingsPage::About,
     ];
@@ -53,6 +55,7 @@ impl SettingsPage {
             SettingsPage::Fonts => "Fonts",
             SettingsPage::Mail => "Mail",
             SettingsPage::Calendar => "Calendar",
+            SettingsPage::Keyboard => "Keyboard",
             SettingsPage::Integrations => "Integrations",
             SettingsPage::About => "About",
         }
@@ -65,6 +68,7 @@ impl SettingsPage {
             SettingsPage::Fonts => "type",
             SettingsPage::Mail => "mail",
             SettingsPage::Calendar => "calendar",
+            SettingsPage::Keyboard => "keyboard",
             SettingsPage::Integrations => "plug",
             SettingsPage::About => "info",
         }
@@ -120,6 +124,7 @@ pub struct SettingsState {
     pub search: Entity<InputState>,
     /// The setting a search result jumped to: scrolled into view and briefly highlighted.
     pub scroll_target: Option<ScrollTarget>,
+    pub keyboard: super::KeyboardSettingsState,
     pub _subscriptions: Vec<Subscription>,
 }
 
@@ -335,6 +340,9 @@ impl MailWindow {
         crate::lifecycle::set_keep_running(self.prefs.keep_running);
         if crate::theme::current_fonts(cx) != self.prefs.fonts {
             crate::theme::apply_fonts(&self.prefs.fonts, cx);
+        }
+        if crate::ui::current_shortcuts(cx) != self.prefs.shortcuts {
+            crate::ui::apply_shortcuts(&self.prefs.shortcuts, cx);
         }
         crate::lifecycle::set_reminder_preferences(&self.prefs, cx);
         self.prepare_outbox_preview(cx);
@@ -806,6 +814,7 @@ impl MailWindow {
             microsoft_config_label: String::new(),
             search,
             scroll_target: None,
+            keyboard: Default::default(),
             _subscriptions: subs,
         });
         self.refresh_settings_cache();
@@ -830,6 +839,8 @@ impl MailWindow {
             }
             s.page = page;
             s.scroll_target = None;
+            s.keyboard.recording = None;
+            s.keyboard.error = None;
             s.scroll.set_offset(point(px(0.), px(0.)));
         }
         cx.notify();
@@ -965,6 +976,7 @@ impl MailWindow {
             SettingsPage::Fonts => self.render_settings_fonts(state, cx).into_any_element(),
             SettingsPage::Mail => self.render_settings_mail(state, cx).into_any_element(),
             SettingsPage::Calendar => self.render_settings_calendar(state, cx).into_any_element(),
+            SettingsPage::Keyboard => self.render_settings_keyboard(state, cx).into_any_element(),
             SettingsPage::Integrations => state.mcp.as_ref().map(|setup| self.render_mcp_setup(setup, cx)).unwrap_or_else(|| div().into_any_element()),
             SettingsPage::About => self.render_settings_about(state, cx).into_any_element(),
         } };
@@ -987,6 +999,9 @@ impl MailWindow {
                     .id("settings-dialog")
                     .key_context(super::SETTINGS_CONTEXT)
                     .track_focus(&state.focus)
+                    .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        this.handle_shortcut_capture(event, window, cx);
+                    }))
                     .on_action(cx.listener(|this, _: &super::FocusSettingsSearch, window, cx| this.focus_settings_search(window, cx)))
                     .tab_group()
                     .role(gpui::Role::Dialog)
@@ -1741,6 +1756,13 @@ impl MailWindow {
                 }),
             ))
             .child(setting_row(
+                "All Inboxes",
+                "Show a combined inbox across your accounts in the Mail sidebar.",
+                Switch::new("pref-all-inboxes").checked(prefs.show_all_inboxes).on_click(cx.listener(|this, checked: &bool, window, cx| {
+                    this.set_show_all_inboxes(*checked, window, cx);
+                })).into_any_element(),
+            ))
+            .child(setting_row(
                 "Focused Inbox",
                 "Sort the Inbox into Focused and Other.",
                 Switch::new("pref-focused").checked(self.focused_enabled).on_click(cx.listener(|this, _checked: &bool, _w, cx| this.toggle_focused_inbox(cx))).into_any_element(),
@@ -1789,7 +1811,7 @@ impl MailWindow {
             ))
             .child(setting_row(
                 "Default reply",
-                "What the reply box and Ctrl R do.",
+                &format!("What the reply box and {} do.", self.shortcut_hint(ShortcutAction::Reply)),
                 choice(&[("Reply", false), ("Reply all", true)], prefs.reply_all_by_default, cx, |this, v, _w, cx| {
                     this.prefs.reply_all_by_default = v;
                     this.save_prefs(cx);
@@ -1925,8 +1947,17 @@ impl MailWindow {
             .child(setting_row("Microsoft app registration", &microsoft_config, div().into_any_element()))
             .child(setting_row("Sign-in tokens", if cfg!(target_os = "macos") { "Stored in Apple Keychain." } else { "Stored in the system keyring." }, div().into_any_element()))
             .child(section("Keyboard", None))
-            .child(div().text_size(crate::ui::ui_px(12.)).text_color(p.muted).line_height(crate::ui::ui_px(20.)).child(
-                "Ctrl N new message · Ctrl E search · Ctrl R reply · Ctrl Shift R reply all · Ctrl F forward · Ctrl Enter send · Ctrl U toggle read · J/K move · E archive or move to Inbox · Delete · S star · Ctrl 1 Mail · Ctrl 2 Calendar · Ctrl Shift A new event · Ctrl , settings · Ctrl Q quit · in settings: Ctrl F or F3 search · in the calendar: ← → T D W M A",
+            .child(setting_row(
+                "Keyboard shortcuts",
+                &self.keyboard_summary(),
+                Button::new("about-keyboard-settings")
+                    .small()
+                    .icon(icon("keyboard").size(px(14.)))
+                    .label("Customize")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.set_settings_page(SettingsPage::Keyboard, window, cx)
+                    }))
+                    .into_any_element(),
             ))
     }
 }
@@ -2301,6 +2332,7 @@ impl SettingEntry {
             "Add account" => "Your accounts",
             "Check for updates" => "Updates",
             "Keyboard shortcuts" => "Keyboard",
+            "Customize mail shortcuts" => "Mail",
             label => label,
         }
     }
@@ -2310,7 +2342,7 @@ const fn entry(page: SettingsPage, section: &'static str, label: &'static str, d
     SettingEntry { page, section, label, description, keywords }
 }
 
-use SettingsPage::{About as AB, Accounts as AC, Calendar as CA, Fonts as FO, General as GE, Mail as MA};
+use SettingsPage::{About as AB, Accounts as AC, Calendar as CA, Fonts as FO, General as GE, Keyboard as KB, Mail as MA};
 
 pub(crate) static SETTINGS_INDEX: &[SettingEntry] = &[
     entry(SettingsPage::Integrations, "MCP", "MCP clients", "Create and revoke account access for local AI harnesses.", "agent automation localhost model context protocol token grant"),
@@ -2357,6 +2389,7 @@ pub(crate) static SETTINGS_INDEX: &[SettingEntry] = &[
     entry(GE, "Notifications", "Event reminders", "Show the calendar reminders window and a desktop notification when reminders are due.", "notifications alert reminder"),
     entry(GE, "Synchronization", "Check for changes every", "How often Overlook looks for new mail and events.", "sync interval refresh poll frequency"),
     entry(MA, "Layout", "Sidebar accounts", "Show every account’s folders, or only the account you are in.", "sidebar all accounts one at a time folders tree"),
+    entry(MA, "Layout", "All Inboxes", "Show a combined inbox across your accounts in the Mail sidebar.", "unified combined all inboxes multi account"),
     entry(MA, "Layout", "Focused Inbox", "Sort the Inbox into Focused and Other.", "other inbox sort"),
     entry(MA, "Layout", "Sender pictures", "Show initials next to each conversation.", "avatars initials photos"),
     entry(MA, "Layout", "Message preview text", "Show the first line of each conversation in the list.", "snippet preview"),
@@ -2372,6 +2405,9 @@ pub(crate) static SETTINGS_INDEX: &[SettingEntry] = &[
     entry(CA, "Events", "Default reminder", "Used when an event or calendar sets no reminder of its own.", "alert notification alarm"),
     entry(CA, "Events", "Show declined events", "", "declined rsvp hide"),
     entry(CA, "Events", "Event reminders", "Show the calendar reminders window and a desktop notification when reminders are due.", "notifications alert"),
+    entry(KB, "Preset", "Keyboard preset", "Switch between Outlook and Gmail keyboard shortcut presets.", "gmail outlook keyboard shortcuts hotkeys keybindings preset"),
+    entry(KB, "Preset", "Reset keyboard shortcuts", "Restore every action to the active preset's defaults.", "reset keyboard shortcuts defaults overrides"),
+    entry(KB, "Mail", "Customize mail shortcuts", "Override compose, reply, archive, delete, search, star, and navigation keys.", "gmail j k e c r a f s v slash hash undo shortcuts keybindings"),
     entry(AB, "Updates", "Check for updates", "From the project’s GitHub releases.", "update version upgrade automatic"),
     entry(AB, "Links", "Source", "github.com/last-refuge/overlook", "github repository code website"),
     entry(AB, "On this device", "Mail, events, drafts, and attachments", "Open the data folder.", "data folder storage location"),
@@ -2458,5 +2494,15 @@ mod search_tests {
         assert_eq!(choices[1].family.as_deref(), Some(overlook_core::SYSTEM_UI_FONT));
         assert!(choices.iter().any(|c| c.family.as_deref() == Some("Georgia")));
         assert!(choices.iter().any(|c| c.family.as_deref() == Some("CustomFont") && c.title.contains("(kept)")));
+    }
+
+    #[test]
+    fn keyboard_shortcut_settings_are_searchable() {
+        let hits = search_settings("gmail");
+        assert!(hits.iter().any(|e| e.page == SettingsPage::Keyboard && e.label == "Keyboard preset"));
+        let hits = search_settings("reset keyboard");
+        assert!(hits.iter().any(|e| e.page == SettingsPage::Keyboard && e.label == "Reset keyboard shortcuts"));
+        let hits = search_settings("shortcuts");
+        assert!(hits.iter().any(|e| e.page == SettingsPage::Keyboard));
     }
 }

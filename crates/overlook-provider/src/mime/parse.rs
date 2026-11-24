@@ -65,9 +65,16 @@ pub(crate) fn message_from_parsed(account: &Account, bytes: &[u8], parsed: Optio
         None => Default::default(),
     };
 
-    let Collected { mut text, html, calendar, attachments } = collected;
-    if text.is_none() {
-        text = html.as_deref().map(html_to_text);
+    let Collected { mut text, html, calendar, disposition_notification, attachments } = collected;
+    let plain_has_visible = text
+        .as_deref()
+        .is_some_and(|t| !snippet_of(t).is_empty());
+    if text.is_none() || (!plain_has_visible && html.is_some()) {
+        if let Some(rendered) = html.as_deref().map(html_to_text) {
+            if text.is_none() || !snippet_of(&rendered).is_empty() {
+                text = Some(rendered);
+            }
+        }
     }
     // Nothing recognisable at all: show a bounded prefix of the bytes rather than an empty message.
     let blank = |t: &Option<String>| t.as_deref().is_none_or(|t| t.trim().is_empty());
@@ -82,6 +89,7 @@ pub(crate) fn message_from_parsed(account: &Account, bytes: &[u8], parsed: Optio
         _ => String::new(),
     };
     let invitation = calendar.as_deref().and_then(overlook_core::ics::parse_invitation);
+    let read_receipt = disposition_notification.as_deref().and_then(overlook_core::read_receipt::parse_mdn);
     let is_outgoing = !from.email.is_empty() && from.email.eq_ignore_ascii_case(&account.email);
 
     Message {
@@ -110,6 +118,7 @@ pub(crate) fn message_from_parsed(account: &Account, bytes: &[u8], parsed: Optio
         is_important: false,
         focus_override: None,
         invitation,
+        read_receipt,
     }
 }
 
@@ -120,6 +129,7 @@ pub fn headers_from_rfc822(account: &Account, bytes: &[u8], local_id: MessageId,
     m.body = Body::default();
     m.snippet = String::new();
     m.attachments.clear();
+    m.read_receipt = None;
     m
 }
 
@@ -163,23 +173,7 @@ fn addresses(list: Option<&mail_parser::Address<'_>>) -> Vec<Address> {
 }
 
 fn snippet_of(text: &str) -> String {
-    let mut out = String::new();
-    let mut last_space = true;
-    for ch in text.chars() {
-        if ch.is_whitespace() {
-            if !last_space {
-                out.push(' ');
-                last_space = true;
-            }
-        } else {
-            out.push(ch);
-            last_space = false;
-        }
-        if out.chars().count() >= SNIPPET_CHARS {
-            break;
-        }
-    }
-    out.trim().to_owned()
+    overlook_core::clean_snippet(text, SNIPPET_CHARS)
 }
 
 #[derive(Default)]
@@ -187,6 +181,7 @@ struct Collected {
     text: Option<String>,
     html: Option<String>,
     calendar: Option<String>,
+    disposition_notification: Option<String>,
     attachments: Vec<Attachment>,
 }
 
@@ -205,6 +200,16 @@ fn walk(parts: &[MessagePart<'_>], id: u32, path: Option<&str>, out: &mut Collec
             }
         }
         PartType::Message(nested) => {
+            let is_mdn = part.content_type().is_some_and(|ct| {
+                ct.ctype().eq_ignore_ascii_case("message")
+                    && ct.subtype().is_some_and(|s| s.eq_ignore_ascii_case("disposition-notification"))
+            });
+            if is_mdn {
+                if out.disposition_notification.is_none() {
+                    out.disposition_notification = Some(String::from_utf8_lossy(nested.raw_message.as_ref()).into_owned());
+                }
+                return;
+            }
             // A forwarded message as an attachment. Its own parts are not expanded.
             let filename = part.attachment_name().map(str::to_owned).unwrap_or_else(|| {
                 let subject = nested.subject().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("forwarded message");
@@ -240,6 +245,17 @@ fn leaf(part: &MessagePart<'_>, path: &str, out: &mut Collected, local_id: &Mess
         PartType::Binary(b) | PartType::InlineBinary(b) => (true, b.len()),
         _ => (false, 0),
     };
+
+    if mime == "message/disposition-notification" {
+        if out.disposition_notification.is_none() {
+            out.disposition_notification = match &part.body {
+                PartType::Text(t) | PartType::Html(t) => Some(t.to_string()),
+                PartType::Binary(b) | PartType::InlineBinary(b) => Some(String::from_utf8_lossy(b).into_owned()),
+                _ => None,
+            };
+        }
+        return;
+    }
 
     if mime.starts_with("text/calendar") && out.calendar.is_none() {
         out.calendar = match &part.body {
@@ -528,5 +544,126 @@ Content-Disposition: attachment; filename*=UTF-8''r%C3%A9sum%C3%A9.pdf
         assert!(part_bytes(raw, "7").is_none());
         let plain = b"From: a@example.com\r\nSubject: p\r\nContent-Type: text/plain\r\n\r\nHello\r\n";
         assert_eq!(part_bytes(plain, "1").unwrap(), b"Hello\r\n");
+    }
+
+    #[test]
+    fn parses_incoming_rfc8098_mdn_receipt_message() {
+        let raw = crlf(
+            "From: Maya Chen <maya@northstar.example>
+To: Jason <jason@example.com>
+Subject: Read: Contract review
+Date: Tue, 14 Oct 2026 10:02:00 -0700
+Message-ID: <mdn-1@northstar.example>
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=disposition-notification; boundary=\"mdn-bnd\"
+
+--mdn-bnd
+Content-Type: text/plain; charset=utf-8
+
+This is a Return Receipt for the mail that you sent to maya@northstar.example.
+--mdn-bnd
+Content-Type: message/disposition-notification
+
+Reporting-UA: mail.northstar.example; Mozilla Thunderbird 128.0
+Final-Recipient: rfc822; maya@northstar.example
+Original-Message-ID: <optin-smtp@overlook.example>
+Disposition: manual-action/MDN-sent-manually; displayed
+--mdn-bnd
+Content-Type: text/rfc822-headers
+
+From: Jason <jason@example.com>
+To: Maya Chen <maya@northstar.example>
+Subject: Contract review
+Message-ID: <optin-smtp@overlook.example>
+Disposition-Notification-To: jason@example.com
+--mdn-bnd--
+",
+        );
+
+        let m = message_from_rfc822(&account(), &raw, MessageId::from("m-mdn"), &MessageFlags::default());
+        assert_eq!(m.subject, "Read: Contract review");
+        assert!(
+            m.body.text.as_deref().unwrap_or("").contains("Return Receipt"),
+            "human-readable report text is preserved: {:?}",
+            m.body.text
+        );
+        assert!(
+            !m.attachments.iter().any(|a| a.mime_type == "message/disposition-notification"),
+            "MDN metadata part must not appear as a bogus attachment: {:?}",
+            m.attachments
+        );
+        let receipt = m.read_receipt.as_ref().expect("RFC 8098 MDN receipt parsed");
+        assert!(receipt.is_displayed());
+        assert_eq!(receipt.original_message_id.as_deref(), Some("<optin-smtp@overlook.example>"));
+        assert_eq!(receipt.final_recipient.as_deref(), Some("maya@northstar.example"));
+        assert_eq!(receipt.disposition, "manual-action/MDN-sent-manually; displayed");
+        assert_eq!(receipt.summary_banner(), "Read receipt from the recipient's mail client");
+    }
+
+    #[test]
+    fn ignores_non_mdn_delivery_status_reports() {
+        let raw = crlf(
+            "From: Mail Delivery Subsystem <mailer-daemon@example.com>
+To: jason@example.com
+Subject: Delivery Status Notification (Failure)
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=delivery-status; boundary=\"dsn-bnd\"
+
+--dsn-bnd
+Content-Type: text/plain
+
+Address not found.
+--dsn-bnd
+Content-Type: message/delivery-status
+
+Reporting-MTA: dns; mx.example.com
+Final-Recipient: rfc822; missing@example.com
+Action: failed
+Status: 5.1.1
+--dsn-bnd--
+",
+        );
+        let m = message_from_rfc822(&account(), &raw, MessageId::from("m-dsn"), &MessageFlags::default());
+        assert!(m.read_receipt.is_none());
+    }
+
+    #[test]
+    fn snippet_falls_back_to_html_when_plain_is_blank_and_strips_preheader_spacers() {
+        // 1. Blank text/plain part alongside real HTML body.
+        let raw_blank_plain = crlf(
+            "From: Carl Friedrik <contact@carlfriedrik.com>
+To: jason@example.com
+Subject: Your order is on its way! (#A60412)
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary=\"alt-bnd\"
+
+--alt-bnd
+Content-Type: text/plain; charset=utf-8
+
+   
+--alt-bnd
+Content-Type: text/html; charset=utf-8
+
+<div>&zwnj;&nbsp;&#847;&zwnj;&nbsp;&#847;&zwnj;&nbsp;&#847;</div><p>Your order is on the way</p><p>Hi Jason,</p>
+--alt-bnd--
+",
+        );
+        let m = message_from_rfc822(&account(), &raw_blank_plain, MessageId::from("m-blank-plain"), &MessageFlags::default());
+        assert_eq!(m.snippet, "Your order is on the way Hi Jason,");
+
+        // 2. HTML body padded with 200+ invisible preheader spacer characters before visible text.
+        let spacer = "&zwnj;&nbsp;&#847;".repeat(120);
+        let raw_padded_html = crlf(&format!(
+            "From: Carl Friedrik <contact@carlfriedrik.com>
+To: jason@example.com
+Subject: Your order is on its way! (#A60412)
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+
+<html><body><div>{spacer}</div><h1>Your order is on the way</h1><p>Hi Jason,</p></body></html>
+"
+        ));
+        let m2 = message_from_rfc822(&account(), &raw_padded_html, MessageId::from("m-padded-html"), &MessageFlags::default());
+        assert_eq!(m2.snippet, "Your order is on the way Hi Jason,");
     }
 }

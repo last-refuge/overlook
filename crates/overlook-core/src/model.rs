@@ -196,6 +196,7 @@ impl Address {
 pub enum LabelKind {
     Inbox,
     Starred,
+    Snoozed,
     Drafts,
     Sent,
     Archive,
@@ -213,6 +214,7 @@ impl LabelKind {
         match self {
             LabelKind::Inbox => "inbox",
             LabelKind::Starred => "starred",
+            LabelKind::Snoozed => "snoozed",
             LabelKind::Drafts => "drafts",
             LabelKind::Sent => "sent",
             LabelKind::Archive => "archive",
@@ -228,6 +230,7 @@ impl LabelKind {
         Some(match key {
             "inbox" => LabelKind::Inbox,
             "starred" => LabelKind::Starred,
+            "snoozed" => LabelKind::Snoozed,
             "drafts" => LabelKind::Drafts,
             "sent" => LabelKind::Sent,
             "archive" => LabelKind::Archive,
@@ -242,7 +245,7 @@ impl LabelKind {
 
     /// Whether this kind is a view computed from message state rather than a stored label.
     pub fn is_virtual(self) -> bool {
-        matches!(self, LabelKind::Starred | LabelKind::Drafts | LabelKind::Outbox)
+        matches!(self, LabelKind::Starred | LabelKind::Snoozed | LabelKind::Drafts | LabelKind::Outbox)
     }
 }
 
@@ -331,6 +334,68 @@ pub fn file_badge(filename: &str) -> String {
         .unwrap_or_else(|| "FILE".to_owned())
 }
 
+/// Collapses whitespace and strips invisible Unicode formatting/preheader-spacer characters
+/// (such as ZWNJ, Combining Grapheme Joiner `&#847;`, ZWSP, soft hyphen, BOM, and Braille blank)
+/// that marketing/transactional emails pad into preview text, capping at `max_chars` characters.
+pub fn clean_snippet(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut count = 0usize;
+    let mut last_space = true;
+    for ch in text.chars() {
+        if is_invisible_snippet_char(ch) {
+            continue;
+        }
+        if ch == '\u{200D}' {
+            // Preserve zero-width joiners inside emoji sequences, but drop leading/standalone
+            // joiner padding.
+            if !last_space {
+                out.push(ch);
+                count += 1;
+            }
+            continue;
+        }
+        if ch.is_whitespace() || ch.is_control() {
+            if !last_space {
+                out.push(' ');
+                count += 1;
+                last_space = true;
+            }
+        } else {
+            out.push(ch);
+            count += 1;
+            last_space = false;
+        }
+        if count >= max_chars {
+            break;
+        }
+    }
+    out.trim().to_owned()
+}
+
+fn is_invisible_snippet_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'
+            | '\u{1160}'
+            | '\u{17B4}'
+            | '\u{17B5}'
+            | '\u{180E}'
+            | '\u{200B}'
+            | '\u{200C}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{2800}'
+            | '\u{3164}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+    )
+}
+
 pub fn human_size(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     let b = bytes as f64;
@@ -394,6 +459,10 @@ pub struct Message {
     pub focus_override: Option<bool>,
     /// Calendar invitation carried by the message (from a `text/calendar` part).
     pub invitation: Option<crate::ics::Invitation>,
+    /// Parsed RFC 8098 Message Disposition Notification (MDN) when this message is a
+    /// read/disposition receipt from a recipient's mail client.
+    #[serde(default)]
+    pub read_receipt: Option<crate::read_receipt::ReadReceipt>,
 }
 
 impl Message {
@@ -429,6 +498,8 @@ pub struct ConversationSummary {
     pub label_ids: BTreeSet<LabelId>,
     /// True when any message in the conversation has local changes awaiting sync.
     pub pending: bool,
+    /// Active device-local snooze wake timestamp, if this conversation is snoozed.
+    pub snoozed_until: Option<Timestamp>,
 }
 
 impl ConversationSummary {
@@ -517,6 +588,7 @@ impl ConversationSummary {
             latest_message_id: latest.id.clone(),
             label_ids,
             pending,
+            snoozed_until: None,
         })
     }
 
@@ -660,6 +732,10 @@ pub struct Draft {
     /// (and shown, collapsed, in the composer). The quoted text is not part of `body_text`.
     #[serde(default)]
     pub include_quote: bool,
+    /// Opt-in per-message RFC 8098 read receipt request (`Disposition-Notification-To`).
+    /// Always defaults to `false` on new messages, replies, forwards, and resends.
+    #[serde(default)]
+    pub request_read_receipt: bool,
     /// The signature chosen for this message, by id in the account's signatures.
     #[serde(default)]
     pub signature_id: Option<String>,
@@ -692,6 +768,7 @@ impl Draft {
             body_html: None,
             imported: None,
             include_quote: false,
+            request_read_receipt: false,
             signature_id: None,
             signature_html: None,
             attachments: Vec::new(),
@@ -924,7 +1001,42 @@ mod tests {
             is_important: false,
             focus_override: None,
             invitation: None,
+            read_receipt: None,
         }
+    }
+
+    #[test]
+    fn draft_read_receipt_request_is_opt_in_and_off_by_default() {
+        let acct = AccountId::from("acct");
+        let owner = Address::named("Jason", "jason@example.com");
+        let source = msg(Address::named("Maya", "maya@northstar.example"), 100);
+
+        assert!(!Draft::new(acct.clone(), DraftKind::New, 1).request_read_receipt);
+        for kind in [DraftKind::New, DraftKind::Reply, DraftKind::ReplyAll, DraftKind::Forward] {
+            assert!(
+                !Draft::in_response_to(acct.clone(), kind, &source, &owner, 2).request_read_receipt,
+                "{kind:?} must default request_read_receipt to false"
+            );
+        }
+        assert!(!Draft::resend_of(acct.clone(), &source, 3).request_read_receipt);
+
+        // Deserializing legacy draft JSON without request_read_receipt defaults to false.
+        let mut draft = Draft::new(acct, DraftKind::New, 1);
+        draft.request_read_receipt = true;
+        let mut json: serde_json::Value = serde_json::to_value(&draft).unwrap();
+        json.as_object_mut().unwrap().remove("request_read_receipt");
+        let legacy: Draft = serde_json::from_value(json).unwrap();
+        assert!(!legacy.request_read_receipt);
+    }
+
+    #[test]
+    fn clean_snippet_strips_invisible_preheader_padding_and_collapses_whitespace() {
+        let padding = "\u{200C}\u{00A0}\u{034F}\u{200B}\u{FEFF}\u{00AD}\u{2800}".repeat(60);
+        assert_eq!(clean_snippet(&padding, 160), "");
+        let padded = format!("{padding}  Your order is on the way\n\tHi Jason,  ");
+        assert_eq!(clean_snippet(&padded, 160), "Your order is on the way Hi Jason,");
+        // Emoji ZWJ sequences stay intact while leading ZWJ padding is stripped.
+        assert_eq!(clean_snippet("\u{200D}\u{200D}Family \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}", 160), "Family \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}");
     }
 
     #[test]

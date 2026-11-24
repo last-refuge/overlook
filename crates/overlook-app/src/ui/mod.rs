@@ -24,11 +24,13 @@ mod list_menu;
 #[cfg(target_os = "macos")]
 mod macos_menu;
 mod settings;
+mod shortcuts;
 mod signature;
 mod reader;
 mod reminders;
 mod sidebar;
 mod shell;
+mod snooze;
 mod toolbar;
 mod widgets;
 mod time_zone;
@@ -48,6 +50,7 @@ pub use composer::Composer;
 pub(crate) use composer_window::WindowSetup;
 pub(crate) use reminders::ReminderWindow;
 pub use settings::{SettingsPage, SettingsState};
+pub(crate) use shortcuts::{apply_keybindings as apply_shortcuts, current_shortcuts, KeyboardSettingsState};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
@@ -59,7 +62,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use gpui_kit::base::{h_flex, v_flex};
-use overlook_core::time::{format_clock, now};
+use overlook_core::time::{format_clock, now, Timestamp};
 use overlook_core::*;
 use overlook_provider::sample::SampleProvider;
 use overlook_store::{LocalChange, ListFilter, MailIndex, MailboxView, Store};
@@ -127,6 +130,8 @@ actions!(
         SelectAllConversations,
         DeleteForeverSelected,
         MoveSelected,
+        SnoozeSelected,
+        UnsnoozeSelected,
     ]
 );
 
@@ -188,72 +193,9 @@ pub(crate) fn toast(window: &mut Window, cx: &mut App, level: crate::notify::Lev
 pub struct AppearanceGlobal(pub AppearancePreference);
 impl Global for AppearanceGlobal {}
 
-pub fn init(cx: &mut App) {
+pub fn init(shortcuts: &ShortcutPrefs, cx: &mut App) {
     prompt::init(cx);
-    cx.bind_keys([
-        KeyBinding::new("ctrl-n", Compose, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-e", FocusSearch, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-k", OpenCommandPalette, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-shift-p", OpenCommandPalette, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("escape", Escape, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-enter", SendMessage, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-shift-o", PopOutComposer, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-shift-h", ToggleMessageHistory, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-r", Reply, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-shift-r", ReplyAll, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-f", Forward, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-u", ToggleRead, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-shift-v", MoveSelected, Some(WINDOW_CONTEXT)),
-        // Text fields bind ctrl-z in their own, deeper context, so typing is undone there.
-        KeyBinding::new("ctrl-z", UndoLast, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-h", ShowHistory, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("f5", SyncNow, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("f2", RenameFolder, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-1", SwitchToMail, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-2", SwitchToCalendar, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-3", SwitchToContacts, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-shift-a", NewEventAction, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-s", SaveCalendarEvent, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-,", OpenSettings, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-q", QuitOverlook, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-b", FormatBold, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-i", FormatItalic, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-shift-x", FormatStrike, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-shift-c", FormatCode, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-shift-8", FormatBullets, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-shift-7", FormatNumbers, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-shift-9", FormatQuote, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-shift-p", TogglePreview, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("left", CalendarPrevious, Some(CALENDAR_CONTEXT)),
-        KeyBinding::new("right", CalendarNext, Some(CALENDAR_CONTEXT)),
-        KeyBinding::new("t", CalendarToday, Some(CALENDAR_CONTEXT)),
-        KeyBinding::new("d", CalendarDay, Some(CALENDAR_CONTEXT)),
-        KeyBinding::new("w", CalendarWeek, Some(CALENDAR_CONTEXT)),
-        KeyBinding::new("a", CalendarAgenda, Some(CALENDAR_CONTEXT)),
-        KeyBinding::new("m", CalendarMonth, Some(CALENDAR_CONTEXT)),
-        KeyBinding::new("delete", CalendarDeleteSelected, Some(CALENDAR_CONTEXT)),
-        KeyBinding::new("enter", CalendarEditSelected, Some(CALENDAR_CONTEXT)),
-        KeyBinding::new("down", CalendarSelectNext, Some(CALENDAR_CONTEXT)),
-        KeyBinding::new("up", CalendarSelectPrevious, Some(CALENDAR_CONTEXT)),
-        KeyBinding::new("j", NextConversation, Some(LIST_CONTEXT)),
-        KeyBinding::new("down", NextConversation, Some(LIST_CONTEXT)),
-        KeyBinding::new("k", PrevConversation, Some(LIST_CONTEXT)),
-        KeyBinding::new("up", PrevConversation, Some(LIST_CONTEXT)),
-        KeyBinding::new("e", ArchiveSelected, Some(LIST_CONTEXT)),
-        KeyBinding::new("backspace", ArchiveSelected, Some(LIST_CONTEXT)),
-        KeyBinding::new("delete", TrashSelected, Some(LIST_CONTEXT)),
-        KeyBinding::new("shift-delete", DeleteForeverSelected, Some(LIST_CONTEXT)),
-        KeyBinding::new("shift-down", ExtendSelectionNext, Some(LIST_CONTEXT)),
-        KeyBinding::new("shift-up", ExtendSelectionPrev, Some(LIST_CONTEXT)),
-        KeyBinding::new("ctrl-a", SelectAllConversations, Some(LIST_CONTEXT)),
-        KeyBinding::new("v", MoveSelected, Some(LIST_CONTEXT)),
-        KeyBinding::new("s", ToggleStar, Some(LIST_CONTEXT)),
-        KeyBinding::new("u", ToggleRead, Some(LIST_CONTEXT)),
-        KeyBinding::new("enter", OpenSelected, Some(LIST_CONTEXT)),
-        // Inside Settings, find keys search settings instead of forwarding mail.
-        KeyBinding::new("ctrl-f", FocusSettingsSearch, Some(SETTINGS_CONTEXT)),
-        KeyBinding::new("f3", FocusSettingsSearch, Some(SETTINGS_CONTEXT)),
-    ]);
+    shortcuts::apply_keybindings(shortcuts, cx);
     #[cfg(target_os = "macos")]
     macos_menu::init(cx);
 }
@@ -304,6 +246,8 @@ pub struct QuickLook {
 enum LocalWrite {
     Change(LocalChange),
     MoveFocus { ids: Vec<MessageId>, focused: bool, sender: Option<String> },
+    Snooze { conversation_id: ConversationId, wake_at: Timestamp },
+    CancelSnooze { conversation_id: ConversationId },
 }
 
 /// The server-side part of a search.
@@ -316,12 +260,55 @@ pub enum OnlineSearch {
     Failed(String),
 }
 
+/// Uniquely identifies a conversation together with its owning account, so threads stay
+/// attached to their account in combined views even if similar mail appears in multiple accounts.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct ConversationRef {
+    pub account_id: AccountId,
+    pub id: ConversationId,
+}
+
+impl ConversationRef {
+    pub(crate) fn of(summary: &ConversationSummary) -> Self {
+        Self { account_id: summary.account_id.clone(), id: summary.id.clone() }
+    }
+}
+
+/// Formats an account entry for the header and sidebar account switcher menus,
+/// showing both the account's name and email address when a distinct name exists.
+pub(crate) fn format_account_menu_label(custom_name: Option<&str>, display_name: &str, email: &str, kind_label: &str) -> String {
+    let name = custom_name
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .or_else(|| {
+            let d = display_name.trim();
+            (!d.is_empty()).then_some(d)
+        });
+    match name {
+        Some(n) if !n.eq_ignore_ascii_case(email) => format!("{n} · {email}"),
+        _ => format!("{email} · {kind_label}"),
+    }
+}
+
+/// Combines inbox conversation lists from multiple accounts into a single newest-first list,
+/// keeping every conversation attached to its owning account without merging across accounts.
+pub(crate) fn combine_inbox_conversations(per_account: impl IntoIterator<Item = Vec<ConversationSummary>>) -> Vec<ConversationSummary> {
+    let mut combined: Vec<ConversationSummary> = per_account.into_iter().flatten().collect();
+    combined.sort_by(|a, b| {
+        b.latest
+            .cmp(&a.latest)
+            .then_with(|| a.account_id.cmp(&b.account_id))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    combined
+}
+
 /// The mail a drag carries. A row in the list names its conversation and leaves the
 /// messages to be looked up when the drag lands; building their ids for every row on every
 /// repaint cost far more than the rare drag that needs them.
 #[derive(Clone, Debug)]
 pub enum DraggedMail {
-    Conversation(ConversationId),
+    Conversation(ConversationRef),
     /// The selected rows, looked up when the drag lands.
     Selection,
 }
@@ -330,7 +317,7 @@ pub enum DraggedMail {
 /// this, so the same mailbox shows the same numbers wherever it appears.
 pub(crate) fn sidebar_counts(index: &MailIndex, owner: &str, focused_enabled: bool) -> HashMap<MailboxView, usize> {
     let mut counts = HashMap::new();
-    for view in [MailboxView::Kind(LabelKind::Inbox), MailboxView::Kind(LabelKind::Starred)]
+    for view in [MailboxView::Kind(LabelKind::Inbox), MailboxView::Kind(LabelKind::Starred), MailboxView::Kind(LabelKind::Snoozed)]
         .into_iter()
         .chain(index.labels().iter().filter(|l| l.kind == LabelKind::User).map(|l| MailboxView::Label(l.id.clone())))
     {
@@ -417,6 +404,7 @@ struct RowsKey {
     /// Bumped whenever the conversations, drafts or Outbox are reloaded.
     data: u64,
     account: AccountId,
+    all_inboxes: bool,
     view: MailboxView,
     filter: ListFilter,
     inbox_tab: Option<FocusTab>,
@@ -432,6 +420,7 @@ struct RowLayout {
     compact: bool,
     avatars: bool,
     previews: bool,
+    all_inboxes: bool,
     ui_size: u8,
     list_family: String,
     list_size: Option<u8>,
@@ -724,16 +713,18 @@ pub struct MailWindow {
     outgoing_dir: PathBuf,
 
     view: MailboxView,
+    /// Showing the combined All Inboxes view across connected mail accounts.
+    all_inboxes: bool,
     filter: ListFilter,
     /// The selected conversation that was automatically marked read in the Unread list.
-    unread_selection: Option<ConversationId>,
+    unread_selection: Option<ConversationRef>,
     search_input: Entity<InputState>,
     search_query: String,
     search_coverage: String,
     /// Cached local search coverage sentence for the active query.
     local_search_coverage: String,
-    /// Local FTS search hits computed off the UI thread, keyed by `search_generation`.
-    local_search_hits: Option<(u64, BTreeSet<MessageId>)>,
+    /// Local FTS search hits computed off the UI thread, keyed by `search_generation` and account.
+    local_search_hits: Option<(u64, HashMap<AccountId, BTreeSet<MessageId>>)>,
     /// The server-side half of a search: bumped per query so stale results are dropped.
     search_generation: u64,
     online_search: OnlineSearch,
@@ -785,9 +776,12 @@ pub struct MailWindow {
     rows_unread: std::cell::Cell<usize>,
     /// Unread conversations in the Other tab of the Inbox, for its tab label.
     other_unread: usize,
-    /// The calendar event behind each invitation in the list/reader, by iCalendar UID:
+    /// The calendar event behind each invitation in the list/reader, by (account, iCalendar UID):
     /// populated on thread/mail/calendar refresh, never queried synchronously in render.
-    invite_events: HashMap<String, Option<Event>>,
+    invite_events: HashMap<(AccountId, String), Option<Event>>,
+    /// Incoming RFC 8098 read receipts matched to outgoing messages in the open thread,
+    /// keyed by the sent message's local id. Populated in `load_thread`, never in `render()`.
+    thread_read_receipts: HashMap<MessageId, Vec<ConfirmedReadReceipt>>,
     /// The row layout the list's cached heights were measured with.
     row_layout: std::cell::RefCell<Option<RowLayout>>,
     drafts: Vec<Draft>,
@@ -798,10 +792,10 @@ pub struct MailWindow {
     /// Opened messages whose bodies are downloading now, ahead of the queue.
     pub(crate) bodies_loading: HashSet<MessageId>,
 
-    selected: Option<ConversationId>,
+    selected: Option<ConversationRef>,
     /// The rows picked with Ctrl/Shift-click, Shift-arrows or Ctrl-A, `selected` among
     /// them. Empty for a plain single selection. Bulk actions act on these rows.
-    marked: BTreeSet<ConversationId>,
+    marked: BTreeSet<ConversationRef>,
     outbox_selected: Option<DraftId>,
     outbox_preview: Option<reader::OutboxPreview>,
     outbox_preview_gen: u64,
@@ -880,6 +874,8 @@ pub struct MailWindow {
     message_windows: Vec<email_modal::MessageWindow>,
     /// The New/Rename folder dialog, when open.
     folder_prompt: Option<folder_manage::FolderPrompt>,
+    /// The Snooze picker dialog, when open.
+    snooze_modal: Option<snooze::SnoozeModal>,
     history: Option<history::HistoryState>,
     appearance: AppearancePreference,
     density: Density,
@@ -914,6 +910,8 @@ pub struct MailWindow {
     // Calendar module state.
     pub(crate) module: Module,
     pub(crate) cal_view: CalView,
+    pub(crate) cal_enabled_accounts: BTreeSet<AccountId>,
+    pub(crate) cal_color_picker_open: Option<AccountId>,
     pub(crate) cal_anchor: i64,
     pub(crate) cal_events: Vec<Event>,
     pub(crate) calendars: Vec<Calendar>,
@@ -940,6 +938,7 @@ pub struct MailWindow {
     pub(crate) caldav_last_sync: Option<i64>,
     pub(crate) caldav_changes: Vec<CalDavChange>,
     pub(crate) caldav_previews: HashMap<OperationId, String>,
+    pub(crate) caldav_uncached_accounts: Vec<AccountId>,
     pub(crate) show_caldav_changes: bool,
     caldav_syncing: HashMap<AccountId, CalendarConnectionId>,
     caldav_next_retry: HashMap<AccountId, i64>,
@@ -1114,6 +1113,7 @@ impl MailWindow {
         let list_width = store.setting::<f32>("panes.list").ok().flatten().unwrap_or(340.);
         let list_height = store.setting::<f32>("panes.list_height").ok().flatten().unwrap_or(300.);
         let outgoing_dir = crate::data_dir().join("outgoing");
+        let cal_enabled_accounts = calendar::load_calendar_enabled_accounts(&store, &accounts, &account.id);
 
         let mut this = Self {
             focus_handle: cx.focus_handle(),
@@ -1142,6 +1142,7 @@ impl MailWindow {
             time_zone_prompt: None,
             outgoing_dir,
             view: MailboxView::Kind(LabelKind::Inbox),
+            all_inboxes: false,
             filter: ListFilter::All,
             unread_selection: None,
             search_input,
@@ -1177,6 +1178,7 @@ impl MailWindow {
             rows_unread: Default::default(),
             other_unread: 0,
             invite_events: HashMap::new(),
+            thread_read_receipts: HashMap::new(),
             row_layout: Default::default(),
             drafts: Vec::new(),
             outbox: Vec::new(),
@@ -1240,6 +1242,7 @@ impl MailWindow {
             message_owner,
             message_windows: Vec::new(),
             folder_prompt: None,
+            snooze_modal: None,
             history: None,
             appearance,
             density,
@@ -1260,6 +1263,8 @@ impl MailWindow {
             attachments_dir,
             module: startup_module,
             cal_view: CalView::Week,
+            cal_enabled_accounts,
+            cal_color_picker_open: None,
             cal_anchor: overlook_core::tz::day_start(now()),
             cal_events: Vec::new(),
             calendars: Vec::new(),
@@ -1278,6 +1283,7 @@ impl MailWindow {
             caldav_last_sync: None,
             caldav_changes: Vec::new(),
             caldav_previews: HashMap::new(),
+            caldav_uncached_accounts: Vec::new(),
             show_caldav_changes: false,
             caldav_syncing: HashMap::new(),
             caldav_next_retry: HashMap::new(),
@@ -1393,9 +1399,10 @@ impl MailWindow {
                 }
             }
         }
+        let _ = this.store.wake_due_snoozes(now());
         this.reload(cx);
         if this.selected.is_none() {
-            if let Some(first) = this.conversations.first().map(|c| c.id.clone()) {
+            if let Some(first) = this.conversations.first().map(ConversationRef::of) {
                 this.set_selected(Some(first));
                 this.load_thread(cx);
             }
@@ -1496,10 +1503,11 @@ impl MailWindow {
         })
         .detach();
 
-        // Periodic synchronization while accounts are reachable.
+        // Periodic synchronization while accounts are reachable, plus snooze wakeup checks.
         cx.spawn_in(window, async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_secs(15)).await;
             let alive = this.update_in(cx, |this, window, cx| {
+                this.check_due_snoozes(cx);
                 if this.prefs.check_for_updates && now() - this.update.last_check > 24 * 3_600_000 {
                     this.check_for_updates(false, window, cx);
                 }
@@ -1637,7 +1645,8 @@ impl MailWindow {
         self.other_indexes_lru.retain(|existing| existing != &id);
         self.other_indexes_lru.push_back(id.clone());
         self.other_indexes.insert(id, index);
-        while self.other_indexes.len() > MAX_OTHER_INDEXES {
+        let limit = if self.all_inboxes { MAX_OTHER_INDEXES.max(self.accounts.len()) } else { MAX_OTHER_INDEXES };
+        while self.other_indexes.len() > limit {
             if let Some(evicted) = self.other_indexes_lru.pop_front() {
                 self.other_indexes.remove(&evicted);
             } else {
@@ -1646,8 +1655,212 @@ impl MailWindow {
         }
     }
 
+    pub(crate) fn all_inboxes_active(&self) -> bool {
+        self.all_inboxes && self.has_account() && self.folder_owner.is_none() && !self.is_message_window()
+    }
+
+    pub(crate) fn set_show_all_inboxes(&mut self, enabled: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.prefs.show_all_inboxes == enabled {
+            return;
+        }
+        self.prefs.show_all_inboxes = enabled;
+        self.save_prefs(cx);
+        if !enabled && self.all_inboxes {
+            self.all_inboxes = false;
+            self.select_view(MailboxView::Kind(LabelKind::Inbox), window, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn open_all_inboxes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.has_account() {
+            return;
+        }
+        if self.offline_active() {
+            let back = self.writing_account();
+            if !back.id.0.is_empty() {
+                self.switch_account(back.id, window, cx);
+            }
+        }
+        if !self.all_inboxes || !self.search_query.trim().is_empty() {
+            self.unread_selection = None;
+        }
+        if !self.search_query.is_empty() {
+            self.search_query.clear();
+            self.local_search_hits = None;
+            self.local_search_coverage.clear();
+            let input = self.search_input.clone();
+            input.update(cx, |s, cx| s.set_value("", window, cx));
+        }
+        if self.composer.as_ref().is_some_and(|c| c.draft.kind != DraftKind::New) {
+            self.close_composer(window, cx);
+        }
+        self.all_inboxes = true;
+        self.view = MailboxView::Kind(LabelKind::Inbox);
+        self.outbox_selected = None;
+        self.outbox_preview = None;
+        self.ensure_all_inboxes_indexes();
+        self.refresh_mail();
+        let others: Vec<AccountId> = self
+            .accounts
+            .iter()
+            .filter(|a| a.id != self.account.id)
+            .map(|a| a.id.clone())
+            .collect();
+        self.rebuild_mail_index(cx);
+        for acct in others {
+            self.rebuild_other_account_index(acct, cx);
+        }
+        if self.selected.is_none() || !self.conversations.iter().any(|c| Some(ConversationRef::of(c)) == self.selected) {
+            self.set_selected(self.conversations.first().map(ConversationRef::of));
+            self.marked.clear();
+            self.expanded.clear();
+            self.load_thread(cx);
+            self.fetch_conversation_extras(window, cx);
+        }
+        self.list_focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn ensure_all_inboxes_indexes(&mut self) {
+        let active = self.account.id.clone();
+        if self.mail_index_account.as_ref() != Some(&active) && !active.0.is_empty() {
+            self.mail_index = self.store.mail_index(&active).unwrap_or_default();
+            self.mail_index_account = Some(active.clone());
+            self.account_message_count = self.store.message_count(&active).unwrap_or(0);
+        }
+        let missing: Vec<AccountId> = self
+            .accounts
+            .iter()
+            .filter(|a| a.id != active && !self.other_indexes.contains_key(&a.id))
+            .map(|a| a.id.clone())
+            .collect();
+        for id in missing {
+            let idx = self.store.mail_index(&id).unwrap_or_default();
+            self.cache_other_index(id, idx);
+        }
+    }
+
+    fn rebuild_other_account_index(&mut self, acct: AccountId, cx: &mut Context<Self>) {
+        let store = self.store.clone();
+        cx.spawn(async move |this, cx| {
+            let index = cx.background_spawn({
+                let acct = acct.clone();
+                async move { store.mail_index(&acct) }
+            }).await;
+            let _ = this.update(cx, |this, cx| {
+                if !this.accounts.iter().any(|a| a.id == acct) || this.account.id == acct {
+                    return;
+                }
+                let has_pending = this.local_writes.lock().unwrap().iter().any(|(a, _)| a == &acct)
+                    || this.local_in_flight.iter().any(|(a, _)| a == &acct);
+                if has_pending {
+                    return;
+                }
+                if let Ok(index) = index {
+                    this.cache_other_index(acct, index);
+                    if this.all_inboxes_active() {
+                        this.refresh_mail();
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Total unread Inbox conversations across all connected accounts (respecting Focused Inbox).
+    pub(crate) fn all_inboxes_unread_count(&self) -> usize {
+        let inbox = MailboxView::Kind(LabelKind::Inbox);
+        let focus = self.focused_enabled.then_some(FocusTab::Focused);
+        self.accounts
+            .iter()
+            .map(|a| {
+                if a.id == self.account.id {
+                    self.counts.get(&inbox).copied().unwrap_or(0)
+                } else if let Some(idx) = self.other_indexes.get(&a.id) {
+                    idx.view_count(&a.email, &inbox, focus)
+                } else {
+                    self.account_counts.get(&a.id).and_then(|c| c.get(&inbox)).copied().unwrap_or(0)
+                }
+            })
+            .sum()
+    }
+
+    /// Unread count for the Focused tab badge in the list header.
+    pub(crate) fn focused_inbox_unread_count(&self) -> usize {
+        if self.all_inboxes_active() {
+            self.all_inboxes_unread_count()
+        } else {
+            self.counts.get(&MailboxView::Kind(LabelKind::Inbox)).copied().unwrap_or(0)
+        }
+    }
+
     pub(crate) fn owner(&self) -> Address {
         Address::named(&self.account.display_name, &self.account.email)
+    }
+
+    pub(crate) fn owner_for(&self, id: &AccountId) -> Address {
+        if let Some(a) = self.known_account(id) {
+            Address::named(&a.display_name, &a.email)
+        } else {
+            self.owner()
+        }
+    }
+
+    pub(crate) fn account_email(&self, id: &AccountId) -> String {
+        self.known_account(id).map(|a| a.email).unwrap_or_else(|| self.account.email.clone())
+    }
+
+    /// Account label for switcher menus: shows the account's name and address whenever a
+    /// distinct display/custom name exists, otherwise address and provider kind.
+    pub(crate) fn account_menu_label(&self, account: &Account) -> String {
+        let custom = self.account_prefs.get(&account.id).map(|p| p.name.as_str());
+        format_account_menu_label(custom, &account.display_name, &account.email, self.account_kind_label(account))
+    }
+
+    /// The mail account to reply/forward from for `source`: always the message's own account
+    /// when it is a connected mail account, falling back to `writing_account` for offline copies.
+    pub(crate) fn reply_account_for(&self, source: &Message) -> Account {
+        if !self.is_offline(&source.account_id) {
+            if let Some(a) = self.accounts.iter().find(|a| a.id == source.account_id) {
+                return a.clone();
+            }
+        }
+        self.writing_account()
+    }
+
+    pub(crate) fn index_for(&self, id: &AccountId) -> Option<&MailIndex> {
+        if self.mail_index_account.as_ref() == Some(id) {
+            Some(&self.mail_index)
+        } else {
+            self.other_indexes.get(id)
+        }
+    }
+
+    pub(crate) fn index_for_mut(&mut self, id: &AccountId) -> Option<&mut MailIndex> {
+        if self.mail_index_account.as_ref() == Some(id) {
+            Some(&mut self.mail_index)
+        } else {
+            self.other_indexes.get_mut(id)
+        }
+    }
+
+    pub(crate) fn labels_for_account(&self, id: &AccountId) -> &[Label] {
+        if self.mail_index_account.as_ref() == Some(id) {
+            &self.labels
+        } else if let Some(idx) = self.other_indexes.get(id) {
+            idx.labels()
+        } else {
+            self.labels_of(id)
+        }
+    }
+
+    pub(crate) fn message_ids_in(&self, target: &ConversationRef) -> Vec<MessageId> {
+        self.index_for(&target.account_id)
+            .map(|idx| idx.message_ids_in(&target.id))
+            .unwrap_or_default()
     }
 
     pub(crate) fn is_sample(&self, account: &AccountId) -> bool {
@@ -1753,6 +1966,7 @@ impl MailWindow {
         self.new_event = None;
         self.cal_desc_cache.borrow_mut().take();
         self.invite_events.clear();
+        self.thread_read_receipts.clear();
         let previous_id = self.account.id.clone();
         let previous_contacts = std::mem::take(&mut self.contacts);
         if !previous_contacts.is_empty() && previous_id != account.id {
@@ -1766,7 +1980,13 @@ impl MailWindow {
         // neither are offline folders.
         if self.folder_owner.is_none() && !self.offline_active() {
             self.save_setting("active_account", &id);
+            if self.cal_enabled_accounts.len() <= 1 {
+                self.cal_enabled_accounts.clear();
+            }
+            self.cal_enabled_accounts.insert(id.clone());
+            calendar::save_calendar_enabled_accounts(&self.store, &self.cal_enabled_accounts);
         }
+        self.all_inboxes = false;
         self.view = MailboxView::Kind(LabelKind::Inbox);
         self.filter = ListFilter::All;
         self.set_selected(None);
@@ -1784,7 +2004,7 @@ impl MailWindow {
         }
         self.reload(cx);
         self.refresh_other_contacts(cx);
-        self.set_selected(self.conversations.first().map(|c| c.id.clone()));
+        self.set_selected(self.conversations.first().map(ConversationRef::of));
         self.marked.clear();
         self.load_thread(cx);
         self.focus_current_module(window, cx);
@@ -1927,6 +2147,8 @@ impl MailWindow {
         self.syncing.remove(&id);
         self.account_counts.remove(&id);
         self.account_counts_stale.remove(&id);
+        self.other_indexes.remove(&id);
+        self.other_indexes_lru.retain(|existing| existing != &id);
         self.refresh_idle_watchers();
         self.accounts = self.store.accounts().unwrap_or_default();
         self.refresh_account_metadata();
@@ -1934,6 +2156,14 @@ impl MailWindow {
         crate::ui::toast(window, cx, crate::notify::Level::Info, format!("Removed {} from this device.", account.email));
         match self.accounts.first().map(|a| a.id.clone()) {
             Some(next) => {
+                self.cal_enabled_accounts.remove(&id);
+                if self.cal_color_picker_open.as_ref() == Some(&id) {
+                    self.cal_color_picker_open = None;
+                }
+                if self.cal_enabled_accounts.is_empty() {
+                    self.cal_enabled_accounts.insert(next.clone());
+                }
+                calendar::save_calendar_enabled_accounts(&self.store, &self.cal_enabled_accounts);
                 self.switch_account(next, window, cx);
                 // Settings stays open, now on the account that took over.
                 if self.settings.is_some() {
@@ -1953,6 +2183,7 @@ impl MailWindow {
     /// Leaves the window on the "Add an account" screen once the last account is gone.
     fn show_no_account(&mut self, cx: &mut Context<Self>) {
         self.account = no_account();
+        self.all_inboxes = false;
         self.view = MailboxView::Kind(LabelKind::Inbox);
         self.filter = ListFilter::All;
         self.set_selected(None);
@@ -2233,10 +2464,14 @@ impl MailWindow {
     }
 
     fn view_title(&self) -> String {
+        if self.all_inboxes_active() {
+            return "All Inboxes".to_owned();
+        }
         match &self.view {
             MailboxView::Kind(kind) => match kind {
                 LabelKind::Inbox => "Inbox",
                 LabelKind::Starred => "Starred",
+                LabelKind::Snoozed => "Snoozed",
                 LabelKind::Drafts => "Drafts",
                 LabelKind::Sent => "Sent",
                 LabelKind::Archive => "Archive",
@@ -2291,6 +2526,12 @@ impl MailWindow {
             self.reload_account_labels();
             if mail.contains(&self.account.id) {
                 self.reload_mail(cx);
+            }
+            if self.all_inboxes_active() {
+                let active = self.account.id.clone();
+                for acct in mail.iter().filter(|a| **a != active) {
+                    self.rebuild_other_account_index(acct.clone(), cx);
+                }
             }
             self.reload_folder_windows(mail, cx);
         }
@@ -2359,6 +2600,13 @@ impl MailWindow {
         } else {
             self.rebuild_mail_index(cx);
         }
+        if self.all_inboxes_active() {
+            self.ensure_all_inboxes_indexes();
+            let others: Vec<AccountId> = self.accounts.iter().filter(|a| a.id != acct).map(|a| a.id.clone()).collect();
+            for other in others {
+                self.rebuild_other_account_index(other, cx);
+            }
+        }
         self.refresh_mail();
         self.reload_drafts(cx);
         self.status = self.store.account_status(&acct).unwrap_or_default();
@@ -2378,28 +2626,28 @@ impl MailWindow {
         if clear_existing {
             self.invite_events.clear();
         }
-        let acct = self.account.id.clone();
-        if acct.0.is_empty() {
-            return;
-        }
-        let mut needed: HashSet<String> = HashSet::new();
+        let mut needed: HashSet<(AccountId, String)> = HashSet::new();
         for c in &self.conversations {
             if let Some(inv) = &c.invitation {
-                needed.insert(inv.uid.clone());
+                needed.insert((c.account_id.clone(), inv.uid.clone()));
             }
         }
         for m in &self.thread {
             if let Some(inv) = &m.invitation {
-                needed.insert(inv.uid.clone());
+                needed.insert((m.account_id.clone(), inv.uid.clone()));
             }
         }
         if self.invite_events.len() > 512 {
-            self.invite_events.retain(|uid, _| needed.contains(uid));
+            self.invite_events.retain(|key, _| needed.contains(key));
         }
-        for uid in needed {
-            if !self.invite_events.contains_key(&uid) {
+        for (acct, uid) in needed {
+            if acct.0.is_empty() {
+                continue;
+            }
+            let key = (acct.clone(), uid.clone());
+            if !self.invite_events.contains_key(&key) {
                 let event = self.store.event_by_ical_uid(&acct, &uid).ok().flatten();
-                self.invite_events.insert(uid, event);
+                self.invite_events.insert(key, event);
             }
         }
     }
@@ -2413,31 +2661,58 @@ impl MailWindow {
         let searching = !self.search_query.trim().is_empty();
         self.conversations = if searching {
             self.search_results()
+        } else if self.all_inboxes_active() {
+            let inbox = MailboxView::Kind(LabelKind::Inbox);
+            let mut per_account = Vec::with_capacity(self.accounts.len());
+            for a in &self.accounts {
+                let open = self.unread_selection.as_ref().filter(|s| s.account_id == a.id).map(|s| &s.id);
+                if let Some(idx) = self.index_for(&a.id) {
+                    per_account.push(idx.conversations_including(&a.email, &inbox, self.filter, focus, open));
+                }
+            }
+            combine_inbox_conversations(per_account)
         } else {
-            self.mail_index.conversations_including(&owner, &self.view, self.filter, focus, self.unread_selection.as_ref())
+            let open = self.unread_selection.as_ref().filter(|s| s.account_id == acct).map(|s| &s.id);
+            self.mail_index.conversations_including(&owner, &self.view, self.filter, focus, open)
         };
         self.rows_unread.set(self.conversations.iter().filter(|c| c.is_unread()).count());
         self.list_data_generation += 1;
         // Search coverage uses the cached local coverage sentence while searching (no SQLite scan here).
-        self.search_coverage = if searching { self.search_coverage_line(&acct) } else { String::new() };
+        self.search_coverage = if searching {
+            if self.all_inboxes_active() {
+                self.local_search_coverage.clone()
+            } else {
+                self.search_coverage_line(&acct)
+            }
+        } else {
+            String::new()
+        };
         self.counts = sidebar_counts(&self.mail_index, &owner, self.focused_enabled);
         self.other_unread = if self.focused_enabled {
-            self.mail_index.view_count(&owner, &MailboxView::Kind(LabelKind::Inbox), Some(FocusTab::Other))
+            if self.all_inboxes_active() {
+                let inbox = MailboxView::Kind(LabelKind::Inbox);
+                self.accounts
+                    .iter()
+                    .filter_map(|a| self.index_for(&a.id).map(|idx| idx.view_count(&a.email, &inbox, Some(FocusTab::Other))))
+                    .sum()
+            } else {
+                self.mail_index.view_count(&owner, &MailboxView::Kind(LabelKind::Inbox), Some(FocusTab::Other))
+            }
         } else {
             0
         };
         self.refresh_invite_events(false);
         if !self.marked.is_empty() {
-            let shown: HashSet<&ConversationId> = self.conversations.iter().map(|c| &c.id).collect();
+            let shown: HashSet<ConversationRef> = self.conversations.iter().map(ConversationRef::of).collect();
             self.marked.retain(|id| shown.contains(id));
         }
-        if let Some(sel) = &self.selected {
-            let row = self.conversations.iter().find(|c| &c.id == sel);
+        if let Some(sel) = self.selected.clone() {
+            let row = self.conversations.iter().find(|c| ConversationRef::of(c) == sel);
             if row.is_none_or(ConversationSummary::is_unread) {
                 self.unread_selection = None;
             }
             if row.is_none() && !searching {
-                let remaining = self.mail_index.message_ids_in(sel);
+                let remaining = self.message_ids_in(&sel);
                 if email_modal::keep_modal_selection_after_refresh(self.is_message_window(), remaining.len()) {
                     // Stay on the open conversation in a standalone message window after
                     // mailbox actions (archive, trash, folder move, filter change) until
@@ -2531,22 +2806,45 @@ impl MailWindow {
     }
 
     fn load_thread(&mut self, cx: &mut Context<Self>) {
-        let thread = match &self.selected {
-            Some(id) => self.store.messages_in_conversation(&self.account.id, id).unwrap_or_default(),
-            None => Vec::new(),
+        let (thread_acct, thread) = match &self.selected {
+            Some(sel) => (
+                Some(sel.account_id.clone()),
+                self.store.messages_in_conversation(&sel.account_id, &sel.id).unwrap_or_default(),
+            ),
+            None => (None, Vec::new()),
         };
         let history_changed = thread.len() != self.thread.len() || thread.iter().zip(&self.thread).any(|(a, b)| a.id != b.id || a.subject != b.subject || a.body != b.body);
         self.thread = thread;
-        let unwritten = self.unwritten_changes();
-        self.apply_to_thread(&unwritten);
+        if let Some(acct) = thread_acct {
+            let unwritten = self.unwritten_changes_for(&acct);
+            self.apply_to_thread_for(&acct, &unwritten);
+        }
         if history_changed {
             self.thread_revision = self.thread_revision.wrapping_add(1);
             self.plain_text_html_cache.borrow_mut().clear();
             self.prepare_thread_history(cx);
         }
         self.refresh_invite_events(false);
+        self.refresh_thread_read_receipts();
         self.refresh_attachment_presence(cx);
         self.prepare_inline_images(cx);
+    }
+
+    /// Populates `self.thread_read_receipts` for outgoing messages in the open thread whose
+    /// RFC 5322 `Message-ID` matches incoming RFC 8098 MDN receipts in the same account.
+    fn refresh_thread_read_receipts(&mut self) {
+        self.thread_read_receipts.clear();
+        for m in &self.thread {
+            if !m.is_outgoing {
+                continue;
+            }
+            let Some(rfc_id) = m.rfc_message_id.as_deref() else { continue };
+            if let Ok(receipts) = self.store.read_receipts_for_message(&m.account_id, rfc_id) {
+                if !receipts.is_empty() {
+                    self.thread_read_receipts.insert(m.id.clone(), receipts);
+                }
+            }
+        }
     }
 
     /// Checks on-disk presence for attachments in the open thread off the UI thread so
@@ -2595,19 +2893,20 @@ impl MailWindow {
     /// queue, which skips them once they are here. The window never edits the queues: a
     /// sync may be saving them at the same moment.
     fn fetch_missing_bodies(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread_acct_id) = self.thread.first().map(|m| m.account_id.clone()) else { return };
         let missing: Vec<(MessageId, ProviderId)> = self
             .thread
             .iter()
-            .filter(|m| !m.body.is_cached() && m.account_id == self.account.id && !self.bodies_loading.contains(&m.id))
+            .filter(|m| !m.body.is_cached() && m.account_id == thread_acct_id && !self.bodies_loading.contains(&m.id))
             .filter_map(|m| Some((m.id.clone(), m.provider_id.clone()?)))
             .collect();
         if missing.is_empty() {
             return;
         }
-        let Some(provider) = self.providers.get(&self.account.id).map(|p| p.mail.clone()) else { return };
-        let account = self.account.clone();
+        let Some(account) = self.known_account(&thread_acct_id) else { return };
+        let Some(provider) = self.providers.get(&thread_acct_id).map(|p| p.mail.clone()) else { return };
         let store = self.store.clone();
-        let labels = self.labels.clone();
+        let labels = self.labels_for_account(&thread_acct_id).to_vec();
         let ids: Vec<MessageId> = missing.iter().map(|(id, _)| id.clone()).collect();
         let pids: Vec<ProviderId> = missing.into_iter().map(|(_, pid)| pid).collect();
         self.bodies_loading.extend(ids.iter().cloned());
@@ -2660,7 +2959,7 @@ impl MailWindow {
             }
         }
         if !to_verify.is_empty() {
-            let acct = self.account.id.clone();
+            let thread_acct = self.thread.first().map(|m| m.account_id.clone()).unwrap_or_else(|| self.account.id.clone());
             let thread_rev = self.thread_revision;
             cx.spawn_in(window, async move |this, cx| {
                 let (present, missing): (Vec<AttachmentId>, Vec<Attachment>) = cx
@@ -2678,7 +2977,8 @@ impl MailWindow {
                     })
                     .await;
                 let _ = this.update_in(cx, |this, window, cx| {
-                    if this.account.id != acct || this.thread_revision != thread_rev {
+                    let current_acct = this.thread.first().map(|m| &m.account_id).unwrap_or(&this.account.id);
+                    if *current_acct != thread_acct || this.thread_revision != thread_rev {
                         return;
                     }
                     let mut changed = false;
@@ -2702,18 +3002,31 @@ impl MailWindow {
     }
 
     fn search_results(&self) -> Vec<ConversationSummary> {
-        let Some((gen, hit_set)) = &self.local_search_hits else {
+        let Some((gen, hits_by_account)) = &self.local_search_hits else {
             return Vec::new();
         };
         if *gen != self.search_generation {
             return self.conversations.clone();
         }
-        self.mail_index.conversations_matching_including(hit_set, &self.account.email, self.filter, self.unread_selection.as_ref())
+        if self.all_inboxes_active() {
+            let mut per_account = Vec::with_capacity(self.accounts.len());
+            for a in &self.accounts {
+                let Some(hit_set) = hits_by_account.get(&a.id).filter(|s| !s.is_empty()) else { continue };
+                let Some(idx) = self.index_for(&a.id) else { continue };
+                let open = self.unread_selection.as_ref().filter(|s| s.account_id == a.id).map(|s| &s.id);
+                per_account.push(idx.conversations_matching_including(hit_set, &a.email, self.filter, open));
+            }
+            combine_inbox_conversations(per_account)
+        } else {
+            let Some(hit_set) = hits_by_account.get(&self.account.id) else { return Vec::new() };
+            let open = self.unread_selection.as_ref().filter(|s| s.account_id == self.account.id).map(|s| &s.id);
+            self.mail_index.conversations_matching_including(hit_set, &self.account.email, self.filter, open)
+        }
     }
 
     /// The Focused/Other split applies only to the Inbox when the feature is on.
     pub(crate) fn inbox_focus(&self) -> Option<FocusTab> {
-        (self.focused_enabled && self.view == MailboxView::Kind(LabelKind::Inbox)).then_some(self.inbox_tab)
+        (self.focused_enabled && (self.all_inboxes_active() || self.view == MailboxView::Kind(LabelKind::Inbox))).then_some(self.inbox_tab)
     }
 
     pub(crate) fn set_inbox_tab(&mut self, tab: FocusTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -2722,8 +3035,8 @@ impl MailWindow {
         }
         self.inbox_tab = tab;
         self.refresh_mail();
-        if !self.conversations.iter().any(|c| Some(&c.id) == self.selected.as_ref()) {
-            self.set_selected(self.conversations.first().map(|c| c.id.clone()));
+        if !self.conversations.iter().any(|c| Some(ConversationRef::of(c)) == self.selected) {
+            self.set_selected(self.conversations.first().map(ConversationRef::of));
             self.marked.clear();
             self.expanded.clear();
             self.load_thread(cx);
@@ -2752,28 +3065,37 @@ impl MailWindow {
 
     fn move_conversation_focus(
         &mut self,
-        conversation: &ConversationId,
+        conversation: &ConversationRef,
         focused: bool,
         always: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let ids = self.mail_index.message_ids_in(conversation);
+        let acct = conversation.account_id.clone();
+        let ids = self.message_ids_in(conversation);
         if ids.is_empty() {
             return;
         }
-        let sender = if always { self.mail_index.focus_sender(conversation, &self.view).cloned() } else { None };
+        let view = if self.all_inboxes_active() { MailboxView::Kind(LabelKind::Inbox) } else { self.view.clone() };
+        let sender = if always {
+            self.index_for(&acct).and_then(|idx| idx.focus_sender(&conversation.id, &view).cloned())
+        } else {
+            None
+        };
         let next = self.neighbour_after_removal_of(std::slice::from_ref(conversation));
-        self.mail_index.set_focus_override(&ids, Some(focused));
-        if let Some(sender) = &sender {
-            self.mail_index.set_focus_rule(&sender.email, Some(focused));
+        if let Some(idx) = self.index_for_mut(&acct) {
+            idx.set_focus_override(&ids, Some(focused));
+            if let Some(sender) = &sender {
+                idx.set_focus_rule(&sender.email, Some(focused));
+            }
         }
-        self.queue_local_write(self.account.id.clone(), LocalWrite::MoveFocus {
+        self.queue_local_write(acct.clone(), LocalWrite::MoveFocus {
             ids,
             focused,
             sender: sender.as_ref().map(|sender| sender.email.clone()),
         });
         self.mail_index_generation += 1;
+        self.mark_counts_stale([acct]);
         self.write_local_changes(window, cx);
         let target = if focused { "Focused" } else { "Other" };
         let text = match sender {
@@ -3069,12 +3391,12 @@ impl MailWindow {
             return;
         }
         let Some(message) = self.store.message(&attachment.message_id).ok().flatten() else { return };
-        let Some(provider) = self.providers.get(&self.account.id).map(|p| p.mail.clone()) else {
+        let msg_account = message.account_id.clone();
+        let Some(account) = self.known_account(&msg_account) else { return };
+        let Some(provider) = self.providers.get(&msg_account).map(|p| p.mail.clone()) else {
             crate::ui::toast(window, cx, crate::notify::Level::Warning, "Sign in again to download attachments.");
             return;
         };
-        let account = self.account.clone();
-        let origin_account = self.account.id.clone();
         let origin_selected = self.selected.clone();
         let origin_module = self.module;
         let origin_message_id = attachment.message_id.clone();
@@ -3099,11 +3421,10 @@ impl MailWindow {
                     Ok(path) => {
                         this.downloaded_attachments.insert(attachment.id.clone());
                         this.inline_images.remove(&attachment.id);
-                        let still_viewing = this.account.id == origin_account
-                            && this.module == origin_module
+                        let still_viewing = this.module == origin_module
                             && this.selected == origin_selected
                             && this.thread.iter().any(|m| m.id == origin_message_id);
-                        if this.account.id == origin_account && this.thread.iter().any(|m| m.id == origin_message_id) {
+                        if this.thread.iter().any(|m| m.id == origin_message_id) {
                             this.load_thread(cx);
                         }
                         match after {
@@ -3215,8 +3536,8 @@ impl MailWindow {
     }
 
     fn selected_summary(&self) -> Option<&ConversationSummary> {
-        let id = self.selected.as_ref()?;
-        self.conversations.iter().find(|c| &c.id == id)
+        let sel = self.selected.as_ref()?;
+        self.conversations.iter().find(|c| ConversationRef::of(c) == *sel)
     }
 
     /// Summary of the open conversation, falling back to `self.thread` when the
@@ -3230,15 +3551,21 @@ impl MailWindow {
             return None;
         }
         let pending = BTreeSet::new();
-        ConversationSummary::from_messages(&self.thread, &self.account.email, &pending)
+        let owner_email = self.account_email(&self.thread[0].account_id);
+        let mut summary = ConversationSummary::from_messages(&self.thread, &owner_email, &pending)?;
+        summary.snoozed_until = self
+            .index_for(&summary.account_id)
+            .and_then(|idx| idx.snoozed_until(&summary.id));
+        Some(summary)
     }
 
     // ------------------------------------------------------------ navigation
 
     fn select_view(&mut self, view: MailboxView, window: &mut Window, cx: &mut Context<Self>) {
-        if self.view != view || !self.search_query.trim().is_empty() {
+        if self.view != view || self.all_inboxes || !self.search_query.trim().is_empty() {
             self.unread_selection = None;
         }
+        self.all_inboxes = false;
         if !self.search_query.is_empty() {
             self.search_query.clear();
             self.local_search_hits = None;
@@ -3260,8 +3587,8 @@ impl MailWindow {
             }
             self.refresh_mail();
         }
-        if self.selected.is_none() || !self.conversations.iter().any(|c| Some(&c.id) == self.selected.as_ref()) {
-            self.set_selected(self.conversations.first().map(|c| c.id.clone()));
+        if self.selected.is_none() || !self.conversations.iter().any(|c| Some(ConversationRef::of(c)) == self.selected) {
+            self.set_selected(self.conversations.first().map(ConversationRef::of));
             self.marked.clear();
             self.expanded.clear();
             self.load_thread(cx);
@@ -3307,28 +3634,42 @@ impl MailWindow {
     fn run_local_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let generation = self.search_generation;
         let query = self.search_query.clone();
+        let all_inboxes = self.all_inboxes_active();
         let acct = self.account.id.clone();
+        let target_accounts: Vec<AccountId> = if all_inboxes {
+            self.accounts.iter().map(|a| a.id.clone()).collect()
+        } else {
+            vec![acct.clone()]
+        };
         let store = self.store.clone();
         cx.spawn_in(window, async move |this, cx| {
             let (hits, coverage) = cx
                 .background_spawn({
                     let acct = acct.clone();
                     async move {
-                        let hits: BTreeSet<MessageId> = store.search(&acct, &query).unwrap_or_default().into_iter().collect();
-                        let coverage = store.search_coverage(&acct).map(|c| c.sentence()).unwrap_or_default();
-                        (hits, coverage)
+                        let mut by_account = HashMap::with_capacity(target_accounts.len());
+                        for id in &target_accounts {
+                            let found: BTreeSet<MessageId> = store.search(id, &query).unwrap_or_default().into_iter().collect();
+                            by_account.insert(id.clone(), found);
+                        }
+                        let coverage = if all_inboxes {
+                            format!("Searched cached mail across {} accounts on this device.", target_accounts.len())
+                        } else {
+                            store.search_coverage(&acct).map(|c| c.sentence()).unwrap_or_default()
+                        };
+                        (by_account, coverage)
                     }
                 })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
-                if this.search_generation != generation || this.account.id != acct {
+                if this.search_generation != generation || this.all_inboxes_active() != all_inboxes || (!all_inboxes && this.account.id != acct) {
                     return;
                 }
                 this.local_search_hits = Some((generation, hits));
                 this.local_search_coverage = coverage;
                 this.refresh_mail();
                 if !this.search_query.is_empty() && this.selected_summary().is_none() {
-                    this.set_selected(this.conversations.first().map(|c| c.id.clone()));
+                    this.set_selected(this.conversations.first().map(ConversationRef::of));
                     this.marked.clear();
                     this.load_thread(cx);
                     this.fetch_conversation_extras(window, cx);
@@ -3357,6 +3698,9 @@ impl MailWindow {
     /// Asks the provider for matches beyond what is on this device and downloads the ones
     /// that are missing, after a short pause so every keystroke does not become a request.
     fn start_online_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.all_inboxes_active() {
+            return;
+        }
         let query = self.search_query.trim().to_owned();
         if query.chars().count() < 2 {
             return;
@@ -3428,7 +3772,7 @@ impl MailWindow {
         .detach();
     }
 
-    fn set_selected(&mut self, id: Option<ConversationId>) {
+    fn set_selected(&mut self, id: Option<ConversationRef>) {
         if self.selected == id {
             return;
         }
@@ -3444,7 +3788,7 @@ impl MailWindow {
         self.selected = id;
     }
 
-    fn select_conversation(&mut self, id: Option<ConversationId>, window: &mut Window, cx: &mut Context<Self>) {
+    fn select_conversation(&mut self, id: Option<ConversationRef>, window: &mut Window, cx: &mut Context<Self>) {
         crate::watchdog::mark("open conversation");
         if self.composer.is_some() {
             self.close_composer(window, cx);
@@ -3457,10 +3801,11 @@ impl MailWindow {
         self.load_thread(cx);
         self.fetch_conversation_extras(window, cx);
         // Reading marks the conversation read: a local change with its pending operation.
+        let unread_acct = self.thread.first().map(|m| m.account_id.clone());
         let unread: Vec<MessageId> = self.thread.iter().filter(|m| !m.is_read).map(|m| m.id.clone()).collect();
-        if !unread.is_empty() {
+        if let (Some(acct), false) = (unread_acct, unread.is_empty()) {
             match self.prefs.mark_as_read {
-                MarkAsRead::WhenSelected => self.mark_open_conversation_read(unread, window, cx),
+                MarkAsRead::WhenSelected => self.mark_open_conversation_read(&acct, unread, window, cx),
                 MarkAsRead::AfterDelay => {
                     self.mark_read_generation += 1;
                     let generation = self.mark_read_generation;
@@ -3470,7 +3815,7 @@ impl MailWindow {
                         cx.background_executor().timer(Duration::from_secs(delay)).await;
                         let _ = this.update_in(cx, |this, window, cx| {
                             if this.mark_read_generation == generation && this.selected == selected {
-                                this.mark_open_conversation_read(unread, window, cx);
+                                this.mark_open_conversation_read(&acct, unread, window, cx);
                             }
                         });
                     })
@@ -3488,11 +3833,11 @@ impl MailWindow {
         cx.notify();
     }
 
-    fn mark_open_conversation_read(&mut self, unread: Vec<MessageId>, window: &mut Window, cx: &mut Context<Self>) {
+    fn mark_open_conversation_read(&mut self, account: &AccountId, unread: Vec<MessageId>, window: &mut Window, cx: &mut Context<Self>) {
         if self.filter == ListFilter::Unread && self.selected_summary().is_some_and(ConversationSummary::is_unread) {
             self.unread_selection = self.selected.clone();
         }
-        self.set_read(unread, true, window, cx);
+        self.set_read_for(account, unread, true, window, cx);
     }
 
     /// Renders the latest message of the conversations above and below the open one
@@ -3506,7 +3851,7 @@ impl MailWindow {
         if self.prefs.remote_images == RemoteImages::Allow {
             return;
         }
-        let Some(i) = self.selected.as_ref().and_then(|id| self.conversations.iter().position(|c| &c.id == id)) else { return };
+        let Some(i) = self.selected.as_ref().and_then(|sel| self.conversations.iter().position(|c| ConversationRef::of(c) == *sel)) else { return };
         let ids: Vec<MessageId> = [Some(i + 1), i.checked_sub(1)]
             .into_iter()
             .flatten()
@@ -3593,19 +3938,19 @@ impl MailWindow {
         if self.conversations.is_empty() {
             return;
         }
-        let current = self.selected.as_ref().and_then(|id| self.conversations.iter().position(|c| &c.id == id));
+        let current = self.selected.as_ref().and_then(|sel| self.conversations.iter().position(|c| ConversationRef::of(c) == *sel));
         let next = match current {
             Some(i) => (i as i32 + delta).clamp(0, self.conversations.len() as i32 - 1) as usize,
             None => 0,
         };
-        let id = self.conversations[next].id.clone();
+        let target = ConversationRef::of(&self.conversations[next]);
         // Reveal the target before opening it, while the old row positions still apply.
-        let ix = self.shown_rows.borrow().iter().position(|r| matches!(r, ListRow::Conversation(c) if c.id == id));
+        let ix = self.shown_rows.borrow().iter().position(|r| matches!(r, ListRow::Conversation(c) if ConversationRef::of(c) == target));
         if let Some(ix) = ix {
             self.list_state.scroll_to_reveal_item(ix);
         }
-        if Some(&id) != self.selected.as_ref() {
-            self.select_conversation(Some(id), window, cx);
+        if Some(&target) != self.selected.as_ref() {
+            self.select_conversation(Some(target), window, cx);
         }
     }
 
@@ -3629,39 +3974,43 @@ impl MailWindow {
     /// memory, then the store write (with its pending operation) and the sync to the
     /// provider run in the background, in the order the changes were made.
     fn apply_local(&mut self, change: LocalChange, window: &mut Window, cx: &mut Context<Self>) {
+        let acct = self.account.id.clone();
         self.mail_index.apply(&change);
         self.mail_index_generation += 1;
-        self.apply_to_thread(std::slice::from_ref(&change));
+        if self.thread.first().is_some_and(|m| m.account_id == acct) {
+            self.apply_to_thread_for(&acct, std::slice::from_ref(&change));
+        }
         self.refresh_mail();
-        self.queue_local_write(self.account.id.clone(), LocalWrite::Change(change));
+        self.queue_local_write(acct, LocalWrite::Change(change));
         self.write_local_changes(window, cx);
         cx.notify();
     }
 
-    /// Shows changes that are not in the store yet on the open conversation.
-    fn apply_to_thread(&mut self, changes: &[LocalChange]) {
-        let inbox = self.labels.iter().find(|l| l.kind == LabelKind::Inbox).map(|l| l.id.clone());
-        let trash = self.labels.iter().find(|l| l.kind == LabelKind::Trash).map(|l| l.id.clone());
+    /// Shows changes that are not in the store yet on the open conversation for `account`.
+    pub(super) fn apply_to_thread_for(&mut self, account: &AccountId, changes: &[LocalChange]) {
+        let labels = self.labels_for_account(account);
+        let inbox = labels.iter().find(|l| l.kind == LabelKind::Inbox).map(|l| l.id.clone());
+        let trash = labels.iter().find(|l| l.kind == LabelKind::Trash).map(|l| l.id.clone());
         for change in changes {
             let ids = change.message_ids();
             if matches!(change, LocalChange::DeleteForever { .. }) {
-                self.thread.retain(|m| !ids.contains(&m.id));
+                self.thread.retain(|m| m.account_id != *account || !ids.contains(&m.id));
                 continue;
             }
-            for m in self.thread.iter_mut().filter(|m| ids.contains(&m.id)) {
+            for m in self.thread.iter_mut().filter(|m| m.account_id == *account && ids.contains(&m.id)) {
                 overlook_store::apply_to_message(m, change, inbox.as_ref(), trash.as_ref());
             }
         }
     }
 
-    /// Mailbox changes made in the window that the store does not have yet.
-    fn unwritten_changes(&self) -> Vec<LocalChange> {
+    /// Mailbox changes made in the window for `account` that the store does not have yet.
+    fn unwritten_changes_for(&self, account: &AccountId) -> Vec<LocalChange> {
         let queued = self.local_writes.lock().unwrap();
         self.local_in_flight
             .iter()
             .chain(queued.iter())
-            .filter_map(|(_, w)| match w {
-                LocalWrite::Change(c) => Some(c.clone()),
+            .filter_map(|(a, w)| match w {
+                LocalWrite::Change(c) if a == account => Some(c.clone()),
                 _ => None,
             })
             .collect()
@@ -3682,17 +4031,26 @@ impl MailWindow {
         let store = self.store.clone();
         let pending_writes = self.local_writes.clone();
         let mut accounts: BTreeSet<AccountId> = writes.iter().map(|(a, _)| a.clone()).collect();
+        let mut sync_accounts: BTreeSet<AccountId> = writes
+            .iter()
+            .filter_map(|(a, w)| (!matches!(w, LocalWrite::Snooze { .. } | LocalWrite::CancelSnooze { .. })).then(|| a.clone()))
+            .collect();
         let acct = self.account.id.clone();
+        let other_accounts: Vec<AccountId> = accounts.iter().filter(|a| *a != &acct).cloned().collect();
         let window_handle = window.window_handle();
         let owner = self.window_owner();
         cx.spawn(async move |this, cx| {
-            let (errors, index, count) = cx
+            let (errors, index, count, other_indexes) = cx
                 .background_spawn({
                     let store = store.clone();
                     let acct = acct.clone();
                     async move {
                         let errors = apply_local_writes(&store, writes);
-                        (errors, store.mail_index(&acct), store.message_count(&acct).unwrap_or(0))
+                        let refreshed_others: Vec<(AccountId, MailIndex)> = other_accounts
+                            .into_iter()
+                            .filter_map(|id| store.mail_index(&id).ok().map(|idx| (id, idx)))
+                            .collect();
+                        (errors, store.mail_index(&acct), store.message_count(&acct).unwrap_or(0), refreshed_others)
                     }
                 })
                 .await;
@@ -3708,19 +4066,33 @@ impl MailWindow {
                             this.write_local_changes(window, cx);
                             return;
                         }
+                        let mut needs_refresh = false;
                         if this.account.id == acct {
                             if let Ok(index) = index {
                                 this.account_message_count = count;
                                 this.replace_mail_index(index);
                                 this.mail_index_generation += 1;
-                                this.refresh_mail();
+                                needs_refresh = true;
                             }
                         }
+                        for (other_id, other_index) in other_indexes {
+                            if other_id != this.account.id && (this.all_inboxes_active() || this.other_indexes.contains_key(&other_id)) {
+                                this.cache_other_index(other_id.clone(), other_index);
+                                if this.all_inboxes_active() {
+                                    needs_refresh = true;
+                                }
+                            }
+                        }
+                        if needs_refresh {
+                            this.refresh_mail();
+                        }
+                        this.mark_counts_stale(accounts.iter().cloned());
+                        this.refresh_account_counts(cx);
                         if accounts.contains(&this.offline.id) {
                             // Offline files follow: moved, deleted, and their state saved beside them.
                             this.sync_offline_files(cx);
                         }
-                        for acct in accounts.iter().cloned() {
+                        for acct in sync_accounts.iter().cloned() {
                             this.next_retry.remove(&acct);
                             if this.connected(&acct) {
                                 this.sync_account(acct, window, cx);
@@ -3746,6 +4118,9 @@ impl MailWindow {
                         break;
                     }
                     accounts.extend(remaining.iter().map(|(a, _)| a.clone()));
+                    sync_accounts.extend(remaining.iter().filter_map(|(a, w)| {
+                        (!matches!(w, LocalWrite::Snooze { .. } | LocalWrite::CancelSnooze { .. })).then(|| a.clone())
+                    }));
                     let store = store.clone();
                     let more_errors = cx
                         .background_spawn(async move { apply_local_writes(&store, remaining) })
@@ -3763,7 +4138,7 @@ impl MailWindow {
                         });
                         let _ = owner.window.update(cx, |_, window, cx| {
                             owner.parent.update(cx, |main, cx| {
-                                for acct in accounts.iter().cloned() {
+                                for acct in sync_accounts.iter().cloned() {
                                     main.next_retry.remove(&acct);
                                     if main.connected(&acct) {
                                         main.sync_account(acct, window, cx);
@@ -3791,17 +4166,24 @@ impl MailWindow {
     // `target_message_ids`.
 
     /// The rows an action applies to, newest first: the marked set, else the open one.
-    pub(crate) fn target_conversations(&self) -> Vec<ConversationId> {
+    pub(crate) fn target_conversations(&self) -> Vec<ConversationRef> {
         if self.marked.is_empty() {
             return self.selected.iter().cloned().collect();
         }
-        self.target_rows().map(|c| c.id.clone()).collect()
+        self.target_rows().map(ConversationRef::of).collect()
     }
 
     /// The summaries of the target rows, in list order. Membership is a set lookup, so a
     /// Select All over a long list stays linear (the toolbar asks several times a frame).
     fn target_rows(&self) -> impl Iterator<Item = &ConversationSummary> + '_ {
-        self.conversations.iter().filter(move |c| if self.marked.is_empty() { self.selected.as_ref() == Some(&c.id) } else { self.marked.contains(&c.id) })
+        self.conversations.iter().filter(move |c| {
+            let key = ConversationRef::of(c);
+            if self.marked.is_empty() {
+                self.selected.as_ref() == Some(&key)
+            } else {
+                self.marked.contains(&key)
+            }
+        })
     }
 
     /// More than one row is selected: the reader shows a count and reply is off.
@@ -3815,12 +4197,34 @@ impl MailWindow {
         if self.marked.is_empty() {
             return self.selected_message_ids();
         }
-        self.target_conversations().iter().flat_map(|c| self.mail_index.message_ids_in(c)).collect()
+        self.target_conversations().iter().flat_map(|c| self.message_ids_in(c)).collect()
+    }
+
+    /// The target messages grouped by their owning account, preserving per-account action ownership.
+    pub(crate) fn target_message_ids_by_account(&self) -> std::collections::BTreeMap<AccountId, Vec<MessageId>> {
+        let mut by_account: std::collections::BTreeMap<AccountId, Vec<MessageId>> = std::collections::BTreeMap::new();
+        if self.marked.is_empty() {
+            for m in &self.thread {
+                by_account.entry(m.account_id.clone()).or_default().push(m.id.clone());
+            }
+            return by_account;
+        }
+        for c in self.target_conversations() {
+            let ids = self.message_ids_in(&c);
+            if !ids.is_empty() {
+                by_account.entry(c.account_id).or_default().extend(ids);
+            }
+        }
+        by_account
     }
 
     /// What the target rows have in common, for menu and toolbar wording.
     pub(super) fn selection_state(&self) -> list_menu::SelectionState {
-        list_menu::selection_state(self.target_rows(), &self.labels)
+        if self.all_inboxes_active() {
+            list_menu::selection_state_for(self.target_rows(), |acct| self.labels_for_account(acct))
+        } else {
+            list_menu::selection_state(self.target_rows(), &self.labels)
+        }
     }
 
     /// `(all in Trash, any in Inbox)` for the target rows: the open thread's own labels for
@@ -3840,7 +4244,7 @@ impl MailWindow {
     /// Moves the anchor without the side effects of opening a conversation: nothing is
     /// marked read and focus stays put. With `keep_marked` the set survives, as it must
     /// when the anchor moves inside it.
-    fn select_quietly(&mut self, id: Option<ConversationId>, keep_marked: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn select_quietly(&mut self, id: Option<ConversationRef>, keep_marked: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.composer.is_some() {
             self.close_composer(window, cx);
         }
@@ -3862,7 +4266,7 @@ impl MailWindow {
     /// While a reply is being written the open thread stays put, so the row is marked as
     /// the menu's target instead of opened: closing the composer over a right-click would
     /// discard or file the draft unasked.
-    pub(crate) fn mark_for_menu(&mut self, id: &ConversationId, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn mark_for_menu(&mut self, id: &ConversationRef, window: &mut Window, cx: &mut Context<Self>) {
         let in_selection = if self.marked.is_empty() { self.selected.as_ref() == Some(id) } else { self.marked.contains(id) };
         if in_selection {
             return;
@@ -3876,13 +4280,13 @@ impl MailWindow {
         }
     }
 
-    fn position_of(&self, id: &ConversationId) -> Option<usize> {
-        self.conversations.iter().position(|c| &c.id == id)
+    fn position_of(&self, id: &ConversationRef) -> Option<usize> {
+        self.conversations.iter().position(|c| ConversationRef::of(c) == *id)
     }
 
     /// Ctrl-click: adds or removes a row. The anchor follows if it was removed, and a set
     /// of one collapses back to a plain selection.
-    pub(crate) fn toggle_marked(&mut self, id: ConversationId, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_marked(&mut self, id: ConversationRef, window: &mut Window, cx: &mut Context<Self>) {
         if self.marked.is_empty() {
             if let Some(sel) = self.selected.clone() {
                 self.marked.insert(sel);
@@ -3893,7 +4297,7 @@ impl MailWindow {
         }
         let anchor_marked = self.selected.as_ref().is_some_and(|s| self.marked.contains(s));
         if !anchor_marked {
-            let newest = self.conversations.iter().find(|c| self.marked.contains(&c.id)).map(|c| c.id.clone());
+            let newest = self.conversations.iter().map(ConversationRef::of).find(|c| self.marked.contains(c));
             self.select_quietly(newest, true, window, cx);
         }
         if self.marked.len() == 1 {
@@ -3903,7 +4307,7 @@ impl MailWindow {
     }
 
     /// Shift-click: marks every row between the anchor and `id`.
-    pub(crate) fn extend_marked_to(&mut self, id: ConversationId, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn extend_marked_to(&mut self, id: ConversationRef, window: &mut Window, cx: &mut Context<Self>) {
         let Some(anchor) = self.selected.as_ref().and_then(|s| self.position_of(s)) else {
             return self.select_conversation(Some(id), window, cx);
         };
@@ -3914,7 +4318,7 @@ impl MailWindow {
 
     fn mark_range(&mut self, anchor: usize, end: usize) {
         let (lo, hi) = (anchor.min(end), anchor.max(end));
-        self.marked = self.conversations[lo..=hi].iter().map(|c| c.id.clone()).collect();
+        self.marked = self.conversations[lo..=hi].iter().map(ConversationRef::of).collect();
         if self.marked.len() == 1 {
             self.marked.clear();
         }
@@ -3934,8 +4338,8 @@ impl MailWindow {
         let end = if hi > anchor { hi } else { lo };
         let next = (end as i32 + delta).clamp(0, self.conversations.len() as i32 - 1) as usize;
         self.mark_range(anchor, next);
-        let id = self.conversations[next].id.clone();
-        let ix = self.shown_rows.borrow().iter().position(|r| matches!(r, ListRow::Conversation(c) if c.id == id));
+        let target = ConversationRef::of(&self.conversations[next]);
+        let ix = self.shown_rows.borrow().iter().position(|r| matches!(r, ListRow::Conversation(c) if ConversationRef::of(c) == target));
         if let Some(ix) = ix {
             self.list_state.scroll_to_reveal_item(ix);
         }
@@ -3947,79 +4351,118 @@ impl MailWindow {
             return;
         }
         if self.selected.as_ref().and_then(|s| self.position_of(s)).is_none() {
-            self.select_quietly(self.conversations.first().map(|c| c.id.clone()), true, window, cx);
+            self.select_quietly(self.conversations.first().map(ConversationRef::of), true, window, cx);
         }
-        self.marked = self.conversations.iter().map(|c| c.id.clone()).collect();
+        self.marked = self.conversations.iter().map(ConversationRef::of).collect();
         cx.notify();
     }
 
     /// The row to open once `removed` have left the list: the one after the last of them,
     /// else the one before the first.
-    fn neighbour_after_removal_of(&self, removed: &[ConversationId]) -> Option<ConversationId> {
+    fn neighbour_after_removal_of(&self, removed: &[ConversationRef]) -> Option<ConversationRef> {
         let positions: Vec<usize> = removed.iter().filter_map(|id| self.position_of(id)).collect();
         let (lo, hi) = (*positions.iter().min()?, *positions.iter().max()?);
         self.conversations
             .get(hi + 1)
             .or_else(|| if lo > 0 { self.conversations.get(lo - 1) } else { None })
-            .map(|c| c.id.clone())
+            .map(ConversationRef::of)
     }
 
     /// The row to land on once the target rows are gone.
-    fn removal_neighbour(&self) -> Option<ConversationId> {
+    fn removal_neighbour(&self) -> Option<ConversationRef> {
         self.neighbour_after_removal_of(&self.target_conversations())
     }
 
-    /// Whether this account's server deletes single messages for good (IMAP).
+    /// Whether `account`'s server deletes single messages for good (IMAP).
+    pub(crate) fn can_delete_forever_for(&self, account: &AccountId) -> bool {
+        self.providers.get(account).is_some_and(|p| p.mail.supports_delete_forever())
+    }
+
+    /// Whether the active account's server deletes single messages for good (IMAP).
     pub(crate) fn can_delete_forever(&self) -> bool {
-        self.providers.get(&self.account.id).is_some_and(|p| p.mail.supports_delete_forever())
+        self.can_delete_forever_for(&self.account.id)
+    }
+
+    /// Whether every targeted account supports permanent single-message deletion.
+    pub(crate) fn can_delete_forever_selected(&self) -> bool {
+        let targets = self.target_conversations();
+        if targets.is_empty() {
+            return self.can_delete_forever();
+        }
+        targets.iter().all(|c| self.can_delete_forever_for(&c.account_id))
     }
 
     /// Whether every message is in Trash / has the Inbox label, for toolbar wording.
     pub(crate) fn thread_state(&self) -> (bool, bool) {
-        let trash = self.labels.iter().find(|l| l.kind == LabelKind::Trash).map(|l| l.id.clone());
-        let inbox = self.labels.iter().find(|l| l.kind == LabelKind::Inbox).map(|l| l.id.clone());
+        let labels = self
+            .thread
+            .first()
+            .map(|m| self.labels_for_account(&m.account_id))
+            .unwrap_or(&self.labels);
+        let trash = labels.iter().find(|l| l.kind == LabelKind::Trash).map(|l| l.id.clone());
+        let inbox = labels.iter().find(|l| l.kind == LabelKind::Inbox).map(|l| l.id.clone());
         let in_trash = !self.thread.is_empty() && trash.as_ref().is_some_and(|t| self.thread.iter().all(|m| m.has_label(t)));
         let in_inbox = inbox.as_ref().is_some_and(|i| self.thread.iter().any(|m| m.has_label(i)));
         (in_trash, in_inbox)
     }
 
-    pub(crate) fn archive(&mut self, ids: Vec<MessageId>, window: &mut Window, cx: &mut Context<Self>) {
-        if ids.is_empty() {
+    pub(crate) fn archive_by_account(&mut self, by_account: std::collections::BTreeMap<AccountId, Vec<MessageId>>, window: &mut Window, cx: &mut Context<Self>) {
+        if by_account.is_empty() {
             return;
         }
         let next = self.removal_neighbour();
-        self.perform("Archived", vec![LocalChange::Archive { message_ids: ids }], true, window, cx);
+        let multi_account = by_account.len() > 1;
+        for (i, (acct, ids)) in by_account.into_iter().enumerate() {
+            let toast = !multi_account || i == 0;
+            self.perform_for(acct, "Archived", vec![LocalChange::Archive { message_ids: ids }], toast, window, cx);
+        }
         self.select_after_removal(next, window, cx);
     }
 
-    pub(crate) fn trash(&mut self, ids: Vec<MessageId>, window: &mut Window, cx: &mut Context<Self>) {
-        if ids.is_empty() {
+    pub(crate) fn trash_by_account(&mut self, by_account: std::collections::BTreeMap<AccountId, Vec<MessageId>>, window: &mut Window, cx: &mut Context<Self>) {
+        if by_account.is_empty() {
             return;
         }
         let next = self.removal_neighbour();
-        self.perform("Moved to Trash", vec![LocalChange::Trash { message_ids: ids }], true, window, cx);
+        let multi_account = by_account.len() > 1;
+        for (i, (acct, ids)) in by_account.into_iter().enumerate() {
+            let toast = !multi_account || i == 0;
+            self.perform_for(acct, "Moved to Trash", vec![LocalChange::Trash { message_ids: ids }], toast, window, cx);
+        }
         self.select_after_removal(next, window, cx);
     }
 
-    /// Puts archived (or trashed) messages back in the Inbox.
-    /// Trashed messages are untrashed, junk is taken out of Junk (Gmail keeps the SPAM
-    /// label otherwise, and the Inbox view hides anything still carrying it), and the rest
-    /// get the Inbox label.
-    pub(crate) fn move_to_inbox(&mut self, ids: Vec<MessageId>, window: &mut Window, cx: &mut Context<Self>) {
-        if ids.is_empty() {
+    pub(crate) fn move_target_to_inbox(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let by_account = self.target_message_ids_by_account();
+        self.move_to_inbox_by_account(by_account, window, cx);
+    }
+
+    pub(crate) fn move_to_inbox_by_account(&mut self, by_account: std::collections::BTreeMap<AccountId, Vec<MessageId>>, window: &mut Window, cx: &mut Context<Self>) {
+        if by_account.is_empty() {
             return;
         }
         let next = self.removal_neighbour();
-        let changes = self.changes_to_inbox(&ids);
-        self.perform("Moved to Inbox", changes, true, window, cx);
+        let multi_account = by_account.len() > 1;
+        for (i, (acct, ids)) in by_account.into_iter().enumerate() {
+            let changes = self.changes_to_inbox_for(&acct, &ids);
+            let toast = !multi_account || i == 0;
+            self.perform_for(acct, "Moved to Inbox", changes, toast, window, cx);
+        }
         self.select_after_removal(next, window, cx);
     }
 
-    /// What putting `ids` back in the Inbox changes, as [`Self::move_to_inbox`] describes.
-    pub(crate) fn changes_to_inbox(&self, ids: &[MessageId]) -> Vec<LocalChange> {
-        let of_kind = |kind: LabelKind| self.labels.iter().find(|l| l.kind == kind).map(|l| l.id.clone());
+    /// What putting `ids` of `account` back in its Inbox changes.
+    pub(crate) fn changes_to_inbox_for(&self, account: &AccountId, ids: &[MessageId]) -> Vec<LocalChange> {
+        let labels = self.labels_for_account(account);
+        let of_kind = |kind: LabelKind| labels.iter().find(|l| l.kind == kind).map(|l| l.id.clone());
         let (trash, spam) = (of_kind(LabelKind::Trash), of_kind(LabelKind::Spam));
-        let with_label = |label: &Option<LabelId>| -> Vec<MessageId> { ids.iter().filter(|id| self.mail_index.message(id).is_some_and(|m| label.as_ref().is_some_and(|l| m.has_label(l)))).cloned().collect() };
+        let index = self.index_for(account);
+        let with_label = |label: &Option<LabelId>| -> Vec<MessageId> {
+            ids.iter()
+                .filter(|id| index.and_then(|idx| idx.message(id)).is_some_and(|m| label.as_ref().is_some_and(|l| m.has_label(l))))
+                .cloned()
+                .collect()
+        };
         let trashed = with_label(&trash);
         let junk = with_label(&spam);
         let others: Vec<MessageId> = ids.iter().filter(|id| !trashed.contains(id)).cloned().collect();
@@ -4033,51 +4476,112 @@ impl MailWindow {
         changes
     }
 
-    /// Applies a user label and, like moving to a folder, takes the messages out of the Inbox.
-    pub(crate) fn move_to_label(&mut self, ids: Vec<MessageId>, label_id: LabelId, window: &mut Window, cx: &mut Context<Self>) {
+    /// Applies a user label in `account` and, like moving to a folder, takes the messages out of the Inbox.
+    pub(crate) fn move_to_label_for(&mut self, account: AccountId, ids: Vec<MessageId>, label_id: LabelId, window: &mut Window, cx: &mut Context<Self>) {
         if ids.is_empty() {
             return;
         }
-        if self.offline_active() {
+        if self.is_offline(&account) {
             return self.move_offline(ids, label_id, window, cx);
         }
-        let name = self.labels.iter().find(|l| l.id == label_id).map(|l| l.name.clone()).unwrap_or_default();
-        let inbox = self.labels.iter().find(|l| l.kind == LabelKind::Inbox).map(|l| l.id.clone());
-        let was_in_inbox: Vec<MessageId> = ids.iter().filter(|id| self.mail_index.message(id).is_some_and(|m| inbox.as_ref().is_some_and(|i| m.has_label(i)))).cloned().collect();
+        let labels = self.labels_for_account(&account);
+        let name = labels.iter().find(|l| l.id == label_id).map(|l| l.name.clone()).unwrap_or_default();
+        let inbox = labels.iter().find(|l| l.kind == LabelKind::Inbox).map(|l| l.id.clone());
+        let index = self.index_for(&account);
+        let was_in_inbox: Vec<MessageId> = ids
+            .iter()
+            .filter(|id| index.and_then(|idx| idx.message(id)).is_some_and(|m| inbox.as_ref().is_some_and(|i| m.has_label(i))))
+            .cloned()
+            .collect();
         let next = self.removal_neighbour();
         let changes = vec![LocalChange::AddLabel { message_ids: ids, label_id }, LocalChange::Archive { message_ids: was_in_inbox }];
-        self.perform(format!("Moved to {name}"), changes, true, window, cx);
+        self.perform_for(account, format!("Moved to {name}"), changes, true, window, cx);
         self.select_after_removal(next, window, cx);
     }
 
-    /// Handles a conversation dropped onto a sidebar destination.
+    /// Handles a conversation dropped onto a Move destination (from the palette or active account's sidebar).
     pub(crate) fn drop_on_view(&mut self, drag: ConversationDrag, view: MailboxView, window: &mut Window, cx: &mut Context<Self>) {
-        // Starring marks the latest message of each conversation, as the Star action does.
-        let (ids, latest): (Vec<MessageId>, Vec<MessageId>) = match &drag.mail {
-            DraggedMail::Conversation(id) => (self.mail_index.message_ids_in(id), self.conversations.iter().filter(|c| &c.id == id).map(|c| c.latest_message_id.clone()).collect()),
-            DraggedMail::Selection => (self.target_message_ids(), self.target_rows().map(|c| c.latest_message_id.clone()).collect()),
+        self.drop_on_account_view(drag, None, view, window, cx);
+    }
+
+    /// Handles a conversation dropped onto a sidebar destination (optionally scoped to `target_account`).
+    pub(crate) fn drop_on_account_view(&mut self, drag: ConversationDrag, target_account: Option<AccountId>, view: MailboxView, window: &mut Window, cx: &mut Context<Self>) {
+        let conversations: Vec<ConversationRef> = match &drag.mail {
+            DraggedMail::Conversation(c) => vec![c.clone()],
+            DraggedMail::Selection => self.target_conversations(),
         };
-        // The conversation can have left the index since the drag began.
-        if ids.is_empty() {
+        let mut by_account: std::collections::BTreeMap<AccountId, Vec<MessageId>> = std::collections::BTreeMap::new();
+        let mut latest_by_account: std::collections::BTreeMap<AccountId, Vec<MessageId>> = std::collections::BTreeMap::new();
+        for c in &conversations {
+            let ids = self.message_ids_in(c);
+            if !ids.is_empty() {
+                by_account.entry(c.account_id.clone()).or_default().extend(ids);
+            }
+            if let Some(row) = self.conversations.iter().find(|row| ConversationRef::of(row) == *c) {
+                latest_by_account.entry(c.account_id.clone()).or_default().push(row.latest_message_id.clone());
+            }
+        }
+        if by_account.is_empty() {
             return;
         }
-        let spam = self.labels.iter().find(|l| l.kind == LabelKind::Spam).map(|l| l.id.clone());
         if self.offline_active() {
             if let MailboxView::Label(label_id) = view {
+                let ids: Vec<MessageId> = by_account.into_values().flatten().collect();
                 self.move_offline(ids, label_id, window, cx);
             }
             return;
         }
+        // Moving into a specific user label requires the target account to match the messages' account.
+        if let MailboxView::Label(label_id) = &view {
+            let owner = target_account.or_else(|| (by_account.len() == 1).then(|| by_account.keys().next().cloned()).flatten());
+            let Some(owner) = owner else {
+                return crate::ui::toast(window, cx, crate::notify::Level::Info, "Select conversations from one account to move to a folder.");
+            };
+            if by_account.keys().any(|a| a != &owner) {
+                return crate::ui::toast(window, cx, crate::notify::Level::Info, "Conversations can only be moved to folders in their own account.");
+            }
+            let ids = by_account.remove(&owner).unwrap_or_default();
+            self.move_to_label_for(owner, ids, label_id.clone(), window, cx);
+            self.note_recent_move(view);
+            return;
+        }
         match view.clone() {
-            MailboxView::Kind(LabelKind::Inbox) => self.move_to_inbox(ids, window, cx),
-            MailboxView::Kind(LabelKind::Archive) => self.archive(ids, window, cx),
-            MailboxView::Kind(LabelKind::Trash) => self.trash(ids, window, cx),
-            MailboxView::Kind(LabelKind::Starred) => return self.set_starred(latest, true, window, cx),
-            MailboxView::Kind(LabelKind::Spam) if spam.is_some() => self.move_to_label(ids, spam.expect("checked"), window, cx),
-            MailboxView::Label(label_id) => self.move_to_label(ids, label_id, window, cx),
+            MailboxView::Kind(LabelKind::Inbox) => self.move_to_inbox_by_account(by_account, window, cx),
+            MailboxView::Kind(LabelKind::Archive) => self.archive_by_account(by_account, window, cx),
+            MailboxView::Kind(LabelKind::Trash) => self.trash_by_account(by_account, window, cx),
+            MailboxView::Kind(LabelKind::Starred) => {
+                for (acct, ids) in latest_by_account {
+                    self.set_starred_for(acct, ids, true, window, cx);
+                }
+                return;
+            }
+            MailboxView::Kind(LabelKind::Spam) => {
+                let next = self.removal_neighbour();
+                let mut moved = false;
+                for (acct, ids) in by_account {
+                    let spam = self.labels_for_account(&acct).iter().find(|l| l.kind == LabelKind::Spam).map(|l| l.id.clone());
+                    if let Some(spam_id) = spam {
+                        let inbox = self.labels_for_account(&acct).iter().find(|l| l.kind == LabelKind::Inbox).map(|l| l.id.clone());
+                        let index = self.index_for(&acct);
+                        let was_in_inbox: Vec<MessageId> = ids
+                            .iter()
+                            .filter(|id| index.and_then(|idx| idx.message(id)).is_some_and(|m| inbox.as_ref().is_some_and(|i| m.has_label(i))))
+                            .cloned()
+                            .collect();
+                        let changes = vec![LocalChange::AddLabel { message_ids: ids, label_id: spam_id }, LocalChange::Archive { message_ids: was_in_inbox }];
+                        self.perform_for(acct, "Moved to Junk", changes, !moved, window, cx);
+                        moved = true;
+                    }
+                }
+                if moved {
+                    self.select_after_removal(next, window, cx);
+                }
+            }
             _ => return crate::ui::toast(window, cx, crate::notify::Level::Info, "Messages can be dropped on Inbox, Archive, Trash, Junk, Starred, or a label."),
         }
-        self.note_recent_move(view);
+        if !self.all_inboxes_active() {
+            self.note_recent_move(view);
+        }
     }
 
     /// The destinations the Move picker can offer: Inbox, Archive, Junk (when the account
@@ -4090,18 +4594,33 @@ impl MailWindow {
             out.retain(|(v, _)| v != &self.view);
             return out;
         }
+        let target_accounts: BTreeSet<AccountId> = self.target_conversations().into_iter().map(|c| c.account_id).collect();
+        let single_account = if target_accounts.len() == 1 {
+            target_accounts.into_iter().next()
+        } else if target_accounts.is_empty() {
+            Some(self.account.id.clone())
+        } else {
+            None
+        };
         let mut out = vec![
             (MailboxView::Kind(LabelKind::Inbox), "Inbox".to_owned()),
             (MailboxView::Kind(LabelKind::Archive), "Archive".to_owned()),
         ];
-        if self.labels.iter().any(|l| l.kind == LabelKind::Spam) {
+        let has_spam = match &single_account {
+            Some(acct) => self.labels_for_account(acct).iter().any(|l| l.kind == LabelKind::Spam),
+            None => self.accounts.iter().any(|a| self.labels_for_account(&a.id).iter().any(|l| l.kind == LabelKind::Spam)),
+        };
+        if has_spam {
             out.push((MailboxView::Kind(LabelKind::Spam), "Junk".to_owned()));
         }
         out.push((MailboxView::Kind(LabelKind::Trash), "Trash".to_owned()));
-        let mut user: Vec<&Label> = self.labels.iter().filter(|l| l.kind == LabelKind::User).collect();
-        user.sort_by_cached_key(|l| overlook_core::sidebar::folder_title(&l.name).to_lowercase());
-        out.extend(user.into_iter().map(|l| (MailboxView::Label(l.id.clone()), overlook_core::sidebar::folder_title(&l.name).to_owned())));
-        out.retain(|(v, _)| v != &self.view);
+        if let Some(acct) = single_account {
+            let mut user: Vec<&Label> = self.labels_for_account(&acct).iter().filter(|l| l.kind == LabelKind::User).collect();
+            user.sort_by_cached_key(|l| overlook_core::sidebar::folder_title(&l.name).to_lowercase());
+            out.extend(user.into_iter().map(|l| (MailboxView::Label(l.id.clone()), overlook_core::sidebar::folder_title(&l.name).to_owned())));
+        }
+        let current_view = if self.all_inboxes_active() { MailboxView::Kind(LabelKind::Inbox) } else { self.view.clone() };
+        out.retain(|(v, _)| v != &current_view);
         out
     }
 
@@ -4121,7 +4640,7 @@ impl MailWindow {
         self.save_setting(&self.recent_moves_key(), &self.recent_moves);
     }
 
-    fn select_after_removal(&mut self, next: Option<ConversationId>, window: &mut Window, cx: &mut Context<Self>) {
+    fn select_after_removal(&mut self, next: Option<ConversationRef>, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_message_window() {
             // Stay in the message window with this email until closed or sent,
             // unless it was permanently deleted.
@@ -4134,15 +4653,15 @@ impl MailWindow {
             // A bulk action is over: whatever is left is a plain selection again.
             self.marked.clear();
         }
-        if self.selected.is_none() || !self.conversations.iter().any(|c| Some(&c.id) == self.selected.as_ref()) {
-            let next = next.filter(|id| self.conversations.iter().any(|c| &c.id == id));
+        if self.selected.is_none() || !self.conversations.iter().any(|c| Some(ConversationRef::of(c)) == self.selected) {
+            let next = next.filter(|target| self.conversations.iter().any(|c| ConversationRef::of(c) == *target));
             self.select_conversation(next, window, cx);
         }
     }
 
-    pub(crate) fn set_read(&mut self, ids: Vec<MessageId>, read: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn set_read_for(&mut self, account: &AccountId, ids: Vec<MessageId>, read: bool, window: &mut Window, cx: &mut Context<Self>) {
         if !ids.is_empty() {
-            self.apply_local(overlook_store::LocalChange::SetRead { message_ids: ids, read }, window, cx);
+            self.apply_local_for(account, overlook_store::LocalChange::SetRead { message_ids: ids, read }, window, cx);
         }
     }
 
@@ -4150,21 +4669,35 @@ impl MailWindow {
     /// conversations whatever folder the search began in, so there the newest message
     /// outside Trash is starred, which keeps the conversation in Starred.
     fn star_view(&self) -> MailboxView {
-        if self.search_query.trim().is_empty() { self.view.clone() } else { MailboxView::Kind(LabelKind::Inbox) }
+        if self.all_inboxes_active() || !self.search_query.trim().is_empty() {
+            MailboxView::Kind(LabelKind::Inbox)
+        } else {
+            self.view.clone()
+        }
     }
 
     /// Stars or unstars whole conversations: starring marks each one's newest message,
     /// unstarring clears every starred message in it, so none stays in Starred (#39).
-    pub(crate) fn star_conversations(&mut self, conversations: Vec<ConversationId>, starred: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let ids = self.mail_index.star_targets(&conversations, &self.star_view(), starred);
-        if !ids.is_empty() {
-            self.set_starred(ids, starred, window, cx);
+    pub(crate) fn star_conversations(&mut self, conversations: Vec<ConversationRef>, starred: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let mut by_account: std::collections::BTreeMap<AccountId, Vec<ConversationId>> = std::collections::BTreeMap::new();
+        for c in conversations {
+            by_account.entry(c.account_id).or_default().push(c.id);
+        }
+        let view = self.star_view();
+        for (acct, convs) in by_account {
+            let ids = self
+                .index_for(&acct)
+                .map(|idx| idx.star_targets(&convs, &view, starred))
+                .unwrap_or_default();
+            if !ids.is_empty() {
+                self.set_starred_for(acct, ids, starred, window, cx);
+            }
         }
     }
 
-    pub(crate) fn set_starred(&mut self, ids: Vec<MessageId>, starred: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn set_starred_for(&mut self, account: AccountId, ids: Vec<MessageId>, starred: bool, window: &mut Window, cx: &mut Context<Self>) {
         let title = if starred { "Starred" } else { "Unstarred" };
-        self.perform(title, vec![LocalChange::SetStarred { message_ids: ids, starred }], false, window, cx);
+        self.perform_for(account, title, vec![LocalChange::SetStarred { message_ids: ids, starred }], false, window, cx);
     }
 
     // --------------------------------------------------------------- compose
@@ -4211,11 +4744,13 @@ impl MailWindow {
     /// Replies to or forwards one particular message of the conversation.
     pub(crate) fn reply_to(&mut self, kind: DraftKind, source: Message, window: &mut Window, cx: &mut Context<Self>) {
         if self.reuse_reply(kind, &source, window, cx) { return; }
-        // Mail in an offline folder is answered from the mail account shown before it.
-        let mut draft = Draft::in_response_to_with(self.writing_account().id, kind, &source, &self.writing_owner(), now(), self.prefs.quote_on_reply);
+        // Use the thread's owning mail account; offline copies fall back to the writing account.
+        let reply_acct = self.reply_account_for(&source);
+        let reply_owner = Address::named(&reply_acct.display_name, &reply_acct.email);
+        let mut draft = Draft::in_response_to_with(reply_acct.id.clone(), kind, &source, &reply_owner, now(), self.prefs.quote_on_reply);
         // The quoted original is appended at send time and shown collapsed under the editor, and
         // the signature goes between what is written and the quote.
-        self.apply_signature(&mut draft, self.default_signature_id(true).as_deref());
+        self.apply_signature(&mut draft, self.default_signature_id_for(&reply_acct.id, true).as_deref());
         // Open at once; the new draft is written in the background.
         let to_save = draft.clone();
         self.open_composer(draft, window, cx);
@@ -4233,7 +4768,8 @@ impl MailWindow {
             crate::ui::toast(window, cx, crate::notify::Level::Warning, "This message hasn’t been downloaded yet.");
             return;
         }
-        let draft = Draft::resend_of(self.writing_account().id, &source, now());
+        let reply_acct = self.reply_account_for(&source);
+        let draft = Draft::resend_of(reply_acct.id, &source, now());
         let to_save = draft.clone();
         self.open_composer(draft, window, cx);
         self.attach_forwarded(to_save.id.clone(), source, window, cx);
@@ -4279,9 +4815,10 @@ impl MailWindow {
         if let Ok(Some(draft)) = self.store.draft(&id) {
             if draft.state != DraftState::Editing { return; }
             if let Some(conv) = draft.conversation_id.clone() {
+                let target = ConversationRef { account_id: draft.account_id.clone(), id: conv };
                 // Show the conversation being replied to, if it is in this view.
-                if self.conversations.iter().any(|c| c.id == conv) {
-                    self.set_selected(Some(conv));
+                if self.conversations.iter().any(|c| ConversationRef::of(c) == target) {
+                    self.set_selected(Some(target));
                     self.marked.clear();
                     self.load_thread(cx);
                 }
@@ -4398,8 +4935,10 @@ impl MailWindow {
             return;
         }
         let active = self.account.id.clone();
-        self.sync_caldav_account(active.clone(), true, cx);
         let ids: Vec<AccountId> = self.accounts.iter().map(|a| a.id.clone()).collect();
+        for id in &ids {
+            self.sync_caldav_account(id.clone(), true, cx);
+        }
         for id in ids {
             self.verify_pending.insert(id.clone());
             self.next_retry.remove(&id);
@@ -4518,6 +5057,12 @@ impl MailWindow {
                         this.reload_account_labels();
                         this.refresh_account_counts(cx);
                     }
+                    if this.all_inboxes_active() || this.other_indexes.contains_key(&account.id) {
+                        this.rebuild_other_account_index(account.id.clone(), cx);
+                    }
+                    if this.module == Module::Calendar || this.cal_filter_includes(&account.id) {
+                        this.reload_calendar();
+                    }
                     this.refresh_other_contacts_for(account.id.clone(), cx);
                     this.refresh_settings_cache();
                     cx.notify();
@@ -4630,6 +5175,8 @@ impl MailWindow {
     fn on_escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
         if self.palette.is_some() {
             self.close_palette(window, cx);
+        } else if self.snooze_modal.is_some() {
+            self.close_snooze_modal(window, cx);
         } else if self.folder_prompt.is_some() {
             self.close_folder_prompt(window, cx);
         } else if self.history.is_some() {
@@ -4642,7 +5189,7 @@ impl MailWindow {
             self.quick_look = None;
             cx.notify();
         } else if self.settings.is_some() {
-            if !self.clear_settings_search(window, cx) {
+            if !self.cancel_recording_shortcut(cx) && !self.clear_settings_search(window, cx) {
                 self.close_settings(window, cx);
             }
         } else if self.composer.is_some() {
@@ -4826,12 +5373,12 @@ impl MailWindow {
         if self.offline_active() {
             return; // Offline folders have no Inbox or Archive.
         }
-        let ids = self.target_message_ids();
+        let by_account = self.target_message_ids_by_account();
         let (in_trash, in_inbox) = self.removal_state();
         if in_trash || !in_inbox {
-            self.move_to_inbox(ids, window, cx);
+            self.move_to_inbox_by_account(by_account, window, cx);
         } else {
-            self.archive(ids, window, cx);
+            self.archive_by_account(by_account, window, cx);
         }
     }
     fn on_trash(&mut self, _: &TrashSelected, window: &mut Window, cx: &mut Context<Self>) {
@@ -4842,22 +5389,30 @@ impl MailWindow {
         if self.removal_state().0 {
             return; // Already in Trash: the toolbar and menu say Restore instead.
         }
-        let ids = self.target_message_ids();
-        self.trash(ids, window, cx);
+        let by_account = self.target_message_ids_by_account();
+        self.trash_by_account(by_account, window, cx);
     }
     fn on_toggle_star(&mut self, _: &ToggleStar, window: &mut Window, cx: &mut Context<Self>) {
         if self.marked.is_empty() && !self.thread.is_empty() {
             // The open conversation (a message window may hold just one of its messages).
+            let acct = self.thread[0].account_id.clone();
             let mut conversations: Vec<ConversationId> = self.thread.iter().map(|m| m.conversation_id.clone()).collect();
             conversations.dedup();
-            let starred = conversations.iter().flat_map(|c| self.mail_index.message_ids_in(c)).any(|id| self.mail_index.message(&id).is_some_and(|m| m.is_starred)) || self.thread.iter().any(|m| m.is_starred);
-            let mut ids = self.mail_index.star_targets(&conversations, &self.star_view(), !starred);
+            let index = self.index_for(&acct);
+            let starred = conversations
+                .iter()
+                .flat_map(|c| index.map(|idx| idx.message_ids_in(c)).unwrap_or_default())
+                .any(|id| index.and_then(|idx| idx.message(&id)).is_some_and(|m| m.is_starred))
+                || self.thread.iter().any(|m| m.is_starred);
+            let mut ids = index
+                .map(|idx| idx.star_targets(&conversations, &self.star_view(), !starred))
+                .unwrap_or_default();
             if ids.is_empty() {
                 // Not in this window's index: act on the messages shown.
                 ids = if starred { self.thread.iter().filter(|m| m.is_starred).map(|m| m.id.clone()).collect() } else { self.thread.iter().max_by_key(|m| m.date).map(|m| m.id.clone()).into_iter().collect() };
             }
             if !ids.is_empty() {
-                self.set_starred(ids, !starred, window, cx);
+                self.set_starred_for(acct, ids, !starred, window, cx);
             }
             return;
         }
@@ -4867,8 +5422,10 @@ impl MailWindow {
     }
     fn on_toggle_read(&mut self, _: &ToggleRead, window: &mut Window, cx: &mut Context<Self>) {
         let unread_any = if self.marked.is_empty() { self.thread.iter().any(|m| !m.is_read) } else { self.selection_state().any_unread };
-        let ids = self.target_message_ids();
-        self.set_read(ids, unread_any, window, cx);
+        let by_account = self.target_message_ids_by_account();
+        for (acct, ids) in by_account {
+            self.set_read_for(&acct, ids, unread_any, window, cx);
+        }
     }
     fn on_extend_next(&mut self, _: &ExtendSelectionNext, window: &mut Window, cx: &mut Context<Self>) {
         self.extend_selection(1, window, cx);
@@ -4888,24 +5445,33 @@ impl MailWindow {
     /// after asking. Only the messages this view shows go, so a row in Trash cannot take
     /// the rest of its conversation out of the Inbox.
     pub(crate) fn on_delete_forever(&mut self, _: &DeleteForeverSelected, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.can_delete_forever() {
+        if !self.can_delete_forever_selected() {
             crate::ui::toast(window, cx, crate::notify::Level::Info, "This account can only move mail to Trash.");
             return;
         }
         let targets = self.target_conversations();
         let delete_view = if self.is_message_window() {
             email_modal::delete_forever_view(&self.view, &self.thread, &self.labels)
+        } else if self.all_inboxes_active() {
+            MailboxView::Kind(LabelKind::Inbox)
         } else {
             self.view.clone()
         };
-        let ids: Vec<MessageId> = targets
-            .iter()
-            .flat_map(|c| self.mail_index.visible_message_ids_in(c, &delete_view))
-            .collect();
-        if ids.is_empty() {
+        let mut by_account: std::collections::BTreeMap<AccountId, Vec<MessageId>> = std::collections::BTreeMap::new();
+        for c in &targets {
+            let ids = self
+                .index_for(&c.account_id)
+                .map(|idx| idx.visible_message_ids_in(&c.id, &delete_view))
+                .unwrap_or_default();
+            if !ids.is_empty() {
+                by_account.entry(c.account_id.clone()).or_default().extend(ids);
+            }
+        }
+        let total_ids: usize = by_account.values().map(Vec::len).sum();
+        if total_ids == 0 {
             return;
         }
-        let what = match (targets.len(), ids.len()) {
+        let what = match (targets.len(), total_ids) {
             (1, 1) => "this message".to_owned(),
             (1, n) => format!("the {n} messages in this conversation"),
             (k, n) => format!("the {n} messages in these {k} conversations"),
@@ -4921,31 +5487,38 @@ impl MailWindow {
             &["Delete", "Cancel"],
             cx,
         );
-        let account = self.account.id.clone();
         cx.spawn_in(window, async move |this, cx| {
             if answer.await != Ok(0) {
                 return;
             }
             let _ = this.update_in(cx, |this, window, cx| {
-                // The prompt was open a while: delete only what is still there, in that account.
-                if this.account.id != account {
-                    return;
-                }
-                let ids: Vec<MessageId> = ids.into_iter().filter(|id| this.mail_index.message(id).is_some()).collect();
-                if ids.is_empty() {
-                    return;
-                }
-                let n = ids.len();
+                // The prompt was open a while: delete only what is still there, in each owning account.
+                let mut total_deleted = 0usize;
                 let next = this.neighbour_after_removal_of(&targets);
-                if this.offline_active() {
-                    // Their files go from disk once the deletion is written.
-                    this.doom_offline_files(&ids);
+                for (acct, ids) in by_account {
+                    let ids: Vec<MessageId> = ids
+                        .into_iter()
+                        .filter(|id| this.index_for(&acct).and_then(|idx| idx.message(id)).is_some())
+                        .collect();
+                    if ids.is_empty() {
+                        continue;
+                    }
+                    let n = ids.len();
+                    total_deleted += n;
+                    if this.is_offline(&acct) {
+                        // Their files go from disk once the deletion is written.
+                        this.doom_offline_files(&ids);
+                    }
+                    this.apply_local_for(&acct, overlook_store::LocalChange::DeleteForever { message_ids: ids, folder: None }, window, cx);
+                    let title = if n == 1 { "Permanently deleted a message".to_owned() } else { format!("Permanently deleted {n} messages") };
+                    this.record(acct, title, "Skipped Trash".into(), overlook_store::Reversal::None, None, window, cx);
                 }
-                this.apply_local(overlook_store::LocalChange::DeleteForever { message_ids: ids, folder: None }, window, cx);
-                let title = if n == 1 { "Permanently deleted a message".to_owned() } else { format!("Permanently deleted {n} messages") };
-                this.record(account.clone(), title.clone(), "Skipped Trash".into(), overlook_store::Reversal::None, None, window, cx);
+                if total_deleted == 0 {
+                    return;
+                }
                 this.clear_marked();
                 this.select_after_removal(next, window, cx);
+                let title = if total_deleted == 1 { "Permanently deleted a message".to_owned() } else { format!("Permanently deleted {total_deleted} messages") };
                 crate::ui::toast(window, cx, crate::notify::Level::Success, format!("{title}."));
             });
         })
@@ -5170,13 +5743,23 @@ impl MailWindow {
                 h_flex()
                     .items_center()
                     .gap(px(10.))
-                    .child(
+                    .child(if self.all_inboxes_active() {
+                        h_flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(icon("inbox").size(px(14.)).text_color(p.muted))
+                            .child(format!(
+                                "All Inboxes · {} account{}",
+                                self.accounts.len(),
+                                if self.accounts.len() == 1 { "" } else { "s" }
+                            ))
+                    } else {
                         h_flex()
                             .items_center()
                             .gap(px(6.))
                             .when(self.has_account(), |row| row.child(self.account_mark(&self.account).render(15., &p)))
-                            .child(format!("{} · {}", self.account.provider.label(), self.account.email)),
-                    )
+                            .child(format!("{} · {}", self.account.provider.label(), self.account.email))
+                    })
                     .when(is_sample, |row| {
                         row.child(
                             Switch::new("connection")
@@ -5398,6 +5981,12 @@ fn apply_local_writes(store: &Store, writes: Vec<(AccountId, LocalWrite)>) -> Ve
                 LocalWrite::MoveFocus { ids, focused, sender } => {
                     store.set_focus_override_and_rule(&acct, &ids, Some(focused), sender.as_deref())
                 }
+                LocalWrite::Snooze { conversation_id, wake_at } => {
+                    store.snooze_conversation(&acct, &conversation_id, wake_at).map(|_| ())
+                }
+                LocalWrite::CancelSnooze { conversation_id } => {
+                    store.cancel_snooze(&acct, &conversation_id).map(|_| ())
+                }
             }
             .err()
             .map(|e| e.to_string())
@@ -5566,6 +6155,8 @@ impl Render for MailWindow {
             .on_action(cx.listener(|_, _: &QuitOverlook, _window, cx| cx.defer(crate::lifecycle::quit)))
             .on_action(cx.listener(|this, _: &UndoLast, window, cx| this.undo_last(window, cx)))
             .on_action(cx.listener(|this, _: &ShowHistory, window, cx| this.open_history(window, cx)))
+            .on_action(cx.listener(Self::on_snooze_selected))
+            .on_action(cx.listener(Self::on_unsnooze_selected))
             .size_full()
             .bg(p.background)
             .text_color(p.foreground)
@@ -5592,6 +6183,7 @@ impl Render for MailWindow {
             .when(self.module == Module::Calendar && self.new_event.as_ref().is_some_and(|f| f.dragged.is_some()), |d| d.child(self.render_event_modal(cx)))
             .when(self.event_in_modal().is_some(), |d| d.child(self.render_event_details_modal(cx)))
             .when(self.folder_prompt.is_some(), |d| d.child(self.render_folder_prompt(cx)))
+            .when(self.snooze_modal.is_some(), |d| d.child(self.render_snooze_modal(cx)))
             .when(self.history.is_some(), |d| d.child(self.render_history(cx)))
             .when(self.quick_look.is_some(), |d| d.child(self.render_quick_look(cx)))
             .when(self.palette.is_some(), |d| d.child(self.render_palette(cx)))
@@ -5694,5 +6286,202 @@ mod blocking_io_tests {
             first + second
         }));
         assert_eq!(out, Some(42));
+    }
+}
+
+#[cfg(test)]
+mod multi_account_tests {
+    use super::{apply_local_writes, combine_inbox_conversations, format_account_menu_label, ConversationRef, LocalWrite};
+    use overlook_core::*;
+    use overlook_store::{ListFilter, LocalChange, MailboxView, Store};
+    use std::collections::BTreeSet;
+    // The parent's GPUI glob also exports a `test` proc macro.
+    use std::prelude::v1::test;
+
+    fn google_account(id: &str, name: &str, email: &str) -> Account {
+        Account {
+            id: AccountId::from(id),
+            provider: ProviderKind::Gmail,
+            display_name: name.into(),
+            email: email.into(),
+            created_at: 1_000,
+        }
+    }
+
+    fn seed_google_inbox(store: &Store, account: &Account) -> (LabelId, LabelId) {
+        store.upsert_account(account).unwrap();
+        let inbox = LabelId::from(format!("{}:INBOX", account.id.0));
+        let trash = LabelId::from(format!("{}:TRASH", account.id.0));
+        for label in [
+            Label {
+                id: inbox.clone(),
+                account_id: account.id.clone(),
+                kind: LabelKind::Inbox,
+                name: "Inbox".into(),
+                provider_id: Some(ProviderId("INBOX".into())),
+                color: None,
+                sort_order: 0,
+            },
+            Label {
+                id: trash.clone(),
+                account_id: account.id.clone(),
+                kind: LabelKind::Trash,
+                name: "Trash".into(),
+                provider_id: Some(ProviderId("TRASH".into())),
+                color: None,
+                sort_order: 1,
+            },
+        ] {
+            store.upsert_label(&label).unwrap();
+        }
+        (inbox, trash)
+    }
+
+    fn msg(account: &Account, id: &str, conv: &str, subject: &str, date: i64, inbox: &LabelId) -> Message {
+        Message {
+            id: MessageId::from(id),
+            account_id: account.id.clone(),
+            conversation_id: ConversationId::from(conv),
+            provider_id: Some(ProviderId(id.into())),
+            from: Address::named("Sender", "sender@example.com"),
+            to: vec![Address::named(&account.display_name, &account.email)],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            reply_to: None,
+            subject: subject.into(),
+            snippet: format!("Snippet for {subject}"),
+            body: Body { text: Some("Hello".into()), html: None },
+            date,
+            is_read: false,
+            is_starred: false,
+            is_outgoing: false,
+            label_ids: [inbox.clone()].into_iter().collect::<BTreeSet<_>>(),
+            attachments: Vec::new(),
+            rfc_message_id: Some(format!("<{id}@example.com>")),
+            in_reply_to: None,
+            references: Vec::new(),
+            category: None,
+            is_important: false,
+            focus_override: None,
+            invitation: None,
+            read_receipt: None,
+        }
+    }
+
+    #[test]
+    fn account_menu_label_shows_name_and_address() {
+        assert_eq!(
+            format_account_menu_label(None, "Work Jason", "jason@work.example", "Gmail"),
+            "Work Jason · jason@work.example"
+        );
+        assert_eq!(
+            format_account_menu_label(Some("Personal"), "Jason", "jason@gmail.com", "Gmail"),
+            "Personal · jason@gmail.com"
+        );
+        assert_eq!(
+            format_account_menu_label(None, "jason@gmail.com", "jason@gmail.com", "Gmail"),
+            "jason@gmail.com · Gmail"
+        );
+    }
+
+    #[test]
+    fn active_account_setting_switches_both_ways_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("overlook.db");
+        let a = google_account("gmail:one@gmail.com", "One", "one@gmail.com");
+        let b = google_account("gmail:two@gmail.com", "Two", "two@gmail.com");
+        {
+            let store = Store::open(&db).unwrap();
+            store.upsert_account(&a).unwrap();
+            store.upsert_account(&b).unwrap();
+            store.set_setting("active_account", &b.id).unwrap();
+        }
+        {
+            let store = Store::open(&db).unwrap();
+            assert_eq!(store.setting::<AccountId>("active_account").unwrap(), Some(b.id.clone()));
+            store.set_setting("active_account", &a.id).unwrap();
+        }
+        {
+            let store = Store::open(&db).unwrap();
+            assert_eq!(store.setting::<AccountId>("active_account").unwrap(), Some(a.id.clone()));
+        }
+    }
+
+    #[test]
+    fn all_inboxes_merges_newest_first_and_keeps_identical_threads_separate_per_account() {
+        let store = Store::open_in_memory().unwrap();
+        let a = google_account("gmail:one@gmail.com", "One", "one@gmail.com");
+        let b = google_account("gmail:two@gmail.com", "Two", "two@gmail.com");
+        let (inbox_a, _) = seed_google_inbox(&store, &a);
+        let (inbox_b, _) = seed_google_inbox(&store, &b);
+
+        // Similar mail sent to both accounts, even sharing a raw ConversationId, must remain distinct per account.
+        store
+            .upsert_messages(&[
+                msg(&a, "a-old", "shared-thread", "Newsletter", 1_000, &inbox_a),
+                msg(&b, "b-mid", "shared-thread", "Newsletter", 2_000, &inbox_b),
+                msg(&a, "a-new", "a-only", "Urgent", 3_000, &inbox_a),
+            ])
+            .unwrap();
+
+        let idx_a = store.mail_index(&a.id).unwrap();
+        let idx_b = store.mail_index(&b.id).unwrap();
+        let inbox = MailboxView::Kind(LabelKind::Inbox);
+        let combined = combine_inbox_conversations([
+            idx_a.conversations(&a.email, &inbox, ListFilter::All, None),
+            idx_b.conversations(&b.email, &inbox, ListFilter::All, None),
+        ]);
+
+        assert_eq!(combined.len(), 3);
+        assert_eq!(combined[0].account_id, a.id);
+        assert_eq!(combined[0].latest, 3_000);
+        assert_eq!(combined[1].account_id, b.id);
+        assert_eq!(combined[1].latest, 2_000);
+        assert_eq!(combined[2].account_id, a.id);
+        assert_eq!(combined[2].latest, 1_000);
+        assert_ne!(ConversationRef::of(&combined[1]), ConversationRef::of(&combined[2]));
+    }
+
+    #[test]
+    fn cross_account_archive_and_trash_act_on_each_owning_account() {
+        let store = Store::open_in_memory().unwrap();
+        let a = google_account("gmail:one@gmail.com", "One", "one@gmail.com");
+        let b = google_account("gmail:two@gmail.com", "Two", "two@gmail.com");
+        let (inbox_a, _) = seed_google_inbox(&store, &a);
+        let (inbox_b, trash_b) = seed_google_inbox(&store, &b);
+
+        let m_a = msg(&a, "m-a1", "a:t1", "Alpha", 1_000, &inbox_a);
+        let m_b = msg(&b, "m-b1", "b:t1", "Beta", 2_000, &inbox_b);
+        store.upsert_messages(&[m_a.clone(), m_b.clone()]).unwrap();
+
+        let errors = apply_local_writes(
+            &store,
+            vec![
+                (a.id.clone(), LocalWrite::Change(LocalChange::Archive { message_ids: vec![m_a.id.clone()] })),
+                (b.id.clone(), LocalWrite::Change(LocalChange::Trash { message_ids: vec![m_b.id.clone()] })),
+            ],
+        );
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+
+        let updated_a = store.message(&m_a.id).unwrap().unwrap();
+        let updated_b = store.message(&m_b.id).unwrap().unwrap();
+        assert!(!updated_a.has_label(&inbox_a), "account A message should be archived");
+        assert!(!updated_b.has_label(&inbox_b), "account B message should leave Inbox");
+        assert!(updated_b.has_label(&trash_b), "account B message should be in account B Trash");
+        assert_eq!(store.pending_operations(&a.id).unwrap().len(), 1);
+        assert_eq!(store.pending_operations(&b.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reply_draft_uses_thread_owning_account() {
+        let a = google_account("gmail:one@gmail.com", "One", "one@gmail.com");
+        let b = google_account("gmail:two@gmail.com", "Two", "two@gmail.com");
+        let inbox_b = LabelId::from("gmail:two@gmail.com:INBOX");
+        let source = msg(&b, "m-b1", "b:t1", "Hello from B", 2_000, &inbox_b);
+        let owner_b = Address::named(&b.display_name, &b.email);
+        let draft = Draft::in_response_to_with(b.id.clone(), DraftKind::Reply, &source, &owner_b, 3_000, true);
+        assert_eq!(draft.account_id, b.id);
+        assert_ne!(draft.account_id, a.id);
+        assert_eq!(draft.in_reply_to, Some(source.id));
     }
 }

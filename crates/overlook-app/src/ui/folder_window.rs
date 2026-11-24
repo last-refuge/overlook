@@ -237,10 +237,14 @@ impl MailWindow {
             return;
         }
         let fonts_changed = self.prefs.fonts != prefs.fonts;
+        let shortcuts_changed = self.prefs.shortcuts != prefs.shortcuts;
         self.prefs = prefs;
         self.account_prefs = account_prefs;
         if fonts_changed && crate::theme::current_fonts(cx) != self.prefs.fonts {
             crate::theme::apply_fonts(&self.prefs.fonts, cx);
+        }
+        if shortcuts_changed && crate::ui::current_shortcuts(cx) != self.prefs.shortcuts {
+            crate::ui::apply_shortcuts(&self.prefs.shortcuts, cx);
         }
         self.prepare_outbox_preview(cx);
         self.prepare_composer_preview(cx);

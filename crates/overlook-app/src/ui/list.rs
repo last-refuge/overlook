@@ -52,6 +52,8 @@ fn changed_span<T: PartialEq>(old: &[T], new: &[T]) -> Option<(std::ops::Range<u
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RowAction {
     Archive,
+    Snooze,
+    CancelSnooze,
     Delete,
     ToggleRead,
     ToggleStar,
@@ -237,7 +239,7 @@ impl MailWindow {
                     .border_color(p.divider)
                     .when(focus_split, |row| {
                         // The tab not on show says how much unread mail waits in it.
-                        let focused_unread = self.counts.get(&MailboxView::Kind(LabelKind::Inbox)).copied().unwrap_or(0);
+                        let focused_unread = self.focused_inbox_unread_count();
                         let other_unread = self.other_unread;
                         let focus_tab = |label: &'static str, tab: FocusTab, cx: &mut Context<Self>| {
                             let active = inbox_tab == tab;
@@ -284,7 +286,11 @@ impl MailWindow {
         };
 
         let body: AnyElement = if no_rows {
-            let nothing_local = !self.is_sample(&self.account.id) && self.account_message_count == 0;
+            let nothing_local = if self.all_inboxes_active() {
+                false
+            } else {
+                !self.is_sample(&self.account.id) && self.account_message_count == 0
+            };
             let paused_hint: String = match &self.status.state {
                 SyncState::SyncFailed(reason) | SyncState::Paused(reason) if nothing_local && !self.is_syncing_active() => reason.clone(),
                 _ => "Your inbox will appear here in a moment.".to_owned(),
@@ -299,16 +305,24 @@ impl MailWindow {
                 (_, false) => ("No results".into(), "Try another name or keyword.".into()),
                 (MailboxView::Kind(LabelKind::Inbox), _) if focus_split && inbox_tab == FocusTab::Other => ("Nothing in Other.".into(), "Newsletters and automated mail land here.".into()),
                 (MailboxView::Kind(LabelKind::Inbox), _) => ("Your inbox is clear.".into(), "New mail will appear here.".into()),
+                (MailboxView::Kind(LabelKind::Snoozed), _) => ("No snoozed conversations".into(), "Snooze an email to return it to your inbox later.".into()),
                 (MailboxView::Kind(LabelKind::Drafts), _) => ("No drafts".into(), "Messages you start are saved on this device.".into()),
                 (MailboxView::Kind(LabelKind::Outbox), _) => ("Outbox is empty".into(), "Messages waiting to be sent appear here.".into()),
                 _ => ("Nothing here".into(), "There are no messages in this view.".into()),
+            };
+            let empty_icon = if container {
+                "folder"
+            } else if matches!(self.view, MailboxView::Kind(LabelKind::Snoozed)) && self.search_query.is_empty() {
+                "clock"
+            } else {
+                "inbox"
             };
             v_flex()
                 .items_center()
                 .pt(px(72.))
                 .gap(px(6.))
                 .text_color(p.muted)
-                .child(icon(if container { "folder" } else { "inbox" }).size(px(28.)).text_color(p.divider))
+                .child(icon(empty_icon).size(px(28.)).text_color(p.divider))
                 .child(div().text_size(crate::ui::ui_px(14.)).font_weight(FontWeight::MEDIUM).text_color(p.foreground).child(title))
                 .child(div().text_size(crate::ui::ui_px(12.)).child(hint))
                 .when(container, |d| {
@@ -363,6 +377,7 @@ impl MailWindow {
         let key = RowsKey {
             data: self.list_data_generation,
             account: self.account.id.clone(),
+            all_inboxes: self.all_inboxes_active(),
             view: self.view.clone(),
             filter: self.filter,
             inbox_tab: self.inbox_focus(),
@@ -373,6 +388,7 @@ impl MailWindow {
         if self.rows_key.borrow().as_ref() != Some(&key) {
             let context_changed = self.rows_key.borrow().as_ref().is_some_and(|prev| {
                 prev.account != key.account
+                    || prev.all_inboxes != key.all_inboxes
                     || prev.view != key.view
                     || prev.filter != key.filter
                     || prev.inbox_tab != key.inbox_tab
@@ -390,6 +406,7 @@ impl MailWindow {
             compact,
             avatars: self.prefs.show_avatars,
             previews: self.prefs.show_previews,
+            all_inboxes: self.all_inboxes_active(),
             ui_size: self.prefs.fonts.clamped_ui_size(),
             list_family: self.prefs.fonts.effective_list_family().to_owned(),
             list_size: self.prefs.fonts.list_size,
@@ -451,6 +468,24 @@ impl MailWindow {
             MailboxView::Kind(LabelKind::Outbox) if self.search_query.is_empty() => {
                 rows.extend(self.outbox.iter().cloned().map(ListRow::Draft));
             }
+            MailboxView::Kind(LabelKind::Snoozed) if self.search_query.is_empty() && !self.all_inboxes_active() => {
+                let now = overlook_core::time::now();
+                let groups: Vec<overlook_core::SnoozeGroup> = self
+                    .conversations
+                    .iter()
+                    .map(|c| overlook_core::snooze::snooze_group(c.snoozed_until.unwrap_or(now), now, &self.time_zone))
+                    .collect();
+                let mut current: Option<&overlook_core::SnoozeGroup> = None;
+                for (i, c) in self.conversations.iter().enumerate() {
+                    let group = &groups[i];
+                    if current != Some(group) {
+                        let n = groups[i..].iter().take_while(|g| *g == group).count();
+                        rows.push(ListRow::Group(group.label().to_owned().into(), n));
+                        current = Some(group);
+                    }
+                    rows.push(ListRow::Conversation(c.clone()));
+                }
+            }
             _ => {
                 let now = overlook_core::time::now();
                 let groups: Vec<DayGroup> = self.conversations.iter().map(|c| day_group(c.latest, now, &self.time_zone)).collect();
@@ -471,22 +506,50 @@ impl MailWindow {
 
     fn render_conversation_row(&self, c: &ConversationSummary, compact: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *cx.palette();
-        let selected = self.selected.as_ref() == Some(&c.id);
-        let marked = self.marked.contains(&c.id);
+        let row_ref = super::ConversationRef::of(c);
+        let selected = self.selected.as_ref() == Some(&row_ref);
+        let marked = self.marked.contains(&row_ref);
         // A marked row is tinted like the open one; only the open one gets the edge bar.
         let highlighted = selected || marked;
         let unread = c.is_unread();
         let now = overlook_core::time::now();
         let time = relative_label(c.latest, now, &self.time_zone);
-        let who = c.participants.first().cloned().unwrap_or_else(|| self.owner());
+        let who = c.participants.first().cloned().unwrap_or_else(|| self.owner_for(&c.account_id));
+        let row_labels = self.labels_for_account(&c.account_id);
         let label_name = c
             .label_ids
             .iter()
-            .filter_map(|id| self.labels.iter().find(|l| &l.id == id))
+            .filter_map(|id| row_labels.iter().find(|l| &l.id == id))
             .find(|l| l.kind == LabelKind::User)
             .map(|l| overlook_core::sidebar::folder_title(&l.name).to_owned());
-        let conv_id = c.id.clone();
-        let star_conversation = c.id.clone();
+        let account_badge: Option<AnyElement> = self.all_inboxes_active().then(|| {
+            let name = self.account_name(&c.account_id);
+            let tip = self
+                .known_account(&c.account_id)
+                .map(|a| self.account_menu_label(&a))
+                .unwrap_or_else(|| name.clone());
+            let mark = self.known_account(&c.account_id).map(|a| self.account_mark(&a).render(12., &p));
+            h_flex()
+                .id(SharedString::from(format!("acct-badge-{}-{}", c.account_id.0, c.id)))
+                .flex_shrink(1.)
+                .min_w(px(0.))
+                .max_w(px(150.))
+                .items_center()
+                .gap(px(4.))
+                .px(px(6.))
+                .py(px(1.))
+                .rounded(px(5.))
+                .bg(if highlighted { p.message_surface().opacity(0.6) } else { p.chip })
+                .text_size(self.list_text_px(10.5))
+                .line_height(self.list_text_px(15.))
+                .text_color(if highlighted { p.selection_text } else { p.muted })
+                .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
+                .children(mark)
+                .child(div().min_w_0().truncate().child(name))
+                .into_any_element()
+        });
+        let conv_ref = row_ref.clone();
+        let star_conversation = row_ref.clone();
         let starred = c.starred;
         let pending = c.pending;
         // Dragging one row of a marked set drags the whole set.
@@ -494,19 +557,22 @@ impl MailWindow {
             let n = self.marked.len();
             super::ConversationDrag { mail: super::DraggedMail::Selection, title: format!("{n} conversations"), count: 0 }
         } else {
-            super::ConversationDrag { mail: super::DraggedMail::Conversation(c.id.clone()), title: c.subject.clone(), count: c.message_count }
+            super::ConversationDrag { mail: super::DraggedMail::Conversation(row_ref.clone()), title: c.subject.clone(), count: c.message_count }
         };
         let me = cx.entity().downgrade();
-        let menu_id = c.id.clone();
-        let has_junk = self.labels.iter().any(|l| l.kind == LabelKind::Spam);
-        let can_delete_forever = self.can_delete_forever();
+        let menu_ref = row_ref.clone();
+        let has_junk = row_labels.iter().any(|l| l.kind == LabelKind::Spam);
+        let can_delete_forever = self.can_delete_forever_for(&c.account_id);
         // What the row carries under its preview: an invitation's time, its files by name,
         // and its folder.
         let invitation: Vec<AnyElement> = c.invitation.as_ref().filter(|_| !compact).map(|inv| self.invitation_chip(c, inv, cx)).unwrap_or_default();
-        let extras = !compact && (c.has_attachments || label_name.is_some() || !invitation.is_empty());
+        let snooze_chip: Option<AnyElement> = c.snoozed_until.map(|ts| self.render_list_snooze_chip(ts, &p));
+        let compact_snooze_chip = if compact { snooze_chip } else { None };
+        let extra_snooze_chip = if !compact { c.snoozed_until.map(|ts| self.render_list_snooze_chip(ts, &p)) } else { None };
+        let extras = !compact && (c.has_attachments || label_name.is_some() || !invitation.is_empty() || extra_snooze_chip.is_some());
 
         div()
-            .id(SharedString::from(format!("conv-{}", c.id)))
+            .id(SharedString::from(format!("conv-{}-{}", c.account_id.0, c.id)))
             .group("conversation-row")
             .relative()
             .h_flex()
@@ -589,22 +655,36 @@ impl MailWindow {
                             ),
                     )
                     .child(
-                        div()
-                            .truncate()
-                            .text_size(self.list_text_px(13.))
-                            .font_weight(if unread { FontWeight::BOLD } else { FontWeight::NORMAL })
-                            .text_color(p.foreground)
-                            .child(c.subject.clone()),
+                        h_flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(self.list_text_px(13.))
+                                    .font_weight(if unread { FontWeight::BOLD } else { FontWeight::NORMAL })
+                                    .text_color(p.foreground)
+                                    .child(c.subject.clone()),
+                            )
+                            .children(compact_snooze_chip)
+                            .children(account_badge),
                     )
-                    .when(!compact && self.prefs.show_previews, |d| {
-                        d.child(
-                            div()
-                                .truncate()
-                                .text_size(self.list_text_px(12.))
-                                .text_color(p.muted)
-                                .child(c.snippet.clone()),
-                        )
-                    })
+                    .when_some(
+                        (!compact && self.prefs.show_previews)
+                            .then(|| overlook_core::clean_snippet(&c.snippet, 160))
+                            .filter(|s| !s.is_empty()),
+                        |d, snippet| {
+                            d.child(
+                                div()
+                                    .truncate()
+                                    .text_size(self.list_text_px(12.))
+                                    .text_color(p.muted)
+                                    .child(snippet),
+                            )
+                        },
+                    )
                     .when(extras, |d| {
                         let files = &c.attachment_names;
                         // Wraps rather than cutting off what doesn't fit; the list measures
@@ -619,6 +699,7 @@ impl MailWindow {
                                 .min_w_0()
                                 .text_size(self.list_text_px(11.))
                                 .text_color(p.muted)
+                                .children(extra_snooze_chip)
                                 .children(invitation)
                                 // The files by name and type; a message whose only parts are
                                 // pictures in its text keeps the plain "Attachments" note.
@@ -633,7 +714,7 @@ impl MailWindow {
                                     let names = files[1..].join(", ");
                                     d.child(
                                         div()
-                                            .id(SharedString::from(format!("more-files-{}", c.id)))
+                                            .id(SharedString::from(format!("more-files-{}-{}", c.account_id.0, c.id)))
                                             .child(chip(format!("+{more}"), &p))
                                             .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(names.clone()).build(window, cx)),
                                     )
@@ -643,7 +724,7 @@ impl MailWindow {
                     }),
             )
             .child(
-                Button::new(SharedString::from(format!("star-{}", c.id)))
+                Button::new(SharedString::from(format!("star-{}-{}", c.account_id.0, c.id)))
                     .ghost()
                     .xsmall()
                     .icon(
@@ -665,16 +746,16 @@ impl MailWindow {
             .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
                 let modifiers = e.modifiers();
                 if modifiers.control {
-                    this.toggle_marked(conv_id.clone(), window, cx);
+                    this.toggle_marked(conv_ref.clone(), window, cx);
                 } else if modifiers.shift {
-                    this.extend_marked_to(conv_id.clone(), window, cx);
+                    this.extend_marked_to(conv_ref.clone(), window, cx);
                 } else if e.click_count() == 2 {
-                    this.open_conversation_window(conv_id.clone(), window, cx);
+                    this.open_conversation_window(conv_ref.clone(), window, cx);
                 } else {
-                    this.select_conversation(Some(conv_id.clone()), window, cx);
+                    this.select_conversation(Some(conv_ref.clone()), window, cx);
                 }
             }))
-            .context_menu(move |menu, window, cx| Self::row_menu(menu, me.clone(), &menu_id, has_junk, can_delete_forever, window, cx))
+            .context_menu(move |menu, window, cx| Self::row_menu(menu, me.clone(), &menu_ref, has_junk, can_delete_forever, window, cx))
     }
 
     /// The commands a row offers while the pointer is over it, floating over its time and
@@ -682,7 +763,7 @@ impl MailWindow {
     /// alone, so whatever is open stays open.
     fn row_quick_actions(&self, c: &ConversationSummary, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *cx.palette();
-        let state = super::list_menu::selection_state([c], &self.labels);
+        let state = super::list_menu::selection_state([c], self.labels_for_account(&c.account_id));
         let (archive_label, archive_icon) = if state.all_in_trash {
             ("Restore", C::Move)
         } else if !state.any_in_inbox {
@@ -692,16 +773,33 @@ impl MailWindow {
         };
         // Offline mail has no Archive, and deleting it is for good: that asks first, from the
         // menu or the Delete key, not from a button under the pointer.
+        enum QuickGlyph {
+            Color(C),
+            Symbol(&'static str),
+        }
         let offline = self.offline_active();
-        let mut actions = Vec::new();
-        if !offline {
-            actions.push((RowAction::Archive, archive_label, archive_icon));
+        let mut actions: Vec<(RowAction, &'static str, QuickGlyph)> = Vec::new();
+        if c.snoozed_until.is_some() && !offline {
+            actions.push((RowAction::Snooze, "Change snooze time", QuickGlyph::Symbol("clock")));
+            actions.push((RowAction::CancelSnooze, "Cancel snooze", QuickGlyph::Symbol("rotate-ccw")));
+        } else {
+            if !offline {
+                actions.push((RowAction::Archive, archive_label, QuickGlyph::Color(archive_icon)));
+            }
+            if !offline && !state.all_in_trash && !state.all_in_junk {
+                actions.push((RowAction::Snooze, "Snooze", QuickGlyph::Symbol("clock")));
+            }
         }
         if !state.all_in_trash && !offline {
-            actions.push((RowAction::Delete, "Delete", C::Delete));
+            actions.push((RowAction::Delete, "Delete", QuickGlyph::Color(C::Delete)));
         }
-        actions.push(if state.any_unread { (RowAction::ToggleRead, "Mark read", C::Read) } else { (RowAction::ToggleRead, "Mark unread", C::Mail) });
-        actions.push((RowAction::ToggleStar, if state.all_starred { "Unstar" } else { "Star" }, C::Star));
+        actions.push(if state.any_unread {
+            (RowAction::ToggleRead, "Mark read", QuickGlyph::Color(C::Read))
+        } else {
+            (RowAction::ToggleRead, "Mark unread", QuickGlyph::Color(C::Mail))
+        });
+        actions.push((RowAction::ToggleStar, if state.all_starred { "Unstar" } else { "Star" }, QuickGlyph::Color(C::Star)));
+        let row_ref = super::ConversationRef::of(c);
         h_flex()
             .absolute()
             .top(px(6.))
@@ -717,50 +815,64 @@ impl MailWindow {
             .invisible()
             .group_hover("conversation-row", |s| s.visible())
             .children(actions.into_iter().map(|(action, label, glyph)| {
-                let id = c.id.clone();
-                Button::new(SharedString::from(format!("quick-{action:?}-{}", c.id)))
+                let target = row_ref.clone();
+                let icon_el = match glyph {
+                    QuickGlyph::Color(c) => color_icon(c, 15., &p).into_any_element(),
+                    QuickGlyph::Symbol(name) => icon(name).size(px(14.)).text_color(p.action).into_any_element(),
+                };
+                Button::new(SharedString::from(format!("quick-{action:?}-{}-{}", c.account_id.0, c.id)))
                     .ghost()
                     .xsmall()
                     .w(px(26.))
                     .h(px(24.))
-                    .child(color_icon(glyph, 15., &p))
+                    .child(icon_el)
                     .accessibility_label(label)
                     .tooltip(label)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
-                        this.row_action(&id, action, window, cx);
+                        this.row_action(&target, action, window, cx);
                     }))
             }))
     }
 
     /// A row's own command. The open conversation acts as the toolbar would, moving on to
     /// the next one after archiving; any other row changes alone and the selection stays.
-    pub(super) fn row_action(&mut self, id: &ConversationId, action: RowAction, window: &mut Window, cx: &mut Context<Self>) {
-        if self.offline_active() && matches!(action, RowAction::Archive | RowAction::Delete) {
+    pub(super) fn row_action(&mut self, target: &super::ConversationRef, action: RowAction, window: &mut Window, cx: &mut Context<Self>) {
+        if self.offline_active() && matches!(action, RowAction::Archive | RowAction::Delete | RowAction::Snooze | RowAction::CancelSnooze) {
             return;
         }
-        if self.marked.is_empty() && self.selected.as_ref() == Some(id) {
+        if matches!(action, RowAction::Snooze) {
+            self.open_snooze_modal(vec![target.clone()], window, cx);
+            return;
+        }
+        if matches!(action, RowAction::CancelSnooze) {
+            self.cancel_snooze_conversations(vec![target.clone()], window, cx);
+            return;
+        }
+        if self.marked.is_empty() && self.selected.as_ref() == Some(target) {
             match action {
                 RowAction::Archive => self.on_archive(&super::ArchiveSelected, window, cx),
                 RowAction::Delete => self.on_trash(&super::TrashSelected, window, cx),
                 RowAction::ToggleRead => self.on_toggle_read(&super::ToggleRead, window, cx),
                 RowAction::ToggleStar => self.on_toggle_star(&super::ToggleStar, window, cx),
+                RowAction::Snooze | RowAction::CancelSnooze => unreachable!(),
             }
             return;
         }
-        let Some(row) = self.conversations.iter().find(|c| &c.id == id).cloned() else { return };
-        let state = super::list_menu::selection_state([&row], &self.labels);
-        let ids = self.mail_index.message_ids_in(id);
+        let Some(row) = self.conversations.iter().find(|c| super::ConversationRef::of(c) == *target).cloned() else { return };
+        let state = super::list_menu::selection_state([&row], self.labels_for_account(&row.account_id));
+        let ids = self.message_ids_in(target);
         match action {
             RowAction::Archive if state.all_in_trash || !state.any_in_inbox => {
-                let changes = self.changes_to_inbox(&ids);
-                self.perform("Moved to Inbox", changes, true, window, cx);
+                let changes = self.changes_to_inbox_for(&row.account_id, &ids);
+                self.perform_for(row.account_id.clone(), "Moved to Inbox", changes, true, window, cx);
             }
-            RowAction::Archive => self.perform("Archived", vec![LocalChange::Archive { message_ids: ids }], true, window, cx),
-            RowAction::Delete if !state.all_in_trash => self.perform("Moved to Trash", vec![LocalChange::Trash { message_ids: ids }], true, window, cx),
+            RowAction::Archive => self.perform_for(row.account_id.clone(), "Archived", vec![LocalChange::Archive { message_ids: ids }], true, window, cx),
+            RowAction::Delete if !state.all_in_trash => self.perform_for(row.account_id.clone(), "Moved to Trash", vec![LocalChange::Trash { message_ids: ids }], true, window, cx),
             RowAction::Delete => {}
-            RowAction::ToggleRead => self.set_read(ids, state.any_unread, window, cx),
-            RowAction::ToggleStar => self.star_conversations(vec![row.id.clone()], !state.all_starred, window, cx),
+            RowAction::ToggleRead => self.set_read_for(&row.account_id, ids, state.any_unread, window, cx),
+            RowAction::ToggleStar => self.star_conversations(vec![target.clone()], !state.all_starred, window, cx),
+            RowAction::Snooze | RowAction::CancelSnooze => unreachable!(),
         }
     }
 
@@ -804,7 +916,7 @@ impl MailWindow {
                         row.push(
                             // Accept is the answer most invitations get, so it leads: semibold in
                             // the action colour. Decline stays quiet.
-                            Button::new(SharedString::from(format!("rsvp-{label}-{}", c.id)))
+                            Button::new(SharedString::from(format!("rsvp-{label}-{}-{}", c.account_id.0, c.id)))
                                 .ghost()
                                 .xsmall()
                                 .flex_none()
@@ -850,10 +962,7 @@ impl MailWindow {
     /// The calendar event behind an invitation in the list, read purely from memory
     /// (`self.invite_events` is populated on mail/thread/calendar refresh, never in render).
     fn invite_row(&self, account: &AccountId, uid: &str) -> Option<InviteRow> {
-        if account != &self.account.id {
-            return None;
-        }
-        self.invite_events.get(uid).and_then(|e| e.as_ref()).map(|e| InviteRow {
+        self.invite_events.get(&(account.clone(), uid.to_owned())).and_then(|e| e.as_ref()).map(|e| InviteRow {
             event: e.id.clone(),
             start: e.start,
             end: e.end,
@@ -863,10 +972,10 @@ impl MailWindow {
         })
     }
 
-    fn can_move_to_focused_inbox(&self, id: &ConversationId) -> bool {
+    fn can_move_to_focused_inbox(&self, target: &super::ConversationRef) -> bool {
         self.inbox_focus() == Some(FocusTab::Other)
             && self.search_query.trim().is_empty()
-            && self.position_of(id).is_some()
+            && self.position_of(target).is_some()
     }
 
     /// The right-click menu of a conversation row. The row joins the selection first, so
@@ -874,14 +983,14 @@ impl MailWindow {
     fn row_menu(
         mut menu: PopupMenu,
         me: WeakEntity<Self>,
-        id: &ConversationId,
+        target: &super::ConversationRef,
         has_junk: bool,
         can_delete_forever: bool,
         window: &mut Window,
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
         let state = me.update(cx, |this, cx| {
-            this.mark_for_menu(id, window, cx);
+            this.mark_for_menu(target, window, cx);
             // Offline folders to move server mail into, by name.
             let mut offline_folders: Vec<(LabelId, String)> = if this.offers_offline() && !this.offline_active() {
                 this.labels_of(&this.offline.id).iter().filter(|l| l.kind == LabelKind::User).map(|l| (l.id.clone(), Self::offline_folder_name(&l.name))).collect()
@@ -889,10 +998,18 @@ impl MailWindow {
                 Vec::new()
             };
             offline_folders.sort_by_cached_key(|(_, name)| name.to_lowercase());
-            let focus_account = this.can_move_to_focused_inbox(id).then(|| this.account.id.clone());
-            (this.selection_state(), this.view == MailboxView::Kind(LabelKind::Sent), this.offline_active(), this.offers_offline(), offline_folders, focus_account)
+            let focus_target = this.can_move_to_focused_inbox(target).then(|| target.clone());
+            let can_delete = if this.multi_selected() { this.can_delete_forever_selected() } else { can_delete_forever };
+            let state = this.selection_state();
+            let has_junk = if this.multi_selected() { state.has_junk_label } else { has_junk };
+            let snooze_presets = overlook_core::snooze::snooze_presets(
+                overlook_core::time::now(),
+                &this.time_zone,
+                this.prefs.work_start_hour,
+            );
+            (state, !this.all_inboxes_active() && this.view == MailboxView::Kind(LabelKind::Sent), this.offline_active(), this.offers_offline(), offline_folders, focus_target, has_junk, can_delete, snooze_presets)
         });
-        let Ok((state, in_sent, offline, offers_offline, offline_folders, focus_account)) = state else { return menu };
+        let Ok((state, in_sent, offline, offers_offline, offline_folders, focus_target, has_junk, can_delete_forever, snooze_presets)) = state else { return menu };
         let multi = state.count > 1;
         let act = |me: &WeakEntity<Self>, f: fn(&mut Self, &mut Window, &mut Context<Self>)| {
             let me = me.clone();
@@ -901,12 +1018,12 @@ impl MailWindow {
             }
         };
         if !multi {
-            let open_id = id.clone();
+            let open_ref = target.clone();
             let open_me = me.clone();
             menu = menu
                 .item(PopupMenuItem::new("Open").icon(icon("mail-open")).on_click(move |_, window, cx| {
                     open_me
-                        .update(cx, |this, cx| this.open_conversation_window(open_id.clone(), window, cx))
+                        .update(cx, |this, cx| this.open_conversation_window(open_ref.clone(), window, cx))
                         .ok();
                 }))
                 .separator()
@@ -943,13 +1060,13 @@ impl MailWindow {
         menu = menu.item(PopupMenuItem::new(star_label).icon(icon(star_icon)).action(Box::new(super::ToggleStar)).on_click(act(&me, |this, window, cx| {
             this.on_toggle_star(&super::ToggleStar, window, cx);
         })));
+        menu = Self::append_snooze_menu_items(menu, me.clone(), &state, offline, snooze_presets, window, cx);
         menu = menu.separator();
-        if let Some(account) = focus_account.filter(|_| !multi) {
-            let conversation = id.clone();
+        if let Some(conversation) = focus_target.filter(|_| !multi) {
             let me = me.clone();
             menu = menu.item(PopupMenuItem::new("Move to Focused Inbox").icon(icon("inbox")).on_click(move |_, window, cx| {
                 me.update(cx, |this, cx| {
-                    if this.account.id == account && this.can_move_to_focused_inbox(&conversation) {
+                    if this.can_move_to_focused_inbox(&conversation) {
                         this.move_conversation_focus(&conversation, true, true, window, cx);
                     }
                 }).ok();
@@ -997,8 +1114,7 @@ impl MailWindow {
         if has_junk {
             if state.all_in_junk {
                 menu = menu.item(PopupMenuItem::new("Not Junk").icon(icon("shield-check")).on_click(act(&me, |this, window, cx| {
-                    let ids = this.target_message_ids();
-                    this.move_to_inbox(ids, window, cx);
+                    this.move_target_to_inbox(window, cx);
                 })));
             } else {
                 menu = menu.item(PopupMenuItem::new("Move to Junk").icon(icon("shield-alert")).on_click(act(&me, |this, window, cx| {

@@ -374,7 +374,8 @@ fn main() {
             .flatten()
             .unwrap_or_default();
         theme::apply_preference(preference, theme::system_appearance(cx.window_appearance()), cx);
-        ui::init(cx);
+        let shortcuts = prefs.as_ref().map(|p| p.shortcuts.clone()).unwrap_or_default();
+        ui::init(&shortcuts, cx);
         tracing::debug!("startup: theme and keys ready after {} ms", since_start_ms());
         lifecycle::start(store.clone(), provider.clone(), start_hidden, cx);
     });

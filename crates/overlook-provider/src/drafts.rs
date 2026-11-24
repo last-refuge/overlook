@@ -56,6 +56,10 @@ pub fn import(
         })
         .unwrap_or_default();
     draft.body_html = message.body.html.clone();
+    draft.request_read_receipt = parsed.headers().iter().any(|h| {
+        h.name().eq_ignore_ascii_case("Disposition-Notification-To")
+            && !matches!(h.value(), mail_parser::HeaderValue::Empty)
+    });
     draft.imported = Some(DraftSource {
         text: draft.body_text.clone(),
         html: message.body.html,
@@ -165,6 +169,7 @@ pub(crate) fn same_content(left: &[u8], right: &[u8]) -> Result<bool, ProviderEr
         && a.draft.cc == b.draft.cc
         && a.draft.bcc == b.draft.bcc
         && a.draft.subject == b.draft.subject
+        && a.draft.request_read_receipt == b.draft.request_read_receipt
         && source(&a.draft) == source(&b.draft)
         && attachments(&a.draft) == attachments(&b.draft)
         && a.files == b.files)
@@ -243,5 +248,33 @@ mod tests {
         let mut modified = String::from_utf8(edited).unwrap().replace("Hello draft.", "Changed.");
         assert!(!same_content(raw, modified.as_bytes()).unwrap());
         modified.clear();
+    }
+
+    #[test]
+    fn server_draft_round_trip_preserves_read_receipt_opt_in() {
+        let account = Account {
+            id: AccountId::from("a"),
+            provider: ProviderKind::Gmail,
+            display_name: "Test".into(),
+            email: "me@example.com".into(),
+            created_at: 0,
+        };
+        let remote = RemoteDraft {
+            id: ProviderId::from("d2"),
+            revision: "r2".into(),
+            thread_id: None,
+        };
+        let mut draft = Draft::new(account.id.clone(), DraftKind::New, 0);
+        draft.to = vec![Address::new(None, "friend@example.com")];
+        draft.subject = "Check-in".into();
+        draft.body_text = "Hi".into();
+
+        let without = crate::outgoing::build_draft_raw(&account, &draft, None, "<d2@example.com>").unwrap();
+        assert!(!import(&account, &remote, &without).unwrap().draft.request_read_receipt);
+
+        draft.request_read_receipt = true;
+        let with_receipt = crate::outgoing::build_draft_raw(&account, &draft, None, "<d2@example.com>").unwrap();
+        assert!(import(&account, &remote, &with_receipt).unwrap().draft.request_read_receipt);
+        assert!(!same_content(&without, &with_receipt).unwrap());
     }
 }

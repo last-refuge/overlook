@@ -8,6 +8,7 @@
 
 use crate::{ListFilter, LocalChange, MailboxView};
 use overlook_core::focus::{classify_focus, FocusTab};
+use overlook_core::time::Timestamp;
 use overlook_core::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -21,10 +22,17 @@ pub struct MailIndex {
     pub(crate) pending: BTreeSet<MessageId>,
     pub(crate) rules: HashMap<String, bool>,
     pub(crate) correspondents: HashSet<String>,
+    /// Active device-local snoozes keyed by conversation id (`wake_at` timestamp).
+    pub(crate) snoozes: HashMap<ConversationId, Timestamp>,
 }
 
 impl MailIndex {
-    pub(crate) fn new(labels: Vec<Label>, messages: Vec<Message>, pending: BTreeSet<MessageId>, rules: HashMap<String, bool>) -> Self {
+    pub(crate) fn new(
+        labels: Vec<Label>,
+        messages: Vec<Message>,
+        pending: BTreeSet<MessageId>,
+        rules: HashMap<String, bool>,
+    ) -> Self {
         let label_kinds = labels.iter().map(|l| (l.id.clone(), l.kind)).collect();
         let mut correspondents = HashSet::new();
         let mut by_conv: BTreeMap<ConversationId, Vec<Message>> = BTreeMap::new();
@@ -38,7 +46,30 @@ impl MailIndex {
             conv_of.insert(m.id.clone(), m.conversation_id.clone());
             by_conv.entry(m.conversation_id.clone()).or_default().push(m);
         }
-        Self { labels, label_kinds, by_conv, conv_of, pending, rules, correspondents }
+        Self { labels, label_kinds, by_conv, conv_of, pending, rules, correspondents, snoozes: HashMap::new() }
+    }
+
+    pub(crate) fn with_snoozes(mut self, snoozes: HashMap<ConversationId, Timestamp>) -> Self {
+        self.snoozes = snoozes;
+        self
+    }
+
+    pub fn snoozed_until(&self, conversation: &ConversationId) -> Option<Timestamp> {
+        self.snoozes.get(conversation).copied()
+    }
+
+    pub fn is_snoozed(&self, conversation: &ConversationId) -> bool {
+        self.snoozes.contains_key(conversation)
+    }
+
+    /// Optimistically mirrors a snooze in memory until the store rebuild lands.
+    pub fn set_snooze(&mut self, conversation: ConversationId, wake_at: Timestamp) {
+        self.snoozes.insert(conversation, wake_at);
+    }
+
+    /// Optimistically clears a snooze in memory until the store rebuild lands.
+    pub fn clear_snooze(&mut self, conversation: &ConversationId) {
+        self.snoozes.remove(conversation);
     }
 
     pub fn labels(&self) -> &[Label] {
@@ -120,11 +151,16 @@ impl MailIndex {
             }
             visible.clear();
             visible.extend(msgs.iter().filter(is_visible));
-            if let Some(summary) = ConversationSummary::from_message_refs(&visible, owner_email, &self.pending) {
+            if let Some(mut summary) = ConversationSummary::from_message_refs(&visible, owner_email, &self.pending) {
+                summary.snoozed_until = self.snoozes.get(&summary.id).copied();
                 out.push(summary);
             }
         }
-        out.sort_by_key(|c| std::cmp::Reverse(c.latest));
+        if matches!(view, MailboxView::Kind(LabelKind::Snoozed)) {
+            out.sort_by_key(|c| (c.snoozed_until.unwrap_or(Timestamp::MAX), std::cmp::Reverse(c.latest)));
+        } else {
+            out.sort_by_key(|c| std::cmp::Reverse(c.latest));
+        }
         out
     }
 
@@ -151,29 +187,41 @@ impl MailIndex {
         // Every message of a conversation decides whether it belongs to the view. This
         // keeps conversation counts consistent across views (a thread in Inbox still shows
         // all its messages).
-        self.by_conv.values().filter_map(move |msgs| {
+        self.by_conv.iter().filter_map(move |(conv_id, msgs)| {
             let in_trash = |m: &Message| trash.as_ref().is_some_and(|t| m.has_label(t));
             let in_spam = |m: &Message| spam.as_ref().is_some_and(|s| m.has_label(s));
-            let matches_view = msgs.iter().any(|m| match view {
-                MailboxView::Label(id) => m.has_label(id) && !in_trash(m),
-                MailboxView::Kind(LabelKind::Inbox) => inbox.as_ref().is_some_and(|i| m.has_label(i)) && !in_trash(m),
-                MailboxView::Kind(LabelKind::Starred) => m.is_starred && !in_trash(m),
-                MailboxView::Kind(LabelKind::Sent) => sent.as_ref().is_some_and(|s| m.has_label(s)) && !in_trash(m),
-                MailboxView::Kind(LabelKind::Trash) => in_trash(m),
-                MailboxView::Kind(LabelKind::Spam) => in_spam(m),
-                MailboxView::Kind(LabelKind::Archive) => {
-                    if let Some(archive) = &archive_folder {
-                        !in_trash(m) && !in_spam(m) && (m.has_label(archive) || m.label_ids.is_empty())
-                    } else {
-                        !in_trash(m)
-                            && !in_spam(m)
-                            && !inbox.as_ref().is_some_and(|i| m.has_label(i))
-                            && !sent.as_ref().is_some_and(|s| m.has_label(s))
-                    }
+            let is_snoozed = self.snoozes.contains_key(conv_id);
+            let matches_view = match view {
+                MailboxView::Kind(LabelKind::Snoozed) => {
+                    is_snoozed && msgs.iter().any(|m| !in_trash(m) && !in_spam(m))
                 }
-                MailboxView::Kind(LabelKind::Drafts | LabelKind::Outbox | LabelKind::Container) => false,
-                MailboxView::Kind(LabelKind::User) => m.label_ids.iter().any(|l| self.label_kinds.get(l).copied() == Some(LabelKind::User)),
-            });
+                MailboxView::Kind(LabelKind::Inbox) => {
+                    !is_snoozed
+                        && msgs
+                            .iter()
+                            .any(|m| inbox.as_ref().is_some_and(|i| m.has_label(i)) && !in_trash(m))
+                }
+                _ => msgs.iter().any(|m| match view {
+                    MailboxView::Label(id) => m.has_label(id) && !in_trash(m),
+                    MailboxView::Kind(LabelKind::Starred) => m.is_starred && !in_trash(m),
+                    MailboxView::Kind(LabelKind::Sent) => sent.as_ref().is_some_and(|s| m.has_label(s)) && !in_trash(m),
+                    MailboxView::Kind(LabelKind::Trash) => in_trash(m),
+                    MailboxView::Kind(LabelKind::Spam) => in_spam(m),
+                    MailboxView::Kind(LabelKind::Archive) => {
+                        if let Some(archive) = &archive_folder {
+                            !in_trash(m) && !in_spam(m) && (m.has_label(archive) || m.label_ids.is_empty())
+                        } else {
+                            !in_trash(m)
+                                && !in_spam(m)
+                                && !inbox.as_ref().is_some_and(|i| m.has_label(i))
+                                && !sent.as_ref().is_some_and(|s| m.has_label(s))
+                        }
+                    }
+                    MailboxView::Kind(LabelKind::Drafts | LabelKind::Outbox | LabelKind::Container) => false,
+                    MailboxView::Kind(LabelKind::User) => m.label_ids.iter().any(|l| self.label_kinds.get(l).copied() == Some(LabelKind::User)),
+                    MailboxView::Kind(LabelKind::Inbox | LabelKind::Snoozed) => unreachable!(),
+                }),
+            };
             if !matches_view {
                 return None;
             }
@@ -261,7 +309,11 @@ impl MailIndex {
         }
         let mut out: Vec<ConversationSummary> = convs
             .into_iter()
-            .filter_map(|c| ConversationSummary::from_messages(self.by_conv.get(c)?, owner_email, &self.pending))
+            .filter_map(|c| {
+                let mut summary = ConversationSummary::from_messages(self.by_conv.get(c)?, owner_email, &self.pending)?;
+                summary.snoozed_until = self.snoozes.get(&summary.id).copied();
+                Some(summary)
+            })
             .filter(|c| match filter {
                 ListFilter::All => true,
                 ListFilter::Unread => c.is_unread() || Some(&c.id) == open,
@@ -301,9 +353,11 @@ impl MailIndex {
         let inbox = self.label_of_kind(LabelKind::Inbox);
         let trash = self.label_of_kind(LabelKind::Trash);
         let ids = change.message_ids().to_vec();
+        let mut touched_convs: HashSet<ConversationId> = HashSet::new();
         if let LocalChange::DeleteForever { .. } = change {
             for id in &ids {
                 let Some(conv) = self.conv_of.remove(id) else { continue };
+                touched_convs.insert(conv.clone());
                 if let Some(msgs) = self.by_conv.get_mut(&conv) {
                     msgs.retain(|m| &m.id != id);
                     if msgs.is_empty() {
@@ -311,12 +365,43 @@ impl MailIndex {
                     }
                 }
             }
+            for conv in touched_convs {
+                self.snoozes.remove(&conv);
+            }
             return;
         }
         for id in &ids {
-            let Some(conv) = self.conv_of.get(id) else { continue };
-            let Some(m) = self.by_conv.get_mut(conv).and_then(|msgs| msgs.iter_mut().find(|m| &m.id == id)) else { continue };
+            let Some(conv) = self.conv_of.get(id).cloned() else { continue };
+            touched_convs.insert(conv.clone());
+            let Some(m) = self.by_conv.get_mut(&conv).and_then(|msgs| msgs.iter_mut().find(|m| &m.id == id)) else { continue };
             apply_to_message(m, change, inbox.as_ref(), trash.as_ref());
+        }
+        match change {
+            LocalChange::Archive { .. } | LocalChange::Trash { .. } => {
+                for conv in touched_convs {
+                    self.snoozes.remove(&conv);
+                }
+            }
+            LocalChange::AddLabel { label_id, .. }
+                if matches!(self.label_kinds.get(label_id), Some(LabelKind::Trash | LabelKind::Spam)) =>
+            {
+                for conv in touched_convs {
+                    self.snoozes.remove(&conv);
+                }
+            }
+            LocalChange::RemoveLabel { label_id, .. }
+                if self.label_kinds.get(label_id) == Some(&LabelKind::Inbox) =>
+            {
+                for conv in touched_convs {
+                    let still_inbox = self.by_conv.get(&conv).is_some_and(|msgs| {
+                        inbox.as_ref().is_some_and(|i| msgs.iter().any(|m| m.has_label(i)))
+                    });
+                    if !still_inbox {
+                        self.snoozes.remove(&conv);
+                    }
+                }
+            }
+            _ => {}
         }
         self.pending.extend(ids);
     }

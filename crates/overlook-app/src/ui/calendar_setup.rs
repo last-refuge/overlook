@@ -392,8 +392,8 @@ impl MailWindow {
     }
 
     pub(crate) fn ensure_caldav_range(&mut self, cx: &mut Context<Self>) {
-        if !self.caldav_cached {
-            self.sync_caldav_account(self.account.id.clone(), false, cx);
+        for id in self.caldav_uncached_accounts.clone() {
+            self.sync_caldav_account(id, false, cx);
         }
     }
 
@@ -431,7 +431,7 @@ impl MailWindow {
             tz::add_days(tz::day_start(now()), -60),
             tz::add_days(tz::day_start(now()), 366),
         );
-        if self.module == Module::Calendar && self.account.id == id {
+        if self.module == Module::Calendar && self.cal_filter_includes(&id) {
             let (view_from, view_to) = self.cal_range();
             if view_from < from || view_to > to {
                 from = tz::add_days(view_from, -7);
@@ -441,7 +441,7 @@ impl MailWindow {
         self.caldav_syncing
             .insert(id.clone(), connection.id.clone());
         self.caldav_requested.remove(&id);
-        if self.account.id == id {
+        if self.cal_filter_includes(&id) {
             self.cal_status = SyncState::Syncing;
         }
         let store = self.store.clone();
@@ -476,8 +476,7 @@ impl MailWindow {
                 this.reload_calendar();
                 if this.caldav_requested.remove(&id)
                     && delay == 0
-                    && this.account.id == id
-                    && !this.caldav_cached
+                    && this.caldav_uncached_accounts.contains(&id)
                 {
                     this.sync_caldav_account(id, false, cx);
                 }

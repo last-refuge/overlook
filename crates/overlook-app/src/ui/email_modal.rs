@@ -140,16 +140,19 @@ impl MailWindow {
         self.message_owner.is_some()
     }
 
-    /// Opens `id` in its own native window, or brings an already-open window forward.
+    /// Opens `target` in its own native window, or brings an already-open window forward.
     pub(super) fn open_conversation_window(
         &mut self,
-        id: ConversationId,
+        target: ConversationRef,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let account = self.account.id.clone();
-        let view = self.view.clone();
-        self.open_message_window(account, view, MessageTarget::Conversation(id), window, cx);
+        let view = if self.all_inboxes_active() {
+            MailboxView::Kind(LabelKind::Inbox)
+        } else {
+            self.view.clone()
+        };
+        self.open_message_window(target.account_id, view, MessageTarget::Conversation(target.id), window, cx);
     }
 
     /// Opens an Outbox item in its own native window, or brings an already-open window forward.
@@ -319,7 +322,8 @@ impl MailWindow {
         self.reload(cx);
         match target {
             MessageTarget::Conversation(id) => {
-                self.select_conversation(Some(id), window, cx);
+                let conv = ConversationRef { account_id: self.account.id.clone(), id };
+                self.select_conversation(Some(conv), window, cx);
             }
             MessageTarget::Outbox(id) => {
                 self.select_outbox_item(id, window, cx);
@@ -787,6 +791,7 @@ mod tests {
             label_ids: ids.iter().map(|id| LabelId::from(*id)).collect(),
             attachments: vec![],
             invitation: None,
+            read_receipt: None,
             rfc_message_id: None,
             in_reply_to: None,
             references: vec![],

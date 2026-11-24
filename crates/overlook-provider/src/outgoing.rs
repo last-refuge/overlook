@@ -1,10 +1,29 @@
 //! Builds RFC 822 messages for sending: the Gmail API's `users.messages.send` takes the same
 //! bytes SMTP does, so every provider shares this builder.
 
-use lettre::message::header::ContentType;
+use lettre::message::header::{ContentType, Header, HeaderName, HeaderValue};
 use lettre::message::{Attachment as MimeAttachment, Mailbox, MultiPart, SinglePart};
 use lettre::Message as MimeMessage;
 use overlook_core::*;
+
+/// RFC 8098 §2.1 `Disposition-Notification-To` header requesting a standards-based
+/// Message Disposition Notification (read receipt) from the recipient's mail client.
+#[derive(Clone, Debug)]
+struct DispositionNotificationTo(Mailbox);
+
+impl Header for DispositionNotificationTo {
+    fn name() -> HeaderName {
+        HeaderName::new_from_ascii_str("Disposition-Notification-To")
+    }
+
+    fn parse(s: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Self(s.parse()?))
+    }
+
+    fn display(&self) -> HeaderValue {
+        HeaderValue::new(Self::name(), self.0.to_string())
+    }
+}
 
 fn mailbox(address: &Address) -> Result<Mailbox, String> {
     let email = address.email.parse().map_err(|e| format!("invalid address “{}”: {e}", address.email))?;
@@ -68,6 +87,12 @@ fn build_message(
         .subject(draft.subject.clone())
         .message_id(Some(rfc_id.to_owned()))
         .user_agent("Overlook".to_owned());
+    if draft.request_read_receipt {
+        // RFC 8098 §2.1: emit Disposition-Notification-To with the sending account's
+        // address only when the user explicitly opted in on this message.
+        let receipt_to = mailbox(&Address::new(None, &account.email))?;
+        builder = builder.header(DispositionNotificationTo(receipt_to));
+    }
     if keep_bcc { builder = builder.keep_bcc(); }
     if editing {
         // A recipient still being typed stays in the local draft only: Gmail refuses the whole
@@ -317,6 +342,7 @@ mod tests {
             is_important: false,
             focus_override: None,
             invitation: None,
+            read_receipt: None,
         }
     }
 
@@ -413,6 +439,7 @@ mod tests {
             is_important: false,
             focus_override: None,
             invitation: None,
+            read_receipt: None,
         };
         source.in_reply_to = Some("<root@northstar.example>".into());
         let raw = String::from_utf8(build_raw(&account, &draft, Some(&source), "<d1@overlook.lastrefuge.ai>").unwrap()).unwrap();
@@ -434,5 +461,97 @@ mod tests {
         let html = decoded_part(&raw, "text/html");
         assert!(html.contains("<strong>Café — 東京 👋</strong><br>"), "{html}");
         assert!(html.contains("Crème brûlée"), "{html}");
+    }
+
+    #[test]
+    fn read_receipt_header_is_omitted_by_default_and_emitted_only_when_opted_in() {
+        let account = Account {
+            id: AccountId::from("g1"),
+            provider: ProviderKind::Gmail,
+            display_name: "Jason Alexander".into(),
+            email: "jason@example.com".into(),
+            created_at: 0,
+        };
+        let mut draft = Draft::new(account.id.clone(), DraftKind::New, 0);
+        draft.to = vec![Address::named("Maya Chen", "maya@northstar.example")];
+        draft.subject = "Contract review".into();
+        draft.body_text = "Please confirm receipt.".into();
+        assert!(!draft.request_read_receipt, "opt-in must default to false");
+
+        for raw_bytes in [
+            build_raw(&account, &draft, None, "<default-smtp@overlook.example>").unwrap(),
+            build_gmail_raw(&account, &draft, None, "<default-gmail@overlook.example>").unwrap(),
+            build_draft_raw(&account, &draft, None, "<default-draft@overlook.example>").unwrap(),
+        ] {
+            let raw = String::from_utf8(raw_bytes).unwrap();
+            assert!(
+                !raw.to_ascii_lowercase().contains("disposition-notification-to"),
+                "header must be absent by default: {raw}"
+            );
+            assert!(
+                !decoded_part(&raw, "text/html").contains("<img"),
+                "must never inject tracking pixels"
+            );
+        }
+
+        draft.request_read_receipt = true;
+        for raw_bytes in [
+            build_raw(&account, &draft, None, "<optin-smtp@overlook.example>").unwrap(),
+            build_gmail_raw(&account, &draft, None, "<optin-gmail@overlook.example>").unwrap(),
+            build_draft_raw(&account, &draft, None, "<optin-draft@overlook.example>").unwrap(),
+        ] {
+            let raw = String::from_utf8(raw_bytes.clone()).unwrap();
+            assert!(
+                raw.contains("Disposition-Notification-To: jason@example.com\r\n"),
+                "RFC 8098 header must carry the exact sending account address: {raw}"
+            );
+            let html = decoded_part(&raw, "text/html");
+            assert!(
+                !html.contains("<img"),
+                "RFC 8098 read receipts must never inject tracking pixels: {html}"
+            );
+            // Gmail raw upload round-trips through base64url.
+            let encoded = crate::gmail::mapping::base64url_encode(&raw_bytes);
+            let decoded = crate::gmail::mapping::base64url_decode(&encoded);
+            let parsed = mail_parser::MessageParser::default().parse(&decoded).unwrap();
+            let header = parsed
+                .headers()
+                .iter()
+                .find(|h| h.name().eq_ignore_ascii_case("Disposition-Notification-To"))
+                .expect("parsed message preserves Disposition-Notification-To");
+            assert_eq!(header.value().as_text(), Some("jason@example.com"));
+        }
+    }
+
+    #[test]
+    fn smtp_submission_preserves_disposition_notification_to_header() {
+        let account = Account {
+            id: AccountId::from("imap:jason@example.com"),
+            provider: ProviderKind::Imap,
+            display_name: "Jason Alexander".into(),
+            email: "jason@example.com".into(),
+            created_at: 0,
+        };
+        let mut draft = Draft::new(account.id.clone(), DraftKind::New, 0);
+        draft.to = vec![Address::named("Maya Chen", "maya@northstar.example")];
+        draft.subject = "Wire instructions".into();
+        draft.body_text = "Let me know once you see this.".into();
+        draft.request_read_receipt = true;
+
+        let raw = build_raw(&account, &draft, None, "<smtp-mdn@overlook.example>").unwrap();
+        let (addr, rx) = crate::smtp::fake::serve(crate::smtp::fake::Behaviour::Normal);
+        let transport = crate::smtp::Transport::new(
+            ServerEndpoint::new("127.0.0.1", addr.port(), Security::None, "jason@example.com"),
+            "hunter2",
+        );
+        transport
+            .send(&account.email, &["maya@northstar.example".into()], &raw)
+            .unwrap();
+        let seen = rx.recv().unwrap();
+        let data = String::from_utf8(seen.data.expect("SMTP DATA captured")).unwrap();
+        assert!(
+            data.contains("Disposition-Notification-To: jason@example.com\r\n"),
+            "SMTP payload must preserve Disposition-Notification-To: {data}"
+        );
     }
 }

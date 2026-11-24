@@ -11,6 +11,7 @@ use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::text::TextView;
@@ -21,6 +22,462 @@ use overlook_core::sanitize::{sanitize_html, text_to_html, RemoteContent};
 use overlook_core::time::now;
 use overlook_core::tz;
 use overlook_core::*;
+use overlook_store::Store;
+use std::collections::{BTreeSet, HashMap, HashSet};
+
+pub const CALENDAR_ENABLED_ACCOUNTS_KEY: &str = "calendar_enabled_accounts";
+
+/// Curated palette of distinct, accessible colors for differentiating accounts in Calendar.
+pub const ACCOUNT_CALENDAR_COLORS: &[(&str, &str)] = &[
+    ("Blue", "#3B82F6"),
+    ("Emerald", "#10B981"),
+    ("Violet", "#8B5CF6"),
+    ("Amber", "#F59E0B"),
+    ("Rose", "#F43F5E"),
+    ("Teal", "#14B8A6"),
+    ("Orange", "#F97316"),
+    ("Indigo", "#6366F1"),
+    ("Pink", "#EC4899"),
+    ("Slate", "#64748B"),
+];
+
+pub(crate) struct LoadedCalendarView {
+    pub calendars: Vec<Calendar>,
+    pub events: Vec<Event>,
+    pub status: SyncState,
+    pub caldav_connection: Option<CalendarConnection>,
+    pub caldav_cached: bool,
+    pub caldav_last_sync: Option<i64>,
+    pub caldav_changes: Vec<CalDavChange>,
+    pub caldav_uncached_accounts: Vec<AccountId>,
+}
+
+/// Source calendar metadata displayed in event details (side panel and modal).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SourceCalendarInfo {
+    pub calendar_name: String,
+    pub account_detail: Option<String>,
+    pub color: Option<String>,
+}
+
+/// Loads the persisted set of checked calendar accounts. Defaults to ONLY the current active
+/// account when unset or when none of the previously saved accounts exist anymore.
+pub(crate) fn load_calendar_enabled_accounts(
+    store: &Store,
+    accounts: &[Account],
+    active: &AccountId,
+) -> BTreeSet<AccountId> {
+    let valid: HashSet<&AccountId> = accounts.iter().map(|a| &a.id).collect();
+    if let Some(saved) = store
+        .setting::<Vec<AccountId>>(CALENDAR_ENABLED_ACCOUNTS_KEY)
+        .ok()
+        .flatten()
+    {
+        let filtered: BTreeSet<AccountId> =
+            saved.into_iter().filter(|id| valid.contains(id)).collect();
+        if !filtered.is_empty() {
+            return filtered;
+        }
+    }
+    let mut default = BTreeSet::new();
+    if valid.contains(active) {
+        default.insert(active.clone());
+    } else if let Some(first) = accounts.first() {
+        default.insert(first.id.clone());
+    }
+    default
+}
+
+pub(crate) fn save_calendar_enabled_accounts(store: &Store, enabled: &BTreeSet<AccountId>) {
+    let list: Vec<AccountId> = enabled.iter().cloned().collect();
+    let _ = store.set_setting(CALENDAR_ENABLED_ACCOUNTS_KEY, &list);
+}
+
+/// Resolves a distinct hex color for every registered account. Accounts with a valid custom
+/// `AccountPrefs::calendar_color` keep it; all other accounts receive the first unused color
+/// from `ACCOUNT_CALENDAR_COLORS` so different accounts never collide by default.
+pub(crate) fn resolve_account_calendar_colors(
+    accounts: &[Account],
+    account_prefs: &HashMap<AccountId, AccountPrefs>,
+) -> HashMap<AccountId, String> {
+    let mut colors = HashMap::with_capacity(accounts.len());
+    let mut used = HashSet::new();
+
+    for acct in accounts {
+        if let Some(hex) = account_prefs
+            .get(&acct.id)
+            .and_then(|p| p.calendar_color.as_deref())
+            .map(str::trim)
+            .filter(|h| hex_to_hsla(h).is_some())
+        {
+            let normalized = hex.to_ascii_uppercase();
+            used.insert(normalized.clone());
+            colors.insert(acct.id.clone(), normalized);
+        }
+    }
+
+    let mut fallback_idx = 0usize;
+    for acct in accounts {
+        if colors.contains_key(&acct.id) {
+            continue;
+        }
+        let chosen = ACCOUNT_CALENDAR_COLORS
+            .iter()
+            .map(|(_, hex)| *hex)
+            .find(|hex| !used.contains(&hex.to_ascii_uppercase()))
+            .unwrap_or_else(|| {
+                let hex = ACCOUNT_CALENDAR_COLORS[fallback_idx % ACCOUNT_CALENDAR_COLORS.len()].1;
+                fallback_idx += 1;
+                hex
+            });
+        let normalized = chosen.to_ascii_uppercase();
+        used.insert(normalized.clone());
+        colors.insert(acct.id.clone(), normalized);
+    }
+
+    colors
+}
+
+fn combine_calendar_statuses(statuses: &[SyncState]) -> SyncState {
+    if statuses.is_empty() {
+        return SyncState::UpToDate;
+    }
+    if statuses.len() == 1 {
+        return statuses[0].clone();
+    }
+    if statuses.iter().any(|s| matches!(s, SyncState::Syncing)) {
+        return SyncState::Syncing;
+    }
+    if statuses.iter().any(|s| matches!(s, SyncState::SignInRequired)) {
+        return SyncState::SignInRequired;
+    }
+    if let Some(failed) = statuses.iter().find(|s| matches!(s, SyncState::SyncFailed(_))) {
+        return failed.clone();
+    }
+    if let Some(paused) = statuses.iter().find(|s| matches!(s, SyncState::Paused(_))) {
+        return paused.clone();
+    }
+    if statuses.iter().any(|s| matches!(s, SyncState::UpToDate)) {
+        return SyncState::UpToDate;
+    }
+    SyncState::Offline
+}
+
+/// Loads calendars for ALL registered accounts (so every account appears in the sidebar),
+/// while loading events, sync status, and CalDAV metadata only for checked `enabled_accounts`.
+pub(crate) fn load_calendar_view(
+    store: &Store,
+    all_accounts: &[Account],
+    enabled_accounts: &BTreeSet<AccountId>,
+    from: i64,
+    to: i64,
+    tz_key: &str,
+    show_declined_events: bool,
+) -> LoadedCalendarView {
+    let mut calendars = Vec::new();
+    let mut events = Vec::new();
+    let mut statuses = Vec::new();
+    let mut caldav_changes = Vec::new();
+    let mut caldav_uncached_accounts = Vec::new();
+    let mut first_enabled_conn: Option<CalendarConnection> = None;
+    let mut latest_caldav_sync: Option<i64> = None;
+    let mut enabled_list: Vec<&Account> = Vec::new();
+
+    for acct in all_accounts {
+        let conn = store.calendar_connection(&acct.id).ok().flatten();
+        let enabled_conn = conn.as_ref().filter(|c| c.enabled);
+        let caldav_disabled = conn.as_ref().is_some_and(|c| !c.enabled);
+
+        let mut acct_calendars = store.calendars(&acct.id).unwrap_or_default();
+        if caldav_disabled {
+            acct_calendars.retain(|c| !c.id.0.starts_with("caldav:"));
+        }
+        calendars.extend(acct_calendars);
+
+        if !enabled_accounts.contains(&acct.id) {
+            continue;
+        }
+        enabled_list.push(acct);
+
+        let caldav_tz_ok = conn.as_ref().is_none_or(|c| {
+            c.enabled && store.caldav_timezone_matches(&c.id, tz_key).unwrap_or(false)
+        });
+        let mut acct_events = store.events_between(&acct.id, from, to).unwrap_or_default();
+        if !caldav_tz_ok {
+            acct_events.retain(|e| !e.calendar_id.0.starts_with("caldav:"));
+        }
+        if !show_declined_events {
+            acct_events.retain(|e| e.my_response() != Some(ResponseStatus::Declined));
+        }
+        events.extend(acct_events);
+
+        statuses.push(crate::sync::calendar_status(store, &acct.id));
+        caldav_changes.extend(store.caldav_changes(&acct.id).unwrap_or_default());
+
+        if let Some(c) = enabled_conn {
+            if first_enabled_conn.is_none() {
+                first_enabled_conn = Some(c.clone());
+            }
+            if !store.caldav_range_cached(&c.id, from, to, tz_key).unwrap_or(false) {
+                caldav_uncached_accounts.push(acct.id.clone());
+            }
+            if let Some(ts) = store.caldav_last_sync(&c.id).ok().flatten() {
+                latest_caldav_sync = Some(latest_caldav_sync.map_or(ts, |prev| prev.max(ts)));
+            }
+        }
+    }
+
+    events.sort_by(|a, b| {
+        a.start
+            .cmp(&b.start)
+            .then_with(|| a.end.cmp(&b.end))
+            .then_with(|| a.account_id.cmp(&b.account_id))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    let (caldav_connection, caldav_cached, caldav_last_sync) = if enabled_list.len() == 1 {
+        let conn = store.calendar_connection(&enabled_list[0].id).ok().flatten();
+        let cached = conn
+            .as_ref()
+            .filter(|c| c.enabled)
+            .is_some_and(|c| store.caldav_range_cached(&c.id, from, to, tz_key).unwrap_or(false));
+        let last = conn
+            .as_ref()
+            .and_then(|c| store.caldav_last_sync(&c.id).ok().flatten());
+        (conn, cached, last)
+    } else {
+        let cached = first_enabled_conn.is_some() && caldav_uncached_accounts.is_empty();
+        (first_enabled_conn, cached, latest_caldav_sync)
+    };
+
+    LoadedCalendarView {
+        calendars,
+        events,
+        status: combine_calendar_statuses(&statuses),
+        caldav_connection,
+        caldav_cached,
+        caldav_last_sync,
+        caldav_changes,
+        caldav_uncached_accounts,
+    }
+}
+
+pub(crate) fn can_edit_event_for_account(
+    event: &Event,
+    calendar: Option<&Calendar>,
+    owner_email: &str,
+) -> bool {
+    calendar.is_some_and(|c| event.editable_by(owner_email, c))
+        && (!event.calendar_id.0.starts_with("caldav:") || event.attendees.is_empty())
+}
+
+/// Picks the default destination calendar for a new event, preferring the active account's
+/// preferred editable calendar before falling back to any other account's editable calendar.
+pub(crate) fn default_destination_calendar<'a>(
+    active_account: &AccountId,
+    calendars: &'a [Calendar],
+    account_prefs: &HashMap<AccountId, AccountPrefs>,
+) -> Option<&'a Calendar> {
+    let preferred_for = |account_id: &AccountId| -> Option<&'a Calendar> {
+        let prefs = account_prefs.get(account_id);
+        let matches_account = |c: &&Calendar| c.account_id == *account_id && c.can_edit;
+        if let Some(default_key) = prefs.and_then(|p| p.default_calendar.as_deref()) {
+            if let Some(cal) = calendars.iter().filter(matches_account).find(|c| {
+                default_key == c.provider_id.as_ref().map(|id| id.0.as_str()).unwrap_or(&c.id.0)
+            }) {
+                return Some(cal);
+            }
+        }
+        calendars
+            .iter()
+            .filter(matches_account)
+            .find(|c| c.is_primary)
+            .or_else(|| calendars.iter().find(matches_account))
+    };
+
+    if let Some(cal) = preferred_for(active_account) {
+        return Some(cal);
+    }
+    let mut seen = Vec::new();
+    for c in calendars {
+        if !seen.contains(&c.account_id) {
+            seen.push(c.account_id.clone());
+            if let Some(cal) = preferred_for(&c.account_id) {
+                return Some(cal);
+            }
+        }
+    }
+    calendars.iter().find(|c| c.can_edit)
+}
+
+fn account_short_label(account: &Account, custom_name: Option<&str>) -> String {
+    custom_name
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            let d = account.display_name.trim();
+            (!d.is_empty()).then(|| d.to_owned())
+        })
+        .unwrap_or_else(|| account.email.clone())
+}
+
+/// Formats the source calendar name, color, and owning account subtitle for event details.
+pub(crate) fn source_calendar_info(
+    event: &Event,
+    calendar: Option<&Calendar>,
+    account: Option<&Account>,
+    custom_account_name: Option<&str>,
+    show_account: bool,
+) -> SourceCalendarInfo {
+    let calendar_name = calendar
+        .map(|c| c.name.trim())
+        .filter(|n| !n.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| event.calendar_id.0.clone());
+    let color = calendar
+        .and_then(|c| c.color.clone())
+        .or_else(|| event.color.clone());
+    let account_detail = if show_account {
+        account.and_then(|acct| {
+            let custom = custom_account_name.map(str::trim).filter(|n| !n.is_empty());
+            let display = {
+                let d = acct.display_name.trim();
+                (!d.is_empty() && !d.eq_ignore_ascii_case(&acct.email)).then_some(d)
+            };
+            let name = custom.or(display);
+            if calendar_name.eq_ignore_ascii_case(&acct.email) {
+                name.filter(|n| !n.eq_ignore_ascii_case(&calendar_name))
+                    .map(str::to_owned)
+            } else {
+                Some(match name {
+                    Some(n) if !n.eq_ignore_ascii_case(&acct.email) && !n.eq_ignore_ascii_case(&calendar_name) => {
+                        format!("{n} · {}", acct.email)
+                    }
+                    _ => acct.email.clone(),
+                })
+            }
+        })
+    } else {
+        None
+    };
+    SourceCalendarInfo { calendar_name, account_detail, color }
+}
+
+/// Formats the destination calendar label shown on the selector button in the event form.
+pub(crate) fn destination_calendar_button_label(
+    calendar: Option<&Calendar>,
+    account: Option<&Account>,
+    custom_account_name: Option<&str>,
+    show_account: bool,
+) -> String {
+    let Some(cal) = calendar else { return "Choose…".into() };
+    if !show_account {
+        return cal.name.clone();
+    }
+    let Some(acct) = account else {
+        return cal.name.clone();
+    };
+    let short = account_short_label(acct, custom_account_name);
+    if cal.name.eq_ignore_ascii_case(&acct.email) {
+        if !short.eq_ignore_ascii_case(&acct.email) {
+            format!("{} · {}", cal.name, short)
+        } else {
+            cal.name.clone()
+        }
+    } else if cal.name.eq_ignore_ascii_case(&short) {
+        format!("{} · {}", cal.name, acct.email)
+    } else {
+        format!("{} · {}", cal.name, short)
+    }
+}
+
+pub(crate) fn toggle_calendar_visibility_in_store(
+    store: &Store,
+    account_id: &AccountId,
+    calendar_id: &CalendarId,
+    visible: bool,
+) -> overlook_store::Result<()> {
+    store.set_calendar_visible(account_id, calendar_id, visible)
+}
+
+pub(crate) fn save_event_edit_in_store(
+    store: &Store,
+    event: &Event,
+    scope: RecurrenceScope,
+) -> overlook_store::Result<AccountId> {
+    store.apply_series_change(&event.account_id, event, scope)?;
+    Ok(event.account_id.clone())
+}
+
+pub(crate) fn move_event_in_store(
+    store: &Store,
+    event: &Event,
+) -> overlook_store::Result<AccountId> {
+    store.apply_event_change(
+        &event.account_id,
+        event,
+        OperationKind::UpdateEvent { event_id: event.id.clone(), scope: RecurrenceScope::This },
+    )?;
+    Ok(event.account_id.clone())
+}
+
+pub(crate) fn delete_event_in_store(
+    store: &Store,
+    event: &Event,
+    scope: RecurrenceScope,
+) -> overlook_store::Result<AccountId> {
+    store.delete_event_locally_scoped(&event.account_id, event, scope)?;
+    Ok(event.account_id.clone())
+}
+
+pub(crate) fn respond_to_event_in_store(
+    store: &Store,
+    event: &mut Event,
+    responder: &Account,
+    response: ResponseStatus,
+) -> overlook_store::Result<AccountId> {
+    let mut found = false;
+    for a in &mut event.attendees {
+        if a.is_self {
+            a.response = response;
+            found = true;
+        }
+    }
+    if !found {
+        event.attendees.push(Attendee {
+            email: responder.email.clone(),
+            name: Some(responder.display_name.clone()),
+            response,
+            is_self: true,
+            is_organizer: false,
+            optional: false,
+        });
+    }
+    store.apply_event_change(
+        &event.account_id,
+        event,
+        OperationKind::RespondToEvent { event_id: event.id.clone(), response },
+    )?;
+    Ok(event.account_id.clone())
+}
+
+pub(crate) fn create_event_in_store(
+    store: &Store,
+    calendar: &Calendar,
+    owner: &Address,
+    event: &mut Event,
+) -> overlook_store::Result<AccountId> {
+    event.account_id = calendar.account_id.clone();
+    event.calendar_id = calendar.id.clone();
+    event.organizer = Some(owner.clone());
+    store.apply_event_change(
+        &calendar.account_id,
+        event,
+        OperationKind::CreateEvent { event_id: event.id.clone() },
+    )?;
+    Ok(calendar.account_id.clone())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Module {
@@ -223,30 +680,119 @@ impl MailWindow {
         }
     }
 
+    pub(crate) fn cal_target_accounts(&self) -> Vec<Account> {
+        self.sidebar_accounts()
+            .into_iter()
+            .filter(|a| self.cal_enabled_accounts.contains(&a.id))
+            .collect()
+    }
+
+    pub(crate) fn cal_filter_includes(&self, account_id: &AccountId) -> bool {
+        self.cal_enabled_accounts.contains(account_id)
+    }
+
+    pub(crate) fn account_calendar_colors(&self) -> HashMap<AccountId, String> {
+        let ordered = self.sidebar_accounts();
+        resolve_account_calendar_colors(&ordered, &self.account_prefs)
+    }
+
+    pub(crate) fn account_calendar_color(&self, account_id: &AccountId, p: &crate::theme::Palette) -> Hsla {
+        self.account_calendar_colors()
+            .get(account_id)
+            .and_then(|hex| hex_to_hsla(hex))
+            .unwrap_or(p.accent)
+    }
+
+    pub(crate) fn set_account_calendar_color(
+        &mut self,
+        account_id: AccountId,
+        color: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut prefs = self.account_prefs_for(&account_id);
+        prefs.calendar_color = color.filter(|h| hex_to_hsla(h).is_some());
+        self.save_account_prefs(&account_id, prefs, cx);
+        self.cal_color_picker_open = None;
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_calendar_account(&mut self, account_id: AccountId, cx: &mut Context<Self>) {
+        let acct_cals: Vec<Calendar> = self
+            .calendars
+            .iter()
+            .filter(|c| c.account_id == account_id)
+            .cloned()
+            .collect();
+        let currently_checked = self.cal_enabled_accounts.contains(&account_id)
+            && (acct_cals.is_empty() || acct_cals.iter().any(|c| c.visible));
+
+        if currently_checked {
+            self.cal_enabled_accounts.remove(&account_id);
+        } else {
+            self.cal_enabled_accounts.insert(account_id.clone());
+            // If all sub-calendars were previously unchecked, turn them back on so checking
+            // the account immediately brings its events into view.
+            if !acct_cals.is_empty() && acct_cals.iter().all(|c| !c.visible) {
+                for c in &acct_cals {
+                    let _ = toggle_calendar_visibility_in_store(&self.store, &c.account_id, &c.id, true);
+                }
+            }
+        }
+        save_calendar_enabled_accounts(&self.store, &self.cal_enabled_accounts);
+        self.cal_scope_prompt = None;
+        self.cal_contact_card = None;
+        self.reload_calendar();
+        if self.module == Module::Calendar {
+            self.ensure_caldav_range(cx);
+        }
+        cx.notify();
+    }
+
     pub(crate) fn reload_calendar(&mut self) {
         self.refresh_invite_events(true);
-        self.calendars = self.store.calendars(&self.account.id).unwrap_or_default();
+        let all_accounts = self.sidebar_accounts();
+        let enabled_accounts = self.cal_target_accounts();
         let (from, to) = self.cal_range();
-        self.cal_events = self.store.events_between(&self.account.id, from, to).unwrap_or_default();
-        if !self.prefs.show_declined_events {
-            self.cal_events.retain(|e| e.my_response() != Some(ResponseStatus::Declined));
-        }
-        self.cal_status = crate::sync::calendar_status(&self.store, &self.account.id);
-        self.caldav_connection = self.store.calendar_connection(&self.account.id).ok().flatten();
-        self.caldav_cached = self.caldav_connection.as_ref().is_some_and(|c| self.store.caldav_range_cached(&c.id, from, to, &tz::cache_key()).unwrap_or(false));
-        self.caldav_last_sync = self.caldav_connection.as_ref().and_then(|c| self.store.caldav_last_sync(&c.id).ok().flatten());
-        self.caldav_changes = self.store.caldav_changes(&self.account.id).unwrap_or_default();
-        self.caldav_previews = self.caldav_changes.iter().filter_map(|change| {
-            change.remote.as_ref().map(|remote| (change.id.clone(), overlook_provider::caldav::resource_preview(&remote.icalendar)))
-        }).collect();
-        // Date-only and floating projections depend on the local zone. Preserve them on
-        // disk, but don't present an old-zone projection as the current calendar.
-        if self.caldav_connection.as_ref().is_some_and(|c| !self.store.caldav_timezone_matches(&c.id, &tz::cache_key()).unwrap_or(false)) {
-            self.cal_events.clear();
-        }
+        let loaded = load_calendar_view(
+            &self.store,
+            &all_accounts,
+            &self.cal_enabled_accounts,
+            from,
+            to,
+            &tz::cache_key(),
+            self.prefs.show_declined_events,
+        );
+        self.calendars = loaded.calendars;
+        self.cal_events = loaded.events;
+        self.cal_status = if enabled_accounts.iter().any(|a| self.caldav_syncing.contains_key(&a.id)) {
+            SyncState::Syncing
+        } else {
+            loaded.status
+        };
+        self.caldav_connection = loaded.caldav_connection;
+        self.caldav_cached = loaded.caldav_cached;
+        self.caldav_last_sync = loaded.caldav_last_sync;
+        self.caldav_changes = loaded.caldav_changes;
+        self.caldav_uncached_accounts = loaded.caldav_uncached_accounts;
+        self.caldav_previews = self
+            .caldav_changes
+            .iter()
+            .filter_map(|change| {
+                change.remote.as_ref().map(|remote| {
+                    (change.id.clone(), overlook_provider::caldav::resource_preview(&remote.icalendar))
+                })
+            })
+            .collect();
         if let Some(sel) = &self.cal_selected {
-            if self.store.event(sel).ok().flatten().is_none() {
+            let keep = self
+                .store
+                .event(sel)
+                .ok()
+                .flatten()
+                .is_some_and(|e| self.cal_enabled_accounts.contains(&e.account_id));
+            if !keep {
                 self.cal_selected = None;
+                self.cal_event_modal = None;
             }
         }
     }
@@ -323,11 +869,46 @@ impl MailWindow {
         cx.notify();
     }
 
-    pub(crate) fn toggle_calendar_visible(&mut self, id: CalendarId, cx: &mut Context<Self>) {
-        if let Some(c) = self.calendars.iter().find(|c| c.id == id) {
-            let _ = self.store.set_calendar_visible(&c.account_id, &id, !c.visible);
+    pub(crate) fn toggle_calendar_visible(&mut self, account_id: AccountId, id: CalendarId, cx: &mut Context<Self>) {
+        if self.cal_enabled_accounts.contains(&account_id) {
+            if let Some(c) = self.calendars.iter().find(|c| c.account_id == account_id && c.id == id) {
+                let next_visible = !c.visible;
+                let _ = toggle_calendar_visibility_in_store(&self.store, &c.account_id, &id, next_visible);
+                if !next_visible {
+                    let any_other_visible = self
+                        .calendars
+                        .iter()
+                        .any(|other| other.account_id == account_id && other.id != id && other.visible);
+                    if !any_other_visible {
+                        self.cal_enabled_accounts.remove(&account_id);
+                        save_calendar_enabled_accounts(&self.store, &self.cal_enabled_accounts);
+                    }
+                }
+            }
+        } else {
+            // Account was unchecked so all of its calendars appeared unchecked: checking one
+            // specific calendar enables the account with just that calendar selected.
+            self.cal_enabled_accounts.insert(account_id.clone());
+            save_calendar_enabled_accounts(&self.store, &self.cal_enabled_accounts);
+            let acct_cals: Vec<CalendarId> = self
+                .calendars
+                .iter()
+                .filter(|c| c.account_id == account_id)
+                .map(|c| c.id.clone())
+                .collect();
+            for cal_id in acct_cals {
+                let _ = toggle_calendar_visibility_in_store(
+                    &self.store,
+                    &account_id,
+                    &cal_id,
+                    cal_id == id,
+                );
+            }
         }
         self.reload_calendar();
+        if self.module == Module::Calendar {
+            self.ensure_caldav_range(cx);
+        }
         cx.notify();
     }
 
@@ -396,19 +977,23 @@ impl MailWindow {
     }
 
     fn calendar_of(&self, event: &Event) -> Option<&Calendar> {
-        self.calendars.iter().find(|c| c.id == event.calendar_id)
+        self.calendars
+            .iter()
+            .find(|c| c.account_id == event.account_id && c.id == event.calendar_id)
+            .or_else(|| self.calendars.iter().find(|c| c.id == event.calendar_id))
     }
 
     pub(super) fn can_edit_calendar_event(&self, event: &Event) -> bool {
-        self.calendar_of(event).is_some_and(|c| event.editable_by(&self.account.email,c))
-            && (!event.calendar_id.0.starts_with("caldav:") || event.attendees.is_empty())
+        let owner_email = self.account_email(&event.account_id);
+        can_edit_event_for_account(event, self.calendar_of(event), &owner_email)
     }
 
     /// Switches to the calendar, moves to the event's day, and selects it.
     pub(crate) fn show_event_in_calendar(&mut self, id: EventId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(event) = self.store.event(&id).ok().flatten() else { return };
-        if self.account.id != event.account_id {
-            self.switch_account(event.account_id, window, cx);
+        if !self.cal_enabled_accounts.contains(&event.account_id) {
+            self.cal_enabled_accounts.insert(event.account_id.clone());
+            save_calendar_enabled_accounts(&self.store, &self.cal_enabled_accounts);
         }
         self.set_module(Module::Calendar, window, cx);
         self.cal_anchor = tz::day_start(event.start);
@@ -463,14 +1048,16 @@ impl MailWindow {
         }
         let (message, detail) = delete_question(&event.display_title(), scope, guests);
         let answer = window.prompt(PromptLevel::Warning, &message, Some(&detail), &["Delete", "Cancel"], cx);
-        let account = self.account.id.clone();
+        let account = event.account_id.clone();
         cx.spawn_in(window, async move |this, cx| {
             if answer.await != Ok(0) {
                 return;
             }
             let _ = this.update_in(cx, |this, window, cx| {
-                // The prompt was open a while: only delete in the account it asked about.
-                if this.account.id == account {
+                // The prompt was open a while: only delete if the event's owning account is still in view.
+                if this.cal_filter_includes(&account)
+                    && this.store.event(&id).ok().flatten().is_some_and(|e| e.account_id == account)
+                {
                     this.delete_event_scoped(id, scope, window, cx);
                 }
             });
@@ -507,7 +1094,19 @@ impl MailWindow {
         let own = self.can_edit_calendar_event(&event);
         let calendar = match self.calendar_of(&event).filter(|c| c.can_edit) {
             Some(c) => Some(c.id.clone()),
-            None => self.account_prefs_for(&self.account.id).preferred_calendar(&self.calendars).map(|c| c.id.clone()),
+            None => default_destination_calendar(
+                &event.account_id,
+                &self.calendars,
+                &self.account_prefs,
+            )
+            .or_else(|| {
+                default_destination_calendar(
+                    &self.account.id,
+                    &self.calendars,
+                    &self.account_prefs,
+                )
+            })
+            .map(|c| c.id.clone()),
         };
         let form = Self::form_from_event(&event, if own { guest_text(&event.attendees) } else { String::new() }, window, cx);
         let add_meet = own && (event.conference_url.is_some() || event.wants_conference);
@@ -604,7 +1203,15 @@ impl MailWindow {
             cx.notify();
             return;
         };
-        let Some(provider) = self.providers.get(&self.account.id).and_then(|p| p.calendar.clone()) else { return };
+        let target_account_id = form
+            .calendar
+            .as_ref()
+            .and_then(|id| self.calendars.iter().find(|c| &c.id == id))
+            .map(|c| c.account_id.clone())
+            .or_else(|| form.original.as_ref().map(|e| e.account_id.clone()))
+            .unwrap_or_else(|| self.account.id.clone());
+        let Some(account) = self.known_account(&target_account_id) else { return };
+        let Some(provider) = self.providers.get(&target_account_id).and_then(|p| p.calendar.clone()) else { return };
         if emails.is_empty() {
             return;
         }
@@ -617,14 +1224,13 @@ impl MailWindow {
             return;
         };
         cx.notify();
-        let account = self.account.clone();
         let account_id = account.id.clone();
         cx.spawn_in(window, async move |this, cx| {
             let result = super::spawn_blocking_async(async move { provider.free_busy(&account, &emails, start, end).await })
                 .await
                 .unwrap_or_else(|| Err(overlook_provider::ProviderError::Temporary("availability check cancelled".into())));
             let _ = this.update(cx, |this, cx| {
-                if this.account.id != account_id {
+                if this.known_account(&account_id).is_none() {
                     return;
                 }
                 if let Some(f) = this
@@ -662,22 +1268,14 @@ impl MailWindow {
     pub(crate) fn respond_to_event(&mut self, id: EventId, response: ResponseStatus, window: &mut Window, cx: &mut Context<Self>) {
         let Some(mut event) = self.store.event(&id).ok().flatten() else { return };
         if event.id.0.starts_with("caldav:") { return; }
-        let mut found = false;
-        for a in &mut event.attendees {
-            if a.is_self {
-                a.response = response;
-                found = true;
-            }
-        }
-        if !found {
-            event.attendees.push(Attendee { email: self.account.email.clone(), name: Some(self.account.display_name.clone()), response, is_self: true, is_organizer: false, optional: false });
-        }
-        match self.store.apply_event_change(&self.account.id, &event, OperationKind::RespondToEvent { event_id: id, response }) {
-            Ok(_) => {
+        let Some(acct) = self.known_account(&event.account_id) else { return };
+        match respond_to_event_in_store(&self.store, &mut event, &acct, response) {
+            Ok(owner_account) => {
                 self.reload_calendar();
+                self.refresh_invite_events(true);
                 cx.notify();
-                if self.connected(&self.account.id) {
-                    self.sync_now(window, cx);
+                if self.connected(&owner_account) {
+                    self.sync_account(owner_account, window, cx);
                 }
             }
             Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t save your response: {e}")),
@@ -693,8 +1291,8 @@ impl MailWindow {
             }
             cx.notify(); return;
         }
-        match self.store.delete_event_locally_scoped(&self.account.id, &event, scope) {
-            Ok(_) => {
+        match delete_event_in_store(&self.store, &event, scope) {
+            Ok(owner_account) => {
                 self.cal_selected = None;
                 self.reload_calendar();
                 cx.notify();
@@ -704,8 +1302,8 @@ impl MailWindow {
                     RecurrenceScope::All => format!("Deleted every occurrence of “{}”.", event.display_title()),
                 };
                 crate::ui::toast(window, cx, crate::notify::Level::Info, what);
-                if self.connected(&self.account.id) {
-                    self.sync_now(window, cx);
+                if self.connected(&owner_account) {
+                    self.sync_account(owner_account, window, cx);
                 }
             }
             Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t delete the event: {e}")),
@@ -718,7 +1316,12 @@ impl MailWindow {
             crate::ui::toast(window, cx, crate::notify::Level::Warning, "No calendar you can write to is connected yet.");
             return;
         }
-        let calendar = self.account_prefs_for(&self.account.id).preferred_calendar(&self.calendars).map(|c| c.id.clone());
+        let calendar = default_destination_calendar(
+            &self.account.id,
+            &self.calendars,
+            &self.account_prefs,
+        )
+        .map(|c| c.id.clone());
         let day = if self.cal_view == CalView::Week { tz::day_start(now()).max(self.cal_range().0).min(tz::add_days(self.cal_range().1, -1)) } else { self.cal_anchor };
         let date_text = tz::local_date(day).to_string();
         let next_hour = {
@@ -742,7 +1345,12 @@ impl MailWindow {
 
     /// Opens the new-event modal for the time dragged out in the grid.
     fn start_dragged_event(&mut self, start: i64, end: i64, window: &mut Window, cx: &mut Context<Self>) {
-        let calendar = self.account_prefs_for(&self.account.id).preferred_calendar(&self.calendars).map(|c| c.id.clone());
+        let calendar = default_destination_calendar(
+            &self.account.id,
+            &self.calendars,
+            &self.account_prefs,
+        )
+        .map(|c| c.id.clone());
         let form = Self::empty_form(tz::local_date(start).to_string(), tz::local_date(end).to_string(), clock_text(start), clock_text(end), calendar, window, cx);
         let enter = cx.subscribe_in(&form.title, window, |this, _state, event: &InputEvent, window, cx| {
             if let InputEvent::PressEnter { .. } = event {
@@ -826,26 +1434,28 @@ impl MailWindow {
         };
         if let Some(existing_id) = editing {
             let Some(mut existing) = original.clone().or_else(||self.store.event(&existing_id).ok().flatten()) else { return fail("This event no longer exists.", self, cx) };
+            let owner_account = existing.account_id.clone();
+            let owner_address = self.owner_for(&owner_account);
             existing.summary = if title.is_empty() { "(No title)".into() } else { title };
             existing.location = if location.is_empty() { None } else { Some(location) };
             existing.description = if description.is_empty() { None } else { Some(description) };
             existing.start = start;
             existing.end = end;
             existing.all_day = all_day;
-            if !calendar.id.0.starts_with("caldav:") {
-                existing.attendees = merge_guests(&existing.attendees, &guest_addresses, &self.owner());
+            if !existing.calendar_id.0.starts_with("caldav:") {
+                existing.attendees = merge_guests(&existing.attendees, &guest_addresses, &owner_address);
                 existing.wants_conference = add_meet;
             }
             existing.updated = now();
-            if calendar.id.0.starts_with("caldav:") {
+            if existing.calendar_id.0.starts_with("caldav:") {
                 match self.save_caldav_edit(original,Some(existing),scope,cx) {
                     Ok(id)=>{self.new_event=None;self.cal_anchor=tz::day_start(start);self.reload_calendar();self.cal_selected=Some(id);self.cal_focus.focus(window,cx);cx.notify();crate::ui::toast(window,cx,crate::notify::Level::Info,"Saved on this device. Changes will sync when connected.");},
                     Err(e)=>fail(&e,self,cx),
                 }
                 return;
             }
-            match self.store.apply_series_change(&self.account.id, &existing, scope) {
-                Ok(_) => {
+            match save_event_edit_in_store(&self.store, &existing, scope) {
+                Ok(owner_account) => {
                     self.new_event = None;
                     self.cal_anchor = tz::day_start(start);
                     self.reload_calendar();
@@ -853,8 +1463,8 @@ impl MailWindow {
                     self.cal_focus.focus(window, cx);
                     cx.notify();
                     crate::ui::toast(window, cx, crate::notify::Level::Info, "Saved on this device. Syncing to your calendar…");
-                    if self.connected(&self.account.id) {
-                        self.sync_now(window, cx);
+                    if self.connected(&owner_account) {
+                        self.sync_account(owner_account, window, cx);
                     }
                 }
                 Err(e) => fail(&format!("Couldn’t save the event: {e}"), self, cx),
@@ -863,10 +1473,12 @@ impl MailWindow {
         }
         // The form hides guests and Meet for these calendars, so a copy must not bring them.
         let caldav = calendar.id.0.starts_with("caldav:");
+        let target_account = calendar.account_id.clone();
+        let owner_address = self.owner_for(&target_account);
         let pid = new_provider_event_id();
-        let event = Event {
+        let mut event = Event {
             id: EventId(format!("{}:{pid}", calendar.id.0)),
-            account_id: self.account.id.clone(),
+            account_id: target_account.clone(),
             calendar_id: calendar.id.clone(),
             provider_id: Some(ProviderId(pid)),
             ical_uid: None,
@@ -877,8 +1489,8 @@ impl MailWindow {
             end,
             all_day,
             status: EventStatus::Confirmed,
-            organizer: Some(self.owner()),
-            attendees: if caldav { Vec::new() } else { merge_guests(&[], &guest_addresses, &self.owner()) },
+            organizer: Some(owner_address.clone()),
+            attendees: if caldav { Vec::new() } else { merge_guests(&[], &guest_addresses, &owner_address) },
             html_link: None,
             conference_url: None,
             recurring_event_id: None,
@@ -892,13 +1504,29 @@ impl MailWindow {
         };
         if caldav {
             match self.save_caldav_edit(None,Some(event),scope,cx) {
-                Ok(id)=>{self.new_event=None;self.cal_anchor=tz::day_start(start);self.reload_calendar();self.cal_selected=Some(id);self.cal_focus.focus(window,cx);cx.notify();crate::ui::toast(window,cx,crate::notify::Level::Info,"Saved on this device. Changes will sync when connected.");},
+                Ok(id)=>{
+                    if !self.cal_enabled_accounts.contains(&target_account) {
+                        self.cal_enabled_accounts.insert(target_account.clone());
+                        save_calendar_enabled_accounts(&self.store, &self.cal_enabled_accounts);
+                    }
+                    if !calendar.visible {
+                        let _ = toggle_calendar_visibility_in_store(&self.store, &target_account, &calendar.id, true);
+                    }
+                    self.new_event=None;self.cal_anchor=tz::day_start(start);self.reload_calendar();self.cal_selected=Some(id);self.cal_focus.focus(window,cx);cx.notify();crate::ui::toast(window,cx,crate::notify::Level::Info,"Saved on this device. Changes will sync when connected.");
+                },
                 Err(e)=>fail(&e,self,cx),
             }
             return;
         }
-        match self.store.apply_event_change(&self.account.id, &event, OperationKind::CreateEvent { event_id: event.id.clone() }) {
-            Ok(_) => {
+        match create_event_in_store(&self.store, &calendar, &owner_address, &mut event) {
+            Ok(target_account) => {
+                if !self.cal_enabled_accounts.contains(&target_account) {
+                    self.cal_enabled_accounts.insert(target_account.clone());
+                    save_calendar_enabled_accounts(&self.store, &self.cal_enabled_accounts);
+                }
+                if !calendar.visible {
+                    let _ = toggle_calendar_visibility_in_store(&self.store, &target_account, &calendar.id, true);
+                }
                 self.new_event = None;
                 self.cal_anchor = tz::day_start(start);
                 self.reload_calendar();
@@ -906,8 +1534,8 @@ impl MailWindow {
                 self.cal_focus.focus(window, cx);
                 cx.notify();
                 crate::ui::toast(window, cx, crate::notify::Level::Info, "Saved on this device. Syncing to your calendar…");
-                if self.connected(&self.account.id) {
-                    self.sync_now(window, cx);
+                if self.connected(&target_account) {
+                    self.sync_account(target_account, window, cx);
                 }
             }
             Err(e) => fail(&format!("Couldn’t save the event: {e}"), self, cx),
@@ -917,6 +1545,91 @@ impl MailWindow {
 
 
     // --------------------------------------------------------------- sidebar
+
+    fn render_account_color_picker(
+        &self,
+        account_id: &AccountId,
+        current_hex: &str,
+        has_custom: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let p = *cx.palette();
+        let this = cx.entity().downgrade();
+        let mut swatch_rows = v_flex().gap(px(6.));
+        for (row_idx, chunk) in ACCOUNT_CALENDAR_COLORS.chunks(5).enumerate() {
+            let mut row = h_flex().items_center().gap(px(6.));
+            for &(name, hex) in chunk {
+                let swatch_color = hex_to_hsla(hex).unwrap_or(p.accent);
+                let selected = current_hex.eq_ignore_ascii_case(hex);
+                let acct = account_id.clone();
+                let hex_owned = hex.to_owned();
+                let t = this.clone();
+                row = row.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "cal-swatch-{}-{row_idx}-{name}",
+                            account_id.0
+                        )))
+                        .size(px(24.))
+                        .rounded_full()
+                        .bg(swatch_color)
+                        .border_2()
+                        .border_color(if selected { p.foreground } else { gpui_kit::transparent_black() })
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|d| d.opacity(0.85))
+                        .tooltip(move |window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new(name).build(window, cx)
+                        })
+                        .when(selected, |d| {
+                            d.child(icon("check").size(px(12.)).text_color(gpui_kit::white()))
+                        })
+                        .on_click(move |_, _w, cx| {
+                            let _ = t.update(cx, |this, cx| {
+                                this.set_account_calendar_color(acct.clone(), Some(hex_owned.clone()), cx);
+                            });
+                        }),
+                );
+            }
+            swatch_rows = swatch_rows.child(row);
+        }
+
+        let reset_acct = account_id.clone();
+        let reset_this = this.clone();
+        v_flex()
+            .p(px(10.))
+            .gap(px(8.))
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(crate::ui::ui_px(11.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.muted)
+                            .child("Calendar color"),
+                    )
+                    .when(has_custom, |d| {
+                        d.child(
+                            Button::new(SharedString::from(format!("cal-color-reset-{}", account_id.0)))
+                                .ghost()
+                                .xsmall()
+                                .label("Reset")
+                                .on_click(move |_, _w, cx| {
+                                    let _ = reset_this.update(cx, |this, cx| {
+                                        this.set_account_calendar_color(reset_acct.clone(), None, cx);
+                                    });
+                                }),
+                        )
+                    }),
+            )
+            .child(swatch_rows)
+            .into_any_element()
+    }
 
     pub(crate) fn render_calendar_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().navigation_palette();
@@ -929,39 +1642,209 @@ impl MailWindow {
             SyncState::SignInRequired => (p.warning, "Sign-in required".to_owned()),
             SyncState::SyncFailed(r) => (p.warning, format!("Sync failed: {r}")),
         };
-        let mut list = m.rows();
-        for c in &self.calendars {
+
+        let all_accounts = self.sidebar_accounts();
+        let enabled_accounts = self.cal_target_accounts();
+        let account_colors = self.account_calendar_colors();
+        let this = cx.entity().downgrade();
+
+        let render_cal_row = |c: &Calendar, acct_enabled: bool, acct_color: Hsla, cx: &mut Context<Self>| {
+            let account_id = c.account_id.clone();
             let id = c.id.clone();
-            let color = c.color.as_deref().and_then(hex_to_hsla).unwrap_or(p.accent);
-            list = list.child(
-                m.row(SharedString::from(format!("cal-{}", c.id)))
-                    .text_color(if c.visible { p.foreground } else { p.muted })
-                    .hover(|d| d.bg(p.hover))
-                    .child(
-                        h_flex()
-                            .w(px(ROW_ICON_SIZE))
-                            .flex_none()
-                            .justify_center()
-                            .child(
-                                div().size(px(14.)).rounded(px(4.)).border_2().border_color(color)
-                                    .when(c.visible, |d| d.bg(color))
-                                    .flex().items_center().justify_center()
-                                    .when(c.visible, |d| d.child(icon("check").size(px(10.)).text_color(gpui_kit::white()))),
-                            ),
-                    )
-                    .child(div().flex_1().min_w_0().truncate().child(c.name.clone()))
-                    .on_click(cx.listener(move |this, _, _w, cx| this.toggle_calendar_visible(id.clone(), cx))),
-            );
+            let shown = acct_enabled && c.visible;
+            m.row(SharedString::from(format!("cal-{}-{}", c.account_id.0, c.id)))
+                .pl(px(26.))
+                .text_color(if shown { p.foreground } else { p.muted })
+                .hover(|d| d.bg(p.hover))
+                .child(
+                    h_flex()
+                        .w(px(ROW_ICON_SIZE))
+                        .flex_none()
+                        .justify_center()
+                        .child(
+                            div()
+                                .size(px(13.))
+                                .rounded(px(3.5))
+                                .border_2()
+                                .border_color(if shown { acct_color } else { p.muted.opacity(0.55) })
+                                .when(shown, |d| d.bg(acct_color))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .when(shown, |d| d.child(icon("check").size(px(9.)).text_color(gpui_kit::white()))),
+                        ),
+                )
+                .child(div().flex_1().min_w_0().truncate().child(c.name.clone()))
+                .on_click(cx.listener(move |this, _, _w, cx| this.toggle_calendar_visible(account_id.clone(), id.clone(), cx)))
+        };
+
+        let mut list = m.rows();
+        for (idx, acct) in all_accounts.iter().enumerate() {
+            let acct_cals: Vec<&Calendar> = self.calendars.iter().filter(|c| c.account_id == acct.id).collect();
+            let acct_enabled = self.cal_enabled_accounts.contains(&acct.id);
+            let acct_checked = acct_enabled && (acct_cals.is_empty() || acct_cals.iter().any(|c| c.visible));
+            let acct_hex = account_colors
+                .get(&acct.id)
+                .cloned()
+                .unwrap_or_else(|| ACCOUNT_CALENDAR_COLORS[0].1.to_owned());
+            let acct_color = hex_to_hsla(&acct_hex).unwrap_or(p.accent);
+            let has_custom = self
+                .account_prefs
+                .get(&acct.id)
+                .and_then(|ap| ap.calendar_color.as_ref())
+                .is_some();
+
+            let toggle_id = acct.id.clone();
+            let picker_acct_open = acct.id.clone();
+            let picker_acct_content = acct.id.clone();
+            let picker_hex = acct_hex.clone();
+            let picker_this = this.clone();
+            let picker_open = self.cal_color_picker_open.as_ref() == Some(&acct.id);
+            let color_trigger = Button::new(SharedString::from(format!("cal-color-btn-{}", acct.id.0)))
+                .ghost()
+                .small()
+                .w(px(22.))
+                .h(px(22.))
+                .p(px(0.))
+                .tooltip("Customize calendar color")
+                .accessibility_label("Customize calendar color")
+                .child(
+                    div()
+                        .size(px(11.))
+                        .rounded_full()
+                        .bg(acct_color)
+                        .border_1()
+                        .border_color(p.divider),
+                );
+
+            let account_header = h_flex()
+                .items_center()
+                .gap(px(4.))
+                .pr(px(4.))
+                .when(idx > 0, |d| d.mt(px(8.)))
+                .child(
+                    m.row(SharedString::from(format!("cal-acct-{}", acct.id.0)))
+                        .flex_1()
+                        .min_w_0()
+                        .pr(px(4.))
+                        .text_color(if acct_checked { p.foreground } else { p.muted })
+                        .hover(|d| d.bg(p.hover))
+                        .child(
+                            h_flex()
+                                .w(px(ROW_ICON_SIZE))
+                                .flex_none()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .size(px(14.))
+                                        .rounded(px(4.))
+                                        .border_2()
+                                        .border_color(if acct_checked { acct_color } else { p.muted.opacity(0.6) })
+                                        .when(acct_checked, |d| d.bg(acct_color))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .when(acct_checked, |d| {
+                                            d.child(icon("check").size(px(10.)).text_color(gpui_kit::white()))
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(self.account_name(&acct.id)),
+                        )
+                        .on_click(cx.listener(move |this, _, _w, cx| {
+                            this.toggle_calendar_account(toggle_id.clone(), cx);
+                        })),
+                )
+                .child(
+                    Popover::new(SharedString::from(format!("cal-color-popover-{}", acct.id.0)))
+                        .anchor(Anchor::TopLeft)
+                        .open(picker_open)
+                        .overlay_closable(true)
+                        .on_open_change(cx.listener(move |this, open: &bool, _, cx| {
+                            this.cal_color_picker_open = if *open {
+                                Some(picker_acct_open.clone())
+                            } else if this.cal_color_picker_open.as_ref() == Some(&picker_acct_open) {
+                                None
+                            } else {
+                                this.cal_color_picker_open.clone()
+                            };
+                            cx.notify();
+                        }))
+                        .trigger(color_trigger)
+                        .content(move |_, _window, cx| {
+                            picker_this
+                                .update(cx, |this, cx| {
+                                    this.render_account_color_picker(
+                                        &picker_acct_content,
+                                        &picker_hex,
+                                        has_custom,
+                                        cx,
+                                    )
+                                })
+                                .unwrap_or_else(|_| div().into_any_element())
+                        }),
+                );
+
+            list = list.child(account_header);
+            if acct_cals.is_empty() {
+                list = list.child(
+                    div()
+                        .pl(px(34.))
+                        .pr(px(10.))
+                        .py(px(3.))
+                        .text_size(crate::ui::ui_px(11.5))
+                        .text_color(p.muted)
+                        .child("No calendars"),
+                );
+            } else {
+                for c in acct_cals {
+                    list = list.child(render_cal_row(c, acct_enabled, acct_color, cx));
+                }
+            }
         }
-        let owner = self.owner();
+
+        let footer = if enabled_accounts.len() > 1 {
+            let count = enabled_accounts.len();
+            m.footer()
+                .child(
+                    div()
+                        .flex_none()
+                        .size(px(30.))
+                        .rounded_full()
+                        .bg(p.chip)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(icon("calendar-days").size(px(15.)).text_color(p.accent)),
+                )
+                .child(sidebar_owner_details(
+                    "Calendars".to_owned(),
+                    format!("{count} accounts · {text}"),
+                    dot,
+                    &p,
+                ))
+        } else if let Some(acct) = enabled_accounts.first() {
+            let owner = self.owner_for(&acct.id);
+            m.footer()
+                .child(owner_avatar(&owner, 30., &p))
+                .child(sidebar_owner_details(owner.display_name(), format!("Calendar · {text}"), dot, &p))
+        } else {
+            let owner = self.owner();
+            m.footer()
+                .child(owner_avatar(&owner, 30., &p))
+                .child(sidebar_owner_details(owner.display_name(), "No calendars selected".to_owned(), p.muted, &p))
+        };
+
         m.pane(&p)
-            .child(m.heading(&p).child("My calendars"))
+            .child(m.heading(&p).child("Calendars"))
             .child(v_flex().id("calendar-list").flex_1().min_h_0().child(list).overflow_y_scrollbar())
-            .child(
-                m.footer()
-                    .child(owner_avatar(&owner, 30., &p))
-                    .child(sidebar_owner_details(owner.display_name(), format!("Calendar · {text}"), dot, &p)),
-            )
+            .child(footer)
     }
 
     // ------------------------------------------------------------------ main
@@ -980,9 +1863,86 @@ impl MailWindow {
             .child(div().flex_1().text_size(crate::ui::ui_px(18.)).font_weight(FontWeight::SEMIBOLD).child(title))
             .child(div().text_size(crate::ui::ui_px(11.)).text_color(p.muted).child(tz::zone_label(&self.time_zone)));
 
-        let banner = match &self.cal_status {
-            SyncState::SignInRequired if self.account.provider == ProviderKind::Gmail => {
-                let email = self.account.email.clone();
+        let target_accounts = self.cal_target_accounts();
+        let single_account = (target_accounts.len() == 1).then(|| target_accounts[0].clone());
+        let banner = if let Some(acct) = single_account {
+            let acct_id = acct.id.clone();
+            match &self.cal_status {
+                SyncState::SignInRequired if acct.provider == ProviderKind::Gmail => {
+                    let email = acct.email.clone();
+                    Some(
+                        h_flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .px(px(16.))
+                            .h(px(40.))
+                            .bg(p.chip)
+                            .border_b_1()
+                            .border_color(p.divider)
+                            .text_size(crate::ui::ui_px(13.))
+                            .child(icon("key-round").size(px(16.)).text_color(p.warning))
+                            .child(div().flex_1().child(crate::sync::CALENDAR_SIGNIN_WORDING))
+                            .child(Button::new("cal-signin").small().label("Sign in again").on_click(cx.listener(move |this, _, window, cx| this.start_google_sign_in(Some(email.clone()), window, cx)))),
+                    )
+                }
+                _ if matches!(acct.provider, ProviderKind::Imap | ProviderKind::Pop3)
+                    && (self.caldav_connection.is_none()
+                        || !self.caldav_cached
+                        || !self.caldav_changes.is_empty()
+                        || !matches!(self.cal_status, SyncState::UpToDate | SyncState::Syncing)) => Some(
+                    h_flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .px(px(16.))
+                        .min_h(px(40.))
+                        .py(px(8.))
+                        .bg(p.chip)
+                        .border_b_1()
+                        .border_color(p.divider)
+                        .text_size(crate::ui::ui_px(13.))
+                        .text_color(p.muted)
+                        .child(icon("info").size(px(16.)).text_color(p.muted))
+                        .child(div().flex_1().child(if self.caldav_connection.is_none() {
+                            "Connect Fastmail or another calendar service to see your events here.".to_owned()
+                        } else {
+                            match &self.cal_status {
+                                SyncState::Syncing => "Syncing calendar changes… Saved events remain available.".to_owned(),
+                                SyncState::SignInRequired => "Calendar sign-in needs attention. Check the app password and calendar permission in settings.".to_owned(),
+                                SyncState::SyncFailed(error) | SyncState::Paused(error) => error.clone(),
+                                _ if !self.caldav_cached => "This date range has not been downloaded for your current time zone. Connect to sync it; saved events may be incomplete.".to_owned(),
+                                SyncState::Offline => "Offline · Changes are saved on this device and will sync when you reconnect.".to_owned(),
+                                _ => "Changes are saved on this device and waiting to sync.".to_owned(),
+                            }
+                        }))
+                        .when(!self.caldav_changes.is_empty(), |d| d.child(Button::new("caldav-review").small().label(format!("Review {} {}",self.caldav_changes.len(),if self.caldav_changes.len()==1 {"change"} else {"changes"})).on_click(cx.listener(|this,_,_,cx|{this.show_caldav_changes = !this.show_caldav_changes;cx.notify();}))))
+                        .child(Button::new("caldav-settings").small().label(if self.caldav_connection.is_some() { "Calendar settings" } else { "Connect calendars" })
+                            .on_click(cx.listener(|this, _, window, cx| this.open_settings(super::settings::SettingsPage::Accounts, window, cx))))
+                        .when(self.caldav_connection.is_some(), |d| d.child(Button::new("caldav-refresh").small().ghost().label("Sync now")
+                            .on_click(cx.listener(move |this, _, _, cx| this.sync_caldav_account(acct_id.clone(), true, cx))))),
+                ),
+                _ if acct.provider == ProviderKind::Sample && self.cal_status != SyncState::UpToDate => Some(
+                    h_flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .px(px(16.))
+                        .h(px(40.))
+                        .bg(p.chip)
+                        .border_b_1()
+                        .border_color(p.divider)
+                        .text_size(crate::ui::ui_px(13.))
+                        .text_color(p.muted)
+                        .child(icon("info").size(px(16.)).text_color(p.muted))
+                        .child("Sample calendar with fictional events. Connect the sample account (status bar switch) to load them."),
+                ),
+                _ => None,
+            }
+        } else {
+            let gmail_signin = target_accounts.iter().find(|a| {
+                a.provider == ProviderKind::Gmail
+                    && crate::sync::calendar_status(&self.store, &a.id) == SyncState::SignInRequired
+            });
+            if let Some(acct) = gmail_signin {
+                let email = acct.email.clone();
                 Some(
                     h_flex()
                         .items_center()
@@ -994,60 +1954,45 @@ impl MailWindow {
                         .border_color(p.divider)
                         .text_size(crate::ui::ui_px(13.))
                         .child(icon("key-round").size(px(16.)).text_color(p.warning))
-                        .child(div().flex_1().child(crate::sync::CALENDAR_SIGNIN_WORDING))
+                        .child(div().flex_1().child(format!("Sign in again to connect calendar for {email}. Other calendars keep working.")))
                         .child(Button::new("cal-signin").small().label("Sign in again").on_click(cx.listener(move |this, _, window, cx| this.start_google_sign_in(Some(email.clone()), window, cx)))),
                 )
+            } else if !self.caldav_changes.is_empty() || !self.caldav_uncached_accounts.is_empty() {
+                let sync_ids: Vec<AccountId> = target_accounts
+                    .iter()
+                    .filter(|a| matches!(a.provider, ProviderKind::Imap | ProviderKind::Pop3))
+                    .map(|a| a.id.clone())
+                    .collect();
+                let message = if !self.caldav_changes.is_empty() {
+                    "Calendar changes are saved on this device and waiting to sync.".to_owned()
+                } else {
+                    "Some CalDAV calendars have not downloaded this date range for your current time zone yet.".to_owned()
+                };
+                Some(
+                    h_flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .px(px(16.))
+                        .min_h(px(40.))
+                        .py(px(8.))
+                        .bg(p.chip)
+                        .border_b_1()
+                        .border_color(p.divider)
+                        .text_size(crate::ui::ui_px(13.))
+                        .text_color(p.muted)
+                        .child(icon("info").size(px(16.)).text_color(p.muted))
+                        .child(div().flex_1().child(message))
+                        .when(!self.caldav_changes.is_empty(), |d| d.child(Button::new("caldav-review").small().label(format!("Review {} {}",self.caldav_changes.len(),if self.caldav_changes.len()==1 {"change"} else {"changes"})).on_click(cx.listener(|this,_,_,cx|{this.show_caldav_changes = !this.show_caldav_changes;cx.notify();}))))
+                        .child(Button::new("caldav-refresh").small().ghost().label("Sync now")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                for id in &sync_ids {
+                                    this.sync_caldav_account(id.clone(), true, cx);
+                                }
+                            }))),
+                )
+            } else {
+                None
             }
-            _ if matches!(self.account.provider, ProviderKind::Imap | ProviderKind::Pop3)
-                && (self.caldav_connection.is_none()
-                    || !self.caldav_cached
-                    || !self.caldav_changes.is_empty()
-                    || !matches!(self.cal_status, SyncState::UpToDate | SyncState::Syncing)) => Some(
-                h_flex()
-                    .items_center()
-                    .gap(px(10.))
-                    .px(px(16.))
-                    .min_h(px(40.))
-                    .py(px(8.))
-                    .bg(p.chip)
-                    .border_b_1()
-                    .border_color(p.divider)
-                    .text_size(crate::ui::ui_px(13.))
-                    .text_color(p.muted)
-                    .child(icon("info").size(px(16.)).text_color(p.muted))
-                    .child(div().flex_1().child(if self.caldav_connection.is_none() {
-                        "Connect Fastmail or another calendar service to see your events here.".to_owned()
-                    } else {
-                        match &self.cal_status {
-                            SyncState::Syncing => "Syncing calendar changes… Saved events remain available.".to_owned(),
-                            SyncState::SignInRequired => "Calendar sign-in needs attention. Check the app password and calendar permission in settings.".to_owned(),
-                            SyncState::SyncFailed(error) | SyncState::Paused(error) => error.clone(),
-                            _ if !self.caldav_cached => "This date range has not been downloaded for your current time zone. Connect to sync it; saved events may be incomplete.".to_owned(),
-                            SyncState::Offline => "Offline · Changes are saved on this device and will sync when you reconnect.".to_owned(),
-                            _ => "Changes are saved on this device and waiting to sync.".to_owned(),
-                        }
-                    }))
-                    .when(!self.caldav_changes.is_empty(), |d| d.child(Button::new("caldav-review").small().label(format!("Review {} {}",self.caldav_changes.len(),if self.caldav_changes.len()==1 {"change"} else {"changes"})).on_click(cx.listener(|this,_,_,cx|{this.show_caldav_changes = !this.show_caldav_changes;cx.notify();}))))
-                    .child(Button::new("caldav-settings").small().label(if self.caldav_connection.is_some() { "Calendar settings" } else { "Connect calendars" })
-                        .on_click(cx.listener(|this, _, window, cx| this.open_settings(super::settings::SettingsPage::Accounts, window, cx))))
-                    .when(self.caldav_connection.is_some(), |d| d.child(Button::new("caldav-refresh").small().ghost().label("Sync now")
-                        .on_click(cx.listener(|this, _, _, cx| this.sync_caldav_account(this.account.id.clone(), true, cx))))),
-            ),
-            _ if self.account.provider == ProviderKind::Sample && self.cal_status != SyncState::UpToDate => Some(
-                h_flex()
-                    .items_center()
-                    .gap(px(10.))
-                    .px(px(16.))
-                    .h(px(40.))
-                    .bg(p.chip)
-                    .border_b_1()
-                    .border_color(p.divider)
-                    .text_size(crate::ui::ui_px(13.))
-                    .text_color(p.muted)
-                    .child(icon("info").size(px(16.)).text_color(p.muted))
-                    .child("Sample calendar with fictional events. Connect the sample account (status bar switch) to load them."),
-            ),
-            _ => None,
         };
 
         let grid: AnyElement = match self.cal_view {
@@ -1326,8 +2271,8 @@ impl MailWindow {
             if let Err(e)=self.save_caldav_edit(Some(original),Some(event),RecurrenceScope::This,cx){crate::ui::toast(window,cx,crate::notify::Level::Error,e);}
             cx.notify();return;
         }
-        match self.store.apply_event_change(&self.account.id, &event, OperationKind::UpdateEvent { event_id: event.id.clone(), scope: RecurrenceScope::This }) {
-            Ok(_) => {
+        match move_event_in_store(&self.store, &event) {
+            Ok(owner_account) => {
                 self.reload_calendar();
                 self.cal_selected = Some(event.id.clone());
                 let what = if drag.mode == DragMode::Resize {
@@ -1336,8 +2281,8 @@ impl MailWindow {
                     format!("Moved “{}” to {} {}.", event.display_title(), tz::format_day(start), tz::format_clock(start))
                 };
                 crate::ui::toast(window, cx, crate::notify::Level::Info, what);
-                if self.connected(&self.account.id) {
-                    self.sync_now(window, cx);
+                if self.connected(&owner_account) {
+                    self.sync_account(owner_account, window, cx);
                 }
             }
             Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t move the event: {e}")),
@@ -1345,12 +2290,7 @@ impl MailWindow {
     }
 
     fn event_colors(&self, e: &Event, p: &crate::theme::Palette) -> (Hsla, Hsla) {
-        let base = e
-            .color
-            .as_deref()
-            .and_then(hex_to_hsla)
-            .or_else(|| self.calendar_of(e).and_then(|c| c.color.as_deref()).and_then(hex_to_hsla))
-            .unwrap_or(p.accent);
+        let base = self.account_calendar_color(&e.account_id, p);
         let mut fill = base;
         fill.a = if p.is_dark() { 0.28 } else { 0.18 };
         let mut edge = base;
@@ -1599,6 +2539,10 @@ impl MailWindow {
         let p = *cx.palette();
         let (fill, edge) = self.event_colors(e, &p);
         let calendar = self.calendar_of(e);
+        let owner_account = self.accounts.iter().find(|a| a.id == e.account_id);
+        let custom_account_name = self.account_prefs.get(&e.account_id).map(|p| p.name.as_str());
+        let source = source_calendar_info(e, calendar, owner_account, custom_account_name, self.accounts.len() > 1);
+        let source_color = self.account_calendar_color(&e.account_id, &p);
         let when = if e.all_day {
             let single_day = tz::local_date(e.end) <= tz::local_date(tz::add_days(e.start, 1));
             if single_day { format!("{} · All day", tz::format_day(e.start)) } else { format!("{} – {} · All day", tz::format_day(e.start), tz::format_day(tz::add_days(e.end, -1))) }
@@ -1692,7 +2636,32 @@ impl MailWindow {
             .child(v_flex().gap(px(6.)).text_size(crate::ui::ui_px(13.))
                 .child(h_flex().gap(px(8.)).items_center().child(icon("clock").size(px(15.)).text_color(p.muted)).child(when))
                 .children(e.location.clone().map(|l| h_flex().gap(px(8.)).items_center().child(icon("map-pin").size(px(15.)).text_color(p.muted)).child(div().flex_1().min_w_0().child(l))))
-                .children(calendar.map(|c| h_flex().gap(px(8.)).items_center().child(icon("calendar").size(px(15.)).text_color(p.muted)).child(c.name.clone())))
+                .child(
+                    h_flex()
+                        .gap(px(8.))
+                        .items_start()
+                        .child(div().pt(px(2.)).child(icon("calendar").size(px(15.)).text_color(p.muted)))
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap(px(1.))
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .child(div().flex_none().size(px(8.)).rounded_full().bg(source_color))
+                                        .child(div().flex_1().min_w_0().truncate().child(source.calendar_name)),
+                                )
+                                .children(source.account_detail.map(|acct| {
+                                    div()
+                                        .text_size(crate::ui::ui_px(11.5))
+                                        .text_color(p.muted)
+                                        .truncate()
+                                        .child(acct)
+                                })),
+                        ),
+                )
                 .children(reminder_text.map(|t| h_flex().gap(px(8.)).items_center().child(icon("bell").size(px(15.)).text_color(p.muted)).child(format!("Reminder {t}"))))
                 .when(e.pending, |d| d.child(h_flex().gap(px(8.)).items_center().text_color(p.warning).child(icon("cloud-off").size(px(15.)).text_color(p.warning)).child("Saved on this device, waiting to sync"))))
             .when(e.is_invitation() && !e.id.0.starts_with("caldav:"), |d| {
@@ -1925,12 +2894,110 @@ impl MailWindow {
     fn render_new_event(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *cx.palette();
         let Some(form) = self.new_event.as_ref() else { return div().into_any_element() };
-        let caldav = form.calendar.as_ref().is_some_and(|id|id.0.starts_with("caldav:"));
-        let calendar_name = form.calendar.as_ref().and_then(|id| self.calendars.iter().find(|c| &c.id == id)).map(|c| c.name.clone()).unwrap_or_else(|| "Choose…".into());
-        let editable: Vec<(CalendarId, String)> = self.calendars.iter().filter(|c| c.can_edit).map(|c| (c.id.clone(), c.name.clone())).collect();
+        let caldav = form.calendar.as_ref().is_some_and(|id| id.0.starts_with("caldav:"));
+        let selected_cal = form
+            .calendar
+            .as_ref()
+            .and_then(|id| self.calendars.iter().find(|c| &c.id == id));
+        let selected_account = selected_cal.and_then(|c| self.accounts.iter().find(|a| a.id == c.account_id));
+        let selected_custom = selected_cal
+            .and_then(|c| self.account_prefs.get(&c.account_id))
+            .map(|ap| ap.name.as_str());
+        let show_account_label = self.accounts.len() > 1;
+        let calendar_label = destination_calendar_button_label(
+            selected_cal,
+            selected_account,
+            selected_custom,
+            show_account_label,
+        );
+        let selected_cal_color = selected_cal
+            .map(|c| self.account_calendar_color(&c.account_id, &p))
+            .unwrap_or(p.accent);
+        let selected_cal_id = form.calendar.clone();
+
+        let all_accounts = self.sidebar_accounts();
+        let mut editable_groups: Vec<(String, Vec<(CalendarId, String)>)> = Vec::new();
+        let mut total_editable = 0usize;
+        for acct in &all_accounts {
+            let cals: Vec<(CalendarId, String)> = self
+                .calendars
+                .iter()
+                .filter(|c| c.account_id == acct.id && c.can_edit)
+                .map(|c| (c.id.clone(), c.name.clone()))
+                .collect();
+            if !cals.is_empty() {
+                total_editable += cals.len();
+                editable_groups.push((self.account_menu_label(acct), cals));
+            }
+        }
+        let group_menu = editable_groups.len() > 1 || self.accounts.len() > 1;
         let this = cx.entity().downgrade();
         let field = |label: &'static str, input: AnyElement| {
             v_flex().gap(px(4.)).child(div().text_size(crate::ui::ui_px(11.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child(label)).child(input)
+        };
+        let calendar_control: AnyElement = if form.editing.is_none() && total_editable >= 2 {
+            Button::new("pick-calendar")
+                .small()
+                .w_full()
+                .justify_start()
+                .dropdown_caret(true)
+                .tooltip("Choose the destination calendar")
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .items_center()
+                        .gap(px(7.))
+                        .child(div().flex_none().size(px(8.)).rounded_full().bg(selected_cal_color))
+                        .child(div().flex_1().min_w_0().truncate().child(calendar_label)),
+                )
+                .dropdown_menu(move |mut menu, _window, _cx| {
+                    for (idx, (acct_heading, cals)) in editable_groups.iter().enumerate() {
+                        if group_menu {
+                            if idx > 0 {
+                                menu = menu.separator();
+                            }
+                            menu = menu.label(acct_heading.clone());
+                        }
+                        for (id, name) in cals {
+                            let t = this.clone();
+                            let id = id.clone();
+                            let checked = selected_cal_id.as_ref() == Some(&id);
+                            menu = menu.item(
+                                PopupMenuItem::new(name.clone())
+                                    .checked(checked)
+                                    .on_click(move |_, _w, cx| {
+                                        let _ = t.update(cx, |this, cx| {
+                                            if let Some(f) = this.new_event.as_mut() {
+                                                f.calendar = Some(id.clone());
+                                                f.availability_request_id = f.availability_request_id.wrapping_add(1);
+                                                f.checking = false;
+                                                f.availability.clear();
+                                            }
+                                            cx.notify();
+                                        });
+                                    }),
+                            );
+                        }
+                    }
+                    menu
+                })
+                .into_any_element()
+        } else {
+            h_flex()
+                .items_center()
+                .gap(px(7.))
+                .px(px(10.))
+                .py(px(6.))
+                .rounded(px(6.))
+                .bg(p.chip)
+                .border_1()
+                .border_color(p.divider)
+                .text_size(crate::ui::ui_px(12.5))
+                .text_color(p.foreground)
+                .child(div().flex_none().size(px(8.)).rounded_full().bg(selected_cal_color))
+                .child(div().flex_1().min_w_0().truncate().child(calendar_label))
+                .into_any_element()
         };
         let heading = h_flex().flex_none().items_center().px(px(20.)).pt(px(20.)).pb(px(12.)).child(div().flex_1().text_size(crate::ui::ui_px(16.)).font_weight(FontWeight::SEMIBOLD).child(if form.editing.is_some() { "Edit event" } else if form.duplicate_of.is_some() { "Duplicate event" } else { "New event" })).child(Button::new("cancel-new-event").ghost().xsmall().icon(icon("x").size(px(14.))).on_click(cx.listener(|this, _, window, cx| this.cancel_new_event(window, cx))));
         let fields = v_flex()
@@ -1941,6 +3008,7 @@ impl MailWindow {
             .pb(px(16.))
             .gap(px(12.))
             .child(field("Title", Input::new(&form.title).aria_label("Event title").into_any_element()))
+            .child(field("Calendar", calendar_control))
             .child(h_flex().gap(px(8.)).child(div().flex_1().min_w_0().child(field("Starts on", Input::new(&form.date).aria_label("Event start date").into_any_element())))
                 .child(div().flex_1().min_w_0().child(field("Ends on",Input::new(&form.end_date).aria_label("Event end date").into_any_element()))))
             .child(h_flex().items_center().gap(px(10.)).child(Switch::new("all-day").checked(form.all_day).label("All day").on_click(cx.listener(|this, checked: &bool, _w, cx| {
@@ -1997,32 +3065,6 @@ impl MailWindow {
                 d.child(h_flex().items_center().gap(px(6.)).text_size(crate::ui::ui_px(12.)).text_color(p.muted).child(icon("repeat").size(px(13.))).child("Copies this occurrence. The copy won’t repeat."))
             })
             .child(field("Description", div().h(px(120.)).child(Textarea::new(&form.description).h_full()).into_any_element()))
-            .when(form.editing.is_none(), |d| d.child(field(
-                "Calendar",
-                Button::new("pick-calendar")
-                    .small()
-                    .label(calendar_name)
-                    .dropdown_caret(true)
-                    .dropdown_menu(move |mut menu, _window, _cx| {
-                        for (id, name) in &editable {
-                            let t = this.clone();
-                            let id = id.clone();
-                            menu = menu.item(PopupMenuItem::new(name.clone()).on_click(move |_, _w, cx| {
-                                let _ = t.update(cx, |this, cx| {
-                                    if let Some(f) = this.new_event.as_mut() {
-                                        f.calendar = Some(id.clone());
-                                        f.availability_request_id = f.availability_request_id.wrapping_add(1);
-                                        f.checking = false;
-                                        f.availability.clear();
-                                    }
-                                    cx.notify();
-                                });
-                            }));
-                        }
-                        menu
-                    })
-                    .into_any_element(),
-            )))
             .overflow_y_scrollbar();
         // Outside the scrolling part, so Save and a save error are always in view.
         let footer = v_flex()
@@ -2033,7 +3075,7 @@ impl MailWindow {
             .border_t_1()
             .border_color(p.divider)
             .children(form.error.clone().map(|e| h_flex().gap(px(6.)).items_center().text_size(crate::ui::ui_px(12.)).text_color(p.error).child(icon("circle-alert").size(px(14.)).text_color(p.error)).child(e)))
-            .child(h_flex().gap(px(8.)).child(Button::new("save-event").primary().label("Save").tooltip("Save event (Ctrl S)").on_click(cx.listener(|this, _, window, cx| this.save_new_event(window, cx)))).child(Button::new("discard-event").ghost().label("Cancel").on_click(cx.listener(|this, _, window, cx| this.cancel_new_event(window, cx)))));
+            .child(h_flex().gap(px(8.)).child(Button::new("save-event").primary().label("Save").tooltip(self.tooltip_with_hint("Save event", ShortcutAction::SaveCalendarEvent)).on_click(cx.listener(|this, _, window, cx| this.save_new_event(window, cx)))).child(Button::new("discard-event").ghost().label("Cancel").on_click(cx.listener(|this, _, window, cx| this.cancel_new_event(window, cx)))));
         v_flex().size_full().child(heading).child(fields).child(footer).into_any_element()
     }
 
@@ -2550,6 +3592,454 @@ mod calendar_drag_tests {
                 attendee("c@x.test", None, ResponseStatus::NeedsAction),
             ]),
             "3 guests · 1 accepted, 1 tentative, 1 awaiting"
+        );
+    }
+}
+
+#[cfg(test)]
+mod calendar_multi_account_tests {
+    use super::{
+        can_edit_event_for_account, create_event_in_store, default_destination_calendar,
+        delete_event_in_store, destination_calendar_button_label, load_calendar_enabled_accounts,
+        load_calendar_view, move_event_in_store, resolve_account_calendar_colors,
+        respond_to_event_in_store, save_calendar_enabled_accounts, save_event_edit_in_store,
+        source_calendar_info, toggle_calendar_visibility_in_store, ACCOUNT_CALENDAR_COLORS,
+    };
+    use overlook_core::*;
+    use overlook_store::Store;
+    use std::collections::{BTreeSet, HashMap};
+    use std::path::PathBuf;
+
+    fn temp_db(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "overlook-cal-multi-{label}-{}.sqlite",
+            CalendarConnectionId::generate()
+        ))
+    }
+
+    fn make_account(id: &str, provider: ProviderKind, name: &str, email: &str) -> Account {
+        Account {
+            id: AccountId::from(id),
+            provider,
+            display_name: name.into(),
+            email: email.into(),
+            created_at: 1,
+        }
+    }
+
+    fn make_calendar(id: &str, account: &AccountId, name: &str, color: &str, primary: bool, can_edit: bool, visible: bool) -> Calendar {
+        Calendar {
+            id: CalendarId(id.into()),
+            account_id: account.clone(),
+            provider_id: Some(ProviderId(id.into())),
+            name: name.into(),
+            color: Some(color.into()),
+            is_primary: primary,
+            can_edit,
+            visible,
+            sort_order: 0,
+            default_reminders: vec![10],
+        }
+    }
+
+    fn make_event(id: &str, account: &AccountId, calendar: &CalendarId, title: &str, start: i64, end: i64, organizer: Option<Address>) -> Event {
+        Event {
+            id: EventId(id.into()),
+            account_id: account.clone(),
+            calendar_id: calendar.clone(),
+            provider_id: Some(ProviderId(format!("pid-{id}"))),
+            ical_uid: None,
+            summary: title.into(),
+            description: None,
+            location: None,
+            start,
+            end,
+            all_day: false,
+            status: EventStatus::Confirmed,
+            organizer,
+            attendees: Vec::new(),
+            html_link: None,
+            conference_url: None,
+            recurring_event_id: None,
+            updated: 1,
+            event_type: None,
+            color: None,
+            reminders: None,
+            original_start: None,
+            wants_conference: false,
+            pending: false,
+        }
+    }
+
+    fn install_caldav(
+        store: &Store,
+        account: &Account,
+        cal_name: &str,
+        event_title: &str,
+        start: i64,
+        end: i64,
+        tz_key: &str,
+    ) -> (CalendarConnection, CalendarId, EventId) {
+        let conn = CalendarConnection {
+            id: CalendarConnectionId::generate(),
+            account_id: account.id.clone(),
+            settings: CalDavSettings {
+                server_url: "https://caldav.fastmail.com/".into(),
+                username: account.email.clone(),
+                credential_source: CalendarCredentialSource::Separate,
+            },
+            enabled: true,
+            generation: 1,
+        };
+        let cal_id = CalendarId(format!("caldav:{}:primary", conn.id));
+        let ev_id = EventId(format!("{}:ev-1", cal_id.0));
+        let cal = make_calendar(&cal_id.0, &account.id, cal_name, "#7bd148", true, true, true);
+        let ev = make_event(&ev_id.0, &account.id, &cal_id, event_title, start, end, None);
+        let snapshot = CalDavSnapshot {
+            from: start - 7_200_000,
+            to: end + 7_200_000,
+            timezone: tz_key.into(),
+            calendars: vec![CalDavCalendarSnapshot {
+                calendar: cal,
+                resources: vec![CalDavResource {
+                    href: "/cal/ev-1.ics".into(),
+                    etag: "etag-1".into(),
+                    icalendar: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:ev-1@test\r\nSUMMARY:Fastmail Event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n".into(),
+                    events: vec![ev],
+                }],
+            }],
+        };
+        store.reserve_caldav_setup(&account.id, &conn.id).unwrap();
+        store.install_caldav_connection(&conn, None, &snapshot).unwrap();
+        (conn, cal_id, ev_id)
+    }
+
+    #[test]
+    fn calendar_enabled_accounts_defaults_to_active_and_persists() {
+        let path = temp_db("enabled-persist");
+        let work = make_account("acct-work", ProviderKind::Gmail, "Work", "work@example.com");
+        let personal = make_account("acct-personal", ProviderKind::Gmail, "Personal", "me@example.com");
+        let accounts = vec![work.clone(), personal.clone()];
+
+        {
+            let store = Store::open(&path).unwrap();
+            // Default checks ONLY the current active account.
+            assert_eq!(
+                load_calendar_enabled_accounts(&store, &accounts, &work.id),
+                BTreeSet::from([work.id.clone()])
+            );
+
+            // Persist checking both accounts.
+            save_calendar_enabled_accounts(&store, &BTreeSet::from([work.id.clone(), personal.id.clone()]));
+        }
+
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(
+                load_calendar_enabled_accounts(&store, &accounts, &work.id),
+                BTreeSet::from([work.id.clone(), personal.id.clone()])
+            );
+
+            // Persist checking only personal; if personal is later removed, falls back to active.
+            save_calendar_enabled_accounts(&store, &BTreeSet::from([personal.id.clone()]));
+        }
+
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(
+                load_calendar_enabled_accounts(&store, &accounts, &work.id),
+                BTreeSet::from([personal.id.clone()])
+            );
+            assert_eq!(
+                load_calendar_enabled_accounts(&store, &[work.clone()], &work.id),
+                BTreeSet::from([work.id.clone()])
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn account_calendar_colors_assign_distinct_defaults_and_respect_custom_overrides() {
+        let a1 = make_account("acct-1", ProviderKind::Gmail, "Work", "work@example.com");
+        let a2 = make_account("acct-2", ProviderKind::Gmail, "Personal", "me@example.com");
+        let a3 = make_account("acct-3", ProviderKind::Imap, "Fastmail", "me@fastmail.com");
+        let accounts = vec![a1.clone(), a2.clone(), a3.clone()];
+
+        // Out of the box, each account gets a distinct default color from the palette.
+        let defaults = resolve_account_calendar_colors(&accounts, &HashMap::new());
+        assert_eq!(defaults[&a1.id], ACCOUNT_CALENDAR_COLORS[0].1);
+        assert_eq!(defaults[&a2.id], ACCOUNT_CALENDAR_COLORS[1].1);
+        assert_eq!(defaults[&a3.id], ACCOUNT_CALENDAR_COLORS[2].1);
+        assert_ne!(defaults[&a1.id], defaults[&a2.id]);
+        assert_ne!(defaults[&a2.id], defaults[&a3.id]);
+
+        // If account 1 picks account 2's default color, account 2 automatically avoids colliding.
+        let mut prefs = HashMap::new();
+        prefs.insert(
+            a1.id.clone(),
+            AccountPrefs {
+                calendar_color: Some(ACCOUNT_CALENDAR_COLORS[1].1.to_lowercase()),
+                ..Default::default()
+            },
+        );
+        let customized = resolve_account_calendar_colors(&accounts, &prefs);
+        assert_eq!(customized[&a1.id], ACCOUNT_CALENDAR_COLORS[1].1);
+        assert_ne!(customized[&a2.id], customized[&a1.id]);
+        assert_ne!(customized[&a3.id], customized[&a1.id]);
+        assert_ne!(customized[&a3.id], customized[&a2.id]);
+    }
+
+    #[test]
+    fn all_calendars_combines_visible_google_and_enabled_caldav_and_respects_toggles() {
+        let path = temp_db("combined-visibility");
+        let store = Store::open(&path).unwrap();
+        let gmail = make_account("acct-gmail", ProviderKind::Gmail, "Work", "work@gmail.com");
+        let fastmail = make_account("acct-fm", ProviderKind::Imap, "Fastmail", "me@fastmail.com");
+        let disabled_imap = make_account("acct-disabled", ProviderKind::Imap, "Old", "old@imap.example");
+        store.upsert_account(&gmail).unwrap();
+        store.upsert_account(&fastmail).unwrap();
+        store.upsert_account(&disabled_imap).unwrap();
+
+        let t0 = 1_700_000_000_000i64;
+        let t1 = t0 + 3_600_000;
+        let t2 = t0 + 7_200_000;
+        let from = t0 - 3_600_000;
+        let to = t2 + 3_600_000;
+        let tz_key = "UTC";
+
+        // Gmail: 1 visible calendar, 1 hidden calendar.
+        let g_vis = make_calendar("g-vis", &gmail.id, "Work Primary", "#4285f4", true, true, true);
+        let g_hid = make_calendar("g-hid", &gmail.id, "Hidden Holidays", "#f6bf26", false, false, false);
+        store.replace_calendars(&gmail.id, &[g_vis.clone(), g_hid.clone()]).unwrap();
+        store.upsert_events(&[
+            make_event("ev-g-1", &gmail.id, &g_vis.id, "Gmail Standup", t0, t1, Some(Address::named("Work", "work@gmail.com"))),
+            make_event("ev-g-hidden", &gmail.id, &g_hid.id, "Hidden Holiday", t0, t1, None),
+        ]).unwrap();
+
+        // Fastmail: enabled CalDAV connection + visible calendar.
+        let (_conn, fm_cal_id, fm_ev_id) = install_caldav(&store, &fastmail, "Personal CalDAV", "Dentist", t1, t2, tz_key);
+
+        // Disabled CalDAV account: install then disable connection -> must NOT appear!
+        let (disabled_conn, _, _) = install_caldav(&store, &disabled_imap, "Disabled CalDAV", "Ghost Event", t0, t1, tz_key);
+        store
+            .save_calendar_connection(&disabled_imap.id, &disabled_conn.settings, false, Some(disabled_conn.generation))
+            .unwrap();
+
+        let all_accounts = vec![gmail.clone(), fastmail.clone(), disabled_imap.clone()];
+
+        // Only the active account (gmail) checked -> sidebar still lists ALL registered accounts'
+        // calendars (gmail + fastmail), while events come ONLY from gmail!
+        let only_gmail = load_calendar_view(
+            &store,
+            &all_accounts,
+            &BTreeSet::from([gmail.id.clone()]),
+            from,
+            to,
+            tz_key,
+            true,
+        );
+        assert_eq!(only_gmail.calendars.len(), 3);
+        assert!(only_gmail.calendars.iter().any(|c| c.id == g_vis.id));
+        assert!(only_gmail.calendars.iter().any(|c| c.id == g_hid.id));
+        assert!(only_gmail.calendars.iter().any(|c| c.id == fm_cal_id));
+        assert_eq!(
+            only_gmail.events.iter().map(|e| e.summary.as_str()).collect::<Vec<_>>(),
+            vec!["Gmail Standup"]
+        );
+
+        // Checking Fastmail too brings its events into the view alongside Gmail's!
+        let both_enabled = BTreeSet::from([gmail.id.clone(), fastmail.id.clone(), disabled_imap.id.clone()]);
+        let combined = load_calendar_view(&store, &all_accounts, &both_enabled, from, to, tz_key, true);
+        let titles: Vec<&str> = combined.events.iter().map(|e| e.summary.as_str()).collect();
+        assert_eq!(titles, vec!["Gmail Standup", "Dentist"]);
+        assert!(combined.caldav_uncached_accounts.is_empty());
+
+        // Toggle visibility of Fastmail's calendar off: persists and hides ONLY Fastmail's event!
+        toggle_calendar_visibility_in_store(&store, &fastmail.id, &fm_cal_id, false).unwrap();
+        let after_hide = load_calendar_view(&store, &all_accounts, &both_enabled, from, to, tz_key, true);
+        assert_eq!(after_hide.events.len(), 1);
+        assert_eq!(after_hide.events[0].summary, "Gmail Standup");
+        assert!(!after_hide.calendars.iter().find(|c| c.id == fm_cal_id).unwrap().visible);
+
+        // Toggle back on and verify reopening store preserves visibility.
+        toggle_calendar_visibility_in_store(&store, &fastmail.id, &fm_cal_id, true).unwrap();
+        let reopened = Store::open(&path).unwrap();
+        let reloaded = load_calendar_view(&reopened, &all_accounts, &both_enabled, from, to, tz_key, true);
+        assert!(reloaded.events.iter().any(|e| e.id == fm_ev_id));
+
+        // CalDAV timezone mismatch hides ONLY that account's CalDAV events, keeping Gmail events intact!
+        let tz_mismatch = load_calendar_view(&reopened, &all_accounts, &both_enabled, from, to, "America/New_York", true);
+        assert_eq!(tz_mismatch.events.len(), 1);
+        assert_eq!(tz_mismatch.events[0].summary, "Gmail Standup");
+        assert_eq!(tz_mismatch.caldav_uncached_accounts, vec![fastmail.id.clone()]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn owning_account_routing_for_edit_move_delete_rsvp_and_create() {
+        let path = temp_db("owning-account-routing");
+        let store = Store::open(&path).unwrap();
+        let acct_a = make_account("acct-a", ProviderKind::Gmail, "Alice Work", "alice@work.example");
+        let acct_b = make_account("acct-b", ProviderKind::Gmail, "Alice Personal", "alice@personal.example");
+        store.upsert_account(&acct_a).unwrap();
+        store.upsert_account(&acct_b).unwrap();
+
+        let cal_a = make_calendar("cal-a", &acct_a.id, "Work", "#4285f4", true, true, true);
+        let cal_b = make_calendar("cal-b", &acct_b.id, "Personal", "#0b8043", true, true, true);
+        store.replace_calendars(&acct_a.id, &[cal_a.clone()]).unwrap();
+        store.replace_calendars(&acct_b.id, &[cal_b.clone()]).unwrap();
+
+        let t0 = 1_700_000_000_000i64;
+        let t1 = t0 + 3_600_000;
+        let mut ev_b = make_event(
+            "ev-b-1",
+            &acct_b.id,
+            &cal_b.id,
+            "Personal Dinner",
+            t0,
+            t1,
+            Some(Address::named("Alice Personal", "alice@personal.example")),
+        );
+        let mut invite_b = make_event(
+            "ev-b-invite",
+            &acct_b.id,
+            &cal_b.id,
+            "Book Club",
+            t0 + 7_200_000,
+            t1 + 7_200_000,
+            Some(Address::named("Host", "host@club.example")),
+        );
+        invite_b.attendees.push(Attendee {
+            email: acct_b.email.clone(),
+            name: Some(acct_b.display_name.clone()),
+            response: ResponseStatus::NeedsAction,
+            is_self: true,
+            is_organizer: false,
+            optional: false,
+        });
+        store.upsert_events(&[ev_b.clone(), invite_b.clone()]).unwrap();
+
+        // Even if acct_a is the "active" account, acct_b's event is editable under acct_b's email.
+        assert!(can_edit_event_for_account(&ev_b, Some(&cal_b), &acct_b.email));
+        assert!(!can_edit_event_for_account(&ev_b, Some(&cal_b), &acct_a.email));
+        assert!(!can_edit_event_for_account(&invite_b, Some(&cal_b), &acct_b.email));
+
+        // 1. Edit acct_b's event -> routed to acct_b, 0 ops on acct_a.
+        ev_b.summary = "Personal Dinner (Updated)".into();
+        let edited_acct = save_event_edit_in_store(&store, &ev_b, RecurrenceScope::This).unwrap();
+        assert_eq!(edited_acct, acct_b.id);
+        assert_eq!(store.event(&ev_b.id).unwrap().unwrap().summary, "Personal Dinner (Updated)");
+        assert!(store.pending_operations(&acct_a.id).unwrap().is_empty());
+        assert_eq!(store.pending_operations(&acct_b.id).unwrap().len(), 1);
+
+        // 2. Drag-move acct_b's event -> routed to acct_b, 0 ops on acct_a.
+        ev_b.start += 1_800_000;
+        ev_b.end += 1_800_000;
+        let moved_acct = move_event_in_store(&store, &ev_b).unwrap();
+        assert_eq!(moved_acct, acct_b.id);
+        assert_eq!(store.event(&ev_b.id).unwrap().unwrap().start, t0 + 1_800_000);
+        assert!(store.pending_operations(&acct_a.id).unwrap().is_empty());
+        assert_eq!(store.pending_operations(&acct_b.id).unwrap().len(), 2);
+
+        // 3. RSVP on acct_b's invitation -> routed to acct_b, 0 ops on acct_a.
+        let rsvp_acct = respond_to_event_in_store(&store, &mut invite_b, &acct_b, ResponseStatus::Accepted).unwrap();
+        assert_eq!(rsvp_acct, acct_b.id);
+        assert_eq!(store.event(&invite_b.id).unwrap().unwrap().my_response(), Some(ResponseStatus::Accepted));
+        assert!(store.pending_operations(&acct_a.id).unwrap().is_empty());
+        assert_eq!(store.pending_operations(&acct_b.id).unwrap().len(), 3);
+
+        // 4. Delete acct_b's event -> routed to acct_b, 0 ops on acct_a.
+        let deleted_acct = delete_event_in_store(&store, &ev_b, RecurrenceScope::This).unwrap();
+        assert_eq!(deleted_acct, acct_b.id);
+        assert!(store.event(&ev_b.id).unwrap().is_none());
+        assert!(store.pending_operations(&acct_a.id).unwrap().is_empty());
+        assert_eq!(store.pending_operations(&acct_b.id).unwrap().len(), 4);
+
+        // 5. Create new event choosing acct_b's calendar -> written to acct_b with acct_b as organizer.
+        let owner_b = Address::named(&acct_b.display_name, &acct_b.email);
+        let mut new_ev = make_event("cal-b:new-1", &acct_a.id, &cal_a.id, "New Personal Event", t0, t1, None);
+        let created_acct = create_event_in_store(&store, &cal_b, &owner_b, &mut new_ev).unwrap();
+        assert_eq!(created_acct, acct_b.id);
+        let stored_new = store.event(&new_ev.id).unwrap().unwrap();
+        assert_eq!(stored_new.account_id, acct_b.id);
+        assert_eq!(stored_new.calendar_id, cal_b.id);
+        assert_eq!(stored_new.organizer.as_ref().map(|o| o.email.as_str()), Some("alice@personal.example"));
+        assert!(store.pending_operations(&acct_a.id).unwrap().is_empty());
+        assert_eq!(store.pending_operations(&acct_b.id).unwrap().len(), 5);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn default_destination_calendar_prefers_active_account_then_fallback() {
+        let a1 = AccountId::from("a1");
+        let a2 = AccountId::from("a2");
+        let c1_ro = make_calendar("c1-ro", &a1, "Read Only", "#888888", true, false, true);
+        let c1_ed = make_calendar("c1-ed", &a1, "Team", "#4285f4", false, true, true);
+        let c2_prim = make_calendar("c2-prim", &a2, "Personal", "#0b8043", true, true, true);
+        let c2_alt = make_calendar("c2-alt", &a2, "Side Project", "#d50000", false, true, true);
+
+        let mut prefs = HashMap::new();
+        prefs.insert(a2.clone(), AccountPrefs { default_calendar: Some("c2-alt".into()), ..Default::default() });
+
+        let all = vec![c1_ro.clone(), c1_ed.clone(), c2_prim.clone(), c2_alt.clone()];
+
+        // With active = a1, picks a1's editable calendar.
+        assert_eq!(
+            default_destination_calendar(&a1, &all, &prefs).map(|c| &c.id),
+            Some(&c1_ed.id)
+        );
+        // With active = a2, respects a2's preferred default_calendar.
+        assert_eq!(
+            default_destination_calendar(&a2, &all, &prefs).map(|c| &c.id),
+            Some(&c2_alt.id)
+        );
+        // When active account has no editable calendars, falls back to another account's preferred editable calendar.
+        let a1_readonly_only = vec![c1_ro, c2_prim, c2_alt.clone()];
+        assert_eq!(
+            default_destination_calendar(&a1, &a1_readonly_only, &prefs).map(|c| &c.id),
+            Some(&c2_alt.id)
+        );
+    }
+
+    #[test]
+    fn source_calendar_and_destination_labels_show_account_when_multi_account() {
+        let work = make_account("work", ProviderKind::Gmail, "Jason Work", "jason@work.example");
+        let personal = make_account("personal", ProviderKind::Gmail, "Jason", "jason@gmail.com");
+        let work_team = make_calendar("c-team", &work.id, "Team", "#4285f4", false, true, true);
+        let personal_email_cal = make_calendar("c-pers", &personal.id, "jason@gmail.com", "#0b8043", true, true, true);
+        let ev_team = make_event("e1", &work.id, &work_team.id, "Sync", 0, 1, None);
+        let ev_pers = make_event("e2", &personal.id, &personal_email_cal.id, "Gym", 0, 1, None);
+
+        // Single-account mode omits redundant account subtitle.
+        let single = source_calendar_info(&ev_team, Some(&work_team), Some(&work), Some("Work"), false);
+        assert_eq!(single.calendar_name, "Team");
+        assert_eq!(single.account_detail, None);
+
+        // Multi-account mode shows calendar name AND owning account details.
+        let multi = source_calendar_info(&ev_team, Some(&work_team), Some(&work), Some("Work"), true);
+        assert_eq!(multi.calendar_name, "Team");
+        assert_eq!(multi.account_detail.as_deref(), Some("Work · jason@work.example"));
+
+        // When Google primary calendar name equals the email, avoids repeating email twice.
+        let multi_email_cal = source_calendar_info(&ev_pers, Some(&personal_email_cal), Some(&personal), None, true);
+        assert_eq!(multi_email_cal.calendar_name, "jason@gmail.com");
+        assert_eq!(multi_email_cal.account_detail.as_deref(), Some("Jason"));
+
+        // Destination calendar button labels disambiguate account cleanly.
+        assert_eq!(
+            destination_calendar_button_label(Some(&work_team), Some(&work), Some("Work"), false),
+            "Team"
+        );
+        assert_eq!(
+            destination_calendar_button_label(Some(&work_team), Some(&work), Some("Work"), true),
+            "Team · Work"
+        );
+        assert_eq!(
+            destination_calendar_button_label(Some(&personal_email_cal), Some(&personal), None, true),
+            "jason@gmail.com · Jason"
         );
     }
 }

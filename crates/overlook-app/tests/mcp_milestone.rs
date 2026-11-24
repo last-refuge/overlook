@@ -912,6 +912,7 @@ fn mail_content_cannot_grant_writes_or_confirm_delivery() {
                 is_important: false,
                 focus_override: None,
                 invitation: None,
+                read_receipt: None,
             }])
             .unwrap();
     }
