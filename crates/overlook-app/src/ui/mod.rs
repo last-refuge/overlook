@@ -4,6 +4,7 @@ mod account_mark;
 mod account_setup;
 mod calendar;
 mod calendar_setup;
+mod calendar_subscription;
 mod calendar_changes;
 mod composer;
 mod composer_window;
@@ -911,7 +912,14 @@ pub struct MailWindow {
     pub(crate) module: Module,
     pub(crate) cal_view: CalView,
     pub(crate) cal_enabled_accounts: BTreeSet<AccountId>,
-    pub(crate) cal_color_picker_open: Option<AccountId>,
+    pub(crate) cal_color_picker_open: Option<calendar::CalendarColorTarget>,
+    pub(crate) cal_subscriptions: Vec<CalendarSubscription>,
+    pub(crate) cal_subscription_modal: Option<calendar_subscription::SubscriptionModal>,
+    pub(crate) cal_sub_syncing: HashSet<CalendarSubscriptionId>,
+    pub(crate) cal_sub_next_retry: HashMap<CalendarSubscriptionId, i64>,
+    pub(crate) cal_sub_needs_expansion: Vec<CalendarSubscriptionId>,
+    pub(crate) cal_sub_expanding: HashSet<CalendarSubscriptionId>,
+    pub(crate) cal_sub_modal_seq: u64,
     pub(crate) cal_anchor: i64,
     pub(crate) cal_events: Vec<Event>,
     pub(crate) calendars: Vec<Calendar>,
@@ -1265,6 +1273,13 @@ impl MailWindow {
             cal_view: CalView::Week,
             cal_enabled_accounts,
             cal_color_picker_open: None,
+            cal_subscriptions: Vec::new(),
+            cal_subscription_modal: None,
+            cal_sub_syncing: HashSet::new(),
+            cal_sub_next_retry: HashMap::new(),
+            cal_sub_needs_expansion: Vec::new(),
+            cal_sub_expanding: HashSet::new(),
+            cal_sub_modal_seq: 0,
             cal_anchor: overlook_core::tz::day_start(now()),
             cal_events: Vec::new(),
             calendars: Vec::new(),
@@ -2157,7 +2172,10 @@ impl MailWindow {
         match self.accounts.first().map(|a| a.id.clone()) {
             Some(next) => {
                 self.cal_enabled_accounts.remove(&id);
-                if self.cal_color_picker_open.as_ref() == Some(&id) {
+                if matches!(
+                    &self.cal_color_picker_open,
+                    Some(calendar::CalendarColorTarget::Account(acct)) if acct == &id
+                ) {
                     self.cal_color_picker_open = None;
                 }
                 if self.cal_enabled_accounts.is_empty() {
@@ -4936,6 +4954,7 @@ impl MailWindow {
         }
         let active = self.account.id.clone();
         let ids: Vec<AccountId> = self.accounts.iter().map(|a| a.id.clone()).collect();
+        self.sync_all_subscriptions(true, cx);
         for id in &ids {
             self.sync_caldav_account(id.clone(), true, cx);
         }
@@ -4959,6 +4978,7 @@ impl MailWindow {
             return;
         }
         self.expire_idle_sessions(window, cx);
+        self.sync_all_subscriptions(false, cx);
         for id in self.accounts.iter().map(|a| a.id.clone()).collect::<Vec<_>>() {
             self.sync_caldav_account(id, false, cx);
         }
@@ -5188,6 +5208,14 @@ impl MailWindow {
         } else if self.quick_look.is_some() {
             self.quick_look = None;
             cx.notify();
+        } else if self.cal_subscription_modal.is_some() {
+            if !self
+                .cal_subscription_modal
+                .as_ref()
+                .is_some_and(|m| m.busy)
+            {
+                self.close_subscription_modal(window, cx);
+            }
         } else if self.settings.is_some() {
             if !self.cancel_recording_shortcut(cx) && !self.clear_settings_search(window, cx) {
                 self.close_settings(window, cx);
@@ -6179,6 +6207,7 @@ impl Render for MailWindow {
                             .child(self.render_status_bar(cx)))),
             )
             .when(self.settings.is_some(), |d| d.child(self.render_settings(cx)))
+            .when(self.cal_subscription_modal.is_some(), |d| d.child(self.render_subscription_modal(cx)))
             .when(self.account_setup.is_some(), |d| d.child(self.render_account_setup(cx)))
             .when(self.module == Module::Calendar && self.new_event.as_ref().is_some_and(|f| f.dragged.is_some()), |d| d.child(self.render_event_modal(cx)))
             .when(self.event_in_modal().is_some(), |d| d.child(self.render_event_details_modal(cx)))

@@ -17,6 +17,7 @@ pub(crate) enum PaletteCommand {
     MoveTo(MailboxView),
     Account(AccountId),
     Settings(SettingsPage),
+    AddCalendarSubscription,
 }
 
 #[derive(Clone)]
@@ -94,6 +95,13 @@ impl MailWindow {
             entry("Search mail", hint(ShortcutAction::FocusSearch), action(Box::new(FocusSearch))),
             entry("Sync now", hint(ShortcutAction::SyncNow), action(Box::new(SyncNow))),
             entry("New event", hint(ShortcutAction::NewEvent), action(Box::new(NewEventAction))),
+            PaletteEntry {
+                title: SharedString::from("Add calendar from URL…".to_owned()),
+                hint: None,
+                section: None,
+                icon: Some("calendar"),
+                command: PaletteCommand::AddCalendarSubscription,
+            },
             entry("Go to Mail", hint(ShortcutAction::SwitchToMail), PaletteCommand::Module(Module::Mail)),
             entry("Go to Calendar", hint(ShortcutAction::SwitchToCalendar), PaletteCommand::Module(Module::Calendar)),
             entry("Go to Contacts", hint(ShortcutAction::SwitchToContacts), PaletteCommand::Module(Module::Contacts)),
@@ -291,6 +299,16 @@ impl MailWindow {
                 self.switch_account(id, window, cx);
             }
             PaletteCommand::Settings(page) => self.open_settings(page, window, cx),
+            PaletteCommand::AddCalendarSubscription => {
+                if self.is_message_window() {
+                    if self.in_main_window(cx, |this, window, cx| {
+                        this.open_add_subscription_modal(window, cx);
+                    }) {
+                        return;
+                    }
+                }
+                self.open_add_subscription_modal(window, cx);
+            }
         }
     }
 

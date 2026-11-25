@@ -1879,6 +1879,135 @@ impl MailWindow {
                     this.save_prefs(cx);
                 })).into_any_element(),
             ))
+            .child(self.render_subscribed_calendars_settings(cx))
+    }
+
+    fn render_subscribed_calendars_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let p = *cx.palette();
+        let sub_colors = self.subscription_calendar_colors();
+        let mut box_list = v_flex()
+            .gap(px(12.))
+            .child(section(
+                "Subscribed calendars",
+                Some("Read-only iCalendar (.ics) and Apple iCloud public calendar links."),
+            ));
+
+        if self.cal_subscriptions.is_empty() {
+            box_list = box_list.child(
+                div()
+                    .text_size(crate::ui::ui_px(12.))
+                    .text_color(p.muted)
+                    .child("No subscribed calendars yet."),
+            );
+        } else {
+            let mut rows = v_flex().gap(px(8.));
+            for sub in &self.cal_subscriptions {
+                let hex = sub_colors
+                    .get(&sub.id)
+                    .map(String::as_str)
+                    .unwrap_or(super::calendar::ACCOUNT_CALENDAR_COLORS[0].1);
+                let dot_color = super::calendar::hex_to_hsla(hex).unwrap_or(p.accent);
+                let syncing = self.cal_sub_syncing.contains(&sub.id);
+                let detail = super::calendar_subscription::subscription_detail_label(sub);
+                let label = if sub.visible {
+                    sub.name.clone()
+                } else {
+                    format!("{} (Hidden)", sub.name)
+                };
+                let refresh_id = sub.id.clone();
+                let edit_id = sub.id.clone();
+                let remove_id = sub.id.clone();
+                rows = rows.child(
+                    h_flex()
+                        .items_center()
+                        .gap(px(12.))
+                        .p(px(10.))
+                        .rounded(px(8.))
+                        .border_1()
+                        .border_color(p.divider)
+                        .child(
+                            div()
+                                .flex_none()
+                                .size(px(10.))
+                                .rounded_full()
+                                .bg(dot_color),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap(px(2.))
+                                .child(
+                                    div()
+                                        .text_size(crate::ui::ui_px(13.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .truncate()
+                                        .child(label),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(crate::ui::ui_px(11.5))
+                                        .text_color(if sub.last_error.is_some() {
+                                            p.warning
+                                        } else {
+                                            p.muted
+                                        })
+                                        .truncate()
+                                        .child(detail),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .flex_none()
+                                .gap(px(4.))
+                                .child(
+                                    Button::new(SharedString::from(format!("settings-sub-refresh-{}", sub.id)))
+                                        .ghost()
+                                        .small()
+                                        .loading(syncing)
+                                        .disabled(syncing)
+                                        .label("Refresh")
+                                        .on_click(cx.listener(move |this, _, _w, cx| {
+                                            this.sync_subscription(refresh_id.clone(), true, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new(SharedString::from(format!("settings-sub-edit-{}", sub.id)))
+                                        .ghost()
+                                        .small()
+                                        .label("Edit")
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.open_edit_subscription_modal(edit_id.clone(), window, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new(SharedString::from(format!("settings-sub-remove-{}", sub.id)))
+                                        .ghost()
+                                        .small()
+                                        .label("Remove")
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.remove_subscription(remove_id.clone(), window, cx);
+                                        })),
+                                ),
+                        ),
+                );
+            }
+            box_list = box_list.child(rows);
+        }
+
+        box_list
+            .child(
+                h_flex().child(
+                    Button::new("settings-add-sub-cal")
+                        .small()
+                        .icon(icon("plus").size(px(14.)))
+                        .label("Add calendar URL…")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_add_subscription_modal(window, cx);
+                        })),
+                ),
+            )
+            .into_any_element()
     }
 
     fn render_settings_about(&self, state: &SettingsState, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2405,6 +2534,7 @@ pub(crate) static SETTINGS_INDEX: &[SettingEntry] = &[
     entry(CA, "Events", "Default reminder", "Used when an event or calendar sets no reminder of its own.", "alert notification alarm"),
     entry(CA, "Events", "Show declined events", "", "declined rsvp hide"),
     entry(CA, "Events", "Event reminders", "Show the calendar reminders window and a desktop notification when reminders are due.", "notifications alert"),
+    entry(CA, "Subscribed calendars", "Subscribed calendars", "Read-only iCalendar (.ics) and Apple iCloud public calendar links.", "apple icloud webcal ics url subscribe calendar color"),
     entry(KB, "Preset", "Keyboard preset", "Switch between Outlook and Gmail keyboard shortcut presets.", "gmail outlook keyboard shortcuts hotkeys keybindings preset"),
     entry(KB, "Preset", "Reset keyboard shortcuts", "Restore every action to the active preset's defaults.", "reset keyboard shortcuts defaults overrides"),
     entry(KB, "Mail", "Customize mail shortcuts", "Override compose, reply, archive, delete, search, star, and navigation keys.", "gmail j k e c r a f s v slash hash undo shortcuts keybindings"),

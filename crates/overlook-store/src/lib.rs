@@ -16,6 +16,7 @@ mod mcp_mail_read;
 mod mcp_write;
 mod index;
 mod calendar_connections;
+mod calendar_subscriptions;
 mod contact_cards;
 mod caldav;
 mod caldav_outbox;
@@ -994,6 +995,9 @@ impl Store {
     }
 
     pub fn event(&self, id: &EventId) -> Result<Option<Event>> {
+        if CalendarSubscription::is_subscription_event_id(id) {
+            return self.subscription_event(id);
+        }
         self.with_read(|c| Ok(load_events(c, "WHERE e.id=?1", params![id.0])?.pop()))
     }
 
