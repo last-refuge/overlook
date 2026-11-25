@@ -21,6 +21,7 @@ mod watchdog;
 mod malware_scan;
 mod pdf_preview;
 mod single_instance;
+mod subscription_sync;
 mod updater;
 mod offline_disk;
 mod providers;

@@ -214,6 +214,17 @@ pub(crate) fn candidates(
             }
         }
     }
+    for sub in store.calendar_subscriptions()? {
+        let cal = sub.to_calendar();
+        calendars.insert(cal.id.clone(), cal);
+    }
+    if prefs.enabled {
+        for event in store.subscription_events_starting_between(now - DAY, now + 28 * DAY + 1)? {
+            if let Some(candidate) = candidate(event, &calendars, Some(prefs.default_minutes)) {
+                events.insert(candidate.reminder.event.id.clone(), candidate);
+            }
+        }
+    }
     for id in tracked {
         if let std::collections::hash_map::Entry::Vacant(entry) = events.entry(id.clone()) {
             if let Some(candidate) = store
@@ -438,6 +449,70 @@ mod tests {
         event.status = EventStatus::Cancelled;
         store.upsert_events(&[event]).unwrap();
         assert!(refresh(&mut inbox, &store, when).is_empty());
+        assert!(inbox.due().is_empty());
+    }
+
+    #[test]
+    fn visible_subscribed_events_with_valarm_trigger_reminders_and_hide_when_toggled_off() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let sub = overlook_core::CalendarSubscription {
+            id: overlook_core::CalendarSubscriptionId::from("apple-sub"),
+            url: "https://p12-caldav.icloud.com/published/2/token".into(),
+            name: "Family".into(),
+            color: None,
+            visible: true,
+            sort_order: 0,
+            etag: None,
+            last_modified: None,
+            expanded_from: Some(NOW - DAY),
+            expanded_to: Some(NOW + 28 * DAY),
+            expanded_tz: Some("UTC".into()),
+            last_synced_at: Some(NOW),
+            last_error: None,
+            created_at: NOW,
+        };
+        let ev = Event {
+            id: EventId::from("sub:apple-sub:ev1"),
+            account_id: overlook_core::CalendarSubscription::account_id(),
+            calendar_id: sub.calendar_id(),
+            provider_id: None,
+            ical_uid: Some("sub-ev1".into()),
+            summary: "Piano recital".into(),
+            description: None,
+            location: None,
+            start: NOW + 20 * MINUTE,
+            end: NOW + 60 * MINUTE,
+            all_day: false,
+            status: EventStatus::Confirmed,
+            organizer: None,
+            attendees: Vec::new(),
+            html_link: None,
+            conference_url: None,
+            recurring_event_id: None,
+            updated: NOW,
+            event_type: None,
+            color: None,
+            reminders: Some(vec![15]),
+            original_start: None,
+            wants_conference: false,
+            pending: false,
+        };
+        store
+            .create_calendar_subscription(&sub, "RAW", std::slice::from_ref(&ev))
+            .unwrap();
+
+        let mut inbox = Inbox::default();
+        assert!(refresh(&mut inbox, &store, NOW).is_empty());
+        let due_at = NOW + 5 * MINUTE;
+        let fired = refresh(&mut inbox, &store, due_at);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].event.id, ev.id);
+        assert_eq!(fired[0].calendar, "Family");
+
+        store
+            .set_calendar_subscription_visible(&sub.id, false)
+            .unwrap();
+        assert!(refresh(&mut inbox, &store, due_at).is_empty());
         assert!(inbox.due().is_empty());
     }
 }

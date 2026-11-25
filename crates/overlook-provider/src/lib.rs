@@ -11,6 +11,7 @@ pub mod calendar;
 pub mod caldav;
 pub mod credential;
 pub mod gmail;
+pub mod ics_subscription;
 pub mod imap;
 pub mod local;
 pub mod microsoft;

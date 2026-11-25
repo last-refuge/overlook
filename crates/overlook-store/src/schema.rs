@@ -4,7 +4,7 @@ use rusqlite::Connection;
 
 const MIGRATIONS: &[&str] = &[
     V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17, V18, V19, V20,
-    V21, V22, V23, V24, V25, V26, V27,
+    V21, V22, V23, V24, V25, V26, V27, V28,
 ];
 
 /// Device-local email snoozes: one active snooze per (account_id, conversation_id) with
@@ -41,6 +41,49 @@ CREATE TABLE message_read_receipts (
 CREATE INDEX message_read_receipts_original
     ON message_read_receipts(original_message_id)
     WHERE original_message_id IS NOT NULL;
+"#;
+
+/// Subscribed read-only iCalendar (.ics / webcal) feeds and their expanded event projections.
+const V28: &str = r#"
+CREATE TABLE calendar_subscriptions (
+    id TEXT PRIMARY KEY,
+    url TEXT NOT NULL,
+    name TEXT NOT NULL,
+    color TEXT,
+    visible INTEGER NOT NULL DEFAULT 1,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    etag TEXT,
+    last_modified TEXT,
+    raw_ics TEXT,
+    expanded_from INTEGER,
+    expanded_to INTEGER,
+    expanded_tz TEXT,
+    last_synced_at INTEGER,
+    last_error TEXT,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE subscription_events (
+    id TEXT PRIMARY KEY,
+    subscription_id TEXT NOT NULL REFERENCES calendar_subscriptions(id) ON DELETE CASCADE,
+    ical_uid TEXT,
+    summary TEXT NOT NULL,
+    description TEXT,
+    location TEXT,
+    start INTEGER NOT NULL,
+    end INTEGER NOT NULL,
+    all_day INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL,
+    organizer_json TEXT,
+    attendees_json TEXT NOT NULL DEFAULT '[]',
+    html_link TEXT,
+    conference_url TEXT,
+    recurring_event_id TEXT,
+    original_start INTEGER,
+    reminders_json TEXT,
+    updated INTEGER NOT NULL
+);
+CREATE INDEX subscription_events_range ON subscription_events(subscription_id, start, end);
 "#;
 
 const V25: &str = r#"

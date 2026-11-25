@@ -86,6 +86,10 @@ id_type!(
     CalendarConnectionId
 );
 id_type!(
+    /// Local identifier of a subscribed iCalendar (.ics / webcal) URL.
+    CalendarSubscriptionId
+);
+id_type!(
     /// Local identifier of a calendar event (an expanded instance for recurring events).
     EventId
 );

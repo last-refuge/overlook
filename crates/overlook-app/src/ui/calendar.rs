@@ -50,6 +50,14 @@ pub(crate) struct LoadedCalendarView {
     pub caldav_last_sync: Option<i64>,
     pub caldav_changes: Vec<CalDavChange>,
     pub caldav_uncached_accounts: Vec<AccountId>,
+    pub subscriptions: Vec<CalendarSubscription>,
+    pub subscription_needs_expansion: Vec<CalendarSubscriptionId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CalendarColorTarget {
+    Account(AccountId),
+    Subscription(CalendarSubscriptionId),
 }
 
 /// Source calendar metadata displayed in event details (side panel and modal).
@@ -133,6 +141,53 @@ pub(crate) fn resolve_account_calendar_colors(
         let normalized = chosen.to_ascii_uppercase();
         used.insert(normalized.clone());
         colors.insert(acct.id.clone(), normalized);
+    }
+
+    colors
+}
+
+/// Resolves a distinct hex color for every subscribed calendar. Custom `sub.color` overrides
+/// are preserved; remaining subscriptions receive the first unused palette color after accounting
+/// for all account colors and other subscriptions.
+pub(crate) fn resolve_subscription_calendar_colors(
+    subscriptions: &[CalendarSubscription],
+    account_colors: &HashMap<AccountId, String>,
+) -> HashMap<CalendarSubscriptionId, String> {
+    let mut colors = HashMap::with_capacity(subscriptions.len());
+    let mut used: HashSet<String> = account_colors
+        .values()
+        .map(|h| h.to_ascii_uppercase())
+        .collect();
+
+    for sub in subscriptions {
+        if let Some(hex) = sub
+            .color
+            .as_deref()
+            .and_then(normalize_hex_color)
+            .filter(|h| hex_to_hsla(h).is_some())
+        {
+            used.insert(hex.clone());
+            colors.insert(sub.id.clone(), hex);
+        }
+    }
+
+    let mut fallback_idx = 0usize;
+    for sub in subscriptions {
+        if colors.contains_key(&sub.id) {
+            continue;
+        }
+        let chosen = ACCOUNT_CALENDAR_COLORS
+            .iter()
+            .map(|(_, hex)| *hex)
+            .find(|hex| !used.contains(&hex.to_ascii_uppercase()))
+            .unwrap_or_else(|| {
+                let hex = ACCOUNT_CALENDAR_COLORS[fallback_idx % ACCOUNT_CALENDAR_COLORS.len()].1;
+                fallback_idx += 1;
+                hex
+            });
+        let normalized = chosen.to_ascii_uppercase();
+        used.insert(normalized.clone());
+        colors.insert(sub.id.clone(), normalized);
     }
 
     colors
@@ -227,6 +282,17 @@ pub(crate) fn load_calendar_view(
         }
     }
 
+    events.extend(store.subscription_events_between(from, to).unwrap_or_default());
+
+    let subscriptions = store.calendar_subscriptions().unwrap_or_default();
+    let mut subscription_needs_expansion = Vec::new();
+    for sub in &subscriptions {
+        calendars.push(sub.to_calendar());
+        if sub.visible && !crate::subscription_sync::window_covers(sub, from, to, tz_key) {
+            subscription_needs_expansion.push(sub.id.clone());
+        }
+    }
+
     events.sort_by(|a, b| {
         a.start
             .cmp(&b.start)
@@ -259,6 +325,8 @@ pub(crate) fn load_calendar_view(
         caldav_last_sync,
         caldav_changes,
         caldav_uncached_accounts,
+        subscriptions,
+        subscription_needs_expansion,
     }
 }
 
@@ -267,7 +335,8 @@ pub(crate) fn can_edit_event_for_account(
     calendar: Option<&Calendar>,
     owner_email: &str,
 ) -> bool {
-    calendar.is_some_and(|c| event.editable_by(owner_email, c))
+    !CalendarSubscription::is_subscription_calendar_id(&event.calendar_id)
+        && calendar.is_some_and(|c| event.editable_by(owner_email, c))
         && (!event.calendar_id.0.starts_with("caldav:") || event.attendees.is_empty())
 }
 
@@ -362,6 +431,19 @@ pub(crate) fn source_calendar_info(
         None
     };
     SourceCalendarInfo { calendar_name, account_detail, color }
+}
+
+pub(crate) fn source_subscription_info(sub: &CalendarSubscription) -> SourceCalendarInfo {
+    let account_detail = Some(
+        sub.host_label()
+            .map(|h| format!("Subscribed calendar · {h}"))
+            .unwrap_or_else(|| "Subscribed calendar".to_owned()),
+    );
+    SourceCalendarInfo {
+        calendar_name: sub.name.clone(),
+        account_detail,
+        color: sub.color.clone(),
+    }
 }
 
 /// Formats the destination calendar label shown on the selector button in the event form.
@@ -657,7 +739,7 @@ fn clock_text(ts: i64) -> String {
     tz::format_clock(ts)
 }
 
-fn hex_to_hsla(hex: &str) -> Option<Hsla> {
+pub(super) fn hex_to_hsla(hex: &str) -> Option<Hsla> {
     let v = u32::from_str_radix(hex.trim_start_matches('#'), 16).ok()?;
     Some(Rgba::from(gpui_kit::rgb(v)).into())
 }
@@ -701,6 +783,22 @@ impl MailWindow {
             .get(account_id)
             .and_then(|hex| hex_to_hsla(hex))
             .unwrap_or(p.accent)
+    }
+
+    pub(crate) fn subscription_calendar_colors(&self) -> HashMap<CalendarSubscriptionId, String> {
+        let account_colors = self.account_calendar_colors();
+        resolve_subscription_calendar_colors(&self.cal_subscriptions, &account_colors)
+    }
+
+    pub(crate) fn event_calendar_color(&self, e: &Event, p: &crate::theme::Palette) -> Hsla {
+        if let Some(sub_id) = CalendarSubscription::subscription_id_from_calendar(&e.calendar_id) {
+            return self
+                .subscription_calendar_colors()
+                .get(&sub_id)
+                .and_then(|hex| hex_to_hsla(hex))
+                .unwrap_or(p.accent);
+        }
+        self.account_calendar_color(&e.account_id, p)
     }
 
     pub(crate) fn set_account_calendar_color(
@@ -764,7 +862,11 @@ impl MailWindow {
         );
         self.calendars = loaded.calendars;
         self.cal_events = loaded.events;
-        self.cal_status = if enabled_accounts.iter().any(|a| self.caldav_syncing.contains_key(&a.id)) {
+        self.cal_subscriptions = loaded.subscriptions;
+        self.cal_sub_needs_expansion = loaded.subscription_needs_expansion;
+        self.cal_status = if enabled_accounts.iter().any(|a| self.caldav_syncing.contains_key(&a.id))
+            || !self.cal_sub_syncing.is_empty()
+        {
             SyncState::Syncing
         } else {
             loaded.status
@@ -789,7 +891,13 @@ impl MailWindow {
                 .event(sel)
                 .ok()
                 .flatten()
-                .is_some_and(|e| self.cal_enabled_accounts.contains(&e.account_id));
+                .is_some_and(|e| {
+                    if let Some(sub_id) = CalendarSubscription::subscription_id_from_calendar(&e.calendar_id) {
+                        self.cal_subscriptions.iter().any(|s| s.id == sub_id && s.visible)
+                    } else {
+                        self.cal_enabled_accounts.contains(&e.account_id)
+                    }
+                });
             if !keep {
                 self.cal_selected = None;
                 self.cal_event_modal = None;
@@ -818,6 +926,7 @@ impl MailWindow {
                 self.reload_calendar();
                 self.refresh_other_contacts(cx);
                 self.ensure_caldav_range(cx);
+                self.ensure_subscription_expansion(cx);
                 self.cal_focus.focus(window, cx);
             }
             Module::Contacts => {
@@ -847,6 +956,7 @@ impl MailWindow {
         self.cal_view = view;
         self.reload_calendar();
         self.ensure_caldav_range(cx);
+        self.ensure_subscription_expansion(cx);
         cx.notify();
     }
 
@@ -859,6 +969,7 @@ impl MailWindow {
         };
         self.reload_calendar();
         self.ensure_caldav_range(cx);
+        self.ensure_subscription_expansion(cx);
         cx.notify();
     }
 
@@ -866,6 +977,7 @@ impl MailWindow {
         self.cal_anchor = tz::day_start(now());
         self.reload_calendar();
         self.ensure_caldav_range(cx);
+        self.ensure_subscription_expansion(cx);
         cx.notify();
     }
 
@@ -991,7 +1103,9 @@ impl MailWindow {
     /// Switches to the calendar, moves to the event's day, and selects it.
     pub(crate) fn show_event_in_calendar(&mut self, id: EventId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(event) = self.store.event(&id).ok().flatten() else { return };
-        if !self.cal_enabled_accounts.contains(&event.account_id) {
+        if let Some(sub_id) = CalendarSubscription::subscription_id_from_calendar(&event.calendar_id) {
+            let _ = self.store.set_calendar_subscription_visible(&sub_id, true);
+        } else if !self.cal_enabled_accounts.contains(&event.account_id) {
             self.cal_enabled_accounts.insert(event.account_id.clone());
             save_calendar_enabled_accounts(&self.store, &self.cal_enabled_accounts);
         }
@@ -1003,6 +1117,7 @@ impl MailWindow {
         self.new_event = None;
         self.reload_calendar();
         self.ensure_caldav_range(cx);
+        self.ensure_subscription_expansion(cx);
         self.cal_event_modal = None;
         self.reset_detail_scroll();
         self.cal_selected = Some(id);
@@ -1546,29 +1661,32 @@ impl MailWindow {
 
     // --------------------------------------------------------------- sidebar
 
-    fn render_account_color_picker(
+    fn render_calendar_color_picker(
         &self,
-        account_id: &AccountId,
+        target: CalendarColorTarget,
         current_hex: &str,
         has_custom: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = *cx.palette();
         let this = cx.entity().downgrade();
+        let target_key = match &target {
+            CalendarColorTarget::Account(acct) => format!("acct-{}", acct.0),
+            CalendarColorTarget::Subscription(sub) => format!("sub-{}", sub.0),
+        };
         let mut swatch_rows = v_flex().gap(px(6.));
         for (row_idx, chunk) in ACCOUNT_CALENDAR_COLORS.chunks(5).enumerate() {
             let mut row = h_flex().items_center().gap(px(6.));
             for &(name, hex) in chunk {
                 let swatch_color = hex_to_hsla(hex).unwrap_or(p.accent);
                 let selected = current_hex.eq_ignore_ascii_case(hex);
-                let acct = account_id.clone();
+                let target_click = target.clone();
                 let hex_owned = hex.to_owned();
                 let t = this.clone();
                 row = row.child(
                     div()
                         .id(SharedString::from(format!(
-                            "cal-swatch-{}-{row_idx}-{name}",
-                            account_id.0
+                            "cal-swatch-{target_key}-{row_idx}-{name}"
                         )))
                         .size(px(24.))
                         .rounded_full()
@@ -1587,8 +1705,13 @@ impl MailWindow {
                             d.child(icon("check").size(px(12.)).text_color(gpui_kit::white()))
                         })
                         .on_click(move |_, _w, cx| {
-                            let _ = t.update(cx, |this, cx| {
-                                this.set_account_calendar_color(acct.clone(), Some(hex_owned.clone()), cx);
+                            let _ = t.update(cx, |this, cx| match &target_click {
+                                CalendarColorTarget::Account(acct) => {
+                                    this.set_account_calendar_color(acct.clone(), Some(hex_owned.clone()), cx);
+                                }
+                                CalendarColorTarget::Subscription(sub) => {
+                                    this.set_subscription_color(sub.clone(), Some(hex_owned.clone()), cx);
+                                }
                             });
                         }),
                 );
@@ -1596,8 +1719,8 @@ impl MailWindow {
             swatch_rows = swatch_rows.child(row);
         }
 
-        let reset_acct = account_id.clone();
-        let reset_this = this.clone();
+        let reset_target = target;
+        let reset_this = this;
         v_flex()
             .p(px(10.))
             .gap(px(8.))
@@ -1615,13 +1738,18 @@ impl MailWindow {
                     )
                     .when(has_custom, |d| {
                         d.child(
-                            Button::new(SharedString::from(format!("cal-color-reset-{}", account_id.0)))
+                            Button::new(SharedString::from(format!("cal-color-reset-{target_key}")))
                                 .ghost()
                                 .xsmall()
                                 .label("Reset")
                                 .on_click(move |_, _w, cx| {
-                                    let _ = reset_this.update(cx, |this, cx| {
-                                        this.set_account_calendar_color(reset_acct.clone(), None, cx);
+                                    let _ = reset_this.update(cx, |this, cx| match &reset_target {
+                                        CalendarColorTarget::Account(acct) => {
+                                            this.set_account_calendar_color(acct.clone(), None, cx);
+                                        }
+                                        CalendarColorTarget::Subscription(sub) => {
+                                            this.set_subscription_color(sub.clone(), None, cx);
+                                        }
                                     });
                                 }),
                         )
@@ -1646,6 +1774,7 @@ impl MailWindow {
         let all_accounts = self.sidebar_accounts();
         let enabled_accounts = self.cal_target_accounts();
         let account_colors = self.account_calendar_colors();
+        let sub_colors = self.subscription_calendar_colors();
         let this = cx.entity().downgrade();
 
         let render_cal_row = |c: &Calendar, acct_enabled: bool, acct_color: Hsla, cx: &mut Context<Self>| {
@@ -1695,11 +1824,11 @@ impl MailWindow {
                 .is_some();
 
             let toggle_id = acct.id.clone();
-            let picker_acct_open = acct.id.clone();
-            let picker_acct_content = acct.id.clone();
+            let picker_target_open = CalendarColorTarget::Account(acct.id.clone());
+            let picker_target_content = CalendarColorTarget::Account(acct.id.clone());
             let picker_hex = acct_hex.clone();
             let picker_this = this.clone();
-            let picker_open = self.cal_color_picker_open.as_ref() == Some(&acct.id);
+            let picker_open = self.cal_color_picker_open.as_ref() == Some(&picker_target_open);
             let color_trigger = Button::new(SharedString::from(format!("cal-color-btn-{}", acct.id.0)))
                 .ghost()
                 .small()
@@ -1768,8 +1897,8 @@ impl MailWindow {
                         .overlay_closable(true)
                         .on_open_change(cx.listener(move |this, open: &bool, _, cx| {
                             this.cal_color_picker_open = if *open {
-                                Some(picker_acct_open.clone())
-                            } else if this.cal_color_picker_open.as_ref() == Some(&picker_acct_open) {
+                                Some(picker_target_open.clone())
+                            } else if this.cal_color_picker_open.as_ref() == Some(&picker_target_open) {
                                 None
                             } else {
                                 this.cal_color_picker_open.clone()
@@ -1780,8 +1909,8 @@ impl MailWindow {
                         .content(move |_, _window, cx| {
                             picker_this
                                 .update(cx, |this, cx| {
-                                    this.render_account_color_picker(
-                                        &picker_acct_content,
+                                    this.render_calendar_color_picker(
+                                        picker_target_content.clone(),
                                         &picker_hex,
                                         has_custom,
                                         cx,
@@ -1809,8 +1938,229 @@ impl MailWindow {
             }
         }
 
-        let footer = if enabled_accounts.len() > 1 {
-            let count = enabled_accounts.len();
+        // Subscribed iCalendar (.ics / webcal://) calendars.
+        let sub_heading = h_flex()
+            .items_center()
+            .mt(px(12.))
+            .pl(px(18.))
+            .pr(px(4.))
+            .py(px(2.))
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(crate::ui::ui_px(11.5))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(p.muted)
+                    .child("Subscribed"),
+            )
+            .child(
+                Button::new("cal-sub-add")
+                    .ghost()
+                    .small()
+                    .w(px(22.))
+                    .h(px(22.))
+                    .p(px(0.))
+                    .icon(icon("plus").size(px(13.)).text_color(p.muted))
+                    .tooltip("Add calendar from URL")
+                    .accessibility_label("Add calendar from URL")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_add_subscription_modal(window, cx);
+                    })),
+            );
+        list = list.child(sub_heading);
+
+        if self.cal_subscriptions.is_empty() {
+            list = list.child(
+                m.row("cal-sub-empty")
+                    .text_color(p.muted)
+                    .hover(|d| d.bg(p.hover))
+                    .child(
+                        h_flex()
+                            .w(px(ROW_ICON_SIZE))
+                            .flex_none()
+                            .justify_center()
+                            .child(icon("plus").size(px(13.)).text_color(p.muted)),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child("Add calendar URL…"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_add_subscription_modal(window, cx);
+                    })),
+            );
+        } else {
+            for sub in &self.cal_subscriptions {
+                let sub_id = sub.id.clone();
+                let sub_hex = sub_colors
+                    .get(&sub.id)
+                    .cloned()
+                    .unwrap_or_else(|| ACCOUNT_CALENDAR_COLORS[0].1.to_owned());
+                let sub_color = hex_to_hsla(&sub_hex).unwrap_or(p.accent);
+                let has_custom = sub.color.is_some();
+                let syncing = self.cal_sub_syncing.contains(&sub.id);
+                let err_msg = sub.last_error.clone();
+
+                let picker_target_open = CalendarColorTarget::Subscription(sub.id.clone());
+                let picker_target_content = CalendarColorTarget::Subscription(sub.id.clone());
+                let picker_hex = sub_hex.clone();
+                let picker_this = this.clone();
+                let picker_open = self.cal_color_picker_open.as_ref() == Some(&picker_target_open);
+                let color_trigger = Button::new(SharedString::from(format!("sub-color-btn-{}", sub.id)))
+                    .ghost()
+                    .small()
+                    .w(px(22.))
+                    .h(px(22.))
+                    .p(px(0.))
+                    .tooltip("Customize calendar color")
+                    .accessibility_label("Customize calendar color")
+                    .child(
+                        div()
+                            .size(px(11.))
+                            .rounded_full()
+                            .bg(sub_color)
+                            .border_1()
+                            .border_color(p.divider),
+                    );
+
+                let build_sub_menu = {
+                    let me = this.clone();
+                    let sub_id = sub.id.clone();
+                    let sub_url = sub.url.clone();
+                    move |menu: PopupMenu, _window: &mut Window, _cx: &mut Context<PopupMenu>| {
+                        let (t1, id1) = (me.clone(), sub_id.clone());
+                        let (t2, id2) = (me.clone(), sub_id.clone());
+                        let (t3, url3) = (me.clone(), sub_url.clone());
+                        let (t4, id4) = (me.clone(), sub_id.clone());
+                        menu.item(PopupMenuItem::new("Refresh now").on_click(move |_, _w, cx| {
+                            t1.update(cx, |this, cx| this.sync_subscription(id1.clone(), true, cx)).ok();
+                        }))
+                        .item(PopupMenuItem::new("Edit…").on_click(move |_, window, cx| {
+                            t2.update(cx, |this, cx| this.open_edit_subscription_modal(id2.clone(), window, cx)).ok();
+                        }))
+                        .item(PopupMenuItem::new("Copy URL").on_click(move |_, window, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(url3.clone()));
+                            t3.update(cx, |_, cx| {
+                                crate::ui::toast(window, cx, crate::notify::Level::Info, "Calendar URL copied.");
+                            }).ok();
+                        }))
+                        .separator()
+                        .item(PopupMenuItem::new("Remove").on_click(move |_, window, cx| {
+                            t4.update(cx, |this, cx| this.remove_subscription(id4.clone(), window, cx)).ok();
+                        }))
+                    }
+                };
+
+                let toggle_id = sub_id.clone();
+                let row = h_flex()
+                    .items_center()
+                    .gap(px(2.))
+                    .pr(px(4.))
+                    .child(
+                        m.row(SharedString::from(format!("cal-sub-{}", sub.id)))
+                            .flex_1()
+                            .min_w_0()
+                            .pr(px(4.))
+                            .text_color(if sub.visible { p.foreground } else { p.muted })
+                            .hover(|d| d.bg(p.hover))
+                            .child(
+                                h_flex()
+                                    .w(px(ROW_ICON_SIZE))
+                                    .flex_none()
+                                    .justify_center()
+                                    .child(
+                                        div()
+                                            .size(px(13.))
+                                            .rounded(px(3.5))
+                                            .border_2()
+                                            .border_color(if sub.visible { sub_color } else { p.muted.opacity(0.55) })
+                                            .when(sub.visible, |d| d.bg(sub_color))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .when(sub.visible, |d| {
+                                                d.child(icon("check").size(px(9.)).text_color(gpui_kit::white()))
+                                            }),
+                                    ),
+                            )
+                            .child(div().flex_1().min_w_0().truncate().child(sub.name.clone()))
+                            .when_some(err_msg, |d, err| {
+                                d.child(
+                                    div()
+                                        .id(SharedString::from(format!("sub-err-{}", sub.id)))
+                                        .flex_none()
+                                        .tooltip(move |window, cx| {
+                                            gpui_kit::component::tooltip::Tooltip::new(err.clone()).build(window, cx)
+                                        })
+                                        .child(icon("circle-alert").size(px(12.)).text_color(p.warning)),
+                                )
+                            })
+                            .when(sub.last_error.is_none() && syncing, |d| {
+                                d.child(
+                                    div()
+                                        .id(SharedString::from(format!("sub-sync-{}", sub.id)))
+                                        .flex_none()
+                                        .tooltip(|window, cx| {
+                                            gpui_kit::component::tooltip::Tooltip::new("Refreshing…").build(window, cx)
+                                        })
+                                        .child(icon("refresh-cw").size(px(11.)).text_color(p.muted)),
+                                )
+                            })
+                            .on_click(cx.listener(move |this, _, _w, cx| {
+                                this.toggle_subscription_visible(toggle_id.clone(), cx);
+                            }))
+                            .context_menu(build_sub_menu.clone()),
+                    )
+                    .child(
+                        Popover::new(SharedString::from(format!("sub-color-popover-{}", sub.id)))
+                            .anchor(Anchor::TopLeft)
+                            .open(picker_open)
+                            .overlay_closable(true)
+                            .on_open_change(cx.listener(move |this, open: &bool, _, cx| {
+                                this.cal_color_picker_open = if *open {
+                                    Some(picker_target_open.clone())
+                                } else if this.cal_color_picker_open.as_ref() == Some(&picker_target_open) {
+                                    None
+                                } else {
+                                    this.cal_color_picker_open.clone()
+                                };
+                                cx.notify();
+                            }))
+                            .trigger(color_trigger)
+                            .content(move |_, _window, cx| {
+                                picker_this
+                                    .update(cx, |this, cx| {
+                                        this.render_calendar_color_picker(
+                                            picker_target_content.clone(),
+                                            &picker_hex,
+                                            has_custom,
+                                            cx,
+                                        )
+                                    })
+                                    .unwrap_or_else(|_| div().into_any_element())
+                            }),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("sub-more-{}", sub.id)))
+                            .ghost()
+                            .small()
+                            .w(px(20.))
+                            .h(px(20.))
+                            .p(px(0.))
+                            .icon(icon("ellipsis").size(px(12.)).text_color(p.muted))
+                            .tooltip("Calendar options")
+                            .accessibility_label("Calendar options")
+                            .dropdown_menu(build_sub_menu),
+                    );
+                list = list.child(row);
+            }
+        }
+
+        let visible_subs = self.cal_subscriptions.iter().filter(|s| s.visible).count();
+        let footer = if enabled_accounts.len() > 1 || (!enabled_accounts.is_empty() && visible_subs > 0) {
+            let acct_count = enabled_accounts.len();
+            let summary = match (acct_count, visible_subs) {
+                (a, 0) => format!("{a} accounts · {text}"),
+                (1, s) => format!("1 account · {s} subscribed · {text}"),
+                (a, s) => format!("{a} accounts · {s} subscribed · {text}"),
+            };
             m.footer()
                 .child(
                     div()
@@ -1825,7 +2175,26 @@ impl MailWindow {
                 )
                 .child(sidebar_owner_details(
                     "Calendars".to_owned(),
-                    format!("{count} accounts · {text}"),
+                    summary,
+                    dot,
+                    &p,
+                ))
+        } else if enabled_accounts.is_empty() && visible_subs > 0 {
+            m.footer()
+                .child(
+                    div()
+                        .flex_none()
+                        .size(px(30.))
+                        .rounded_full()
+                        .bg(p.chip)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(icon("calendar-days").size(px(15.)).text_color(p.accent)),
+                )
+                .child(sidebar_owner_details(
+                    "Subscribed calendars".to_owned(),
+                    format!("{visible_subs} {} · {text}", if visible_subs == 1 { "calendar" } else { "calendars" }),
                     dot,
                     &p,
                 ))
@@ -2290,7 +2659,7 @@ impl MailWindow {
     }
 
     fn event_colors(&self, e: &Event, p: &crate::theme::Palette) -> (Hsla, Hsla) {
-        let base = self.account_calendar_color(&e.account_id, p);
+        let base = self.event_calendar_color(e, p);
         let mut fill = base;
         fill.a = if p.is_dark() { 0.28 } else { 0.18 };
         let mut edge = base;
@@ -2539,10 +2908,17 @@ impl MailWindow {
         let p = *cx.palette();
         let (fill, edge) = self.event_colors(e, &p);
         let calendar = self.calendar_of(e);
+        let is_subscription = CalendarSubscription::is_subscription_calendar_id(&e.calendar_id);
+        let sub = CalendarSubscription::subscription_id_from_calendar(&e.calendar_id)
+            .and_then(|id| self.cal_subscriptions.iter().find(|s| s.id == id));
         let owner_account = self.accounts.iter().find(|a| a.id == e.account_id);
         let custom_account_name = self.account_prefs.get(&e.account_id).map(|p| p.name.as_str());
-        let source = source_calendar_info(e, calendar, owner_account, custom_account_name, self.accounts.len() > 1);
-        let source_color = self.account_calendar_color(&e.account_id, &p);
+        let source = if let Some(sub) = sub {
+            source_subscription_info(sub)
+        } else {
+            source_calendar_info(e, calendar, owner_account, custom_account_name, self.accounts.len() > 1)
+        };
+        let source_color = self.event_calendar_color(e, &p);
         let when = if e.all_day {
             let single_day = tz::local_date(e.end) <= tz::local_date(tz::add_days(e.start, 1));
             if single_day { format!("{} · All day", tz::format_day(e.start)) } else { format!("{} – {} · All day", tz::format_day(e.start), tz::format_day(tz::add_days(e.end, -1))) }
@@ -2664,7 +3040,7 @@ impl MailWindow {
                 )
                 .children(reminder_text.map(|t| h_flex().gap(px(8.)).items_center().child(icon("bell").size(px(15.)).text_color(p.muted)).child(format!("Reminder {t}"))))
                 .when(e.pending, |d| d.child(h_flex().gap(px(8.)).items_center().text_color(p.warning).child(icon("cloud-off").size(px(15.)).text_color(p.warning)).child("Saved on this device, waiting to sync"))))
-            .when(e.is_invitation() && !e.id.0.starts_with("caldav:"), |d| {
+            .when(e.is_invitation() && !e.id.0.starts_with("caldav:") && !is_subscription, |d| {
                 d.child(
                     v_flex()
                         .gap(px(8.))
@@ -2684,11 +3060,12 @@ impl MailWindow {
             .when(e.conference_url.is_some() || e.html_link.is_some(), |d| {
                 let conf = e.conference_url.clone();
                 let link = e.html_link.clone();
+                let link_label = if is_subscription { "Open link" } else { "Open in Google Calendar" };
                 d.child(
                     h_flex()
                         .gap(px(6.))
                         .children(conf.map(|url| Button::new("join").small().icon(icon("video").size(px(14.))).label("Join").on_click(move |_, _w, cx| cx.open_url(&url))))
-                        .children(link.map(|url| Button::new("open-gcal").ghost().small().icon(icon("external-link").size(px(14.))).label("Open in Google Calendar").on_click(move |_, _w, cx| cx.open_url(&url)))),
+                        .children(link.map(|url| Button::new("open-gcal").ghost().small().icon(icon("external-link").size(px(14.))).label(link_label).on_click(move |_, _w, cx| cx.open_url(&url)))),
                 )
             })
             .when(!e.attendees.is_empty(), |d| {
@@ -3602,8 +3979,9 @@ mod calendar_multi_account_tests {
         can_edit_event_for_account, create_event_in_store, default_destination_calendar,
         delete_event_in_store, destination_calendar_button_label, load_calendar_enabled_accounts,
         load_calendar_view, move_event_in_store, resolve_account_calendar_colors,
-        respond_to_event_in_store, save_calendar_enabled_accounts, save_event_edit_in_store,
-        source_calendar_info, toggle_calendar_visibility_in_store, ACCOUNT_CALENDAR_COLORS,
+        resolve_subscription_calendar_colors, respond_to_event_in_store,
+        save_calendar_enabled_accounts, save_event_edit_in_store, source_calendar_info,
+        source_subscription_info, toggle_calendar_visibility_in_store, ACCOUNT_CALENDAR_COLORS,
     };
     use overlook_core::*;
     use overlook_store::Store;
@@ -4041,5 +4419,133 @@ mod calendar_multi_account_tests {
             destination_calendar_button_label(Some(&personal_email_cal), Some(&personal), None, true),
             "jason@gmail.com · Jason"
         );
+    }
+
+    #[test]
+    fn subscribed_calendar_colors_load_and_read_only_guards() {
+        let store = Store::open_in_memory().unwrap();
+        let acct = make_account("acct-1", ProviderKind::Gmail, "Work", "work@example.com");
+        store.upsert_account(&acct).unwrap();
+        let work_cal = make_calendar("c-work", &acct.id, "Work", "#4285f4", true, true, true);
+        store.replace_calendars(&acct.id, &[work_cal.clone()]).unwrap();
+
+        let t0 = 1_700_000_000_000i64;
+        let t1 = t0 + 3_600_000;
+        let from = t0 - 3_600_000;
+        let to = t1 + 3_600_000;
+        let work_ev = make_event("ev-work", &acct.id, &work_cal.id, "Standup", t0, t1, None);
+        store.upsert_events(&[work_ev]).unwrap();
+
+        let sub1 = CalendarSubscription {
+            id: CalendarSubscriptionId::from("apple-fam"),
+            url: "https://p12-caldav.icloud.com/published/2/secret".into(),
+            name: "Family".into(),
+            color: None,
+            visible: true,
+            sort_order: 0,
+            etag: None,
+            last_modified: None,
+            expanded_from: Some(from),
+            expanded_to: Some(to),
+            expanded_tz: Some("UTC".into()),
+            last_synced_at: Some(t0),
+            last_error: None,
+            created_at: t0,
+        };
+        let sub2 = CalendarSubscription {
+            id: CalendarSubscriptionId::from("us-hol"),
+            url: "https://calendars.icloud.com/holidays/us.ics".into(),
+            name: "US Holidays".into(),
+            color: Some(ACCOUNT_CALENDAR_COLORS[1].1.to_owned()),
+            visible: false,
+            sort_order: 1,
+            etag: None,
+            last_modified: None,
+            expanded_from: Some(from),
+            expanded_to: Some(to),
+            expanded_tz: Some("UTC".into()),
+            last_synced_at: Some(t0),
+            last_error: None,
+            created_at: t0,
+        };
+        let sub1_ev = Event {
+            id: EventId::from("sub:apple-fam:e1"),
+            account_id: CalendarSubscription::account_id(),
+            calendar_id: sub1.calendar_id(),
+            provider_id: None,
+            ical_uid: Some("fam-1".into()),
+            summary: "Soccer".into(),
+            description: None,
+            location: None,
+            start: t0 + 1_800_000,
+            end: t1 + 1_800_000,
+            all_day: false,
+            status: EventStatus::Confirmed,
+            organizer: None,
+            attendees: Vec::new(),
+            html_link: None,
+            conference_url: None,
+            recurring_event_id: None,
+            updated: t0,
+            event_type: None,
+            color: None,
+            reminders: Some(vec![]),
+            original_start: None,
+            wants_conference: false,
+            pending: false,
+        };
+        let sub2_ev = Event {
+            id: EventId::from("sub:us-hol:e1"),
+            calendar_id: sub2.calendar_id(),
+            summary: "Holiday".into(),
+            ..sub1_ev.clone()
+        };
+
+        store.create_calendar_subscription(&sub1, "RAW1", &[sub1_ev.clone()]).unwrap();
+        store.create_calendar_subscription(&sub2, "RAW2", &[sub2_ev]).unwrap();
+
+        let account_colors = resolve_account_calendar_colors(std::slice::from_ref(&acct), &HashMap::new());
+        let sub_colors = resolve_subscription_calendar_colors(&[sub1.clone(), sub2.clone()], &account_colors);
+        assert_eq!(sub_colors[&sub2.id], ACCOUNT_CALENDAR_COLORS[1].1);
+        assert_ne!(sub_colors[&sub1.id], account_colors[&acct.id]);
+        assert_ne!(sub_colors[&sub1.id], sub_colors[&sub2.id]);
+
+        let view = load_calendar_view(
+            &store,
+            std::slice::from_ref(&acct),
+            &BTreeSet::from([acct.id.clone()]),
+            from,
+            to,
+            "UTC",
+            true,
+        );
+        assert_eq!(view.subscriptions.len(), 2);
+        assert!(view.subscription_needs_expansion.is_empty());
+        assert_eq!(
+            view.events.iter().map(|e| e.summary.as_str()).collect::<Vec<_>>(),
+            vec!["Standup", "Soccer"]
+        );
+
+        let view_tz = load_calendar_view(
+            &store,
+            std::slice::from_ref(&acct),
+            &BTreeSet::from([acct.id.clone()]),
+            from,
+            to,
+            "America/Denver",
+            true,
+        );
+        assert_eq!(view_tz.subscription_needs_expansion, vec![sub1.id.clone()]);
+
+        let sub1_cal = sub1.to_calendar();
+        assert!(!can_edit_event_for_account(&sub1_ev, Some(&sub1_cal), &acct.email));
+        assert_eq!(
+            default_destination_calendar(&acct.id, &[sub1_cal, work_cal.clone()], &HashMap::new()).map(|c| &c.id),
+            Some(&work_cal.id)
+        );
+
+        let info = source_subscription_info(&sub1);
+        assert_eq!(info.calendar_name, "Family");
+        assert_eq!(info.account_detail.as_deref(), Some("Subscribed calendar · icloud.com"));
     }
 }
